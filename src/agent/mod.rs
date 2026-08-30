@@ -1351,7 +1351,13 @@ pub(crate) fn spawn_agent_with_capture_home(
         .is_some_and(|backend| matches!(backend, Backend::OpenCode));
     if is_opencode {
         if let Some(home_path) = *home {
-            crate::transport::prepare_opencode_tui_session(home_path, name, *working_dir, args)?;
+            crate::transport::prepare_opencode_tui_session(
+                home_path,
+                name,
+                *working_dir,
+                args,
+                *spawn_mode,
+            )?;
         }
     }
     let is_codex = Backend::from_command(backend_command)
@@ -2883,10 +2889,41 @@ pub(crate) const DAEMON_HANDOFF_INJECT_MARKER: &str = "[AGEND-HANDOFF]";
 /// AUTHORITATIVE live sources; `SESSION-HANDOFF.md` is only a stale-tolerant hint
 /// because a fresh restart's DELETE=kill may have happened before any fresh
 /// handoff was written.
+///
+/// #3415: the opening states the restart and nothing about the agent's memory.
+/// The daemon performed the restart, so that much is observed fact; what
+/// survived inside the agent is not visible from here, and asserting it made the
+/// first sentence of this prompt unverifiable. The operational duty the old
+/// claim carried is stated directly instead — rebuild the in-flight picture from
+/// the sources below rather than recall it — which is what the recovery sequence
+/// needed all along.
+/// #3415: claims about what the agent still remembers, which no daemon-authored
+/// text may make. The daemon observes that it restarted a process; it cannot
+/// observe what survived inside the agent, so any such sentence is unverifiable
+/// in exactly the messages that most need to be trusted.
+///
+/// Shared by both delivered surfaces — the injected `[AGEND-RESUME]` prompt and
+/// the standing instructions — so the two guards cannot drift apart. It is
+/// deliberately a family rather than the one phrase that shipped: a guard pinned
+/// to exact wording is stepped around by the next paraphrase.
+#[cfg(test)]
+pub(crate) const UNVERIFIABLE_MEMORY_CLAIMS: &[&str] = &[
+    "lost your",
+    "lost its",
+    "have lost",
+    "no longer remember",
+    "do not remember",
+    "in-memory context",
+    "your memory",
+    "memory was",
+    "context was lost",
+];
+
 pub(crate) fn fresh_restart_self_kick_prompt() -> String {
     format!(
-        "{DAEMON_RESUME_INJECT_MARKER} You were just fresh-restarted and lost your in-memory \
-         context. If this arrives through Claude ChannelBridge, first call its ack_start tool \
+        "{DAEMON_RESUME_INJECT_MARKER} This session was just fresh-restarted. Treat nothing you \
+         may still recall about work in flight as authoritative — rebuild it from the sources \
+         below before you act on it. If this arrives through Claude ChannelBridge, first call its ack_start tool \
          with the exact delivery_id from the channel metadata, before any recovery action; after \
          the bounded recovery sequence call ack_complete with that same delivery_id; these acks \
          do not send an outward reply. Recover your OWN state now, in this order: (1) rebuild your in-flight picture \
@@ -3146,31 +3183,11 @@ pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam_channel::Receiver<
     (rx, dump)
 }
 
-/// Minimal managed `AgentHandle` over a throwaway `true` PTY, for cross-module
-/// tests that need a registry entry whose CONTENTS are irrelevant — e.g. the
-/// t-65 register-external TOCTOU repro only needs `reg.contains_key(id)` to be
-/// true. Spawns a minimal test PTY child; the caller owns cleanup of the registry.
-/// Uses the platform's portable-pty command shape so cross-platform tests can
-/// construct the same minimal live handle.
-#[cfg(test)]
-pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentHandle {
-    #[cfg(not(target_os = "windows"))]
-    let cmd = CommandBuilder::new("true");
-    #[cfg(target_os = "windows")]
-    let cmd = {
-        let mut c = CommandBuilder::new("cmd");
-        c.args(["/c", "findstr", ".*"]);
-        c
-    };
-    mk_test_handle_over(name, id, cmd, "true")
-}
-
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
-
 #[cfg(test)]
-pub(crate) use tests::mk_test_handle_over;
+pub(crate) use tests::mk_test_handle;
 
 #[cfg(all(test, unix))]
 pub(crate) use tests::mk_sigterm_immune_test_handle;

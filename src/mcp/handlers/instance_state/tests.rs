@@ -1013,6 +1013,256 @@ fn delete_instance_creator_force_refuses_while_audit_lock_is_held() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3414 helper: a fleet.yaml with one Claude instance whose stored args carry
+/// the exact production pin observed on `claude-aef7c0`.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn home_with_pinned_claude(tag: &str, args_yaml: &str) -> std::path::PathBuf {
+    let home = tmp_home_for_create_instance_team(tag);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!("instances:\n  dev:\n    backend: claude\n    args: {args_yaml}\n"),
+    )
+    .unwrap();
+    home
+}
+
+/// #3414 RED: `restart_instance mode=fresh` is a statement about the SESSION,
+/// not merely about the preset. The observed `--resume <uuid>` in the stored
+/// args reached the SPAWN boundary verbatim on every fresh restart, so the
+/// agent reattached to the same conversation while the daemon reported
+/// `mode=fresh spawned=true`.
+///
+/// Asserted at the real SPAWN boundary through the production entry, not on
+/// the pure sanitizer: the contract is about the argv actually handed over.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn fresh_restart_strips_session_pin_at_spawn_boundary_3414() {
+    use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude(
+        "3414-strip",
+        "[\"--resume\", \"cb80bb9d-3613-4c0d-9097-788b1941f5db\", \"--model\", \"claude-opus-5\"]",
+    );
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    *LAST_SPAWN_ARGS.lock() = None;
+
+    let _ = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    let observed = LAST_SPAWN_ARGS
+        .lock()
+        .clone()
+        .expect("fresh restart must reach the SPAWN boundary");
+    assert!(
+        !observed.contains("--resume"),
+        "#3414: mode=fresh must not hand a session pin to SPAWN; got {observed:?}"
+    );
+    assert!(
+        !observed.contains("cb80bb9d-3613-4c0d-9097-788b1941f5db"),
+        "#3414: the pinned session id must not survive a fresh restart; got {observed:?}"
+    );
+    assert!(
+        observed.contains("--model claude-opus-5"),
+        "#3414: unrelated flags must be preserved verbatim; got {observed:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3414 RED (fail-closed): a malformed session selector must refuse BEFORE any
+/// destructive step. `--resume` with no value is unresolvable, and guessing
+/// would either strand the operator on the old session or drop a real value —
+/// so the restart is refused and the live instance is left untouched.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn malformed_session_selector_refuses_without_deleting_3414() {
+    use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    // `--resume=` (explicit `=`, nothing after) is genuinely unresolvable.
+    // A BARE `--resume` is NOT malformed — `claude --help` declares
+    // `-r, --resume [value]`, so the bare form is a legal picker.
+    let home = home_with_pinned_claude("3414-noDelete", "[\"--resume=\"]");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    *LAST_SPAWN_ARGS.lock() = None;
+
+    let refused = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    assert_eq!(
+        refused["code"], "fresh_session_args_invalid",
+        "#3414: malformed selector must fail closed with a structured code: {refused}"
+    );
+    assert_eq!(
+        refused["reason"], "missing_required_value",
+        "#3414: the refusal must name WHY, not just that it refused: {refused}"
+    );
+    assert_eq!(
+        refused["token"], "--resume=",
+        "#3414: the refusal must name WHICH token blocked it: {refused}"
+    );
+    assert!(
+        LAST_SPAWN_ARGS.lock().is_none(),
+        "#3414: a refused preflight must never reach SPAWN"
+    );
+
+    // The live instance must survive: preflight runs before DELETE.
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("fleet.yaml must survive a refused restart");
+    assert!(
+        fleet.instances.contains_key("dev"),
+        "#3414: a refused fresh restart must not delete the instance it refused to restart"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3414 RED (preflight side-effect): malformed fresh args must be rejected
+/// before operator-recovery bookkeeping runs. The old ordering cleared the
+/// persisted `failed_escalated` latch before the typed sanitizer, changing the
+/// escalation store even though the restart was refused.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn malformed_session_selector_preserves_escalation_runtime_3414() {
+    use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3414-preflight-side-effect", "[\"--resume=\"]");
+    crate::daemon::escalation_persist::persist(
+        &home,
+        "dev",
+        &crate::health::PersistedEscalation {
+            total_crashes: 4,
+            crash_times_epoch_ms: vec![111, 222],
+            last_crash_notification_epoch_ms: Some(333),
+            last_hung_notification_epoch_ms: Some(444),
+            hung_since_epoch_ms: Some(555),
+            failed_escalated: true,
+        },
+    );
+    let escalation_path = home.join("health_escalation.json");
+    let escalation_before = std::fs::read(&escalation_path).expect("escalation store");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    *LAST_SPAWN_ARGS.lock() = None;
+
+    let refused = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    assert_eq!(refused["code"], "fresh_session_args_invalid");
+    assert_eq!(
+        std::fs::read(&escalation_path).expect("escalation store after refusal"),
+        escalation_before,
+        "#3414: rejected preflight must not rewrite escalation persistence"
+    );
+    assert!(
+        !crate::agent::deleting::is_deleting(&home, "dev"),
+        "#3414: rejected preflight must not enter the delete window"
+    );
+    assert!(
+        LAST_SPAWN_ARGS.lock().is_none(),
+        "#3414: rejected preflight must not reach SPAWN or arm self-kick"
+    );
+    assert!(
+        runtime.registry.lock().is_empty(),
+        "#3414: rejected preflight must not mutate runtime registry state"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3414 D2 helper: a self-kick delivery the OLD session accepted but never
+/// acknowledged, recorded far enough in the past to be past the watchdog's
+/// acknowledgement window.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn seed_overdue_self_kick_receipt(home: &std::path::Path, instance: &str) {
+    let store = crate::transport::ReceiptStore::for_instance(home, instance).expect("store");
+    let mut envelope = crate::transport::DeliveryEnvelope::new(
+        instance,
+        crate::transport::SessionLocator::claude(
+            "http://127.0.0.1:1/".to_string(),
+            "dead-session".to_string(),
+            "token".to_string(),
+        ),
+        crate::transport::DeliveryKind::Notification,
+        "[AGEND-RESUME] recover your own state",
+        None,
+    );
+    envelope.self_kick = true;
+    store.record_queued(&envelope).expect("queued");
+    let mut accepted = crate::transport::DeliveryReceipt::for_state(
+        &envelope,
+        crate::transport::DeliveryState::ProtocolAccepted,
+    );
+    accepted.recorded_at = "2020-01-01T00:00:00Z".to_string();
+    store.record(accepted).expect("accepted");
+}
+
+/// #3414 RED (D2): `mode=fresh` destroys the session, so every transport
+/// delivery receipt keyed to it becomes unresolvable — the consumer that owed
+/// the acknowledgement no longer exists. Restart deletes through
+/// `delete_instance_under_guard`, whose contract is that the CALLER already
+/// owns the `DeleteFence` fronting the transport delivery cleanup; restart
+/// owned none, so the dead session's `ProtocolAccepted` self-kick survived and
+/// the watchdog escalated it to every channel as an unacknowledged delivery on
+/// an instance the operator had deliberately restarted.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn fresh_restart_clears_dead_session_self_kick_receipt_3414() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3414-d2-fresh", "[]");
+    seed_overdue_self_kick_receipt(&home, "dev");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+
+    let _ = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    let store = crate::transport::ReceiptStore::for_instance(&home, "dev").expect("store");
+    assert!(
+        store.pending_deliveries().expect("pending").is_empty(),
+        "#3414: a fresh restart must not leave a nonterminal receipt keyed to the session it destroyed"
+    );
+    assert_eq!(
+        crate::transport::claude_channel::self_kick_watchdog_pass(&home, "dev").expect("watchdog"),
+        0,
+        "#3414: the watchdog must not escalate an acknowledgement the operator's fresh restart made impossible"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3414 D2 negative control: `mode=resume` restores the SAME session, so its
+/// receipts stay resolvable and must survive. This pins the cleanup to the
+/// fresh path rather than making restart a blanket delivery-state wipe.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn resume_restart_preserves_live_session_receipt_3414() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3414-d2-resume", "[]");
+    seed_overdue_self_kick_receipt(&home, "dev");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+
+    let _ = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "resume", "force": true}),
+        Some(&runtime),
+    );
+
+    let store = crate::transport::ReceiptStore::for_instance(&home, "dev").expect("store");
+    assert_eq!(
+        store.pending_deliveries().expect("pending").len(),
+        1,
+        "#3414: a resume restart keeps the session, so its pending receipt must not be discarded"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #3418 RED: `create_instance` persists a DURABLE fleet.yaml entry — including
 /// `args`, which per #3414 shapes every future spawn of that instance
 /// indefinitely — and currently logs nothing at all. Every neighbouring

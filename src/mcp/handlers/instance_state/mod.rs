@@ -4,6 +4,10 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 pub(crate) mod lifecycle;
+mod restart_prep;
+use restart_prep::{await_unsent_draft_or_grace, restart_spawn_params};
+#[cfg(test)]
+use restart_prep::{restart_draft_gate, DraftGate, RESTART_DRAFT_GRACE};
 #[cfg(not(test))]
 pub(super) mod spawn;
 #[cfg(test)]
@@ -454,105 +458,6 @@ pub(super) fn handle_start_instance_with_runtime(
     }
 }
 
-/// #1625: assemble the SPAWN params for a restart. Tags `layout: same-tab` so
-/// the respawned pane returns to the tab the killed pane occupied (recorded
-/// on its DELETE) instead of opening a fresh tab. `mode` only toggles backend
-/// resume args — placement is identical for resume and fresh restarts — so
-/// the hint is applied unconditionally.
-fn restart_spawn_params(
-    name: &str,
-    backend_command: &str,
-    args: &[String],
-    working_directory: Option<&Path>,
-    env: &std::collections::HashMap<String, String>,
-    mode: &str,
-) -> Value {
-    let mut spawn_params = json!({
-        "name": name,
-        "backend": backend_command,
-        "args": args.join(" "),
-        "working_directory": working_directory.map(|p| p.display().to_string()),
-        "env": serde_json::to_value(env).unwrap_or(serde_json::Value::Null),
-        "layout": "same-tab",
-    });
-    if mode == "resume" {
-        spawn_params["mode"] = json!("resume");
-    } else {
-        // fresh restart only: arm the daemon's first-turn self-kick so the
-        // respawned (context-lost) instance runs its recovery sequence instead of
-        // sitting idle until an operator happens to type (the overnight
-        // restart-strands-the-fleet failure). INDEPENDENT flag — the SPAWN handler
-        // must NOT derive self-kick from SpawnMode::Fresh, which initial fleet
-        // spawns also map to; only THIS restart-fresh path sets it.
-        spawn_params["self_kick_on_ready"] = json!(true);
-    }
-    spawn_params
-}
-
-/// Grace ceiling for [`await_unsent_draft_or_grace`]: even while the operator
-/// keeps typing, force the restart after this long so a context-full / stuck
-/// agent can't be deferred indefinitely. The primary release is the operator
-/// submitting (draft clears well before this); the ceiling only bounds the
-/// pathological continuous-typing case. Tunable.
-const RESTART_DRAFT_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
-/// Re-check cadence while deferring — silent (no per-poll event / nudge).
-const RESTART_DRAFT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
-
-#[derive(Debug, PartialEq, Eq)]
-enum DraftGate {
-    Proceed,
-    Defer,
-}
-
-/// Pure restart-gate decision (unit-tested exhaustively): proceed with the kill
-/// iff `force`, there is no live operator draft, or the grace ceiling has
-/// elapsed; otherwise keep deferring. Kept pure (no clock / no IO) so the whole
-/// decision matrix is deterministic without real sleeps.
-fn restart_draft_gate(
-    force: bool,
-    has_live_draft: bool,
-    elapsed: std::time::Duration,
-    grace: std::time::Duration,
-) -> DraftGate {
-    if force || !has_live_draft || elapsed >= grace {
-        DraftGate::Proceed
-    } else {
-        DraftGate::Defer
-    }
-}
-
-/// Block the restart while the operator has unsent keystrokes in `name`'s input
-/// line, releasing the instant the draft is submitted/cleared or after
-/// [`RESTART_DRAFT_GRACE`]. Emits exactly two log lines (defer-start, proceed) —
-/// no per-poll noise. Thread-safety rationale is at the call site.
-fn await_unsent_draft_or_grace(home: &Path, name: &str, force: bool) {
-    if restart_draft_gate(
-        force,
-        crate::inbox::notify::operator_has_live_draft(home, name),
-        std::time::Duration::ZERO,
-        RESTART_DRAFT_GRACE,
-    ) == DraftGate::Proceed
-    {
-        return; // fast path: force, or no live draft — no wait, no log.
-    }
-    tracing::info!(%name, "restart deferred: operator has an unsent draft in the input line");
-    let start = std::time::Instant::now();
-    while restart_draft_gate(
-        force,
-        crate::inbox::notify::operator_has_live_draft(home, name),
-        start.elapsed(),
-        RESTART_DRAFT_GRACE,
-    ) == DraftGate::Defer
-    {
-        std::thread::sleep(RESTART_DRAFT_POLL);
-    }
-    tracing::info!(
-        %name,
-        elapsed_ms = start.elapsed().as_millis() as u64,
-        "restart proceeding: draft submitted/cleared or grace ceiling reached"
-    );
-}
-
 pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
     handle_restart_instance_with_runtime(home, args, None)
 }
@@ -567,9 +472,6 @@ pub(super) fn handle_restart_instance_with_runtime(
         Err(e) => return e,
     };
     crate::validate_name_or_err!(name);
-    // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
-    // self-orch once-off latch, so a fresh terminal death after this restart re-pages.
-    crate::daemon::escalation_persist::clear_failed_escalated(home, name);
     let reason = args["reason"].as_str().unwrap_or("manual restart");
     let mode = args["mode"].as_str().unwrap_or("resume");
 
@@ -607,6 +509,48 @@ pub(super) fn handle_restart_instance_with_runtime(
         None => return json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
     };
 
+    // #3414 PREFLIGHT — must stay HERE: after `resolve_instance` (it needs the
+    // DECLARED backend + stored args) and before EVERY destructive step below
+    // (draft wait, inbox requeue, DELETE, SPAWN, self-kick arming). Fixing this
+    // at `restart_spawn_params` is too late: by then the instance is gone.
+    //
+    // `mode=fresh` is a statement about the SESSION, not merely about the
+    // preset. `SpawnMode` only selects `Backend::preset_spawn_args`, so a
+    // session pin living in the CALLER args (the observed `--resume <uuid>`)
+    // was never inspected and survived every fresh restart.
+    //
+    // Grammar comes from `resolved.backend` — the DECLARED identity — never
+    // from `backend_command`, whose basename misclassifies wrappers (#2744).
+    // Unresolvable grammar fails closed: guessing would either strand the
+    // operator on the old session or silently drop a real value, and the live
+    // instance is still running at this point.
+    let sanitized_args = if mode == "resume" {
+        resolved.args.clone()
+    } else {
+        match crate::backend_session::sanitize_for_fresh(&resolved.backend, &resolved.args) {
+            Ok(args) => args,
+            Err(error) => {
+                return json!({
+                    "error": format!(
+                        "refusing fresh restart: {error}. Fix the instance's stored args \
+                         (or restart with mode=resume) — the running instance was left untouched."
+                    ),
+                    "name": name,
+                    "code": "fresh_session_args_invalid",
+                    "backend": error.backend,
+                    "token": error.token,
+                    "reason": error.reason.as_str(),
+                });
+            }
+        }
+    };
+
+    // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
+    // self-orch once-off latch, so a fresh terminal death after this restart re-pages.
+    // Keep this AFTER typed session preflight: a refused fresh restart must not
+    // mutate persisted escalation state or any other runtime state.
+    crate::daemon::escalation_persist::clear_failed_escalated(home, name);
+
     // t-95913-5: the operator's unsent keystrokes live ONLY in the input line of
     // the process we're about to kill — a fresh OR resume restart destroys them
     // (`--continue` restores the conversation, not the input line). If the pane
@@ -625,24 +569,60 @@ pub(super) fn handle_restart_instance_with_runtime(
     // silently lose an unconfirmed message; #3228 intentionally chooses
     // visible redelivery and recovery. Resume restarts preserve context → the
     // implicit next-drain ack (A) handles it.
-    if mode != "resume" {
-        crate::inbox::requeue_delivering_for_session_reset(home, name);
-    }
-
     let delete_context = runtime.map(|runtime| crate::agent_ops::DeleteContext {
         registry: &runtime.registry,
         configs: &runtime.configs,
         externals: &runtime.externals,
         notifier: runtime.notifier.as_ref(),
     });
+
+    // #3414: the runtime DELETE goes through `delete_instance_under_guard`,
+    // whose contract is that the CALLER already owns the `DeleteFence`. Restart
+    // owned none, so neither the deleting mark that makes a concurrent
+    // `dispatch_transport` refuse a job aimed at the dying session nor the
+    // transport delivery cleanup that fence fronts ever ran. The legacy API
+    // DELETE builds its own fence inside the daemon
+    // (`agent_ops::delete_instance_with_exit_status`) and the transport lane is a
+    // non-reentrant mutex, so nesting a second fence around that call would block
+    // the serving thread on this lane while we block on its response: the fence is
+    // scoped to exactly the path that lacks one. It opens after the draft gate so
+    // a long grace never marks a still-live instance.
+    let fence = delete_context
+        .is_some()
+        .then(|| crate::daemon::lifecycle::DeleteFence::new(home, name, true));
+
+    if mode != "resume" {
+        crate::inbox::requeue_delivering_for_session_reset(home, name);
+        // A fresh restart destroys the session, so every transport receipt keyed
+        // to it is unresolvable — the consumer that owed the acknowledgement no
+        // longer exists. Left behind, the self-kick watchdog escalates it to every
+        // channel as an unacknowledged delivery on an instance the operator
+        // deliberately restarted. A resume restores the SAME session, so its
+        // receipts stay resolvable and are preserved. Only under the fence:
+        // `remove_instance_delivery_state` requires the cleanup guard so no
+        // in-flight transport job can recreate the files behind it.
+        if fence.is_some() {
+            if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
+                tracing::warn!(
+                    agent = %name,
+                    error = %error,
+                    "restart: transport delivery cleanup failed"
+                );
+            }
+        }
+    }
+
     // Restart intentionally uses no-wait deletion: admission of the kill signal,
     // followed by the replacement spawn, is this path's existing contract.
     let _ = lifecycle::delete_with_runtime_or_legacy(home, name, delete_context.as_ref(), true);
+    // SPAWN refuses a name that is mid-delete (`agent::spawn_agent`), so the fence
+    // must close before the replacement spawn.
+    drop(fence);
 
     let spawn_params = restart_spawn_params(
         name,
         &resolved.backend_command,
-        &resolved.args,
+        &sanitized_args,
         resolved.working_directory.as_deref(),
         &resolved.env,
         mode,

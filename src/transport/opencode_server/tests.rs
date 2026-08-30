@@ -1494,3 +1494,267 @@ fn _server_thread(listener: TcpListener) -> thread::JoinHandle<()> {
         let _ = _read_request_line(&listener);
     })
 }
+
+/// #3414 RED (lead review of 06faebad). Clearing `locator.session_id` in
+/// `prepare_opencode_tui_session` is not enough: `resident_adapter` returns an
+/// ALREADY-RESIDENT worker for the same key and drops the freshly prepared
+/// locator on the floor, so the old session id survives a fresh restart.
+///
+/// The fix only ever worked for the cold path — no resident worker — which is
+/// exactly the case a RESTART is not.
+mod fresh_restart_resident_session_3414 {
+    use super::super::*;
+    use crate::backend::SpawnMode;
+
+    #[allow(clippy::expect_used)]
+    fn scratch_home(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "agend-3414-resident-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&home).expect("scratch home");
+        home
+    }
+
+    /// A hermetic stand-in for `opencode serve`: enough of the HTTP surface for
+    /// `start_or_attach_blocking` to complete, and nothing else.
+    ///
+    /// Paired with `managed: false` on the locator, which is what stops
+    /// `wait_for_server` from ever launching a child
+    /// (`opencode_server.rs:888`). The test therefore needs no installed
+    /// binary and no network beyond loopback.
+    ///
+    /// Answers exactly what the adapter asks for:
+    /// - `GET /global/health`   -> healthy + a version (required, else Err)
+    /// - `GET /session/{id}`    -> 404 for the STALE id, 200 for one we issued
+    /// - `POST /session`        -> a fresh id, recorded so the test can assert it
+    /// - `GET /event`           -> an SSE stream held open
+    struct FakeOpenCode {
+        port: u16,
+        created: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl FakeOpenCode {
+        #[allow(clippy::expect_used)]
+        fn start(known_session: Option<&str>) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake opencode");
+            let port = listener.local_addr().expect("addr").port();
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking fake listener");
+            let created: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let known = known_session.map(str::to_string);
+            let worker_created = Arc::clone(&created);
+            let worker_stop = Arc::clone(&stop);
+            // fire-and-forget: bounded by `stop`, which every test sets in Drop.
+            std::thread::spawn(move || {
+                let mut issued: Vec<String> = Vec::new();
+                if let Some(known) = known.clone() {
+                    issued.push(known);
+                }
+                while !worker_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let mut known_ids = issued.clone();
+                            known_ids.extend(worker_created.lock().clone());
+                            Self::serve_one(stream, known_ids, Arc::clone(&worker_created));
+                            issued = worker_created.lock().clone();
+                            if let Some(known) = known.clone() {
+                                issued.push(known);
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                port,
+                created,
+                stop,
+            }
+        }
+
+        fn serve_one(
+            mut stream: std::net::TcpStream,
+            known_ids: Vec<String>,
+            created: Arc<Mutex<Vec<String>>>,
+        ) {
+            use std::io::{BufRead, BufReader, Write};
+            let peek = match stream.try_clone() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut reader = BufReader::new(peek);
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                return;
+            }
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts.next().unwrap_or_default().to_string();
+            // Drain headers so the peer's write completes.
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) if line.trim().is_empty() => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            let respond = |stream: &mut std::net::TcpStream, code: &str, body: String| {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.flush();
+            };
+            if path == "/global/health" {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "{\"healthy\":true,\"version\":\"0.0.0-test\"}".to_string(),
+                );
+            } else if path == "/event" {
+                // Hold the SSE stream open; the adapter only needs it to connect.
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+                );
+                let _ = stream.flush();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            } else if method == "POST" && path == "/session" {
+                let id = format!("ses-fake-{}", created.lock().len());
+                created.lock().push(id.clone());
+                respond(&mut stream, "200 OK", format!("{{\"id\":\"{id}\"}}"));
+            } else if let Some(id) = path.strip_prefix("/session/") {
+                if known_ids.iter().any(|k| k == id) {
+                    respond(&mut stream, "200 OK", format!("{{\"id\":\"{id}\"}}"));
+                } else {
+                    respond(&mut stream, "404 Not Found", "{}".to_string());
+                }
+            } else {
+                respond(&mut stream, "200 OK", "{}".to_string());
+            }
+        }
+    }
+
+    impl Drop for FakeOpenCode {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+        }
+    }
+
+    /// Seed the resident map with a worker already holding a stale session, the
+    /// state a live OpenCode instance is in when a restart arrives. `join: None`
+    /// keeps the fixture free of a real event-loop thread.
+    #[allow(clippy::expect_used)]
+    fn seed_resident(home: &std::path::Path, instance: &str, session_id: &str, port: u16) {
+        let mut adapter = OpenCodeNativeShared::new(home, instance);
+        let mut locator = SessionLocator::opencode(
+            format!("http://127.0.0.1:{port}"),
+            Some(session_id.to_string()),
+            "opencode".to_string(),
+            "secret".to_string(),
+        );
+        // Unmanaged: `wait_for_server` only launches a child when `managed`
+        // (opencode_server.rs:888), so this keeps the test off any installed
+        // binary while still driving the real attach path.
+        locator.managed = false;
+        // `prepare_opencode_tui_session` resolves the locator from DISK
+        // (`locator_for_instance`), not from the resident adapter, so the
+        // fixture has to persist it or the production path would fall back to
+        // a default managed locator and try to launch a real server.
+        crate::transport::registry::save_session_locator(home, instance, &locator)
+            .expect("persist fixture locator");
+        adapter.locator = Some(locator);
+        resident_workers().lock().insert(
+            resident_key(home, instance),
+            ResidentWorker {
+                adapter: Arc::new(Mutex::new(adapter)),
+                stop: Arc::new(AtomicBool::new(false)),
+                join: None,
+            },
+        );
+    }
+
+    fn drop_resident(home: &std::path::Path, instance: &str) {
+        resident_workers()
+            .lock()
+            .remove(&resident_key(home, instance));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn fresh_restart_does_not_reuse_a_resident_session_3414() {
+        let home = scratch_home("fresh");
+        let fake = FakeOpenCode::start(Some("stale-session"));
+        seed_resident(&home, "dev", "stale-session", fake.port);
+
+        let prepared = crate::transport::prepare_opencode_tui_session(
+            &home,
+            "dev",
+            None,
+            &[],
+            SpawnMode::Fresh,
+        )
+        .expect("fresh preparation");
+
+        // NOT `None`: clearing session_id happens BEFORE resident preparation,
+        // and preparation then creates a new conversation via POST /session.
+        // The contract is that the OLD session is not inherited — asserting
+        // `None` would have been asserting the intermediate state, not the
+        // observable one.
+        assert_ne!(
+            prepared.session_id.as_deref(),
+            Some("stale-session"),
+            "#3414: a fresh restart must not inherit the resident worker's session"
+        );
+        assert!(
+            prepared.session_id.is_some(),
+            "#3414: fresh preparation must still produce a session to talk to"
+        );
+        assert_eq!(
+            fake.created.lock().len(),
+            1,
+            "#3414: fresh must create exactly one NEW session on the server"
+        );
+        drop_resident(&home, "dev");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The mirror: Resume is the whole point of keeping a resident worker, so it
+    /// must still reuse the session it already has.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn resume_restart_still_reuses_the_resident_session_3414() {
+        let home = scratch_home("resume");
+        let fake = FakeOpenCode::start(Some("stale-session"));
+        seed_resident(&home, "dev", "stale-session", fake.port);
+
+        let prepared = crate::transport::prepare_opencode_tui_session(
+            &home,
+            "dev",
+            None,
+            &[],
+            SpawnMode::Resume,
+        )
+        .expect("resume preparation");
+
+        assert_eq!(
+            prepared.session_id.as_deref(),
+            Some("stale-session"),
+            "#3414: resume must keep attaching to the existing session"
+        );
+        drop_resident(&home, "dev");
+        std::fs::remove_dir_all(&home).ok();
+    }
+}

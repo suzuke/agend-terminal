@@ -1,4 +1,66 @@
 use super::*;
+
+/// Minimal managed `AgentHandle` over a throwaway `true` PTY, for cross-module
+/// tests that need a registry entry whose CONTENTS are irrelevant — e.g. the
+/// t-65 register-external TOCTOU repro only needs `reg.contains_key(id)` to be
+/// true. Spawns a minimal test PTY child; the caller owns cleanup of the registry.
+/// Uses the platform's portable-pty command shape so cross-platform tests can
+/// construct the same minimal live handle.
+#[cfg(test)]
+pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentHandle {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = CommandBuilder::new("true");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = CommandBuilder::new("cmd");
+        c.args(["/c", "findstr", ".*"]);
+        c
+    };
+    cmd.cwd(std::env::temp_dir());
+    let child = pair.slave.spawn_command(cmd).expect("spawn test PTY child");
+    drop(pair.slave);
+    let pty_writer: PtyWriter = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
+    let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
+    let core = Arc::new(CoreMutex::new(AgentCore {
+        vterm: VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+    let published_state = core.lock().state.published_handle();
+    let published_observed = core.lock().state.published_observed_handle();
+    AgentHandle {
+        id,
+        name: name.to_string().into(),
+        declared_backend: None,
+        backend_command: "true".to_string(),
+        pty_writer,
+        pty_master,
+        core,
+        published_state,
+        published_observed,
+        child: Arc::new(Mutex::new(child)),
+        submit_key: "\r".to_string(),
+        inject_prefix: String::new(),
+        typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        spawned_at: std::time::Instant::now(),
+        spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crash_disposition::SpawnGeneration::default(),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
 use crate::transport::{
     DeliveryEnvelope, DeliveryKind, DeliveryReceipt, DeliveryState, SessionLocator,
 };
@@ -285,6 +347,46 @@ fn fresh_restart_self_kick_prompt_shape() {
     );
     assert!(p.contains("NOT an operator command"));
     assert!(p.contains("NOT authority to dispatch"));
+}
+
+/// #3415 RED: the prompt's opening asserts a fact the daemon cannot observe —
+/// that the agent "lost your in-memory context". The daemon performed the
+/// restart, so it can state THAT; what survived inside the agent is not visible
+/// from here. An agent that does still remember its work is told something false
+/// by the first sentence of the very message asking it to trust the rest, and
+/// the whole point of this prompt is to be trusted.
+///
+/// The replacement has to carry the same operational weight without the claim:
+/// state the restart, and require the in-flight picture to be REBUILT from the
+/// authoritative sources rather than recalled. That instruction is what the
+/// false sentence was standing in for, so the guard pins it too — deleting the
+/// claim must not quietly delete the duty.
+///
+/// The ban list is deliberately broader than the one phrase that shipped. A
+/// guard pinned to the exact wording is stepped around by the next paraphrase,
+/// and this prompt has no legitimate reason to assert anything about what the
+/// agent remembers. Ordering and the authority guard stay pinned by
+/// `fresh_restart_self_kick_prompt_shape`, so a rewrite that neutralises the
+/// opening but drops the recovery sequence still fails there.
+#[test]
+fn fresh_restart_prompt_makes_no_unverifiable_memory_claim_3415() {
+    let prompt = super::fresh_restart_self_kick_prompt();
+    let lower = prompt.to_lowercase();
+    for claim in super::UNVERIFIABLE_MEMORY_CLAIMS {
+        assert!(
+            !lower.contains(*claim),
+            "#3415: the prompt must not assert what the agent remembers — found {claim:?}"
+        );
+    }
+    assert!(
+        lower.contains("fresh-restarted"),
+        "#3415: it must still state the fact the daemon DOES know — that it restarted this session"
+    );
+    assert!(
+        lower.contains("rebuild"),
+        "#3415: dropping the memory claim must not drop the duty it carried — the in-flight \
+         picture has to be REBUILT from the authoritative sources, not recalled"
+    );
 }
 
 /// RED: a structured fresh-restart bootstrap must not inherit LegacyPty's raw

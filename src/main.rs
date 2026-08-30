@@ -21,6 +21,7 @@ mod backend;
 mod backend_harness;
 mod backend_model;
 mod backend_profile;
+mod backend_session;
 mod background_guidance;
 mod behavioral;
 mod binding;

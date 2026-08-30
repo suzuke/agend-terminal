@@ -336,6 +336,34 @@ fn notify_crash(
     );
 }
 
+/// #3414: a crash respawn is a FRESH spawn, so it owes the same session
+/// contract as `restart_instance mode=fresh` — the stored args are replayed on
+/// every spawn, and a selector left in them reattaches the agent to the session
+/// it crashed in.
+///
+/// The grammar comes from the DECLARED backend, never the command basename. An
+/// instance with no declared backend has no grammar we transcribed, so its args
+/// are returned untouched rather than rewritten on a guess.
+fn fresh_respawn_args(
+    config: &crate::daemon::AgentConfig,
+) -> Result<Vec<String>, crate::backend_session::SessionArgsError> {
+    match config.backend.as_ref() {
+        Some(backend) => crate::backend_session::sanitize_for_fresh(backend, &config.args),
+        None => Ok(config.args.clone()),
+    }
+}
+
+/// #3415: the line written into the respawned agent's PTY. It states what the
+/// daemon observed — it restarted the agent, for this reason, into a new
+/// session — and nothing about what the agent retained, which the daemon cannot
+/// see. The duty the old wording carried is stated directly instead.
+fn respawn_notice(reason: &str) -> String {
+    format!(
+        "[system] Agent restarted due to {reason}. This is a new session: rebuild anything \
+         in flight from the authoritative sources rather than recalling it.\r"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn respawn_agent_worker(
     home: &Path,
@@ -487,12 +515,44 @@ fn respawn_agent_worker(
             return;
         }
     }
+    // #3414 PREFLIGHT — this respawn is Fresh, so the declared session grammar
+    // is resolved BEFORE the spawn and an unresolvable selector refuses rather
+    // than guesses, exactly as on the restart path. Refusing leaves the agent
+    // down, so it takes the same loud failure route as a failed spawn: the
+    // operator is paged rather than left with a silently dead agent.
+    let fresh_args = match fresh_respawn_args(&config) {
+        Ok(args) => args,
+        Err(error) => {
+            if let Some(permit) = permit.take() {
+                let _ = agent::crash_disposition::owner_ledger().mark_failed(permit);
+            }
+            tracing::error!(agent = %config.name, error = %error, "respawn refused: unresolvable session args");
+            crate::event_log::log(
+                home,
+                "crash_respawn_refused",
+                &config.name,
+                &format!("unresolvable session args: {error}"),
+            );
+            crate::channel::notify_all_escalation_channels(
+                &config.name,
+                NotifySeverity::Error,
+                &format!(
+                    "🛑 Agent `{}` crash-respawn REFUSED: {error}. Fix the instance's stored args, then start it.",
+                    config.name
+                ),
+                false,
+            );
+            #[cfg(test)]
+            signal_test_worker_done(&test_done);
+            return;
+        }
+    };
     match agent::spawn_agent(
         &agent::SpawnConfig {
             name: &config.name,
             backend: config.backend.as_ref(),
             backend_command: &config.backend_command,
-            args: &config.args,
+            args: &fresh_args,
             spawn_mode: crate::backend::SpawnMode::Fresh,
             cols,
             rows,
@@ -541,9 +601,7 @@ fn respawn_agent_worker(
                     })
                 };
                 if let Some((tgt, reason)) = snap {
-                    let msg = format!(
-                        "[system] Agent restarted due to {reason}. Previous context was lost.\r"
-                    );
+                    let msg = respawn_notice(&reason);
                     let _ = agent::write_to_pty(&tgt.pty_writer, msg.as_bytes());
                 }
             }
@@ -597,6 +655,280 @@ fn respawn_agent_worker(
 mod tests {
     use super::should_fire_terminal_p0;
     use crate::teams::SelfOrchStatus;
+
+    fn cfg(backend: crate::backend::Backend, args: &[&str]) -> crate::daemon::AgentConfig {
+        crate::daemon::AgentConfig {
+            name: "crashed".to_string(),
+            backend: Some(backend),
+            backend_command: "claude".to_string(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            env: None,
+            working_dir: None,
+            submit_key: "\r".to_string(),
+        }
+    }
+
+    /// #3414 RED: crash respawn is a FRESH spawn — it hands
+    /// `SpawnMode::Fresh` to `spawn_agent` — but it passed the instance's
+    /// stored args straight through, so the session contract #3414 established
+    /// for `restart_instance` stopped at that one entry point.
+    ///
+    /// The production case is the same one #3414 was written for: a durable
+    /// `--resume <uuid>` in fleet.yaml. A crashed Claude agent came back holding
+    /// the conversation it crashed in, on a path that never asks the operator
+    /// for anything. Unrelated flags must survive, exactly as on the restart
+    /// path.
+    #[test]
+    fn crash_respawn_strips_the_session_pin_3414() {
+        let config = cfg(
+            crate::backend::Backend::ClaudeCode,
+            &[
+                "--resume",
+                "cb80bb9d-3613-4c0d-9097-788b1941f5db",
+                "--model",
+                "claude-opus-5",
+            ],
+        );
+        let args = super::fresh_respawn_args(&config).expect("declared grammar must resolve");
+        assert!(
+            !args.iter().any(|a| a == "--resume"),
+            "a crash respawn is Fresh: it must not hand a session pin to SPAWN; got {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("cb80bb9d")),
+            "the pinned session id must not survive a crash respawn; got {args:?}"
+        );
+        assert_eq!(
+            args,
+            vec!["--model".to_string(), "claude-opus-5".to_string()],
+            "unrelated flags must be preserved byte for byte"
+        );
+    }
+
+    /// #3414 RED: the same fail-closed rule. An unresolvable selector must
+    /// refuse rather than guess, here as on the restart path — guessing would
+    /// either strand the agent on the old session or drop a real value.
+    #[test]
+    fn crash_respawn_fails_closed_on_an_unresolvable_selector_3414() {
+        let config = cfg(crate::backend::Backend::ClaudeCode, &["--resume="]);
+        let error = super::fresh_respawn_args(&config)
+            .expect_err("an unresolvable selector must fail closed");
+        assert_eq!(error.token, "--resume=");
+        assert_eq!(
+            error.reason,
+            crate::backend_session::SessionArgsErrorReason::MissingRequiredValue
+        );
+    }
+
+    /// #3415 RED: the third delivered surface. After a crash respawn the daemon
+    /// writes a line straight into the agent's PTY, and that line asserted what
+    /// the agent remembered — the claim #3415 removed from the other two
+    /// surfaces. It was also FALSE here whenever the stored args carried a pin,
+    /// because this path never sanitized them.
+    ///
+    /// Held to the same shared list as the other two surfaces, so the three
+    /// cannot drift apart.
+    #[test]
+    fn crash_respawn_notice_makes_no_unverifiable_memory_claim_3415() {
+        let notice = super::respawn_notice("a crash");
+        let lower = notice.to_lowercase();
+        for claim in crate::agent::UNVERIFIABLE_MEMORY_CLAIMS {
+            assert!(
+                !lower.contains(*claim),
+                "#3415: the respawn notice must not assert what the agent remembers — found {claim:?}"
+            );
+        }
+        assert!(
+            notice.contains("a crash"),
+            "#3415: it must still state the reason the daemon observed"
+        );
+        assert!(
+            lower.contains("new session"),
+            "#3415: dropping the claim must not drop the duty it carried — the agent has to know this is a new session"
+        );
+    }
+
+    /// #3414: the helper being correct is not the contract — the SPAWN using it
+    /// is. Found by mutation: with the four grammar guards and both notice
+    /// guards in place, reverting this one field to `&config.args` left every
+    /// test green, because they all exercised `fresh_respawn_args` directly and
+    /// nothing pinned the wiring.
+    ///
+    /// Scoped to `respawn_agent_worker`'s body so it reads the call site rather
+    /// than the file: the sanitizer runs before the spawn, the spawn takes its
+    /// result, the body names no stored-args field, and nothing rebinds
+    /// `fresh_args` between the two.
+    ///
+    /// SECONDARY, and the r1 re-review is why this says so. The earlier wording
+    /// claimed the stored args could not reach the spawn "under any spelling",
+    /// which a source predicate cannot promise: an alias and a helper both
+    /// walked past it. The rebinding rule closes those two shapes, and another
+    /// spelling will eventually walk past this one too. What actually holds the
+    /// contract is `crash_respawn_spawn_argv_carries_no_session_pin_3414`, which
+    /// reads the argv the kernel saw. This guard stays because it is free and
+    /// fails at the call site, not because it is sufficient.
+    #[test]
+    fn crash_respawn_spawns_with_the_sanitized_args_3414() {
+        let source = include_str!("crash_respawn.rs");
+        let start = source
+            .find("fn respawn_agent_worker(")
+            .expect("respawn worker present");
+        let rest = &source[start..];
+        // End at the next TOP-LEVEL item. Running to EOF would pull this test
+        // module in, and the negative assertion below would then match its own
+        // source — the guard would fail on itself rather than on the code.
+        let cfg_test = ["\n#[cfg(", "test)]"].concat();
+        let end = ["\nfn ", "\nmod ", &cfg_test]
+            .iter()
+            .filter_map(|marker| rest[1..].find(*marker).map(|offset| offset + 1))
+            .min()
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            spawn_source_is_sanitized(body),
+            "the respawn SPAWN must receive the sanitized args"
+        );
+    }
+
+    fn spawn_source_is_sanitized(body: &str) -> bool {
+        let Some(sanitize) = body.find("let fresh_args = match fresh_respawn_args(&config)") else {
+            return false;
+        };
+        let Some(spawn) = body.find("args: &fresh_args,") else {
+            return false;
+        };
+        // Exactly one binding: a second `let fresh_args` after the sanitizer is
+        // how both re-review bypasses reached the spawn while every literal the
+        // guard looks for stayed in place.
+        sanitize < spawn
+            && !body.contains("config.args")
+            && body.matches("let fresh_args").count() == 1
+    }
+
+    /// RED: a mutation that replaces the sanitizer with a clone of the stored
+    /// args still uses the correctly named local at the SPAWN site, so the
+    /// spelling-only guard above accepts it.
+    #[test]
+    fn crash_respawn_spawn_guard_kills_config_args_clone_mutation_3414() {
+        let mutated = r#"
+            fn respawn_agent_worker(config: &AgentConfig) {
+                let fresh_args = config.args.clone();
+                spawn_agent(&SpawnConfig { args: &fresh_args, });
+            }
+        "#;
+        assert!(
+            !spawn_source_is_sanitized(mutated),
+            "the spawn guard must reject a config.args.clone() sanitizer bypass"
+        );
+    }
+
+    /// RED (r2, from the re-review): the same bypass spelled through an ALIAS.
+    /// Nothing here reads `config.args`, the sanitizer call is left standing
+    /// exactly where the guard looks for it, and the SPAWN still takes a local
+    /// called `fresh_args` — which is now the stored args. The shipped predicate
+    /// accepts it.
+    #[test]
+    fn crash_respawn_spawn_guard_kills_aliased_stored_args_mutation_3414() {
+        let mutated = r#"
+            fn respawn_agent_worker(config: AgentConfig) {
+                let fresh_args = match fresh_respawn_args(&config) {
+                    Ok(args) => args,
+                    Err(error) => return,
+                };
+                let AgentConfig { args: stored, .. } = &config;
+                let fresh_args = stored.clone();
+                spawn_agent(&SpawnConfig { args: &fresh_args, });
+            }
+        "#;
+        assert!(
+            !spawn_source_is_sanitized(mutated),
+            "the spawn guard must reject a bypass that rebinds fresh_args from an alias"
+        );
+    }
+
+    /// RED (r2): and through a HELPER. The rebinding call site names no field at
+    /// all, and the helper that clones the stored args sits OUTSIDE the sliced
+    /// body, where this guard never looks.
+    #[test]
+    fn crash_respawn_spawn_guard_kills_helper_stored_args_mutation_3414() {
+        let mutated = r#"
+            fn respawn_agent_worker(config: AgentConfig) {
+                let fresh_args = match fresh_respawn_args(&config) {
+                    Ok(args) => args,
+                    Err(error) => return,
+                };
+                let fresh_args = stored_args_for_respawn(&config);
+                spawn_agent(&SpawnConfig { args: &fresh_args, });
+            }
+        "#;
+        assert!(
+            !spawn_source_is_sanitized(mutated),
+            "the spawn guard must reject a bypass that rebinds fresh_args from a helper"
+        );
+    }
+
+    /// #3415 RED: a guard on one function is stepped around by the next inline
+    /// `format!`. The production region of this file must make no such claim
+    /// anywhere, however it is spelled.
+    #[test]
+    fn crash_respawn_production_region_makes_no_memory_claim_3415() {
+        let source = include_str!("crash_respawn.rs");
+        let production = production_source(source);
+        let offenders = memory_claim_offenders(production);
+        assert!(
+            production.contains("fn respawn_notice("),
+            "#3415: the production slice must include the respawn notice"
+        );
+        assert!(
+            production.contains("respawn_notice(&reason)"),
+            "#3415: the production slice must include the notice call at the real write site"
+        );
+        assert!(
+            production.contains("write_to_pty"),
+            "#3415: the production slice must include the real PTY write site"
+        );
+        assert!(
+            offenders.is_empty(),
+            "#3415: no daemon-authored line here may assert what the agent remembers — found: {offenders:?}"
+        );
+    }
+
+    fn production_source(source: &str) -> &str {
+        let test_module = ["\nmod ", "tests {"].concat();
+        source
+            .find(&test_module)
+            .map_or(source, |boundary| &source[..boundary])
+    }
+
+    fn memory_claim_offenders(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+                    && crate::agent::UNVERIFIABLE_MEMORY_CLAIMS
+                        .iter()
+                        .any(|claim| line.to_lowercase().contains(*claim))
+            })
+            .collect()
+    }
+
+    /// The production slice and the scanner must catch a memory claim inserted
+    /// inline at the PTY write site, not only a bad `respawn_notice` helper.
+    #[test]
+    fn crash_respawn_guard_catches_inline_write_site_memory_claim_mutation_3415() {
+        let mutated = r#"
+            fn respawn_agent_worker() {
+                let msg = format!("Agent restarted; you have lost your in-memory context.");
+                let _ = write_to_pty(msg.as_bytes());
+            }
+        "#;
+        let offenders = memory_claim_offenders(production_source(mutated));
+        assert!(
+            !offenders.is_empty(),
+            "the production-region guard must kill an inline write-site memory-claim mutation"
+        );
+    }
 
     /// #1744-H4: the terminal self-orch P0 fires for a Failed (no-respawn)
     /// self-orchestrator — fail-closed (Yes|Unknown), skipped for No / non-terminal,
@@ -1073,6 +1405,101 @@ mod deleted_gate_tests_1913 {
                 .any(|pending| pending.key() == key),
             "a missing registry must not strand a Ready recovery as Pending"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The stored session pin the victim carries into its crash.
+    const VICTIM_SESSION: &str = "cb80bb9d-3613-4c0d-9097-788b1941f5db";
+
+    /// #3414 r2: what the respawned PROCESS was actually exec'd with.
+    ///
+    /// Every guard above this one reads source text, and the re-review showed
+    /// what that buys: a bypass spelled through an alias or a helper hands the
+    /// stored args to the spawn and still reads as clean. Only the argv the
+    /// kernel saw settles it.
+    ///
+    /// The victim's stored args carry both a session pin and an unrelated flag,
+    /// the real crash-respawn worker runs to a real spawn through the existing
+    /// gate seam, and the backend command is a script that records its own argv.
+    /// `--model x` must survive and neither `--resume` nor the session id may
+    /// appear — a Fresh spawn that reattaches to the session it crashed in is
+    /// the #3414 defect itself.
+    ///
+    /// Unix-only: the fixture is a shell script. The production path it drives
+    /// is platform-independent, and every source-level guard above still runs
+    /// everywhere.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(crash_respawn_gate)]
+    fn crash_respawn_spawn_argv_carries_no_session_pin_3414() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tmp_home("argv");
+        let argv_path = home.join("spawn-argv.txt");
+        let fake_backend = home.join("fake-backend.sh");
+        std::fs::write(
+            &fake_backend,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 2\n",
+                argv_path.display()
+            ),
+        )
+        .expect("write fake backend");
+        std::fs::set_permissions(&fake_backend, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake backend");
+
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let handle = make_handle(false);
+        crate::agent::crash_disposition::owner_ledger()
+            .register_generation(handle.id, handle.generation);
+        reg.lock()
+            .insert(InstanceId::parse(VICTIM_UUID).expect("valid uuid"), handle);
+        let ctx = DaemonContext {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            ..make_ctx(Arc::clone(&reg))
+        };
+        {
+            let mut configs = ctx.configs.lock();
+            let config = configs.get_mut(VICTIM).expect("victim config");
+            config.backend = Some(crate::backend::Backend::ClaudeCode);
+            config.backend_command = fake_backend.display().to_string();
+            config.args = vec![
+                "--resume".to_string(),
+                VICTIM_SESSION.to_string(),
+                "--model".to_string(),
+                "x".to_string(),
+            ];
+        }
+        let (entered_rx, release_tx, done_rx) = worker_gate();
+
+        handle_crash_respawn(&home, VICTIM, &ctx);
+
+        entered_rx.recv().expect("respawn worker entered gate");
+        release_tx.send(()).expect("release respawn worker");
+        done_rx.recv().expect("respawn worker completed");
+
+        let recorded = std::fs::read_to_string(&argv_path).unwrap_or_else(|e| {
+            panic!("the respawn must have EXEC'd the backend and recorded its argv: {e}")
+        });
+        let argv: Vec<&str> = recorded.lines().collect();
+        let model_at = argv
+            .iter()
+            .position(|token| *token == "--model")
+            .unwrap_or_else(|| panic!("--model must survive a crash respawn; argv={argv:?}"));
+        assert_eq!(
+            argv.get(model_at + 1),
+            Some(&"x"),
+            "--model must keep its value; argv={argv:?}"
+        );
+        assert!(
+            !argv.contains(&"--resume"),
+            "a crash respawn is Fresh: the session selector must not reach the process; argv={argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|token| token.contains(VICTIM_SESSION)),
+            "the pinned session id must not reach the process; argv={argv:?}"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 }
