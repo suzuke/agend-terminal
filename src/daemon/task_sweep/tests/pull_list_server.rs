@@ -55,6 +55,12 @@ pub(super) struct PullListServer {
     /// #3320: times the INJECTED would-block was produced and retried. Proves
     /// the arm under test was actually taken rather than missed.
     pub(super) injected_would_block_hits: Arc<AtomicU32>,
+    /// #3320: times the REAL write loop waited out a transient kind. The read
+    /// side counts an INJECTED would-block; this one counts the kernel's, which
+    /// is what makes the large-response regression honest: a host whose socket
+    /// buffers swallow the whole body never enters that arm, and the test must
+    /// FAIL saying so rather than pass having exercised nothing.
+    pub(super) write_would_block_hits: Arc<AtomicU32>,
     pub(super) thread: Option<JoinHandle<()>>,
 }
 
@@ -94,6 +100,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let exited = Arc::new(AtomicBool::new(false));
     let accepted = Arc::new(AtomicU32::new(0));
     let injected_would_block_hits = Arc::new(AtomicU32::new(0));
+    let write_would_block_hits = Arc::new(AtomicU32::new(0));
     let body_for_thread = Arc::clone(&body);
     let requests_for_thread = Arc::clone(&requests);
     let stop_for_thread = Arc::clone(&stop);
@@ -107,6 +114,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let exited_for_thread = Arc::clone(&exited);
     let accepted_for_thread = Arc::clone(&accepted);
     let would_block_hits_for_thread = Arc::clone(&injected_would_block_hits);
+    let write_would_block_for_thread = Arc::clone(&write_would_block_hits);
     let thread = std::thread::spawn(move || {
         // #3320: `stop` is the ONLY termination condition. The wall clock that
         // used to bound this started at construction, so a caller whose setup
@@ -246,6 +254,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                                             | std::io::ErrorKind::Interrupted
                                     ) =>
                                 {
+                                    write_would_block_for_thread.fetch_add(1, Ordering::AcqRel);
                                     std::thread::sleep(StdDuration::from_millis(5));
                                 }
                                 Err(error) => break Err(error),
@@ -296,6 +305,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
         exited,
         accepted,
         injected_would_block_hits,
+        write_would_block_hits,
         thread: Some(thread),
     }
 }
@@ -484,6 +494,17 @@ fn a_would_block_write_is_resumed_not_abandoned_3320() {
     std::thread::sleep(StdDuration::from_millis(250));
     let mut out = String::new();
     stream.read_to_string(&mut out).expect("response");
+
+    // NON-VACUITY: the point of the 4 MiB body is that the write REALLY blocks.
+    // On a host whose socket buffers absorb the whole response it would not,
+    // and every assertion below would hold having exercised nothing — so fail
+    // here, loudly, rather than bank a green that proves nothing.
+    let blocked = server.write_would_block_hits.load(Ordering::Acquire);
+    assert!(
+        blocked > 0,
+        "#3320: the write never blocked, so this fixture no longer reaches the \
+         arm under test — raise the body size for this host"
+    );
 
     let cause = server
         .thread_error
