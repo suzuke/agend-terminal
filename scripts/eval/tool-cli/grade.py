@@ -229,6 +229,7 @@ MANIFEST_CONTRACT = (
     ("created_at", _is_str),
     ("dry_run", lambda v: v is False),
     ("jobs", lambda v: _is_int(v) and v >= 1),
+    ("timeout_secs", lambda v: v == FROZEN_TIMEOUT_SECS),
     ("missing_scenarios", lambda v: v == []),
     ("model", lambda v: v == FROZEN_MODEL),
     ("git_head", _is_str),

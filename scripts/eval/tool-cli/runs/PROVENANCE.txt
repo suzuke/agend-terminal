@@ -75,3 +75,7 @@ and those verdicts cover that one matrix rather than licensing retries until one
 passes. That clause is itself frozen, so moving it forces another A'.
 
 Phase 1 remains excluded either way (SPEC.txt:169).
+
+#3412 r2/r3: the frozen execution budget (--max-turns 15, --timeout 900s) is now graded identity, so the
+committed runs above — recorded under max_turns 40 and carrying no timeout_secs — are INVALID under the current
+freeze rather than merely superseded by it; a fresh matrix under a new commit A' is required for any pilot claim.

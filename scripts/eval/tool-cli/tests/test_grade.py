@@ -220,7 +220,8 @@ def frozen_manifest_rows():
 def write_manifest(runs_dir, **overrides):
     manifest = {"schema": 1, "stamp": "TEST", "created_at": "2026-08-28T00:00:00Z",
                 "dry_run": False, "git_head": "0" * 40, "model": "claude-fable-5",
-                "jobs": 3, "binary_sha256": {"agend-terminal": "0" * 64,
+                "jobs": 3, "timeout_secs": grade.FROZEN_TIMEOUT_SECS,
+                "binary_sha256": {"agend-terminal": "0" * 64,
                                              "agend-mcp-bridge": "0" * 64},
                 "prompt_sha256": {name: sha_of(os.path.join(
                     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

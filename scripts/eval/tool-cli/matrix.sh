@@ -153,7 +153,7 @@ GIT_HEAD="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [ -f "$OUT/manifest.json" ]; then
   python3 -c '
 import json, os, sys
-here, repo, path, stamp, model, head, jobs = sys.argv[1:]
+here, repo, path, stamp, model, head, jobs, timeout = sys.argv[1:]
 sys.path.insert(0, here)
 import grade
 try:
@@ -163,7 +163,7 @@ except (OSError, ValueError) as exc:
     sys.exit("unreadable manifest.json: %s" % exc)
 bad = ["%s=%r (want %r)" % (key, manifest.get(key), want)
        for key, want in (("stamp", stamp), ("model", model), ("git_head", head),
-                         ("jobs", int(jobs)))
+                         ("jobs", int(jobs)), ("timeout_secs", int(timeout)))
        if manifest.get(key) != want]
 # the same field/value table the grader applies to a finished tree
 bad += ["%s is not what this matrix records" % field
@@ -180,13 +180,13 @@ if manifest.get("binary_sha256") != current:
     bad.append("binary_sha256 is not the build this matrix would run")
 if bad:
     sys.exit("; ".join(bad))
-' "$HERE" "$REPO" "$OUT/manifest.json" "$STAMP" "$MODEL" "$GIT_HEAD" "$JOBS" \
+' "$HERE" "$REPO" "$OUT/manifest.json" "$STAMP" "$MODEL" "$GIT_HEAD" "$JOBS" "$TIMEOUT_SECS" \
     || die "refusing to overwrite $OUT/manifest.json: it does not describe this matrix"
 fi
 
 MF_OUT="$OUT" MF_STAMP="$STAMP" MF_MODEL="$MODEL" MF_GIT="$GIT_HEAD" \
 MF_REPO="$REPO" MF_HERE="$HERE" MF_PLAN="$PLAN" MF_MISSING="$MISSING" \
-MF_JOBS="$JOBS" MF_DRY="$DRY" \
+MF_JOBS="$JOBS" MF_DRY="$DRY" MF_TIMEOUT="$TIMEOUT_SECS" \
 python3 - > "$OUT/manifest.json" <<'PY'
 import hashlib, json, os, sys, datetime
 E = os.environ
@@ -220,6 +220,9 @@ json.dump({
     "git_head": E["MF_GIT"],
     "model": E["MF_MODEL"],
     "jobs": int(E["MF_JOBS"]),
+    # the wall-clock budget the tree planned under: a resume that changes it is
+    # a different experiment wearing the same directory
+    "timeout_secs": int(E["MF_TIMEOUT"]),
     "binary_sha256": {
         "agend-terminal": sha(os.path.join(repo, "target/release/agend-terminal")),
         "agend-mcp-bridge": sha(os.path.join(repo, "target/release/agend-mcp-bridge")),

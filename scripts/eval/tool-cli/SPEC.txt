@@ -53,6 +53,12 @@ No markdown under scripts/ (tests/docs_bilingual_invariant.rs collects every tra
             --strict-mcp-config --mcp-config DIR/mcp.json --append-system-prompt-file DIR/system.txt --tools "$TOOLS"
      MODEL   = claude-fable-5 (the fleet's Claude-instance default); the resolved model from the stream-json `system/init`
                event is recorded and MUST equal MODEL (else the run is marked invalid, not graded).
+     BUDGET  = the frozen execution budget: --max-turns 15 and --timeout 900s. Both decide how much room a run had to
+               succeed, so both are identity, recorded at three levels and refused at each: run.sh records `max_turns`
+               and `timeout_secs` into metadata.json; grade.py refuses any other recorded value (max_turns_not_frozen /
+               timeout_not_frozen); matrix.sh records `timeout_secs` in the manifest and REFUSES to resume a tree whose
+               manifest planned under a different one (the same comparison it already makes for jobs/model/git_head).
+               `timed_out` says the cap was hit; `timeout_secs` says what the cap WAS. Changing either is a new commit A'.
      mcp arm: DIR/mcp.json = {"mcpServers":{"agend-terminal":{"command":"DIR/bin/agend-mcp-bridge","args":[],
                "env":{"AGEND_HOME":"DIR/home","AGEND_INSTANCE_NAME":"probe"}}}} ; TOOLS="Bash,Read,mcp__agend-terminal__*"
                (Bash stays available on purpose: S13 measures whether the agent reaches for the CLI anyway.)
