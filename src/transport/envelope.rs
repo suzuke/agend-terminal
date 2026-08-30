@@ -20,8 +20,10 @@ pub(crate) struct SessionLocator {
     /// OpenCode's HTTP Basic-auth username.  Never included in normal logs.
     #[serde(default)]
     pub username: Option<String>,
-    /// OpenCode's loopback server password.  The locator is stored in the
-    /// private transport state directory and is never logged.
+    /// Loopback session credential: OpenCode's server password, or the Claude
+    /// ChannelBridge bearer token. Authoritative only in the private
+    /// session-locator artifact; durable delivery receipts and exports omit it
+    /// (see `durable_session_locator`), and it is never logged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     /// Optional provider/model selected for the shared OpenCode session.
@@ -127,7 +129,7 @@ pub(crate) struct DeliveryEnvelope {
     pub delivery_id: Uuid,
     pub instance: String,
     /// Delivery persistence/export must retain the locator needed to identify
-    /// a session without copying OpenCode's Basic password into the durable
+    /// a session without copying any backend credential into the durable
     /// receipt. The private session-locator artifact still serializes the
     /// complete locator for backend restart/reconnect.
     #[serde(with = "durable_session_locator")]
@@ -171,10 +173,13 @@ mod durable_session_locator {
     where
         S: Serializer,
     {
+        // EVERY backend: this field carries OpenCode's server password on one
+        // route and the Claude ChannelBridge bearer token on another, so an
+        // allowlist of one backend leaked the other. No production reader takes
+        // the credential from a durable envelope — the private session-locator
+        // artifact is authoritative — so it is always safe to drop here.
         let mut redacted = locator.clone();
-        if redacted.backend == "opencode" {
-            redacted.password = None;
-        }
+        redacted.password = None;
         redacted.serialize(serializer)
     }
 

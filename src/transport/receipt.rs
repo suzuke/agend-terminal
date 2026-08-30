@@ -1081,4 +1081,51 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(home);
     }
+
+    /// #40632-2 follow-up: the locator's `password` field carries OpenCode's
+    /// server password AND the Claude ChannelBridge bearer token. Redacting only
+    /// one backend left the other in the durable receipt, so this pins the
+    /// property for Claude too.
+    #[test]
+    fn claude_durable_receipts_redact_bearer_token() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-receipt-claude-credentials-{}",
+            Uuid::new_v4()
+        ));
+        let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
+        let envelope = DeliveryEnvelope::new(
+            "agent",
+            SessionLocator::claude(
+                "http://127.0.0.1:4096".to_string(),
+                "claude-session".to_string(),
+                "do-not-persist-bearer".to_string(),
+            ),
+            DeliveryKind::Prompt,
+            "recovery body",
+            None,
+        );
+
+        let exported = serde_json::to_string(&envelope).expect("export envelope");
+        assert!(!exported.contains("do-not-persist-bearer"));
+        assert!(!exported.contains("\"password\""));
+        store.record_queued(&envelope).expect("queued receipt");
+        let durable = std::fs::read_to_string(store.path()).expect("read receipt");
+        assert!(!durable.contains("do-not-persist-bearer"));
+        assert!(!durable.contains("\"password\""));
+
+        // Non-secret identity still recovers.
+        let (recovered, _) = store
+            .delivery(envelope.delivery_id)
+            .expect("load receipt")
+            .expect("durable envelope");
+        assert_eq!(recovered.session.password, None);
+        assert_eq!(recovered.session.backend, "claude");
+        assert_eq!(
+            recovered.session.session_id.as_deref(),
+            Some("claude-session")
+        );
+        assert_eq!(recovered.session.username.as_deref(), Some("bearer"));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
 }
