@@ -44,7 +44,7 @@ mod release;
 pub(super) mod unwatch;
 mod watch;
 
-pub(super) use checkout::handle_checkout_repo;
+pub(crate) use checkout::handle_checkout_repo;
 #[cfg(test)]
 pub(crate) use checkout::handle_checkout_repo as handle_checkout_repo_for_test;
 pub(super) use cleanup::handle_cleanup_init_commits;

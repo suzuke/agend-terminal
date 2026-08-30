@@ -404,6 +404,8 @@ mod review_assignment_marker_tests {
                 "pr_number": 42,
                 "reviewed_head": EXACT_HEAD,
                 "review_author": {"external": "octocat"},
+                "bind": true,
+                "worktree_binding_required": true,
                 "force": true,
                 "force_reason": "3168 regression"
             }),
@@ -412,20 +414,222 @@ mod review_assignment_marker_tests {
         )
     }
 
+    #[cfg(unix)]
+    fn setup_review_dispatch_repo(label: &str) -> (std::path::PathBuf, String) {
+        let parent = tmp_home(&format!("{label}-repo"));
+        let source = parent.join("source-repo");
+        std::fs::create_dir_all(&source).unwrap();
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("git")
+        };
+        assert!(git(&["init", "-b", "main"], &source).status.success());
+        assert!(git(
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+            &source,
+        )
+        .status
+        .success());
+        let origin = parent.join("origin.git");
+        assert!(git(&["init", "--bare", origin.to_str().unwrap()], &parent,)
+            .status
+            .success());
+        assert!(git(
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+            &source,
+        )
+        .status
+        .success());
+        assert!(git(&["push", "origin", "main"], &source).status.success());
+        assert!(git(&["checkout", "-b", "feat/x"], &source).status.success());
+        std::fs::write(source.join("reviewed.txt"), "reviewed\n").unwrap();
+        assert!(git(&["add", "."], &source).status.success());
+        assert!(git(
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "reviewed",
+            ],
+            &source,
+        )
+        .status
+        .success());
+        let head = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"], &source).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(head.len(), 40);
+        assert!(git(&["checkout", "main"], &source).status.success());
+        (source, head)
+    }
+
+    #[cfg(unix)]
+    fn seed_review_dispatch_home(home: &std::path::Path, source: &std::path::Path, head: &str) {
+        let yaml = format!(
+            "instances:\n  lead:\n    backend: claude\n    id: 11111111-1111-4111-8111-111111111111\n  reviewer:\n    backend: claude\n    id: 22222222-2222-4222-8222-222222222222\n    source_repo: \"{}\"\nteams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n      - reviewer\n    source_repo: owner/repo\n",
+            source.display()
+        );
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+        seed_review_task(home, "t-rev-1");
+        let mut state = crate::daemon::pr_state::new_for_branch(
+            "owner/repo",
+            "feat/x",
+            head,
+            crate::daemon::pr_state::ReviewClass::Dual,
+        );
+        state.pr_number = 0;
+        state.pr_author.clear();
+        crate::daemon::pr_state::save(home, &state).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn run_review_dispatch_with_head(home: &std::path::Path, head: &str) -> Value {
+        let sender = Some(Sender::new("lead").unwrap());
+        handle_delegate_task(
+            home,
+            &json!({
+                "instance": "reviewer",
+                "task": "review the PR",
+                "review_assignment": true,
+                "task_id": "t-rev-1",
+                "branch": "feat/x",
+                "repository": "owner/repo",
+                "pr_number": 42,
+                "reviewed_head": head,
+                "review_author": {"external": "octocat"},
+                "force": true,
+                "force_reason": "review exact-head regression"
+            }),
+            &sender,
+            None,
+        )
+    }
+
+    /// RED #56: the public typed-review dispatch must provision the reviewer
+    /// worktree at the immutable reviewed head, while keeping the subject PR
+    /// branch as the assignment key.
     #[test]
-    fn real_review_assignment_hydrates_existing_provisional_state_3168() {
-        let home = seed_real_review_assignment_home("3168-provisional");
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn real_review_assignment_provisions_exact_head_worktree_56() {
+        let home = tmp_home("56-exact-head");
+        let (source, head) = setup_review_dispatch_repo("56-exact-head");
+        seed_review_dispatch_home(&home, &source, &head);
         let _scm = crate::scm::set_test_scm_provider(Arc::new(ProvisionalPrMock {
             summary: PrSummary {
                 number: 42,
                 head_ref: Some("feat/x".into()),
-                head_ref_oid: Some(EXACT_HEAD.into()),
+                head_ref_oid: Some(head.clone()),
                 author_login: Some("octocat".into()),
                 ..Default::default()
             },
             before_return: None,
         }));
-        let out = run_real_review_assignment(&home);
+
+        let out = run_review_dispatch_with_head(&home, &head);
+        assert!(out.get("error").is_none(), "review dispatch failed: {out}");
+        let binding = crate::binding::read(&home, "reviewer").expect("reviewer binding");
+        let review_branch = binding["branch"].as_str().expect("review branch");
+        assert_ne!(review_branch, "feat/x");
+        assert!(review_branch.starts_with("review/pr42-"), "{binding}");
+        assert_eq!(binding["task_id"], "t-rev-1");
+        assert_eq!(binding["checkout_purpose"], "disposable_review");
+        assert_eq!(binding["provisioned_head"], head);
+        assert_eq!(binding["expected_head"], head);
+        let worktree = std::path::PathBuf::from(binding["worktree"].as_str().unwrap());
+        assert_eq!(
+            crate::git_helpers::git_cmd(&worktree, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim(),
+            head
+        );
+        assert!(
+            binding["review_assignment_id"].as_str().is_some(),
+            "{binding}"
+        );
+
+        let _ = crate::worktree_pool::release_full(&home, "reviewer", false);
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
+    }
+
+    /// RED #56: an authoritative exact-head mismatch must be surfaced from the
+    /// public dispatch entry before any reviewer workspace state is committed.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn real_review_assignment_mismatch_has_no_workspace_side_effects_56() {
+        let home = tmp_home("56-mismatch");
+        let (source, _actual_head) = setup_review_dispatch_repo("56-mismatch");
+        let wrong_head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        seed_review_dispatch_home(&home, &source, wrong_head);
+        let _scm = crate::scm::set_test_scm_provider(Arc::new(ProvisionalPrMock {
+            summary: PrSummary {
+                number: 42,
+                head_ref: Some("feat/x".into()),
+                head_ref_oid: Some(wrong_head.into()),
+                author_login: Some("octocat".into()),
+                ..Default::default()
+            },
+            before_return: None,
+        }));
+
+        let out = run_review_dispatch_with_head(&home, wrong_head);
+        assert_eq!(out["code"], "expected_head_mismatch", "{out}");
+        assert_eq!(out["expected_head"], wrong_head, "{out}");
+        assert!(out["actual_head"].as_str().is_some(), "{out}");
+        assert!(crate::binding::read(&home, "reviewer").is_none());
+        assert!(crate::daemon::assignment_authority::active_branches(&home).is_empty());
+        assert!(crate::daemon::ci_watch::ci_watches_dir(&home)
+            .read_dir()
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true));
+        let review_branch = format!("review/pr42-{wrong_head}-r0");
+        assert!(!source
+            .join(".git")
+            .join("refs")
+            .join("heads")
+            .join(review_branch)
+            .exists());
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn real_review_assignment_hydrates_existing_provisional_state_3168() {
+        let home = tmp_home("3168-provisional");
+        let (source, head) = setup_review_dispatch_repo("3168-provisional");
+        seed_review_dispatch_home(&home, &source, &head);
+        let _scm = crate::scm::set_test_scm_provider(Arc::new(ProvisionalPrMock {
+            summary: PrSummary {
+                number: 42,
+                head_ref: Some("feat/x".into()),
+                head_ref_oid: Some(head.clone()),
+                author_login: Some("octocat".into()),
+                ..Default::default()
+            },
+            before_return: None,
+        }));
+        let out = run_review_dispatch_with_head(&home, &head);
         assert_eq!(out["review_assignment"], true, "{out}");
         let state = crate::daemon::pr_state::load(&home, "owner/repo", "feat/x")
             .expect("hydrated pr-state");
@@ -436,7 +640,9 @@ mod review_assignment_marker_tests {
                 .is_some(),
             "real marker path must persist the assignment after hydration"
         );
+        let _ = crate::worktree_pool::release_full(&home, "reviewer", false);
         std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
     }
 
     #[test]

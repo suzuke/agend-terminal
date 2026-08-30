@@ -483,103 +483,8 @@ fn checkout_expected_head_correct_head_wrong_from_ref() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 7. review_assignment bind=true rejected before store
+// 7. send schema exposes bind parameter
 // ══════════════════════════════════════════════════════════════════════
-
-#[test]
-fn review_assignment_bind_true_rejected_before_store() {
-    use crate::identity::Sender;
-    use crate::mcp::handlers::comms_gates::DispatchPreChecks;
-    use crate::mcp::handlers::comms_gates::ReviewAuthor;
-    use crate::mcp::handlers::review_assignment::validate_review_assignment_marker;
-
-    let home = tmp_home("ra-bind");
-    let sender = Sender::new("lead").unwrap();
-    let args = json!({
-        "instance": "reviewer",
-        "task_id": "t-test",
-        "branch": "feat/x",
-        "repository": "owner/repo",
-        "pr_number": 42,
-        "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "bind": true,
-    });
-    let checks = DispatchPreChecks {
-        force: false,
-        force_reason: None,
-        second_reviewer: false,
-        plan_ack_required: 0,
-        review_assignment: true,
-        review_author: Some(ReviewAuthor::Agent("author".into())),
-        pr_number: Some(42),
-    };
-
-    let result = validate_review_assignment_marker(&home, &sender, "reviewer", &args, &checks);
-    assert!(
-        result.is_err(),
-        "review_assignment with bind=true must be rejected: {result:?}"
-    );
-    let err = result.unwrap_err();
-    assert_eq!(
-        err["code"].as_str(),
-        Some("review_assignment_bind_rejected"),
-        "error code must be review_assignment_bind_rejected: {err}"
-    );
-
-    std::fs::remove_dir_all(&home).ok();
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// 8. review_assignment worktree_binding_required=true rejected
-// ══════════════════════════════════════════════════════════════════════
-
-#[test]
-fn review_assignment_worktree_binding_required_rejected() {
-    use crate::identity::Sender;
-    use crate::mcp::handlers::comms_gates::DispatchPreChecks;
-    use crate::mcp::handlers::comms_gates::ReviewAuthor;
-    use crate::mcp::handlers::review_assignment::validate_review_assignment_marker;
-
-    let home = tmp_home("ra-wbr");
-    let sender = Sender::new("lead").unwrap();
-    let args = json!({
-        "instance": "reviewer",
-        "task_id": "t-test",
-        "branch": "feat/x",
-        "repository": "owner/repo",
-        "pr_number": 42,
-        "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "worktree_binding_required": true,
-    });
-    let checks = DispatchPreChecks {
-        force: false,
-        force_reason: None,
-        second_reviewer: false,
-        plan_ack_required: 0,
-        review_assignment: true,
-        review_author: Some(ReviewAuthor::Agent("author".into())),
-        pr_number: Some(42),
-    };
-
-    let result = validate_review_assignment_marker(&home, &sender, "reviewer", &args, &checks);
-    assert!(
-        result.is_err(),
-        "review_assignment with worktree_binding_required=true must be rejected: {result:?}"
-    );
-    let err = result.unwrap_err();
-    assert_eq!(
-        err["code"].as_str(),
-        Some("review_assignment_worktree_binding_rejected"),
-        "error code must be review_assignment_worktree_binding_rejected: {err}"
-    );
-
-    std::fs::remove_dir_all(&home).ok();
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// 9. send schema exposes bind parameter
-// ══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn send_schema_exposes_bind_parameter() {
     let send_def = crate::mcp::tools::def_send();
@@ -592,11 +497,11 @@ fn send_schema_exposes_bind_parameter() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 10. review_assignment omitted bind does not auto-bind
+// 8. review_assignment marker validation remains side-effect-free
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn review_assignment_omitted_bind_does_not_auto_bind() {
+fn review_assignment_marker_validation_does_not_bind() {
     use crate::identity::Sender;
     use crate::mcp::handlers::comms_gates::DispatchPreChecks;
     use crate::mcp::handlers::comms_gates::ReviewAuthor;
@@ -611,7 +516,7 @@ fn review_assignment_omitted_bind_does_not_auto_bind() {
         "repository": "owner/repo",
         "pr_number": 42,
         "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        // NO bind field — must still not auto-bind
+        // The marker validator itself has no workspace side effects.
     });
     let checks = DispatchPreChecks {
         force: false,
@@ -625,12 +530,13 @@ fn review_assignment_omitted_bind_does_not_auto_bind() {
 
     let result = validate_review_assignment_marker(&home, &sender, "reviewer", &args, &checks);
     // The validation will fail (no PrState exists), but the error should be about
-    // PrState, not about bind/lease conflict
+    // PrState, not about bind/lease conflict. Public dispatch provisioning is
+    // covered by the exact-head integration tests in the comms-delegate suite.
     if let Err(e) = &result {
         let code = e["code"].as_str().unwrap_or("");
         assert!(
             !code.contains("lease") && !code.contains("bind"),
-            "omitted bind on review_assignment must not produce a bind/lease error: {e}"
+            "marker validation must not produce a bind/lease error: {e}"
         );
     }
     std::fs::remove_dir_all(&home).ok();

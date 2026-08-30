@@ -981,6 +981,17 @@ pub(crate) fn resolve_team_source_repo(home: &Path, agent: &str) -> Option<PathB
     None
 }
 
+/// Resolve the canonical source repository path using the same tiered lookup
+/// as ordinary branch dispatch. Review assignments use this path to provision
+/// their separate disposable workspace while keeping the subject branch in
+/// assignment authority.
+pub(crate) fn resolve_source_repo_for_target(home: &Path, target: &str) -> PathBuf {
+    let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|f| f.resolve_instance(target));
+    resolve_source_repo(home, target, None, resolved.as_ref()).0
+}
+
 /// Parse `owner/repo` from a `git remote get-url origin` output.
 ///
 /// Accepts the three formats GitHub commonly serves:

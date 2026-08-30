@@ -61,7 +61,7 @@ fn fire_marker_authority_validated_hook(home: &Path) {
 ///       same-namespace self-review; `External(login)` is a distinct principal and
 ///       is NEVER string-compared to the agent target. (sender == target is already
 ///       rejected upstream in `resolve_delegate`.)
-// #6: pub(crate) so ci/review_workspace_tests can drive bind rejection tests.
+// #6: pub(crate) so ci/review_workspace_tests can drive the marker gate.
 pub(crate) fn validate_review_assignment_marker(
     home: &Path,
     sender: &Sender,
@@ -69,27 +69,6 @@ pub(crate) fn validate_review_assignment_marker(
     args: &Value,
     checks: &DispatchPreChecks,
 ) -> Result<String, Value> {
-    // #6: review_assignment must not bind the reviewer to the implementer's branch.
-    // Workspace provisioning is a separate concern — reviewers get isolated worktrees
-    // via `repo checkout` instead.
-    if args.get("bind").and_then(|v| v.as_bool()) == Some(true) {
-        return Err(json!({
-            "error": "review_assignment must not bind the reviewer to the subject branch \
-                      — use an isolated review branch via repo checkout instead",
-            "code": "review_assignment_bind_rejected",
-        }));
-    }
-    if args
-        .get("worktree_binding_required")
-        .and_then(|v| v.as_bool())
-        == Some(true)
-    {
-        return Err(json!({
-            "error": "review_assignment does not support worktree_binding_required \
-                      — reviewer workspace provisioning is separate",
-            "code": "review_assignment_worktree_binding_rejected",
-        }));
-    }
     // (a) mandatory explicit generation-bound identifiers.
     if args["task_id"].as_str().unwrap_or("").is_empty() {
         return Err(json!({
@@ -278,19 +257,82 @@ pub(crate) fn validate_review_assignment_marker(
     Ok(repo_slug)
 }
 
+fn review_workspace_branch(
+    pr_number: u64,
+    reviewed_head: &str,
+    slot: crate::review_receipt::ReviewSlot,
+    assignment_id: uuid::Uuid,
+) -> String {
+    let slot = match slot {
+        crate::review_receipt::ReviewSlot::Primary => "r0",
+        crate::review_receipt::ReviewSlot::Secondary => "r1",
+    };
+    let head8: String = reviewed_head.chars().take(8).collect();
+    let assignment8 = assignment_id.simple().to_string();
+    format!("review/pr{pr_number}-{head8}-{slot}-{}", &assignment8[..8])
+}
+
+fn provision_review_workspace(
+    home: &Path,
+    target: &str,
+    task_id: &str,
+    pr_number: u64,
+    reviewed_head: &str,
+    slot: crate::review_receipt::ReviewSlot,
+    assignment_id: uuid::Uuid,
+) -> Result<String, Value> {
+    let source_repo = dispatch_hook::resolve_source_repo_for_target(home, target);
+    let branch = review_workspace_branch(pr_number, reviewed_head, slot, assignment_id);
+    let checkout = crate::mcp::handlers::ci::handle_checkout_repo(
+        home,
+        &json!({
+            "repository_path": source_repo.display().to_string(),
+            "branch": branch,
+            "bind": true,
+            "task_id": task_id,
+            "from_ref": reviewed_head,
+            "expected_head": reviewed_head,
+            "checkout_purpose": "disposable_review",
+        }),
+        target,
+    );
+    if checkout.get("error").is_some() {
+        return Err(checkout);
+    }
+    Ok(branch)
+}
+
+/// Deliver a validated reviewer-assignment marker dispatch after provisioning
+/// the isolated reviewer workspace. This is the public handler's path; the
+/// store-only helper below remains available to focused store tests/callers.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_review_assignment_with_workspace(
+    home: &Path,
+    sender: &Sender,
+    target: &str,
+    task: &str,
+    args: &Value,
+    checks: &DispatchPreChecks,
+    composed: &ComposedDelegate,
+    repo_slug: &str,
+) -> Value {
+    dispatch_review_assignment_via_store_impl(
+        home, sender, target, task, args, checks, composed, repo_slug, true,
+    )
+}
+
 /// t-…-17 C11 (A1→A2→A3): deliver a validated reviewer-assignment marker dispatch
-/// through the DURABLE outbox store instead of `deliver_delegate`. Called from
-/// [`handle_delegate_task`] AFTER `maybe_auto_bind_lease` (bind) has succeeded and
-/// the marker gate has resolved the canonical `repo_slug`.
+/// through the DURABLE outbox store instead of `deliver_delegate`. This store-only
+/// entry is kept separate from the public handler so it can be exercised without
+/// a source checkout in focused authority/store tests.
 ///
-/// A1 `persist` the PENDING record (mint assignment_id + delivery_nonce; store the
-/// mandatory `pr_number` — the generation identity). A2 `durable_enqueue` the
+/// A1 persists the PENDING record (mint assignment_id + delivery_nonce; store the
+/// mandatory `pr_number` — the generation identity). A2 `durable_enqueue`s the
 /// reviewer's actionable inbox row (the store owns delivery — this is NOT a
-/// `deliver_delegate`/API send). A3 emit a best-effort self-IPC WAKE pointer OUTSIDE
-/// all flocks (`durable_enqueue` has already released its lock). A store failure
-/// AFTER the bind FAILS LOUD (structured error) rather than silently proceeding
-/// (I23) — the bind is already durable, so a swallowed store error would strand the
-/// assignment with no record.
+/// `deliver_delegate`/API send). A3 emits a best-effort self-IPC WAKE pointer
+/// OUTSIDE all flocks. The public workspace path wraps this sequence with
+/// exact-head provisioning and cleans up its fresh binding on later failure.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_review_assignment_via_store(
     home: &Path,
@@ -301,6 +343,23 @@ pub(super) fn dispatch_review_assignment_via_store(
     checks: &DispatchPreChecks,
     composed: &ComposedDelegate,
     repo_slug: &str,
+) -> Value {
+    dispatch_review_assignment_via_store_impl(
+        home, sender, target, task, args, checks, composed, repo_slug, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_review_assignment_via_store_impl(
+    home: &Path,
+    sender: &Sender,
+    target: &str,
+    task: &str,
+    args: &Value,
+    checks: &DispatchPreChecks,
+    composed: &ComposedDelegate,
+    repo_slug: &str,
+    provision_workspace: bool,
 ) -> Value {
     // All three are gate-validated: branch + task_id non-empty, pr_number nonzero.
     let branch = args["branch"].as_str().unwrap_or_default();
@@ -373,27 +432,90 @@ pub(super) fn dispatch_review_assignment_via_store(
         args["parent_id"].as_str().map(String::from),
         &now,
     );
-    // A1 — persist the PENDING record (no PrState/inbox row seeded — I9).
+    // A1 — provision the reviewer workspace before the assignment can be delivered.
+    // `checkout` validates `expected_head` before creating the review branch and
+    // owns rollback for every later provisioning failure.
+    let review_branch = if provision_workspace {
+        match provision_review_workspace(
+            home,
+            target,
+            task_id,
+            pr_number,
+            reviewed_head,
+            slot,
+            record.assignment_id,
+        ) {
+            Ok(branch) => Some(branch),
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
+    let cleanup_workspace = || {
+        if !provision_workspace {
+            return;
+        }
+        let outcome = crate::worktree_pool::release_full(home, target, false);
+        if let Some(error) = outcome.error {
+            tracing::warn!(%target, branch = ?review_branch, %error,
+                "review assignment workspace cleanup failed");
+        }
+    };
+    // A2 — persist the PENDING record (no PrState/inbox row seeded — I9).
     if let Err(e) = crate::daemon::assignment_authority::persist(home, &record) {
+        cleanup_workspace();
         return json!({
             "ok": false,
-            "error": format!("review_assignment store persist failed after bind: {e}"),
+            "error": format!("review_assignment store persist failed after workspace bind: {e}"),
             "code": "review_assignment_store_persist_failed",
         });
     }
-    // A2 — durable enqueue of the reviewer's actionable row (store owns delivery).
+    if provision_workspace {
+        if let Err(e) = crate::binding::augment_binding_with_lease(
+            home,
+            target,
+            "review",
+            &record.assignment_id.to_string(),
+            reviewed_head,
+        ) {
+            let _ = crate::daemon::assignment_authority::retire_if_id_matches(
+                home,
+                repo_slug,
+                branch,
+                target,
+                record.assignment_id,
+                &now,
+            );
+            cleanup_workspace();
+            return json!({
+                "ok": false,
+                "error": format!("review_assignment workspace lease metadata failed: {e}"),
+                "code": "review_assignment_workspace_lease_failed",
+            });
+        }
+    }
+    // A3 — durable enqueue of the reviewer's actionable row (store owns delivery).
     if let Err(e) =
         crate::daemon::assignment_authority::durable_enqueue(home, repo_slug, branch, target, &now)
     {
+        let _ = crate::daemon::assignment_authority::retire_if_id_matches(
+            home,
+            repo_slug,
+            branch,
+            target,
+            record.assignment_id,
+            &now,
+        );
+        cleanup_workspace();
         return json!({
             "ok": false,
-            "error": format!("review_assignment store enqueue failed after bind: {e}"),
+            "error": format!("review_assignment store enqueue failed after workspace bind: {e}"),
             "code": "review_assignment_store_enqueue_failed",
         });
     }
-    // A3 — best-effort self-IPC WAKE pointer, OUTSIDE all flocks.
+    // A4 — best-effort self-IPC WAKE pointer, OUTSIDE all flocks.
     crate::inbox::notify::wake_review_assignment(home, target);
-    let result = json!({
+    let mut result = json!({
         "target": target,
         "review_assignment": true,
         "assignment_id": record.assignment_id.to_string(),
@@ -402,6 +524,9 @@ pub(super) fn dispatch_review_assignment_via_store(
         "target_instance_id": target_instance_id.full(),
         "review_slot": slot,
     });
+    if let Some(review_branch) = review_branch {
+        result["review_branch"] = json!(review_branch);
+    }
     // Dispatch tracking / UX parity with the legacy path (task_id is explicit).
     let ctx = DeliveryCtx {
         home,

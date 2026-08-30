@@ -454,7 +454,7 @@ pub(crate) fn handle_delegate_task(
     };
 
     if let Some(repo_slug) = review_assignment_repo {
-        return review_assignment::dispatch_review_assignment_via_store(
+        return review_assignment::dispatch_review_assignment_with_workspace(
             home, sender, target, task, args, &checks, &composed, &repo_slug,
         );
     }
