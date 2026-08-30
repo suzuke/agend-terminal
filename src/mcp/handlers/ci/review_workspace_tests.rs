@@ -5,6 +5,7 @@
 //!   2. review_assignment bind/worktree_binding_required rejection (tests 7-8)
 //!   3. `send` schema `bind` parameter exposure (test 9)
 
+#[cfg(unix)]
 use serde_json::json;
 #[cfg(unix)]
 use std::path::Path;

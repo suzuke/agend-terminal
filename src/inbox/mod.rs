@@ -28,7 +28,7 @@ pub use message::{
 };
 
 // Disk health
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn set_test_readonly(readonly: bool) -> bool {
     disk::set_test_readonly(readonly)
 }
