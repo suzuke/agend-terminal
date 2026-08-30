@@ -1492,7 +1492,7 @@ mod tests {
 
     #[test]
     fn kiro_creates_wrapper_script() {
-        let dir = tmp_dir("wrapper/kiro_env");
+        let dir = tmp_dir("kiro_env");
         configure_kiro(&dir, &dir, Some("dev")).expect("configure");
         let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
