@@ -273,6 +273,129 @@ fn checkout_expected_head_existing_branch_mismatch() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 2b. public repo action — mismatch creates no checkout state
+// ══════════════════════════════════════════════════════════════════════
+
+/// The public `repo action=checkout` boundary must reject a review head that
+/// differs from an existing branch before it creates or replaces any state.
+/// The mismatch call starts from a fresh caller, while the exact-head success
+/// call below proves that valid disposable checkout still provisions normally.
+#[test]
+#[cfg(unix)]
+fn checkout_expected_head_public_mismatch_has_no_state() {
+    let home = tmp_home("eh-public-mismatch");
+    let parent = tmp_home("eh-public-mismatch-src");
+    let source = setup_source_repo(&parent, "review/public-mismatch");
+    let expected = get_sha(&source, "main");
+    let review_head = commit_tree(&source, &expected, "review head");
+    remove_origin(&source);
+    seed_origin_view(&source, "main", &expected);
+    let sender = None;
+    let checkout = |args: &serde_json::Value| {
+        crate::mcp::handlers::dispatch::dispatch_repo(&crate::mcp::handlers::dispatch::HandlerCtx {
+            home: &home,
+            args,
+            instance_name: "public-mismatch-agent",
+            sender: &sender,
+            runtime: None,
+        })
+    };
+
+    let args = json!({
+        "action": "checkout",
+        "repository_path": source.display().to_string(),
+        "branch": "review/public-mismatch",
+        "bind": true,
+        "task_id": "task-public-mismatch",
+        "expected_head": &review_head,
+        "from_ref": "main",
+        "checkout_purpose": "disposable_review",
+    });
+    let watch_args = json!({
+        "repository": "owner/repo",
+        "branch": "review/public-mismatch",
+    });
+    let watch = super::handle_watch_ci(&home, &watch_args, "public-mismatch-agent");
+    assert!(
+        watch.get("error").is_none(),
+        "pre-existing watch fixture must arm: {watch}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "review/public-mismatch"),
+    );
+    let watch_before = std::fs::read(&watch_path).expect("watch fixture bytes");
+    let watch_count_before = std::fs::read_dir(crate::daemon::ci_watch::ci_watches_dir(&home))
+        .expect("watch directory")
+        .count();
+
+    let mismatch = checkout(&args);
+    assert_eq!(
+        mismatch["code"].as_str(),
+        Some("expected_head_mismatch"),
+        "public mismatch must fail at the expected-head gate: {mismatch}"
+    );
+    assert!(
+        crate::binding::read(&home, "public-mismatch-agent").is_none(),
+        "fresh mismatch must not create a binding"
+    );
+    assert!(
+        !derived_worktree(&home, "public-mismatch-agent", &source).exists(),
+        "fresh mismatch must not create a worktree"
+    );
+    assert_eq!(
+        std::fs::read(&watch_path).expect("watch after mismatch"),
+        watch_before,
+        "mismatch must preserve the pre-existing watch"
+    );
+    assert_eq!(
+        std::fs::read_dir(crate::daemon::ci_watch::ci_watches_dir(&home))
+            .expect("watch directory after mismatch")
+            .count(),
+        watch_count_before,
+        "mismatch must not create a new watch"
+    );
+    assert_eq!(
+        get_sha(&source, "review/public-mismatch"),
+        expected,
+        "mismatch must not move the existing branch"
+    );
+
+    seed_terminal_task(&home, "task-public-success", "review/public-success", false);
+    let success_args = json!({
+        "action": "checkout",
+        "repository_path": source.display().to_string(),
+        "branch": "review/public-success",
+        "bind": true,
+        "task_id": "task-public-success",
+        "expected_head": &expected,
+        "from_ref": "main",
+        "checkout_purpose": "disposable_review",
+    });
+    let success = checkout(&success_args);
+    assert!(
+        success.get("error").is_none(),
+        "exact-head public checkout control must succeed: {success}"
+    );
+    assert_eq!(success["actual_head"].as_str(), Some(expected.as_str()));
+    assert!(
+        crate::binding::read(&home, "public-mismatch-agent").is_some(),
+        "exact-head success must create a binding"
+    );
+    assert!(
+        std::path::Path::new(success["path"].as_str().expect("success worktree path")).exists(),
+        "exact-head success must create a worktree"
+    );
+    assert_eq!(
+        get_sha(&source, "review/public-success"),
+        expected,
+        "exact-head success must create the branch at the expected commit"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // 3. checkout expected_head — idempotent same head
 // ══════════════════════════════════════════════════════════════════════
 
