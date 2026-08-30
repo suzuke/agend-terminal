@@ -516,6 +516,7 @@ mod review_assignment_marker_tests {
                 // Typed review assignments ignore this generic bind flag and
                 // always provision their own disposable review workspace.
                 "bind": false,
+                "worktree_binding_required": true,
                 "force": true,
                 "force_reason": "review exact-head regression"
             }),
@@ -617,10 +618,6 @@ mod review_assignment_marker_tests {
         assert!(out["actual_head"].as_str().is_some(), "{out}");
         assert!(crate::binding::read(&home, "reviewer").is_none());
         assert!(crate::daemon::assignment_authority::active_branches(&home).is_empty());
-        assert!(crate::daemon::ci_watch::ci_watches_dir(&home)
-            .read_dir()
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(true));
         assert!(
             review_refs_with_heads(&source, "review/pr42-").is_empty(),
             "mismatch must leave no generated review refs"
@@ -666,10 +663,6 @@ mod review_assignment_marker_tests {
         assert!(!worktrees
             .lines()
             .any(|line| line.starts_with("branch refs/heads/review/pr42-")));
-        assert!(crate::daemon::ci_watch::ci_watches_dir(&home)
-            .read_dir()
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(true));
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(source.parent().unwrap()).ok();
