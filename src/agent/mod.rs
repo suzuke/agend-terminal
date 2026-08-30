@@ -1956,7 +1956,9 @@ pub(crate) fn spawn_self_kick_bootstrap(
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let thread_name = format!("{name}_selfkick");
-    // Production callers discard the handle; tests may join it for deterministic teardown.
+    // fire-and-forget: production callers discard the handle, so the thread runs detached;
+    // it is bounded by `timeout` and observes `shutdown`. Tests may join the returned
+    // handle for deterministic teardown.
     let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
         let _census = crate::thread_census::register("self_kick");
         let readiness_deadline = std::time::Instant::now() + timeout;

@@ -104,6 +104,7 @@ pub(crate) fn start_gateway(
     // A restart (PR-3b) calling this again after a prior death should
     // clear the stale flag — the new attempt gets its own fair chance.
     GATEWAY_DEAD.store(false, std::sync::atomic::Ordering::Relaxed);
+    // fire-and-forget: the gateway worker exits on permanent death; process shutdown reaps the detached thread.
     if let Err(e) = std::thread::Builder::new()
         .name("discord-gateway".into())
         .spawn(move || {

@@ -209,6 +209,75 @@ fn is_spawn_call_line(line: &str) -> bool {
         || line.contains("tokio::task::spawn(")
 }
 
+fn is_test_cfg_attribute(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(expression) = trimmed
+        .strip_prefix("#[cfg(")
+        .and_then(|rest| rest.strip_suffix(")]"))
+    else {
+        return false;
+    };
+    expression == "test"
+        || ((expression.starts_with("all(") || expression.starts_with("any("))
+            && expression.contains("test")
+            && !expression.contains("not(test)"))
+}
+
+fn is_inline_module_declaration(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix) && trimmed.contains('{'))
+}
+
+fn production_section(content: &str) -> &str {
+    // A cfg(test) import or item is still part of the source file's production
+    // section. Only an inline test module marks the boundary of test-only code.
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let mut line_starts = Vec::with_capacity(lines.len());
+    let mut offset = 0;
+    for line in &lines {
+        line_starts.push(offset);
+        offset += line.len();
+    }
+
+    for (index, line) in lines.iter().enumerate() {
+        if !is_test_cfg_attribute(line) {
+            continue;
+        }
+        let mut next = index + 1;
+        while let Some(candidate) = lines.get(next) {
+            let trimmed = candidate.trim();
+            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#[") {
+                next += 1;
+            } else {
+                break;
+            }
+        }
+        if lines
+            .get(next)
+            .is_some_and(|candidate| is_inline_module_declaration(candidate))
+        {
+            return &content[..line_starts[index]];
+        }
+    }
+    content
+}
+
+#[test]
+fn cfg_test_import_does_not_hide_later_production_spawn() {
+    let fixture = "#[cfg(test)]\nuse std::time::Duration;\n\nfn production() {\n    std::thread::spawn(|| {});\n}\n";
+    let production = production_section(fixture);
+    assert!(
+        production.lines().any(is_spawn_call_line),
+        "an early cfg(test) import must not hide a later production spawn"
+    );
+    assert!(
+        !production.contains("fire-and-forget"),
+        "fixture spawn must remain unrationalized so this regression exercises the audit"
+    );
+}
+
 /// Sprint 21 Phase 5 invariant — enforces v1.2 §10.5 Rule 5 on every
 /// production spawn site outside the legacy exemption list.
 ///
@@ -228,11 +297,7 @@ fn spawn_rationale_present_at_every_in_scope_spawn_site() {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // Cut off at the first `#[cfg(test)]` so test-module spawns don't
-        // trigger the invariant. Production spawns must come before any
-        // test module in the file.
-        let cutoff_byte = content.find("#[cfg(test)]").unwrap_or(content.len());
-        let prod_section = &content[..cutoff_byte];
+        let prod_section = production_section(&content);
         let lines: Vec<&str> = prod_section.lines().collect();
 
         for (idx, line) in lines.iter().enumerate() {

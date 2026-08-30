@@ -1121,6 +1121,7 @@ fn init_daemon_services(
     let api_configs = Arc::clone(&configs);
     let api_externals = Arc::clone(&externals);
     let (api_ready_tx, api_ready_rx) = std::sync::mpsc::sync_channel(1);
+    // fire-and-forget: the API accept loop observes daemon shutdown and exits; process exit reaps the detached worker.
     std::thread::Builder::new()
         .name("api_server".into())
         .spawn(move || {
