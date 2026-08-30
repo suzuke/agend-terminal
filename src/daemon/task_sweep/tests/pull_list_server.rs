@@ -215,7 +215,42 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                     let written = if inject_write_for_thread.load(Ordering::Acquire) {
                         Err(std::io::Error::other("#3320 injected write failure"))
                     } else {
-                        stream.write_all(response.as_bytes())
+                        // #3320: this socket is non-blocking, so a response
+                        // larger than the send buffer comes back as a PARTIAL
+                        // write plus `WouldBlock` — which `write_all` reports as
+                        // a failure, stranding the rest of the body. Resume from
+                        // the remaining bytes and wait the transient kinds out,
+                        // exactly as the read wait above does. `stop` stays the
+                        // ONLY bound, and every other error still ends the
+                        // exchange with its cause recorded.
+                        let bytes = response.as_bytes();
+                        let mut sent = 0;
+                        loop {
+                            if stop_for_thread.load(Ordering::Acquire) {
+                                break 'serving;
+                            }
+                            match stream.write(&bytes[sent..]) {
+                                Ok(0) => {
+                                    break Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+                                }
+                                Ok(n) => {
+                                    sent += n;
+                                    if sent == bytes.len() {
+                                        break Ok(());
+                                    }
+                                }
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::Interrupted
+                                    ) =>
+                                {
+                                    std::thread::sleep(StdDuration::from_millis(5));
+                                }
+                                Err(error) => break Err(error),
+                            }
+                        }
                     };
                     if let Err(error) = written {
                         record_thread_error(
@@ -416,6 +451,58 @@ fn write_side_failure_is_reported_not_swallowed_3320() {
     );
 
     // And teardown must still be quiet.
+    drop(server);
+}
+
+/// #3320 RED-E: a response too large for the socket send buffer must be
+/// RESUMED, not abandoned.
+///
+/// The note on RED-C above deferred exactly this. The accepted socket is
+/// normalised to NON-BLOCKING, so a response bigger than the send buffer makes
+/// the write return `WouldBlock` after a PARTIAL write — and `write_all`
+/// reports that as a failure. The exchange then ends with a recorded cause and
+/// the client receives a truncated body: the same swallowed-write class this
+/// file already guards on the read side, arriving through the OS rather than
+/// through a seam.
+///
+/// Nothing is injected. The client sends its request and then STALLS before
+/// draining, so the send buffer genuinely fills and the write genuinely blocks.
+#[test]
+fn a_would_block_write_is_resumed_not_abandoned_3320() {
+    // Comfortably larger than the socket send buffer plus the client receive
+    // buffer, so the block is a certainty rather than a race.
+    let body = "x".repeat(4 * 1024 * 1024);
+    let server = pull_list_server(body.clone());
+
+    let addr = server.base_url.trim_start_matches("http://").to_string();
+    let mut stream = std::net::TcpStream::connect(&addr).expect("connect");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .expect("request");
+    // Stall so the server reaches its write arm and fills the buffer before
+    // anything is drained.
+    std::thread::sleep(StdDuration::from_millis(250));
+    let mut out = String::new();
+    stream.read_to_string(&mut out).expect("response");
+
+    let cause = server
+        .thread_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert!(
+        cause.is_none(),
+        "#3320: a would-block on a large response is not a failure — it means \
+         the rest of the body still has to go out; got {cause:?}"
+    );
+    assert!(
+        out.ends_with(&body),
+        "#3320: the response was truncated — received {} bytes, the body alone \
+         is {}",
+        out.len(),
+        body.len()
+    );
+
     drop(server);
 }
 
