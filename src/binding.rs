@@ -59,7 +59,6 @@ pub(crate) fn parse_binding_guarded(content: &str) -> Option<serde_json::Value> 
     }
     Some(v)
 }
-
 /// #1990: true if a binding file is present at a version this daemon understands
 /// OR a NEWER one. Distinct from [`read`], which returns `None` for a
 /// future-version binding (the correct fail-closed for daemon-side actors that
