@@ -601,6 +601,24 @@ fn notification_only_assignee_unsubscribes_without_erasing_co_subscribers_3159()
     w["subscribers"] = json!(subs);
     std::fs::write(&path, serde_json::to_string_pretty(&w).unwrap()).unwrap();
 
+    let correlation = "suzuke/agend-terminal@main";
+    crate::daemon::ci_handoff_track::record(
+        &home,
+        "dev",
+        correlation,
+        "2026-01-01T00:00:01Z",
+        None,
+        None,
+    );
+    crate::daemon::ci_handoff_track::record(
+        &home,
+        "other-watcher",
+        correlation,
+        "2026-01-01T00:00:02Z",
+        None,
+        None,
+    );
+
     let r = handle_unwatch_ci(
         &home,
         &json!({"repository": "suzuke/agend-terminal", "branch": "main", "head_sha": SHA_A}),
@@ -638,6 +656,19 @@ fn notification_only_assignee_unsubscribes_without_erasing_co_subscribers_3159()
     assert!(
         persisted["auto_arm_optout"].as_bool() != Some(true),
         "assignee unsubscribe must not tombstone: {persisted}"
+    );
+    let tracks = crate::daemon::ci_handoff_track::list(&home);
+    assert!(
+        tracks
+            .iter()
+            .all(|(_, track)| !(track.target == "dev" && track.correlation == correlation)),
+        "assignee track must be settled: {tracks:?}"
+    );
+    assert!(
+        tracks.iter().any(|(_, track)| {
+            track.target == "other-watcher" && track.correlation == correlation
+        }),
+        "co-subscriber's track must survive: {tracks:?}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

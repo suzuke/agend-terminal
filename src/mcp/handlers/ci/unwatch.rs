@@ -48,10 +48,12 @@ fn settle_caller_track(home: &Path, repo: &str, branch: &str, caller: &str) {
 /// the watch (`handle_watch_ci`'s protected-ref gate): operator (empty caller)
 /// passes; a privileged watch requires orchestrator authority over EVERY
 /// persisted `next_after_ci` continuation target. A `notification_only` watch's
-/// merge-receipt assignee is a narrower principal: it may unsubscribe only its
-/// own subscription, never full-disarm or remove co-subscribers. Anything else
-/// is rejected — a weaker gate would re-open the #2622/#1575 cross-agent class
-/// this handler was hardened against.
+/// merge-receipt `merge_authority` principal and the orchestrator of its task
+/// assignee also hold full-disarm authority. Its merge-receipt assignee is a
+/// narrower principal: it may unsubscribe only its own subscription, never
+/// full-disarm or remove co-subscribers. Anything else is rejected — a weaker
+/// gate would re-open the #2622/#1575 cross-agent class this handler was
+/// hardened against.
 pub(super) fn unwatch_exact_head(
     home: &Path,
     repo: &str,
