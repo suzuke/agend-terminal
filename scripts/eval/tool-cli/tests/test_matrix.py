@@ -180,6 +180,9 @@ class MatrixAuthority(unittest.TestCase):
         with open(os.path.join(self.out, "manifest.json"), "r", encoding="utf-8") as fh:
             self.assertEqual(json.load(fh).get("timeout_secs"), 60)
 
+    # Positive control needs real binary digests for a valid manifest.
+    # Negative case stays unguarded because it asserts timeout_secs in the refusal.
+    @unittest.skipUnless(BUILT, NEEDS_BUILD)
     def test_reusing_a_tree_under_the_same_timeout_is_still_allowed(self):
         """Control: the guard refuses a CHANGED budget, not every resume."""
         first = dry_run(self.out, timeout=900)
