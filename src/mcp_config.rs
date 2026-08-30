@@ -1540,16 +1540,17 @@ mod tests {
         // absolute path; under this repo it always contains "agend-terminal"
         // (the checkout dir name), so the old `cmd.contains("agend-terminal")`
         // disjunct was a tautology. The command must be the bridge binary
-        // (`agend-mcp-bridge`) or the `agend-terminal` fallback by filename.
+        // (`agend-mcp-bridge`) by filename: `bridge_binary_path` emits nothing
+        // else, and the `agend-terminal mcp` fallback was removed in #531.
         let fname = std::path::Path::new(cmd)
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("");
         let stem = fname.strip_suffix(".exe").unwrap_or(fname);
         assert!(
-            stem == "agend-mcp-bridge" || stem == "agend-terminal",
-            "command must be the bridge binary or the agend-terminal fallback, \
-             got filename {fname:?} (full path: {cmd})"
+            stem == "agend-mcp-bridge",
+            "command must be the agend-mcp-bridge binary, got filename {fname:?} \
+             (full path: {cmd})"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
