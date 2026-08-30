@@ -513,12 +513,33 @@ mod review_assignment_marker_tests {
                 "pr_number": 42,
                 "reviewed_head": head,
                 "review_author": {"external": "octocat"},
+                // Typed review assignments ignore this generic bind flag and
+                // always provision their own disposable review workspace.
+                "bind": false,
                 "force": true,
                 "force_reason": "review exact-head regression"
             }),
             &sender,
             None,
         )
+    }
+
+    #[cfg(unix)]
+    fn review_refs_with_heads(source: &std::path::Path, prefix: &str) -> Vec<(String, String)> {
+        let pattern = format!("refs/heads/{prefix}*");
+        let refs = crate::git_helpers::git_cmd(
+            source,
+            &["for-each-ref", "--format=%(refname)", pattern.as_str()],
+        )
+        .expect("enumerate review refs");
+        refs.lines()
+            .filter(|reference| reference.starts_with(&format!("refs/heads/{prefix}")))
+            .map(|reference| {
+                let head = crate::git_helpers::git_cmd(source, &["rev-parse", reference])
+                    .expect("resolve review ref");
+                (reference.to_string(), head.trim().to_string())
+            })
+            .collect()
     }
 
     /// RED #56: the public typed-review dispatch must provision the reviewer
@@ -600,13 +621,55 @@ mod review_assignment_marker_tests {
             .read_dir()
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(true));
-        let review_branch = format!("review/pr42-{wrong_head}-r0");
-        assert!(!source
-            .join(".git")
-            .join("refs")
-            .join("heads")
-            .join(review_branch)
-            .exists());
+        assert!(
+            review_refs_with_heads(&source, "review/pr42-").is_empty(),
+            "mismatch must leave no generated review refs"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
+    }
+
+    /// R1 rollback coverage: an existing readonly inbox seam forces the
+    /// post-provision durable enqueue to fail; the fresh review workspace,
+    /// binding, and assignment must all be cleaned up.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn real_review_assignment_enqueue_failure_rolls_back_workspace_56() {
+        let home = tmp_home("56-enqueue-failure");
+        let (source, head) = setup_review_dispatch_repo("56-enqueue-failure");
+        seed_review_dispatch_home(&home, &source, &head);
+        let _scm = crate::scm::set_test_scm_provider(Arc::new(ProvisionalPrMock {
+            summary: PrSummary {
+                number: 42,
+                head_ref: Some("feat/x".into()),
+                head_ref_oid: Some(head.clone()),
+                author_login: Some("octocat".into()),
+                ..Default::default()
+            },
+            before_return: None,
+        }));
+
+        let previous_readonly = crate::inbox::set_test_readonly(true);
+        let out = run_review_dispatch_with_head(&home, &head);
+        crate::inbox::set_test_readonly(previous_readonly);
+
+        assert_eq!(
+            out["code"], "review_assignment_store_enqueue_failed",
+            "{out}"
+        );
+        assert!(crate::binding::read(&home, "reviewer").is_none(), "{out}");
+        assert!(crate::daemon::assignment_authority::active_branches(&home).is_empty());
+        let worktrees = crate::git_helpers::git_cmd(&source, &["worktree", "list", "--porcelain"])
+            .expect("enumerate worktrees");
+        assert!(!worktrees
+            .lines()
+            .any(|line| line.starts_with("branch refs/heads/review/pr42-")));
+        assert!(crate::daemon::ci_watch::ci_watches_dir(&home)
+            .read_dir()
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true));
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(source.parent().unwrap()).ok();

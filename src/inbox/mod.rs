@@ -28,6 +28,10 @@ pub use message::{
 };
 
 // Disk health
+#[cfg(test)]
+pub(crate) fn set_test_readonly(readonly: bool) -> bool {
+    disk::set_test_readonly(readonly)
+}
 pub use disk::{check_disk_space, recover_half_writes};
 
 // Storage CRUD (pub)
