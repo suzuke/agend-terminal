@@ -100,6 +100,23 @@ fn persisted_server_identity_rejects_pid_reuse_or_missing_start_token() {
 }
 
 #[test]
+fn redacted_receipt_locator_matches_current_server_without_widening_credentials() {
+    let current = SessionLocator::opencode(
+        "http://127.0.0.1:4096".to_string(),
+        Some("session".to_string()),
+        "opencode".to_string(),
+        "current-password".to_string(),
+    );
+    let mut redacted = current.clone();
+    redacted.password = None;
+    assert!(OpenCodeNativeShared::same_server(&current, &redacted));
+
+    let mut wrong = current.clone();
+    wrong.password = Some("wrong-password".to_string());
+    assert!(!OpenCodeNativeShared::same_server(&current, &wrong));
+}
+
+#[test]
 fn sse_decoder_handles_split_chunked_unicode_events() {
     let mut decoder = SseDecoder::new(true, Vec::new());
     let body = b"data: {\"type\":\"session.status\",\"properties\":{\"status\":{\"type\":\"busy\"}}}\n\ndata: {\"type\":\"session.idle\"}\n\n";

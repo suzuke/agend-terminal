@@ -975,4 +975,110 @@ mod tests {
         let decoded: DeliveryReceipt = serde_json::from_value(value).expect("legacy receipt");
         assert!(decoded.backend_session_id.is_none());
     }
+
+    #[test]
+    fn opencode_durable_receipts_redact_password_and_restore_locator_identity() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-receipt-opencode-credentials-{}",
+            Uuid::new_v4()
+        ));
+        let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
+        let mut locator = SessionLocator::opencode(
+            "http://127.0.0.1:4096".to_string(),
+            Some("session".to_string()),
+            "opencode".to_string(),
+            "do-not-persist".to_string(),
+        );
+        locator.model = Some("openai/gpt-5".to_string());
+        locator.event_cursor = Some(17);
+        locator.managed = false;
+        locator.server_pid = Some(42);
+        locator.server_start_token = Some(7);
+        let envelope = DeliveryEnvelope::new(
+            "agent",
+            locator,
+            DeliveryKind::Prompt,
+            "recovery body",
+            Some("correlation".to_string()),
+        );
+
+        let exported = serde_json::to_string(&envelope).expect("export envelope");
+        assert!(!exported.contains("do-not-persist"));
+        assert!(!exported.contains("\"password\""));
+        store.record_queued(&envelope).expect("queued receipt");
+        let durable = std::fs::read_to_string(store.path()).expect("read receipt");
+        assert!(!durable.contains("do-not-persist"));
+        assert!(!durable.contains("\"password\""));
+
+        let (recovered, _) = store
+            .delivery(envelope.delivery_id)
+            .expect("load receipt")
+            .expect("durable envelope");
+        assert_eq!(recovered.session.password, None);
+        assert_eq!(recovered.session.backend, "opencode");
+        assert_eq!(
+            recovered.session.endpoint_url.as_deref(),
+            Some("http://127.0.0.1:4096")
+        );
+        assert_eq!(recovered.session.session_id.as_deref(), Some("session"));
+        assert_eq!(recovered.session.username.as_deref(), Some("opencode"));
+        assert_eq!(recovered.session.model.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(recovered.session.event_cursor, Some(17));
+        assert!(!recovered.session.managed);
+        assert_eq!(recovered.session.server_pid, Some(42));
+        assert_eq!(recovered.session.server_start_token, Some(7));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn legacy_opencode_receipt_with_password_still_recovers() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-receipt-opencode-legacy-{}",
+            Uuid::new_v4()
+        ));
+        let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
+        let envelope = DeliveryEnvelope::new(
+            "agent",
+            SessionLocator::opencode(
+                "http://127.0.0.1:4096".to_string(),
+                Some("legacy-session".to_string()),
+                "opencode".to_string(),
+                "legacy-password".to_string(),
+            ),
+            DeliveryKind::Prompt,
+            "legacy body",
+            None,
+        );
+        let mut envelope_value = serde_json::to_value(&envelope).expect("serialize envelope");
+        envelope_value["session"]["password"] = serde_json::json!("legacy-password");
+        let record = serde_json::json!({
+            "envelope": envelope_value,
+            "receipt": DeliveryReceipt::queued(&envelope),
+        });
+        std::fs::write(
+            store.path(),
+            format!(
+                "{}\n",
+                serde_json::to_string(&record).expect("serialize legacy record")
+            ),
+        )
+        .expect("write legacy receipt");
+
+        let (recovered, _) = store
+            .delivery(envelope.delivery_id)
+            .expect("load legacy receipt")
+            .expect("legacy envelope");
+        assert_eq!(
+            recovered.session.password.as_deref(),
+            Some("legacy-password")
+        );
+        assert_eq!(
+            recovered.session.session_id.as_deref(),
+            Some("legacy-session")
+        );
+        assert_eq!(recovered.body, "legacy body");
+
+        let _ = std::fs::remove_dir_all(home);
+    }
 }

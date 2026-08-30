@@ -1704,7 +1704,7 @@ impl OpenCodeNativeShared {
             && current.endpoint_url == requested.endpoint_url
             && current.session_id == requested.session_id
             && current.username == requested.username
-            && current.password == requested.password
+            && (requested.password.is_none() || current.password == requested.password)
             && current.model == requested.model
             && current.managed == requested.managed
     }
@@ -1713,7 +1713,7 @@ impl OpenCodeNativeShared {
         current.backend == requested.backend
             && current.endpoint_url == requested.endpoint_url
             && current.username == requested.username
-            && current.password == requested.password
+            && (requested.password.is_none() || current.password == requested.password)
             && current.model == requested.model
             && current.managed == requested.managed
     }

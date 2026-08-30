@@ -22,7 +22,7 @@ pub(crate) struct SessionLocator {
     pub username: Option<String>,
     /// OpenCode's loopback server password.  The locator is stored in the
     /// private transport state directory and is never logged.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     /// Optional provider/model selected for the shared OpenCode session.
     #[serde(default)]
@@ -126,6 +126,11 @@ pub(crate) enum DeliveryKind {
 pub(crate) struct DeliveryEnvelope {
     pub delivery_id: Uuid,
     pub instance: String,
+    /// Delivery persistence/export must retain the locator needed to identify
+    /// a session without copying OpenCode's Basic password into the durable
+    /// receipt. The private session-locator artifact still serializes the
+    /// complete locator for backend restart/reconnect.
+    #[serde(with = "durable_session_locator")]
     pub session: SessionLocator,
     pub kind: DeliveryKind,
     pub body: String,
@@ -156,6 +161,31 @@ pub(crate) struct DeliveryEnvelope {
     /// delivery originated inside AgEnD and the bridge owns its reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_origin: Option<crate::channel::ChannelKind>,
+}
+
+mod durable_session_locator {
+    use super::SessionLocator;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S>(locator: &SessionLocator, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut redacted = locator.clone();
+        if redacted.backend == "opencode" {
+            redacted.password = None;
+        }
+        redacted.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<SessionLocator, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Accept legacy receipt rows that carried the password. New rows are
+        // emitted through `serialize`, which omits it for OpenCode.
+        SessionLocator::deserialize(deserializer)
+    }
 }
 
 impl DeliveryEnvelope {
