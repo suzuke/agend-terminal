@@ -1515,9 +1515,9 @@ mod tests {
             .unwrap_or("");
         let stem = fname.strip_suffix(".exe").unwrap_or(fname);
         assert!(
-            stem == "agend-mcp-bridge" || stem == "agend-terminal",
-            "command must be the bridge binary or the agend-terminal fallback, \
-             got filename {fname:?} (full path: {cmd})"
+            stem == "agend-mcp-bridge",
+            "command must be the agend-mcp-bridge binary, got filename {fname:?} \
+             (full path: {cmd})"
         );
         let args = entry["args"].as_array().expect("args array");
         assert!(
