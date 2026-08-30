@@ -30,6 +30,21 @@ pub(super) fn armed_exact_head_count(home: &Path, repo: &str, branch: &str) -> u
         .count() as u64
 }
 
+/// Resolve this caller's ci-handoff obligation for the watch's BRANCH.
+///
+/// The correlation is branch-wide (`repo@branch`) while an exact-head unwatch
+/// addresses one immutable SHA, so a successful exact-head unsubscribe or full
+/// disarm deliberately settles that caller's whole `repo@branch` obligation
+/// rather than a per-SHA slice. There is no finer-grained obligation to settle:
+/// the sole production writer keys the track on the same branch-wide
+/// `repo@branch` (`ci_watch::poller`, recorded for a `next_after_ci`
+/// continuation target and only once its inbox row exists), and a
+/// `notification_only` watch creates none of its own because it forbids
+/// `next_after_ci` at arm time.
+///
+/// Resolution matches on target AND correlation, so a co-subscriber's own
+/// obligation on the same branch is left intact. The operator (empty caller)
+/// owns no track and settles nothing — hence the early return.
 fn settle_caller_track(home: &Path, repo: &str, branch: &str, caller: &str) {
     if caller.is_empty() {
         return;
