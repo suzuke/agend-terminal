@@ -55,8 +55,10 @@ pub(super) struct PullListServer {
     /// #3320: times the INJECTED would-block was produced and retried. Proves
     /// the arm under test was actually taken rather than missed.
     pub(super) injected_would_block_hits: Arc<AtomicU32>,
-    /// #3320: times the REAL write loop waited out a transient kind. The read
-    /// side counts an INJECTED would-block; this one counts the kernel's, which
+    /// #3320: times the REAL write loop waited out a would-block. The read side
+    /// counts an INJECTED one; this counts the kernel's — and ONLY a would-block,
+    /// never an `Interrupted`, because buffer pressure is the thing it claims,
+    /// which
     /// is what makes the large-response regression honest: a host whose socket
     /// buffers swallow the whole body never enters that arm, and the test must
     /// FAIL saying so rather than pass having exercised nothing.
@@ -254,7 +256,14 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                                             | std::io::ErrorKind::Interrupted
                                     ) =>
                                 {
-                                    write_would_block_for_thread.fetch_add(1, Ordering::AcqRel);
+                                    // Retry BOTH transient kinds, but count only a
+                                    // real would-block: the counter is what the
+                                    // regression trusts to prove the send buffer
+                                    // actually filled, and an EINTR proves nothing
+                                    // about buffer pressure.
+                                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                                        write_would_block_for_thread.fetch_add(1, Ordering::AcqRel);
+                                    }
                                     std::thread::sleep(StdDuration::from_millis(5));
                                 }
                                 Err(error) => break Err(error),
@@ -481,6 +490,15 @@ fn write_side_failure_is_reported_not_swallowed_3320() {
 fn a_would_block_write_is_resumed_not_abandoned_3320() {
     // Comfortably larger than the socket send buffer plus the client receive
     // buffer, so the block is a certainty rather than a race.
+    //
+    // Windows needs its own size: run 33307408956 / job 99246276242 swallowed the
+    // whole 4 MiB on `windows-latest` without ever blocking, and the guard below
+    // caught it rather than banking a vacuous green. Its loopback buffers are far
+    // larger, so give that platform a body it cannot absorb; every other platform
+    // keeps the size measured here.
+    #[cfg(windows)]
+    let body = "x".repeat(64 * 1024 * 1024);
+    #[cfg(not(windows))]
     let body = "x".repeat(4 * 1024 * 1024);
     let server = pull_list_server(body.clone());
 
@@ -495,17 +513,9 @@ fn a_would_block_write_is_resumed_not_abandoned_3320() {
     let mut out = String::new();
     stream.read_to_string(&mut out).expect("response");
 
-    // NON-VACUITY: the point of the 4 MiB body is that the write REALLY blocks.
-    // On a host whose socket buffers absorb the whole response it would not,
-    // and every assertion below would hold having exercised nothing — so fail
-    // here, loudly, rather than bank a green that proves nothing.
-    let blocked = server.write_would_block_hits.load(Ordering::Acquire);
-    assert!(
-        blocked > 0,
-        "#3320: the write never blocked, so this fixture no longer reaches the \
-         arm under test — raise the body size for this host"
-    );
-
+    // SUBSTANTIVE PROPERTIES FIRST. A broken resume must report ITS OWN cause; if
+    // the non-vacuity guard ran first it would answer for that failure too, and
+    // send whoever broke the loop off to resize the fixture instead.
     let cause = server
         .thread_error
         .lock()
@@ -521,6 +531,18 @@ fn a_would_block_write_is_resumed_not_abandoned_3320() {
         "#3320: the response was truncated — received {} bytes, the body alone \
          is {}",
         out.len(),
+        body.len()
+    );
+
+    // NON-VACUITY, LAST: everything above can hold while nothing was exercised —
+    // a host whose buffers absorb the whole response never enters the retry arm.
+    // Reaching here with a zero count means exactly that, and nothing else.
+    let blocked = server.write_would_block_hits.load(Ordering::Acquire);
+    assert!(
+        blocked > 0,
+        "#3320: the response arrived intact but the write never blocked, so this \
+         fixture no longer reaches the arm under test — raise the body size for \
+         this host (body {} bytes)",
         body.len()
     );
 
