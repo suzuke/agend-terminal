@@ -114,6 +114,13 @@ fn redacted_receipt_locator_matches_current_server_without_widening_credentials(
     let mut wrong = current.clone();
     wrong.password = Some("wrong-password".to_string());
     assert!(!OpenCodeNativeShared::same_server(&current, &wrong));
+
+    let mut wrong_session = current.clone();
+    wrong_session.password = Some("wrong-password".to_string());
+    assert!(!OpenCodeNativeShared::same_session(
+        &current,
+        &wrong_session
+    ));
 }
 
 #[test]

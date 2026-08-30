@@ -188,7 +188,7 @@ mod durable_session_locator {
         D: Deserializer<'de>,
     {
         // Accept legacy receipt rows that carried the password. New rows are
-        // emitted through `serialize`, which omits it for OpenCode.
+        // emitted through `serialize`, which omits it for every backend.
         SessionLocator::deserialize(deserializer)
     }
 }
