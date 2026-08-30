@@ -28,11 +28,30 @@ BUILT = all(os.path.exists(os.path.join(RELEASE, name))
 NEEDS_BUILD = "needs target/release binaries: a conforming run records their digests"
 
 
-def dry_run(out_dir, env_extra=None):
+def dry_run(out_dir, env_extra=None, timeout=None):
     env = dict(os.environ)
     env.update(env_extra or {})
-    return subprocess.run(["bash", MATRIX, "--dry-run", out_dir],
-                          capture_output=True, text=True, env=env, cwd=HERE)
+    argv = ["bash", MATRIX, "--dry-run"]
+    if timeout is not None:
+        argv += ["--timeout", str(timeout)]
+    argv.append(out_dir)
+    return subprocess.run(argv, capture_output=True, text=True, env=env, cwd=HERE)
+
+
+def _claim_the_tree_was_a_real_matrix(out_dir):
+    """Flip the manifest's `dry_run` so the tree stands in for a completed run.
+
+    The reuse guard is what a SECOND invocation meets, and a dry-run manifest
+    fails its `dry_run is False` row for reasons of its own. Clearing that one
+    field leaves the budget as the single variable under test.
+    """
+    path = os.path.join(out_dir, "manifest.json")
+    with open(path, "r", encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    manifest["dry_run"] = False
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh)
+    return manifest
 
 
 class MatrixAuthority(unittest.TestCase):
@@ -123,6 +142,41 @@ class MatrixAuthority(unittest.TestCase):
                             "a manifest describing another matrix must not be overwritten:\n"
                             + proc.stdout + proc.stderr)
 
+
+    def test_reusing_a_tree_under_a_different_timeout_is_refused(self):
+        """#3435 r3: the wall-clock budget must be matrix identity, not just run identity.
+
+        r2 bound the timeout that each RUN records. The tree's own account of
+        itself — the manifest — still said nothing about it, so pointing a second
+        invocation at the same OUT with a different `--timeout` was accepted: the
+        completed runs were skipped as "already complete" and the remainder went
+        on under a different budget. That is one matrix on paper and two in fact,
+        which is the whole thing the manifest guard exists to prevent.
+        """
+        first = dry_run(self.out, timeout=900)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        recorded = _claim_the_tree_was_a_real_matrix(self.out)
+        self.assertEqual(recorded.get("timeout_secs"), 900,
+                         "the manifest must state the budget it planned under")
+
+        second = dry_run(self.out, timeout=60)
+
+        self.assertNotEqual(second.returncode, 0,
+                            "a different wall-clock budget must not silently resume:\n"
+                            + second.stdout + second.stderr)
+        self.assertIn("timeout_secs", second.stdout + second.stderr,
+                      "the refusal must name the field that did not match")
+
+    def test_reusing_a_tree_under_the_same_timeout_is_still_allowed(self):
+        """Control: the guard refuses a CHANGED budget, not every resume."""
+        first = dry_run(self.out, timeout=900)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        _claim_the_tree_was_a_real_matrix(self.out)
+
+        again = dry_run(self.out, timeout=900)
+        self.assertEqual(again.returncode, 0,
+                         "an unchanged budget must still resume:\n"
+                         + again.stdout + again.stderr)
 
     def _plant(self, **meta_extra):
         planned = os.path.join(self.out, "S01", "pair-01", "mcp")
