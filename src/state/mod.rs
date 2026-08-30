@@ -1153,6 +1153,20 @@ impl StateTracker {
         self.blocked_notice_sent = true;
     }
 
+    /// Test-only/state-local escape hatch for arming the one-shot recovery
+    /// notice with a chosen episode, in the spirit of [`Self::set_restarting`].
+    ///
+    /// Production arms this on a PTY-driven leaving-block transition, which
+    /// stamps `block_duration` from the private `blocked_since` `Instant`. A
+    /// test therefore cannot reach the actionable threshold
+    /// (`RECOVERY_NOTICE_MIN_BLOCK`, 30s) without actually waiting — so the
+    /// deterministic supervisor test needs this seam rather than a sleep.
+    #[cfg(test)]
+    pub(crate) fn arm_recovery_notice_for_test(&mut self, episode: RecoveryEpisode) {
+        self.interactive_recovery_pending_notice = true;
+        self.recovery_episode = Some(episode);
+    }
+
     /// If detected state is `PermissionPrompt` but a fresh heartbeat exists,
     /// override to `Active` — the agent is alive and the PTY pattern is a
     /// false positive (A5 fix, design §4.3).

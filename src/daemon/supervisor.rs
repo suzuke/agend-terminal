@@ -1271,14 +1271,19 @@ fn tick(
             );
         }
 
+        // #78207-1: a normal full_delete can set this handle's flag between the
+        // snapshot above and this emit. Re-read the SAME captured Arc here —
+        // monotonic, so no registry re-lock. Sited above the match so it covers
+        // EVERY operator-facing notice with one check: a `Stall` for an instance
+        // that no longer exists, and a `Recovered` that would otherwise tell the
+        // operator a torn-down instance is ready to keep talking. All internal
+        // per-episode cleanup already ran under the core lock above, so this
+        // suppresses the emit only.
+        if deleted.load(std::sync::atomic::Ordering::Acquire) {
+            continue;
+        }
         match action {
             Some(NoticeAction::Stall { tail, silent_secs }) => {
-                // #78207-1: a normal full_delete can set this handle's flag
-                // between the snapshot above and this emit. Re-read the SAME
-                // captured Arc here — monotonic, so no registry re-lock.
-                if deleted.load(std::sync::atomic::Ordering::Acquire) {
-                    continue;
-                }
                 let msg = format_stall_notice(&name, &tail, silent_secs);
                 // Outbound info-leak gate (Sprint 21 Phase 1): `tail`
                 // carries 40 lines of PTY output — must not leak to a

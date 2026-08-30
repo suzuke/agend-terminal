@@ -4589,6 +4589,14 @@ struct StallRecorder {
     caps: ChannelCapabilities,
     seen: parking_lot::Mutex<Vec<String>>,
     peers: parking_lot::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// Only these instances are recorded. The active channel is process-GLOBAL
+    /// and `#[serial]` only orders this test against other `#[serial]` ones, so
+    /// a parallel sibling test emits into whichever recorder is registered right
+    /// now. Such a foreign notice would both inflate the count AND — by landing
+    /// first, making `seen` non-empty — suppress the co-tenant flip that the
+    /// whole harness depends on. Scoping to this test's own agents is what makes
+    /// the counts deterministic.
+    watched: parking_lot::Mutex<Vec<String>>,
 }
 
 impl StallRecorder {
@@ -4597,11 +4605,17 @@ impl StallRecorder {
             caps: ChannelCapabilities::default(),
             seen: parking_lot::Mutex::new(Vec::new()),
             peers: parking_lot::Mutex::new(HashMap::new()),
+            watched: parking_lot::Mutex::new(Vec::new()),
         })
     }
     /// Notifying `agent` deletes `peer`.
     fn pair(&self, agent: &str, peer: Arc<std::sync::atomic::AtomicBool>) {
         self.peers.lock().insert(agent.to_string(), peer);
+    }
+    /// Restrict recording to this harness's own agents (see `watched`).
+    fn watch(&self, agents: &[&str]) {
+        let mut w = self.watched.lock();
+        w.extend(agents.iter().map(|a| a.to_string()));
     }
     fn seen(&self) -> Vec<String> {
         self.seen.lock().clone()
@@ -4616,6 +4630,10 @@ impl Channel for StallRecorder {
         _: &str,
         _: bool,
     ) -> Result<(), ChannelError> {
+        // Ignore anything that is not one of this harness's agents.
+        if !self.watched.lock().iter().any(|w| w == instance) {
+            return Ok(());
+        }
         let mut seen = self.seen.lock();
         if seen.is_empty() {
             if let Some(peer) = self.peers.lock().get(instance) {
@@ -4672,6 +4690,24 @@ fn armed_stall_agent(name: &str) -> (crate::agent::AgentHandle, Box<dyn std::io:
     (handle, reader)
 }
 
+/// An `Idle` agent with fresh output — `check_awaiting_operator` needs BOTH
+/// `silent > 30s` and a prompt state, so this trips neither Stall branch and
+/// falls through to `take_recovery_notice`. The episode is armed via the
+/// state-local seam because `blocked_since` is private and the actionable gate
+/// wants a 30s block, which is otherwise only reachable by waiting.
+fn armed_recovered_agent(name: &str) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+    let (handle, reader) = mock_agent_handle(name, crate::state::AgentState::Idle);
+    handle
+        .core
+        .lock()
+        .state
+        .arm_recovery_notice_for_test(crate::state::RecoveryEpisode {
+            block_duration: RECOVERY_NOTICE_MIN_BLOCK,
+            notice_sent: true,
+        });
+    (handle, reader)
+}
+
 /// Two armed agents in one tick, each paired to delete the other. The first
 /// authorized notice flips its co-tenant's captured flag synchronously, so the
 /// delete always lands after the snapshot and before the second emit —
@@ -4680,15 +4716,20 @@ fn armed_stall_agent(name: &str) -> (crate::agent::AgentHandle, Box<dyn std::io:
 /// The no-flip control is what makes the fenced count meaningful: it proves
 /// BOTH agents were armed and the channel was authorized, so `1` is suppression
 /// rather than a setup that only ever produced one notice.
-fn two_armed_agents_tick(
+///
+/// `arm` selects which notice the pair is armed for, so the identical
+/// synchronous harness covers both `NoticeAction` variants.
+fn two_armed_agents_tick_with(
     tag: &str,
     ch: &Arc<StallRecorder>,
     delete_co_tenant: bool,
+    arm: fn(&str) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>),
 ) -> Vec<String> {
     let home = tmp_home(tag);
     let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-    let (a, _a_reader) = armed_stall_agent("agent-a");
-    let (b, _b_reader) = armed_stall_agent("agent-b");
+    let (a, _a_reader) = arm("agent-a");
+    let (b, _b_reader) = arm("agent-b");
+    ch.watch(&["agent-a", "agent-b"]);
     if delete_co_tenant {
         ch.pair("agent-a", Arc::clone(&b.deleted));
         ch.pair("agent-b", Arc::clone(&a.deleted));
@@ -4709,17 +4750,28 @@ fn two_armed_agents_tick(
     seen
 }
 
+/// The `Stall` arming, which is what the original #78207-1 regression covers.
+fn two_armed_agents_tick(
+    tag: &str,
+    ch: &Arc<StallRecorder>,
+    delete_co_tenant: bool,
+) -> Vec<String> {
+    two_armed_agents_tick_with(tag, ch, delete_co_tenant, armed_stall_agent)
+}
+
 /// The supervisor snapshots live handles under the registry lock and emits the
 /// stall notice later, after dropping the per-agent core lock. A normal
 /// `full_delete` sets the handle's flag in Step 1 and removes it in Step 4, so
 /// the flag can flip INSIDE that window — and the operator gets a stall notice
 /// for an instance that no longer exists (observed 2026-08-20: 3.4s after the
 /// delete finished).
+///
+/// Serialised against every other global-active-channel test (including the
+/// `Recovered` sibling below) — a function-local lock would not have covered
+/// the two of them against each other.
 #[test]
+#[serial_test::serial]
 fn stall_notice_is_fenced_when_the_handle_is_deleted_after_the_snapshot_78207_1() {
-    static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-    let _serial = SERIAL.lock();
-
     // Control: nothing is deleted, so both armed agents must be notified.
     crate::channel::reset_active_channel_for_test();
     let control = StallRecorder::arc();
@@ -4740,6 +4792,43 @@ fn stall_notice_is_fenced_when_the_handle_is_deleted_after_the_snapshot_78207_1(
         fenced_seen.len(),
         1,
         "a handle deleted after the snapshot must not produce an operator stall \
+         notice — got {fenced_seen:?}"
+    );
+
+    crate::channel::reset_active_channel_for_test();
+}
+
+/// `Recovered` rides the SAME snapshot and the same post-lock emit as `Stall`,
+/// so it had the same post-delete window: the guard lived inside the `Stall`
+/// arm while this arm never re-read the flag. Emitting here is worse than a
+/// stale stall — "✅ 已就緒，可以繼續對話" tells the operator to keep talking to
+/// an instance that is being torn down. Hoisting the one guard above `match
+/// action` covers both arms with the same handle-scoped `Arc`.
+#[test]
+#[serial_test::serial]
+fn recovery_notice_is_fenced_when_the_handle_is_deleted_after_the_snapshot_78207_1() {
+    // Control: nothing is deleted, so both armed agents must be notified.
+    crate::channel::reset_active_channel_for_test();
+    let control = StallRecorder::arc();
+    crate::channel::register_active_channel(control.clone());
+    let control_seen =
+        two_armed_agents_tick_with("recovery-control", &control, false, armed_recovered_agent);
+    assert_eq!(
+        control_seen.len(),
+        2,
+        "control: both agents must be armed and the channel authorized — got {control_seen:?}"
+    );
+
+    // Fenced: the first notice deletes its co-tenant mid-tick.
+    crate::channel::reset_active_channel_for_test();
+    let fenced = StallRecorder::arc();
+    crate::channel::register_active_channel(fenced.clone());
+    let fenced_seen =
+        two_armed_agents_tick_with("recovery-fenced", &fenced, true, armed_recovered_agent);
+    assert_eq!(
+        fenced_seen.len(),
+        1,
+        "a handle deleted after the snapshot must not produce an operator recovery \
          notice — got {fenced_seen:?}"
     );
 
