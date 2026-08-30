@@ -217,10 +217,47 @@ fn is_test_cfg_attribute(line: &str) -> bool {
     else {
         return false;
     };
-    expression == "test"
-        || ((expression.starts_with("all(") || expression.starts_with("any("))
-            && expression.contains("test")
-            && !expression.contains("not(test)"))
+    is_test_only_cfg(expression)
+}
+
+/// True only for a cfg expression that cannot hold outside a test build: bare
+/// `test`, or an `all(...)` with a top-level `test` term (a conjunction with
+/// `test` is test-only whatever else it requires). `any(...)` is a disjunction
+/// — `any(unix, test)` compiles in an ordinary unix build — and a feature name
+/// such as `"test-support"` merely contains the substring, so neither of those
+/// may cut the production scan.
+fn is_test_only_cfg(expression: &str) -> bool {
+    let expression = expression.trim();
+    if expression == "test" {
+        return true;
+    }
+    let Some(terms) = expression
+        .strip_prefix("all(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    top_level_terms(terms).into_iter().any(is_test_only_cfg)
+}
+
+/// Split a cfg term list on the commas that are not nested inside parentheses.
+fn top_level_terms(terms: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, ch) in terms.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&terms[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&terms[start..]);
+    out
 }
 
 fn is_inline_module_declaration(line: &str) -> bool {
@@ -276,6 +313,34 @@ fn cfg_test_import_does_not_hide_later_production_spawn() {
         !production.contains("fire-and-forget"),
         "fixture spawn must remain unrationalized so this regression exercises the audit"
     );
+}
+
+#[test]
+fn any_test_cfg_module_does_not_hide_later_production_spawn() {
+    // `any(test, ...)` is a disjunction: this module is compiled in an ordinary
+    // build whenever `feature = "prod"` is on, so it is not a test boundary.
+    let fixture = "#[cfg(any(test, feature = \"prod\"))]\nmod maybe_production {}\n\nfn production() {\n    std::thread::spawn(|| {});\n}\n";
+    let production = production_section(fixture);
+    assert!(
+        production.lines().any(is_spawn_call_line),
+        "an any(test, ...) module must not hide a later production spawn"
+    );
+}
+
+#[test]
+fn feature_name_containing_test_does_not_hide_later_production_spawn() {
+    // "test-support" merely contains the substring; neither form gates the
+    // module on the `test` cfg, so neither may cut the production scan.
+    for fixture in [
+        "#[cfg(all(unix, feature = \"test-support\"))]\nmod support {}\n\nfn production() {\n    std::thread::spawn(|| {});\n}\n",
+        "#[cfg(feature = \"test-support\")]\nmod support {}\n\nfn production() {\n    std::thread::spawn(|| {});\n}\n",
+    ] {
+        let production = production_section(fixture);
+        assert!(
+            production.lines().any(is_spawn_call_line),
+            "a feature named \"test-support\" must not hide a later production spawn: {fixture}"
+        );
+    }
 }
 
 /// Sprint 21 Phase 5 invariant — enforces v1.2 §10.5 Rule 5 on every

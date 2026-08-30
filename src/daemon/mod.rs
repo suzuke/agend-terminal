@@ -1110,18 +1110,18 @@ fn init_daemon_services(
     let configs: Arc<Mutex<HashMap<String, AgentConfig>>> = Arc::new(Mutex::new(HashMap::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // fire-and-forget: api::serve runs the Unix socket accept loop for the
-    // daemon's lifetime. Loop observes shutdown via the cloned AtomicBool;
-    // the socket file is removed during daemon shutdown, which surfaces as a
-    // bind/accept error and exits the loop. JoinHandle dropped because no
-    // graceful join is needed — process exit reaps the thread.
+    // fire-and-forget: api::serve runs the Unix socket accept loop, which blocks
+    // in accept() for the daemon's lifetime. It never polls the shutdown flag —
+    // its only early exit is a persistent accept-error streak (api/mod.rs:424) —
+    // so process exit is what ends and reaps the thread. The JoinHandle is
+    // dropped because a join would block until then.
     let api_reg = Arc::clone(&registry);
     let api_home = home.to_path_buf();
     let api_shutdown = Arc::clone(&shutdown);
     let api_configs = Arc::clone(&configs);
     let api_externals = Arc::clone(&externals);
     let (api_ready_tx, api_ready_rx) = std::sync::mpsc::sync_channel(1);
-    // fire-and-forget: the API accept loop observes daemon shutdown and exits; process exit reaps the detached worker.
+    // fire-and-forget: the API accept loop blocks in accept() for the daemon's lifetime; process exit reaps the detached worker.
     std::thread::Builder::new()
         .name("api_server".into())
         .spawn(move || {
