@@ -57,11 +57,10 @@ pub(super) struct PullListServer {
     pub(super) injected_would_block_hits: Arc<AtomicU32>,
     /// #3320: times the REAL write loop waited out a would-block. The read side
     /// counts an INJECTED one; this counts the kernel's — and ONLY a would-block,
-    /// never an `Interrupted`, because buffer pressure is the thing it claims,
-    /// which
-    /// is what makes the large-response regression honest: a host whose socket
-    /// buffers swallow the whole body never enters that arm, and the test must
-    /// FAIL saying so rather than pass having exercised nothing.
+    /// never an `Interrupted`, because buffer pressure is the thing it claims.
+    /// That is what makes the large-response regression honest: a host whose
+    /// socket buffers swallow the whole body never enters that arm, and the test
+    /// must FAIL saying so rather than pass having exercised nothing.
     pub(super) write_would_block_hits: Arc<AtomicU32>,
     pub(super) thread: Option<JoinHandle<()>>,
 }
@@ -486,19 +485,29 @@ fn write_side_failure_is_reported_not_swallowed_3320() {
 ///
 /// Nothing is injected. The client sends its request and then STALLS before
 /// draining, so the send buffer genuinely fills and the write genuinely blocks.
+///
+/// NOT ON WINDOWS, and the reason is the fixture rather than the fix. Winsock
+/// does not surface a would-block here at any size we should pay for: this PR
+/// measured `windows-latest` absorbing a 4 MiB body (run 33307408956) and then a
+/// 64 MiB one (run 33308761360) without ever entering the retry arm, and
+/// `tui_bridge.rs` already records the same Winsock limit — a 900 KiB write to a
+/// non-reading peer completing there even with a 4 KiB send buffer — and ignores
+/// its two parked-write tests for it. The code under test is platform-independent
+/// and IS exercised here on Linux and macOS; what cannot be provoked on Windows
+/// is the kernel condition, not the behaviour. The non-vacuity guard below is
+/// what turned both of those runs into loud failures instead of silent passes.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "#3320: Winsock never surfaces WouldBlock here — windows-latest \
+              absorbed 4 MiB (run 33307408956) and 64 MiB (run 33308761360) \
+              whole; see tui_bridge.rs for the same limit at 900 KiB. The resume \
+              loop is platform-independent and is covered on Linux and macOS."
+)]
 fn a_would_block_write_is_resumed_not_abandoned_3320() {
     // Comfortably larger than the socket send buffer plus the client receive
-    // buffer, so the block is a certainty rather than a race.
-    //
-    // Windows needs its own size: run 33307408956 / job 99246276242 swallowed the
-    // whole 4 MiB on `windows-latest` without ever blocking, and the guard below
-    // caught it rather than banking a vacuous green. Its loopback buffers are far
-    // larger, so give that platform a body it cannot absorb; every other platform
-    // keeps the size measured here.
-    #[cfg(windows)]
-    let body = "x".repeat(64 * 1024 * 1024);
-    #[cfg(not(windows))]
+    // buffer on the platforms this runs on, so the block is a certainty rather
+    // than a race. See the `ignore` above for why Windows is not one of them.
     let body = "x".repeat(4 * 1024 * 1024);
     let server = pull_list_server(body.clone());
 
