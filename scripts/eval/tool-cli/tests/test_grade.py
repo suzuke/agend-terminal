@@ -1196,6 +1196,20 @@ class Aggregation(TempCase):
         self.assertFalse(summary["plan_gate"]["pass"])
         self.assertFalse(summary["pilot_safety"])
 
+    def test_a_manifest_that_states_no_budget_at_all_is_refused(self):
+        """The other shape of the same gap: absent, not merely wrong.
+
+        Every tree written before the budget became identity has no
+        `timeout_secs` key. Those must be refused too, or the contract only
+        catches trees that tried and failed to conform.
+        """
+        runs, scen = self.frozen_matrix(manifest=False)
+        write_manifest(runs, timeout_secs=DROP)
+        summary = grade.aggregate(runs, scen)
+
+        self.assertIn("manifest_incomplete", summary["plan_gate"]["flags"])
+        self.assertFalse(summary["pilot_safety"])
+
     def test_the_manifest_identity_values_are_checked_not_just_present(self):
         """A complete manifest can still describe another experiment."""
         runs, scen = self.frozen_matrix()
