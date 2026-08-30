@@ -756,7 +756,13 @@ fn tick(
     // that agent's core — the core→registry inversion that risked an AB-BA
     // deadlock with the registry→core render/monitor loops. Backend resolution
     // on the captured values is lock-free.
-    let handles: Vec<(String, Option<crate::backend::Backend>, String, _)> = {
+    let handles: Vec<(
+        String,
+        Option<crate::backend::Backend>,
+        String,
+        _,
+        Arc<std::sync::atomic::AtomicBool>,
+    )> = {
         let reg = agent::lock_registry(registry);
         reg.values()
             // #1915 TIER-B1: skip a handle being deleted (deleted flag set in
@@ -771,12 +777,16 @@ fn tick(
                     h.declared_backend.clone(),
                     h.backend_command.clone(),
                     Arc::clone(&h.core),
+                    // #78207-1: carry the SAME handle-scoped flag the filter
+                    // above just trusted, so the emit can re-read it without
+                    // re-locking the registry.
+                    Arc::clone(&h.deleted),
                 )
             })
             .collect()
     };
 
-    for (name, declared_backend, backend_command, core) in handles {
+    for (name, declared_backend, backend_command, core, deleted) in handles {
         // #1665/#2042 reply-ledger: TTL/settled fallback for a user-message
         // turn that never hit a clear site (no reply, no mirror, no takeover).
         // Lock-free snapshot read; acts only past the grace window AND when the
@@ -1263,6 +1273,12 @@ fn tick(
 
         match action {
             Some(NoticeAction::Stall { tail, silent_secs }) => {
+                // #78207-1: a normal full_delete can set this handle's flag
+                // between the snapshot above and this emit. Re-read the SAME
+                // captured Arc here — monotonic, so no registry re-lock.
+                if deleted.load(std::sync::atomic::Ordering::Acquire) {
+                    continue;
+                }
                 let msg = format_stall_notice(&name, &tail, silent_secs);
                 // Outbound info-leak gate (Sprint 21 Phase 1): `tail`
                 // carries 40 lines of PTY output — must not leak to a

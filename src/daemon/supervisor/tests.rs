@@ -4568,3 +4568,180 @@ fn intra_tick_prompt_release_raises_no_member_reaction_3294() {
         "#3294 r3: a prompt still latched at the tick must raise exactly one normal reaction"
     );
 }
+
+// ───────────── #78207-1: stale Stall notice after a normal full_delete ─────────────
+
+use crate::channel::{
+    BindingOpts, BindingRef, Channel, ChannelCapabilities, ChannelError, ChannelEvent, MsgRef,
+    OutMsg,
+};
+
+/// Records notices and, on the FIRST authorized notify, synchronously flips the
+/// co-tenant's captured `deleted` flag — the delete lands mid-tick, after the
+/// snapshot and before the other agent's emit, with no thread, sleep or spin.
+/// Whichever agent the registry happens to yield first is the live control, so
+/// the test is order-independent.
+///
+/// Twelve of the fourteen methods below are required by the trait and carry no
+/// meaning. `outbound_authorized` does: it defaults to `false`, which drops the
+/// notice inside `gated_notify` and would make the control vacuously quiet.
+struct StallRecorder {
+    caps: ChannelCapabilities,
+    seen: parking_lot::Mutex<Vec<String>>,
+    peers: parking_lot::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+}
+
+impl StallRecorder {
+    fn arc() -> Arc<Self> {
+        Arc::new(Self {
+            caps: ChannelCapabilities::default(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+            peers: parking_lot::Mutex::new(HashMap::new()),
+        })
+    }
+    /// Notifying `agent` deletes `peer`.
+    fn pair(&self, agent: &str, peer: Arc<std::sync::atomic::AtomicBool>) {
+        self.peers.lock().insert(agent.to_string(), peer);
+    }
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().clone()
+    }
+}
+
+impl Channel for StallRecorder {
+    fn notify(
+        &self,
+        instance: &str,
+        _: NotifySeverity,
+        _: &str,
+        _: bool,
+    ) -> Result<(), ChannelError> {
+        let mut seen = self.seen.lock();
+        if seen.is_empty() {
+            if let Some(peer) = self.peers.lock().get(instance) {
+                peer.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        seen.push(instance.to_string());
+        Ok(())
+    }
+    fn outbound_authorized(&self) -> bool {
+        true
+    }
+    fn kind(&self) -> &'static str {
+        "telegram"
+    }
+    fn caps(&self) -> &ChannelCapabilities {
+        &self.caps
+    }
+    fn poll_event(&self) -> Option<ChannelEvent> {
+        None
+    }
+    fn send(&self, _: &BindingRef, _: OutMsg) -> anyhow::Result<MsgRef> {
+        anyhow::bail!("unused")
+    }
+    fn edit(&self, _: &MsgRef, _: OutMsg) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn delete(&self, _: &MsgRef) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn create_binding(&self, _: &str, _: BindingOpts) -> anyhow::Result<BindingRef> {
+        anyhow::bail!("unused")
+    }
+    fn remove_binding(&self, _: &BindingRef) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn has_binding(&self, _: &str) -> bool {
+        false
+    }
+    fn record_binding(&self, _: &str, _: BindingRef, _: String) {}
+    fn take_binding(&self, _: &str) -> Option<BindingRef> {
+        None
+    }
+    fn attach_registry(&self, _: crate::agent::AgentRegistry) {}
+}
+
+/// A `Starting` agent silent past `AWAITING_OP_SILENCE` (30s), default
+/// `IdleExpectation::Active`, no productive output — the sleep-free route to a
+/// `NoticeAction::Stall`. Back-dating the `Instant` is the technique
+/// `state/tests.rs` already uses.
+fn armed_stall_agent(name: &str) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+    let (handle, reader) = mock_agent_handle(name, crate::state::AgentState::Starting);
+    handle.core.lock().state.last_output = Instant::now() - Duration::from_secs(45);
+    (handle, reader)
+}
+
+/// Two armed agents in one tick, each paired to delete the other. The first
+/// authorized notice flips its co-tenant's captured flag synchronously, so the
+/// delete always lands after the snapshot and before the second emit —
+/// whichever order the registry yields.
+///
+/// The no-flip control is what makes the fenced count meaningful: it proves
+/// BOTH agents were armed and the channel was authorized, so `1` is suppression
+/// rather than a setup that only ever produced one notice.
+fn two_armed_agents_tick(
+    tag: &str,
+    ch: &Arc<StallRecorder>,
+    delete_co_tenant: bool,
+) -> Vec<String> {
+    let home = tmp_home(tag);
+    let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let (a, _a_reader) = armed_stall_agent("agent-a");
+    let (b, _b_reader) = armed_stall_agent("agent-b");
+    if delete_co_tenant {
+        ch.pair("agent-a", Arc::clone(&b.deleted));
+        ch.pair("agent-b", Arc::clone(&a.deleted));
+    }
+    registry.lock().insert(a.id, a);
+    registry.lock().insert(b.id, b);
+    super::tick(
+        &home,
+        &registry,
+        &mut Default::default(),
+        &mut Default::default(),
+        &mut Default::default(),
+        past_boot_grace(),
+        &HashMap::new(),
+    );
+    let seen = ch.seen();
+    std::fs::remove_dir_all(&home).ok();
+    seen
+}
+
+/// The supervisor snapshots live handles under the registry lock and emits the
+/// stall notice later, after dropping the per-agent core lock. A normal
+/// `full_delete` sets the handle's flag in Step 1 and removes it in Step 4, so
+/// the flag can flip INSIDE that window — and the operator gets a stall notice
+/// for an instance that no longer exists (observed 2026-08-20: 3.4s after the
+/// delete finished).
+#[test]
+fn stall_notice_is_fenced_when_the_handle_is_deleted_after_the_snapshot_78207_1() {
+    static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _serial = SERIAL.lock();
+
+    // Control: nothing is deleted, so both armed agents must be notified.
+    crate::channel::reset_active_channel_for_test();
+    let control = StallRecorder::arc();
+    crate::channel::register_active_channel(control.clone());
+    let control_seen = two_armed_agents_tick("stall-control", &control, false);
+    assert_eq!(
+        control_seen.len(),
+        2,
+        "control: both agents must be armed and the channel authorized — got {control_seen:?}"
+    );
+
+    // Fenced: the first notice deletes its co-tenant mid-tick.
+    crate::channel::reset_active_channel_for_test();
+    let fenced = StallRecorder::arc();
+    crate::channel::register_active_channel(fenced.clone());
+    let fenced_seen = two_armed_agents_tick("stall-fenced", &fenced, true);
+    assert_eq!(
+        fenced_seen.len(),
+        1,
+        "a handle deleted after the snapshot must not produce an operator stall \
+         notice — got {fenced_seen:?}"
+    );
+
+    crate::channel::reset_active_channel_for_test();
+}
