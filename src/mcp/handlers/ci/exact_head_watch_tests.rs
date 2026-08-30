@@ -348,6 +348,81 @@ fn exact_head_unwatch_disarms_only_the_addressed_sha_3159() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Exact-head unwatch must settle only the caller's repo@branch handoff track;
+/// a co-subscriber's independent obligation survives even when an authorized
+/// full disarm clears the addressed watch.
+#[test]
+fn exact_head_unwatch_settles_caller_track_only_3590() {
+    let home = tmp_home("eh-unwatch-settlement");
+    seed_team(&home, "lead", "reviewer-x");
+    let armed = handle_watch_ci(&home, &exact_head_args(SHA_A), "lead");
+    assert_eq!(armed["subscribers"], json!(["lead"]), "arm: {armed}");
+
+    let path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename_exact_head("suzuke/agend-terminal", "main", SHA_A),
+    );
+    let mut watch: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    watch["subscribers"] = json!([
+        {"instance": "lead", "subscribed_at": "2026-01-01T00:00:00Z"},
+        {"instance": "reviewer-x", "subscribed_at": "2026-01-01T00:00:01Z"},
+    ]);
+    std::fs::write(&path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+    let correlation = "suzuke/agend-terminal@main";
+    crate::daemon::ci_handoff_track::record(
+        &home,
+        "lead",
+        correlation,
+        "2026-01-01T00:00:00Z",
+        None,
+        None,
+    );
+    crate::daemon::ci_handoff_track::record(
+        &home,
+        "reviewer-x",
+        correlation,
+        "2026-01-01T00:00:01Z",
+        None,
+        None,
+    );
+
+    let result = handle_unwatch_ci(
+        &home,
+        &json!({"repository": "suzuke/agend-terminal", "branch": "main", "head_sha": SHA_A}),
+        "lead",
+    );
+    assert!(
+        result.get("error").is_none(),
+        "caller unwatch must succeed: {result}"
+    );
+    assert_eq!(
+        result["watching"].as_bool(),
+        Some(false),
+        "full disarm: {result}"
+    );
+    assert_eq!(
+        result["disarmed"].as_bool(),
+        Some(true),
+        "full disarm: {result}"
+    );
+
+    let tracks = crate::daemon::ci_handoff_track::list(&home);
+    assert!(
+        tracks
+            .iter()
+            .all(|(_, track)| !(track.target == "lead" && track.correlation == correlation)),
+        "caller track must be settled: {tracks:?}"
+    );
+    assert!(
+        tracks
+            .iter()
+            .any(|(_, track)| track.target == "reviewer-x" && track.correlation == correlation),
+        "co-subscriber's track must survive: {tracks:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// A malformed SHA must fail closed — never silently fall back to the
 /// generic branch watch (that would unwatch the whole branch on a typo).
 #[test]
