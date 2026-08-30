@@ -4757,6 +4757,98 @@ fn arch14_symlink_alias_lease_survives_alias_removal() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// The absent-binding release arm must compare a present marker source by
+/// canonical identity: a symlink alias of Git's verified common-dir source is
+/// valid, while a present divergent marker source is refused before removal.
+/// This drives the public bind:false checkout/release path so the proof covers
+/// the marker and Git-linkage shape that production creates.
+#[test]
+#[cfg(unix)]
+fn arch14_bind_false_release_canonicalizes_marker_source() {
+    let checkout = |tag: &str| {
+        let base = release_guard_tmp(tag);
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let source = p778_setup_source_repo(&base, "seed");
+        let response = super::handle_checkout_repo(
+            &home,
+            &serde_json::json!({
+                "repository_path": source.display().to_string(),
+                "branch": "seed",
+                "bind": false,
+            }),
+            "arch14-bindfalse-agent",
+        );
+        assert!(
+            response.get("error").is_none(),
+            "bind:false checkout must succeed: {response}"
+        );
+        let worktree =
+            std::path::PathBuf::from(response["path"].as_str().expect("bind:false checkout path"));
+        (base, home, source, worktree)
+    };
+
+    let (base, home, source, worktree) = checkout("arch14-bindfalse-alias");
+    let alias = base.join("source-alias");
+    std::os::unix::fs::symlink(&source, &alias).expect("source alias");
+    std::fs::write(
+        worktree.join(crate::worktree_pool::MANAGED_MARKER),
+        format!(
+            "agent=arch14-bindfalse-agent\nbranch=seed\nsource_repo={}\nleased_at=x\n",
+            alias.display()
+        ),
+    )
+    .expect("alias marker");
+    assert_eq!(
+        std::fs::canonicalize(&alias).expect("alias resolves"),
+        std::fs::canonicalize(&source).expect("source resolves")
+    );
+
+    let released = dispatch_repo_release(
+        &home,
+        "arch14-bindfalse-agent",
+        worktree.to_str().expect("worktree path"),
+    );
+    assert_eq!(released["released"].as_bool(), Some(true), "{released}");
+    assert!(
+        released.get("error").and_then(|e| e.as_str()).is_none(),
+        "a canonical-equivalent marker source must be accepted: {released}"
+    );
+    assert!(
+        !worktree.exists(),
+        "accepted release must remove the worktree"
+    );
+    std::fs::remove_dir_all(&base).ok();
+
+    let (base, home, _source, worktree) = checkout("arch14-bindfalse-divergent");
+    let divergent = base.join("other-source");
+    std::fs::create_dir_all(&divergent).expect("divergent source");
+    std::fs::write(
+        worktree.join(crate::worktree_pool::MANAGED_MARKER),
+        format!(
+            "agent=arch14-bindfalse-agent\nbranch=seed\nsource_repo={}\nleased_at=x\n",
+            divergent.display()
+        ),
+    )
+    .expect("divergent marker");
+
+    let refused = dispatch_repo_release(
+        &home,
+        "arch14-bindfalse-agent",
+        worktree.to_str().expect("worktree path"),
+    );
+    assert_eq!(
+        refused["code"].as_str(),
+        Some("managed_release_source_mismatch"),
+        "a present divergent marker source must be refused: {refused}"
+    );
+    assert!(
+        worktree.exists(),
+        "refused divergent-source release must preserve the worktree"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
 // ═══ Arch14 legacy marker: absent-binding release (t-…-39872-18) ══════════
 // Superseding contract d-20260720044124067125-6. #2860 landed producer
 // canonical source parity + BINDING-authoritative legacy adoption; the
