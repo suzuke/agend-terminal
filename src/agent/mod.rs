@@ -1954,9 +1954,9 @@ pub(crate) fn spawn_self_kick_bootstrap(
     timeout: std::time::Duration,
     registration_state: BootstrapRegistrationState,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     let thread_name = format!("{name}_selfkick");
-    // fire-and-forget: mirrors spawn_instructions_bootstrap's lifetime/discipline.
+    // Production callers discard the handle; tests may join it for deterministic teardown.
     let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
         let _census = crate::thread_census::register("self_kick");
         let readiness_deadline = std::time::Instant::now() + timeout;
@@ -2003,8 +2003,12 @@ pub(crate) fn spawn_self_kick_bootstrap(
             }
         }
     });
-    if let Err(e) = spawn_result {
-        tracing::warn!(error = %e, "failed to spawn self-kick bootstrap thread");
+    match spawn_result {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to spawn self-kick bootstrap thread");
+            None
+        }
     }
 }
 

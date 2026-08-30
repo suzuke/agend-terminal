@@ -227,7 +227,7 @@ pub fn spawn_instance(
                 .preset()
                 .ready_timeout_secs
                 .saturating_add(15);
-            agent::spawn_self_kick_bootstrap(
+            let _ = agent::spawn_self_kick_bootstrap(
                 std::sync::Arc::clone(context.registry),
                 id,
                 request.name.clone(),

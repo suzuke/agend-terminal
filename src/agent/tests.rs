@@ -492,7 +492,7 @@ fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
     )));
     crate::daemon::hook_shadow::record_event(&name, "UserPromptSubmit", None);
 
-    spawn_self_kick_bootstrap(
+    let bootstrap = spawn_self_kick_bootstrap(
         Arc::clone(&registry),
         id,
         name.clone(),
@@ -500,15 +500,9 @@ fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
         std::time::Duration::from_secs(2),
         BootstrapRegistrationState::AlreadyRegistered,
         None,
-    );
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while adapter_requests.load(Ordering::SeqCst) == 0
-        && written.lock().is_empty()
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    )
+    .expect("self-kick bootstrap thread");
+    bootstrap.join().expect("self-kick bootstrap");
     crate::transport::test_support::set_delivery_hook(None);
 
     assert_eq!(
@@ -912,7 +906,7 @@ fn fresh_restart_self_kick_legacy_uses_captured_target_and_arms_hook() {
         .state
         .current = crate::state::AgentState::Idle;
     crate::daemon::hook_shadow::record_event(&fixture.name, "UserPromptSubmit", None);
-    spawn_self_kick_bootstrap(
+    let bootstrap = spawn_self_kick_bootstrap(
         Arc::clone(&fixture.registry),
         fixture.id,
         fixture.name.clone(),
@@ -920,14 +914,9 @@ fn fresh_restart_self_kick_legacy_uses_captured_target_and_arms_hook() {
         std::time::Duration::from_secs(2),
         BootstrapRegistrationState::AlreadyRegistered,
         None,
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while (!fixture.written.lock().ends_with(b"\r")
-        || !crate::daemon::inject_delivery::is_armed_for_test(&fixture.name))
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    )
+    .expect("self-kick bootstrap thread");
+    bootstrap.join().expect("self-kick bootstrap");
     let written = fixture.written.lock().clone();
     assert!(
         !written.is_empty(),
@@ -991,7 +980,7 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
     let bootstrap_id = fixture.id;
     let bootstrap_name = fixture.name.clone();
     let bootstrap_home = fixture.home.clone();
-    spawn_self_kick_bootstrap(
+    let _ = spawn_self_kick_bootstrap(
         bootstrap_registry,
         bootstrap_id,
         bootstrap_name,

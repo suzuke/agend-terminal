@@ -1282,7 +1282,7 @@ fn spawn_handoff_requester_self_kick(
         .map(|backend| backend.preset().ready_timeout_secs)
         .unwrap_or(60)
         .saturating_add(15);
-    crate::agent::spawn_self_kick_bootstrap(
+    let _ = crate::agent::spawn_self_kick_bootstrap(
         Arc::clone(&ctx.registry),
         requester_id,
         name,
