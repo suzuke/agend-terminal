@@ -188,9 +188,11 @@ pub(super) fn handle_crash_observation(
     let tx = ctx.crash_tx.clone();
     let shutdown_for_respawn = Arc::clone(&ctx.shutdown);
     let name_for_err = crashed_name.to_owned();
-    // fire-and-forget: respawn worker is short-lived (sleep delay then
-    // spawn_agent + restore health + start TUI server). Observes
-    // shutdown flag immediately after backoff to abort cleanly.
+    // fire-and-forget: respawn worker runs the whole respawn (backoff, spawn_agent,
+    // restore health, start the TUI server, then wait for prompt readiness before
+    // the notice). Bounded: the readiness wait ends at `ready_timeout_secs + 15`,
+    // and both the backoff and that wait observe the shutdown flag, so the thread
+    // always ends on its own.
     if let Err(e) = std::thread::Builder::new()
         .name(format!("{crashed_name}_respawn"))
         .spawn(move || {
@@ -589,6 +591,28 @@ fn respawn_agent_worker(
                     core.health.respawn_ok(is_alive);
                 }
             }
+            let rdir = run_dir(home);
+            let n = config.name.clone();
+            let n_err = n.clone();
+            let reg2 = Arc::clone(reg);
+            // Publish the per-agent TUI socket BEFORE the readiness wait below:
+            // this is the only publisher of `run/<pid>/<name>.port` on the respawn
+            // path, and until it runs that file still names the dead pre-crash
+            // listener, so nothing can attach. Gating it on readiness would leave a
+            // respawn that never reaches Idle unattachable for the whole wait budget
+            // — the moment an operator most needs the pane. `spawn_one` publishes in
+            // the same order. Nothing couples the two: the notice below writes
+            // through the registry handle's PTY, not this socket.
+            //
+            // fire-and-forget: respawn-time TUI server exits when the agent
+            // is removed from the registry (socket-file removal in
+            // delete_transaction).
+            if let Err(e) = std::thread::Builder::new()
+                .name(format!("{n}_tui_server"))
+                .spawn(move || serve_agent_tui(&n, &rdir, &reg2))
+            {
+                tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI server");
+            }
             {
                 // #3462-v2: wait for the respawned prompt to actually accept input
                 // instead of guessing with a fixed sleep. The handle is already
@@ -643,19 +667,6 @@ fn respawn_agent_worker(
                         );
                     }
                 }
-            }
-            let rdir = run_dir(home);
-            let n = config.name.clone();
-            let n_err = n.clone();
-            let reg2 = Arc::clone(reg);
-            // fire-and-forget: respawn-time TUI server exits when the agent
-            // is removed from the registry (socket-file removal in
-            // delete_transaction).
-            if let Err(e) = std::thread::Builder::new()
-                .name(format!("{n}_tui_server"))
-                .spawn(move || serve_agent_tui(&n, &rdir, &reg2))
-            {
-                tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI server");
             }
         }
         Err(e) => {
