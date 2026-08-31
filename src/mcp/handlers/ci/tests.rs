@@ -3460,11 +3460,24 @@ fn tombstone_rearm_clears_notify_cursors_and_rotates_generation() {
     assert_eq!(tombstone["auto_arm_optout"], true);
     assert_eq!(tombstone["last_run_id"].as_u64(), Some(100));
 
+    // t-…-21627-5: re-arm against a REAL routed typed task. This fixture used to
+    // pass a phantom `t-1`, which only worked because the `NotFound` arm accepted
+    // the caller's own class; the epoch behaviour under test is unrelated to that.
+    let rearm_task = crate::tasks::handle(
+        &home,
+        "dev-2",
+        &serde_json::json!({
+            "action": "create",
+            "title": "tombstone re-arm task",
+            "review_class": "dual",
+        }),
+    );
+    let rearm_task_id = rearm_task["id"].as_str().expect("task id").to_string();
     super::handle_watch_ci(
         &home,
         &serde_json::json!({
             "repository": "o/r", "branch": "feat/x",
-            "task_id": "t-1", "review_class": "dual", "next_after_ci": "lead",
+            "task_id": rearm_task_id, "review_class": "dual", "next_after_ci": "lead",
         }),
         "dev-2",
     );
@@ -3496,7 +3509,7 @@ fn tombstone_rearm_clears_notify_cursors_and_rotates_generation() {
     assert_eq!(v["rate_limit_remaining"].as_u64(), Some(17));
     assert_eq!(v["consecutive_skips"].as_u64(), Some(3));
     assert_eq!(v["effective_interval_secs"].as_u64(), Some(120));
-    assert_eq!(v["task_id"], "t-1");
+    assert_eq!(v["task_id"], rearm_task_id.as_str());
     assert_eq!(v["review_class"], "dual");
     // Single target is stored in its scalar form by `next_after_ci_json`.
     assert_eq!(v["next_after_ci"], serde_json::json!("lead"));
@@ -3538,6 +3551,184 @@ fn task_linked_watch_rejects_review_class_divergence_3419() {
     assert!(
         !crate::daemon::ci_watch::ci_watches_dir(&home).exists(),
         "watch divergence must be rejected before watch-file creation"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// t-…-21627-5 RED: the `TaskRouteError::NotFound` arm used to accept the
+/// caller's own `review_class` verbatim, so an identified caller could name a
+/// task that exists on NO board and still stamp a class onto the watch — the
+/// dangerous direction being `single` asserted onto a dual-required subject.
+///
+/// Authority here is the empty/non-empty caller split; the gate never consults
+/// team role, so an orchestrator takes exactly the same branch as a plain agent.
+/// Both caller shapes are pinned so a future refactor cannot quietly make the
+/// decision role-sensitive without a failing test.
+#[test]
+fn manual_rearm_rejects_unroutable_task_for_identified_callers() {
+    for caller in ["dev-1", "lead"] {
+        let home = watch_test_home(&format!("rearm-unroutable-{caller}"));
+        let response = super::handle_watch_ci(
+            &home,
+            &serde_json::json!({
+                "repository": "o/r",
+                "branch": "feat/x",
+                "task_id": "t-does-not-exist",
+                "review_class": "single",
+            }),
+            caller,
+        );
+        assert_eq!(
+            response["code"], "watch_task_link_unresolved",
+            "caller '{caller}' must not stamp its own class onto an unroutable task: {response}"
+        );
+        assert!(
+            !crate::daemon::ci_watch::ci_watches_dir(&home).exists(),
+            "rejection must precede watch-file creation for '{caller}'"
+        );
+        assert!(
+            !crate::daemon::pr_state::pr_state_dir(&home).exists(),
+            "rejection must precede PrState creation for '{caller}'"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// t-…-21627-5 BOUNDARY: the gate is deliberately scoped to the STAMPING case.
+/// An identified caller may still arm against an unroutable task when it supplies
+/// no class, because nothing is asserted — `review_class` is persisted only when
+/// resolved, so the sidecar carries none and the merge gate still fails closed on
+/// the PR state's own Unresolved class.
+///
+/// This test exists to pin that boundary in BOTH directions: widening the gate to
+/// classless arms breaks it (that widening also broke 24 pre-existing fixtures
+/// across notification_only / exact_head / dispatch_hook, none of which supply a
+/// class), and dropping the class check entirely reopens the fail-open pinned by
+/// `manual_rearm_rejects_unroutable_task_for_identified_callers`.
+#[test]
+fn manual_rearm_allows_classless_unroutable_arm_and_asserts_no_class() {
+    let home = watch_test_home("rearm-unroutable-classless");
+    let response = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/x",
+            "task_id": "t-does-not-exist",
+        }),
+        "dev-1",
+    );
+    assert!(
+        !response["error"].is_string(),
+        "a classless arm asserts no authority and must still be allowed: {response}"
+    );
+    let v = read_watch(&watch_path_for(&home, "o/r", "feat/x"));
+    assert!(
+        v.get("review_class").map(|c| c.is_null()).unwrap_or(true),
+        "a classless arm must persist NO review_class — that is why it is safe: {v}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// t-…-21627-5 positive control: tightening the NotFound arm must NOT turn
+/// legitimate inheritance into a rejection. A routed task with an omitted class
+/// still inherits the task's own durable authority.
+#[test]
+fn manual_rearm_inherits_routed_class_when_class_omitted() {
+    let home = watch_test_home("rearm-inherit-routed-class");
+    let created = crate::tasks::handle(
+        &home,
+        "dev-1",
+        &serde_json::json!({
+            "action": "create",
+            "title": "governed watch task",
+            "review_class": "dual",
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id").to_string();
+    let response = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/governed",
+            "task_id": task_id,
+        }),
+        "dev-1",
+    );
+    assert!(
+        !response["error"].is_string(),
+        "routed task with omitted class must arm: {response}"
+    );
+    let v = read_watch(&watch_path_for(&home, "o/r", "feat/governed"));
+    assert_eq!(
+        v["review_class"], "dual",
+        "omitted class must inherit the routed task's class: {v}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// t-…-21627-5 positive control: a routed task whose class MATCHES the explicit
+/// argument still arms (only divergence is fatal).
+#[test]
+fn manual_rearm_accepts_matching_explicit_class() {
+    let home = watch_test_home("rearm-matching-class");
+    let created = crate::tasks::handle(
+        &home,
+        "dev-1",
+        &serde_json::json!({
+            "action": "create",
+            "title": "governed watch task",
+            "review_class": "dual",
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id").to_string();
+    let response = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/governed",
+            "task_id": task_id,
+            "review_class": "dual",
+        }),
+        "dev-1",
+    );
+    assert!(
+        !response["error"].is_string(),
+        "matching explicit class must arm: {response}"
+    );
+    let v = read_watch(&watch_path_for(&home, "o/r", "feat/governed"));
+    assert_eq!(v["review_class"], "dual", "{v}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// t-…-21627-5: the operator (empty caller) keeps the taskless override, but it
+/// is no longer silent — the override is written to the audit log naming the
+/// task_id and the class it retained.
+#[test]
+fn manual_rearm_operator_taskless_override_is_retained_and_audited() {
+    let home = watch_test_home("rearm-operator-taskless");
+    let response = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/x",
+            "task_id": "t-does-not-exist",
+            "review_class": "single",
+        }),
+        "",
+    );
+    assert!(
+        !response["error"].is_string(),
+        "operator taskless override must still arm: {response}"
+    );
+    let v = read_watch(&watch_path_for(&home, "o/r", "feat/x"));
+    assert_eq!(v["review_class"], "single", "{v}");
+    let log = std::fs::read_to_string(home.join("event-log.jsonl"))
+        .expect("taskless operator override must write an audit line");
+    assert!(
+        log.contains("ci_watch_taskless_class_override")
+            && log.contains("t-does-not-exist")
+            && log.contains("single"),
+        "audit must name the task_id and the retained class: {log}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

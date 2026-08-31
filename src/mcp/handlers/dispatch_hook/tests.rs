@@ -2400,10 +2400,15 @@ fn all_dispatch_directives_reach_armed_watch_1877() {
     ));
     let (home, _canonical) =
         p781_canonical_with_team_source_repo(&parent, "feat/1877-all", true, "val", &["val-dev"]);
+    // t-…-21627-5: this arm supplies an explicit `dual`, so it is in the #2745 R3
+    // regime — a class-carrying watch must reference a task that actually routes.
+    // The phantom `T-1877-all` used to work only because the NotFound arm accepted
+    // the caller's own class, which is the fail-open this change closes.
+    let task_id = create_review_class_task(&home, "dual");
     let r = super::dispatch_auto_bind_lease_with_chain(
         &home,
         "val-dev",
-        "T-1877-all",
+        &task_id,
         "feat/1877-all",
         None,
         Some("reviewer"),
@@ -2423,7 +2428,7 @@ fn all_dispatch_directives_reach_armed_watch_1877() {
     );
     assert_eq!(
         watch["task_id"].as_str(),
-        Some("T-1877-all"),
+        Some(task_id.as_str()),
         "#1031: task_id dropped from armed watch. Got: {watch}"
     );
     assert_eq!(
