@@ -938,6 +938,68 @@ fn p0x_release_full_happy_path_removes_worktree_and_binding() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// t-…-87866-27 RED: the release path mutates the worktree at a PATH, but every
+/// lock it takes is keyed by AGENT (`acquire_agent_mutation_lock`,
+/// `acquire_binding_file_lock`) or by BRANCH (`acquire_branch_lease_lock`). None
+/// of those is visible to a DIFFERENT agent operating on the SAME normalized
+/// path — and `ci/checkout.rs` provisions that same path while holding the
+/// canonical per-path flock (`checkout_txn::acquire_path_lock`), whose own doc
+/// names repo-release as its next consumer. So probe the shared domain at the
+/// destructive moment: while this release is about to remove the worktree, the
+/// per-path lock for that worktree must NOT be free.
+///
+/// Deterministic and sleepless: the probe runs inside the existing
+/// `BeforeWorktreeRemove` phase seam, and `try_acquire_path_lock` is
+/// non-blocking, so the observation is a pure function of who holds the flock at
+/// that instant.
+#[test]
+fn release_holds_the_canonical_path_lock_while_removing_the_worktree() {
+    let home = tmp_home("path-lock-release");
+    let repo = tmp_repo("path-lock-release-repo");
+    let lease = lease_bound(&home, &repo, "agent-pl", "feat/pl");
+    assert!(lease.path.exists(), "pre: worktree must exist");
+
+    let path_was_free = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let outcome = {
+        let observed = std::sync::Arc::clone(&path_was_free);
+        let reached = std::sync::Arc::clone(&probed);
+        let probe_home = home.clone();
+        let probe_path = lease.path.clone();
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+                reached.store(true, std::sync::atomic::Ordering::SeqCst);
+                let free = crate::mcp::handlers::ci::checkout_txn::try_acquire_path_lock(
+                    &probe_home,
+                    &probe_path,
+                    "same-path-probe",
+                )
+                .is_some();
+                observed.store(free, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        release_full(&home, "agent-pl", false)
+    };
+
+    assert!(
+        probed.load(std::sync::atomic::Ordering::SeqCst),
+        "the release must reach the destructive phase for this probe to mean anything"
+    );
+    assert!(
+        outcome.released,
+        "release must still succeed under the path lock: {:?}",
+        outcome.error
+    );
+    assert!(
+        !path_was_free.load(std::sync::atomic::Ordering::SeqCst),
+        "the canonical per-path lock was FREE while the release removed the worktree — a \
+         same-path checkout by another agent could interleave with this teardown"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// S1 RED: a release that snapshots binding generation A must not tear down a
 /// same-agent generation B installed before destructive authority is reacquired.
 /// The phase seam makes the interleaving deterministic (no sleeps).
