@@ -23,6 +23,96 @@ use std::path::Path;
 
 use super::gh_poll::{GhPrMetadata, GhPrState};
 
+/// Which agent an auto-arm speaks for, and — only when strictly proven — the
+/// task whose authority the watch may carry.
+struct AutoArmSubject {
+    agent: String,
+    /// `Some` ONLY when exactly one signature-valid binding matches this exact
+    /// repository AND branch and its `task_id` strictly routes to a board task.
+    /// Never fabricated; every other shape leaves this `None`.
+    task_id: Option<String>,
+}
+
+/// Resolve the auto-arm subject for `repo`/`branch`.
+///
+/// Two separable questions, deliberately answered by two different rules:
+///
+/// * WHO is notified keeps the historical branch-only resolution, so a legacy
+///   binding written without `source_repo` still receives its `[ci-pass]` —
+///   tightening that would silently drop notifications, which is a regression,
+///   not a hardening.
+/// * WHETHER task-backed authority travels with the watch is strict: exactly
+///   one signature-valid binding on this exact repository+branch, whose
+///   `task_id` strictly routes. Zero, several, cross-repository, unsigned,
+///   tampered, or stale/unroutable all fail closed to notification-only.
+fn resolve_auto_arm_subject(home: &Path, repo: &str, branch: &str) -> Option<AutoArmSubject> {
+    // Both sides must resolve to the same canonical slug for a repository
+    // match to mean anything. A local checkout and its GitHub origin therefore
+    // identify the same repository, while an unresolved value cannot carry
+    // task authority. A legacy binding without `source_repo` is not an
+    // exact-repo candidate.
+    let canonical_repo =
+        crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(Path::new(repo));
+    let exact: Vec<(String, serde_json::Value)> = crate::binding::binding_scan_all(home)
+        .into_iter()
+        .filter(|(_, v)| {
+            if v["branch"].as_str() != Some(branch) {
+                return false;
+            }
+            let Some(source_repo) = v["source_repo"].as_str().map(str::trim) else {
+                return false;
+            };
+            if source_repo.is_empty() {
+                return false;
+            }
+            let Some(canonical_repo) = canonical_repo.as_deref() else {
+                return false;
+            };
+            crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(Path::new(
+                source_repo,
+            ))
+            .as_deref()
+                == Some(canonical_repo)
+        })
+        .collect();
+
+    if let [(agent, binding)] = exact.as_slice() {
+        if crate::binding::signature_valid(home, agent) {
+            let task_id = binding["task_id"]
+                .as_str()
+                .filter(|t| !t.is_empty())
+                .filter(|t| crate::tasks::load_routed(home, t).is_ok())
+                .map(str::to_string);
+            return Some(AutoArmSubject {
+                agent: agent.clone(),
+                task_id,
+            });
+        }
+        tracing::warn!(
+            repo = %repo,
+            branch = %branch,
+            agent = %agent,
+            "auto-arm: exact repo+branch binding is not signature-valid — arming \
+             notification-only without task authority"
+        );
+    } else if exact.len() > 1 {
+        // Explicit ambiguity: never silently speak for whichever binding the
+        // directory happened to yield first.
+        tracing::warn!(
+            repo = %repo,
+            branch = %branch,
+            candidates = exact.len(),
+            "auto-arm: several bindings claim this exact repo+branch — arming \
+             notification-only without task authority"
+        );
+    }
+
+    crate::binding::scan_existing_branch_binding(home, "", branch, "").map(|agent| AutoArmSubject {
+        agent,
+        task_id: None,
+    })
+}
+
 /// For every OPEN, non-draft, same-repo PR in `prs` that has no armed ci-watch,
 /// arm one (subscriber = the agent bound to the branch). Idempotent: an existing
 /// watch is left untouched (a repeated push to the same branch does NOT re-arm).
@@ -50,7 +140,7 @@ pub fn auto_arm_unwatched_open_prs(home: &Path, repo: &str, prs: &[GhPrMetadata]
         // to this branch? That is the agent who pushed and is waiting.
         // #2117 P3b: branch-only scan (source_repo="") — route CI-pass to whoever
         // is bound to this branch; repo precision unnecessary for this lookup.
-        let Some(agent) = crate::binding::scan_existing_branch_binding(home, "", branch, "") else {
+        let Some(subject) = resolve_auto_arm_subject(home, repo, branch) else {
             // Fail LOUD — never silently drop. We cannot reliably route a
             // `[ci-pass]` for an open PR with no bound agent (released worktree /
             // external PR); notifying the wrong agent is worse than a loud log.
@@ -64,7 +154,15 @@ pub fn auto_arm_unwatched_open_prs(home: &Path, repo: &str, prs: &[GhPrMetadata]
             continue;
         };
 
+        let agent = subject.agent;
         let mut args = serde_json::json!({ "repository": repo, "branch": branch });
+        // Only an already-PROVEN routed task id is carried. Never fabricated,
+        // and `review_class` is still never set here — an inherited class, if
+        // the task has one, is resolved by the watch handler from the task
+        // itself, not guessed by this module.
+        if let Some(task_id) = &subject.task_id {
+            args["task_id"] = serde_json::json!(task_id);
+        }
         if let Some(orch) = crate::fleet::team_orchestrator_for(home, &agent) {
             if orch != agent {
                 args["next_after_ci"] = serde_json::json!(orch);
@@ -337,6 +435,237 @@ mod tests {
         assert!(
             !watch_exists(&home, "feat/orphan"),
             "with no bound agent, must NOT arm (fail-loud, not mis-notify)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── t-…-21627-10: exact repo+branch task carrier ────────────────────────
+    //
+    // Authority may be carried ONLY by exactly one signature-valid binding on
+    // this exact repository+branch whose task_id strictly routes. Every other
+    // shape stays notification-only: the watch is still armed (so `[ci-pass]`
+    // is not lost) but carries no task_id and no review_class.
+
+    /// Write a SIGNED binding. Required for any carrier test: an unsigned
+    /// binding is fail-closed by design, so a test that forgot the sidecar
+    /// would pass for the wrong reason.
+    fn bind_signed(home: &Path, agent: &str, branch: &str, repo: &str, task_id: &str) {
+        let dir = crate::paths::runtime_dir(home).join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = serde_json::json!({
+            "version": 1,
+            "agent": agent,
+            "task_id": task_id,
+            "branch": branch,
+            "worktree": format!("/tmp/wt-{agent}"),
+            "source_repo": repo,
+            "issued_at": "2026-06-05T00:00:00Z",
+        });
+        let body = serde_json::to_string_pretty(&payload).unwrap();
+        std::fs::write(dir.join("binding.json"), &body).unwrap();
+        let tag = agentic_git_core::integrity_core::sign_binding(home, body.as_bytes())
+            .expect("sign binding");
+        std::fs::write(dir.join("binding.json.sig"), tag).unwrap();
+    }
+
+    /// A real routed board task, so `load_routed` genuinely succeeds.
+    fn routed_task(home: &Path) -> String {
+        let created = crate::tasks::handle(
+            home,
+            "dev-x",
+            &serde_json::json!({"action": "create", "title": "auto-arm carrier"}),
+        );
+        created["id"].as_str().expect("task id").to_string()
+    }
+
+    fn armed_task_id(home: &Path, branch: &str) -> Option<String> {
+        watch_json(home, branch)
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// A production-shaped binding source: a local checkout whose origin is
+    /// the GitHub slug used by the PR metadata.
+    fn real_repo_with_github_origin(root: &Path, name: &str, slug: &str) -> PathBuf {
+        let repo = root.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("spawn git init");
+        assert!(init.status.success(), "git init failed: {:?}", init);
+        let origin = format!("https://github.com/{slug}.git");
+        let remote = std::process::Command::new("git")
+            .args(["remote", "add", "origin", &origin])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("spawn git remote add");
+        assert!(
+            remote.status.success(),
+            "git remote add failed: {:?}",
+            remote
+        );
+        assert_eq!(
+            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(&repo).as_deref(),
+            Some(slug),
+            "fixture origin must resolve to the expected canonical GitHub slug"
+        );
+        repo
+    }
+
+    /// Control for the whole matrix: the carrier path DOES fire when every
+    /// precondition holds. Without this, each negative below could be passing
+    /// because the feature never works at all.
+    #[test]
+    fn exact_signed_binding_with_routed_task_carries_that_task_id() {
+        let home = tmp_home("carrier-positive");
+        let tid = routed_task(&home);
+        bind_signed(&home, "dev-x", "feat/x", REPO, &tid);
+        auto_arm_unwatched_open_prs(
+            &home,
+            REPO,
+            &[meta("feat/x", GhPrState::Open, false, false)],
+        );
+        assert!(watch_exists(&home, "feat/x"), "watch must be armed");
+        assert_eq!(
+            armed_task_id(&home, "feat/x").as_deref(),
+            Some(tid.as_str()),
+            "a unique signature-valid exact repo+branch binding with a routed task must carry it"
+        );
+        assert!(
+            watch_json(&home, "feat/x")
+                .get("review_class")
+                .and_then(|v| v.as_str())
+                .is_none(),
+            "carrying a task_id must not invent a review_class"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Regression for the real representation emitted by a checkout binding:
+    /// the binding stores a local source path while the PR metadata stores a
+    /// GitHub owner/repo slug. Both must canonicalize to the same authority.
+    #[test]
+    fn local_checkout_origin_matching_pr_repo_carries_that_task_id() {
+        let home = tmp_home("carrier-local-origin");
+        let source_repo = real_repo_with_github_origin(&home, "source-repo", REPO);
+        let tid = routed_task(&home);
+        bind_signed(
+            &home,
+            "dev-x",
+            "feat/x",
+            &source_repo.display().to_string(),
+            &tid,
+        );
+        auto_arm_unwatched_open_prs(
+            &home,
+            REPO,
+            &[meta("feat/x", GhPrState::Open, false, false)],
+        );
+        assert_eq!(
+            armed_task_id(&home, "feat/x").as_deref(),
+            Some(tid.as_str()),
+            "a local source path with a matching origin must carry the routed task"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Cross-repository collision: same branch name, DIFFERENT repository. The
+    /// old branch-only scan would select this binding and speak for it.
+    #[test]
+    fn cross_repo_same_branch_binding_carries_no_task_id() {
+        let home = tmp_home("carrier-crossrepo");
+        let tid = routed_task(&home);
+        bind_signed(&home, "dev-other", "feat/x", "other/repo", &tid);
+        auto_arm_unwatched_open_prs(
+            &home,
+            REPO,
+            &[meta("feat/x", GhPrState::Open, false, false)],
+        );
+        assert!(
+            watch_exists(&home, "feat/x"),
+            "notification-only arm still happens"
+        );
+        assert_eq!(
+            armed_task_id(&home, "feat/x"),
+            None,
+            "a binding from another repository must never carry task authority here"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Two signature-valid bindings on the SAME exact repo+branch: ambiguous,
+    /// so no authority may be carried (first-match-wins is exactly the bug).
+    #[test]
+    fn ambiguous_exact_bindings_carry_no_task_id() {
+        let home = tmp_home("carrier-ambiguous");
+        let tid = routed_task(&home);
+        bind_signed(&home, "dev-a", "feat/x", REPO, &tid);
+        bind_signed(&home, "dev-b", "feat/x", REPO, &tid);
+        auto_arm_unwatched_open_prs(
+            &home,
+            REPO,
+            &[meta("feat/x", GhPrState::Open, false, false)],
+        );
+        assert!(
+            watch_exists(&home, "feat/x"),
+            "notification-only arm still happens"
+        );
+        assert_eq!(
+            armed_task_id(&home, "feat/x"),
+            None,
+            "ambiguous candidates must fail closed, not pick the first one"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Signature sidecar tampered after signing → not signature-valid.
+    #[test]
+    fn invalid_signature_binding_carries_no_task_id() {
+        let home = tmp_home("carrier-badsig");
+        let tid = routed_task(&home);
+        bind_signed(&home, "dev-x", "feat/x", REPO, &tid);
+        let dir = crate::paths::runtime_dir(&home).join("dev-x");
+        std::fs::write(dir.join("binding.json.sig"), "deadbeef").unwrap();
+        auto_arm_unwatched_open_prs(
+            &home,
+            REPO,
+            &[meta("feat/x", GhPrState::Open, false, false)],
+        );
+        assert!(
+            watch_exists(&home, "feat/x"),
+            "notification-only arm still happens"
+        );
+        assert_eq!(
+            armed_task_id(&home, "feat/x"),
+            None,
+            "an invalid signature must fail closed on authority"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The binding names a task that routes to no board (stale / deleted).
+    #[test]
+    fn stale_unroutable_task_id_is_not_carried() {
+        let home = tmp_home("carrier-stale");
+        bind_signed(&home, "dev-x", "feat/x", REPO, "t-does-not-exist");
+        auto_arm_unwatched_open_prs(
+            &home,
+            REPO,
+            &[meta("feat/x", GhPrState::Open, false, false)],
+        );
+        assert!(
+            watch_exists(&home, "feat/x"),
+            "notification-only arm still happens"
+        );
+        assert_eq!(
+            armed_task_id(&home, "feat/x"),
+            None,
+            "an unroutable task_id must never be carried"
         );
         std::fs::remove_dir_all(&home).ok();
     }
