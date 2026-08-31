@@ -212,7 +212,7 @@ mod tests {
     fn ui_state_routes_shift_x_to_delete_and_plain_x_to_view_close() {
         let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let home =
-            std::env::temp_dir().join(format!("agend-uistate-delete-{}", std::process::id()));
+            std::env::temp_dir().join(format!("agend-delete-uistate-{}", std::process::id()));
         std::fs::create_dir_all(&home).ok();
         let fleet_path = home.join("fleet.yaml");
         let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded::<usize>();
