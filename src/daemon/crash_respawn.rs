@@ -1184,6 +1184,125 @@ mod tests {
         );
     }
 
+    /// Body of `respawn_agent_worker`, scoped exactly like the #3414 and R1
+    /// guards above. A file-level scan is vacuous for these: the module imports
+    /// and this test module already mention every symbol they look for.
+    fn respawn_worker_body(source: &str) -> &str {
+        let start = source
+            .find("fn respawn_agent_worker(")
+            .expect("respawn worker present");
+        let rest = &source[start..];
+        let cfg_test = ["\n#[cfg(", "test)]"].concat();
+        let end = ["\nfn ", "\nmod ", &cfg_test]
+            .iter()
+            .filter_map(|marker| rest[1..].find(*marker).map(|offset| offset + 1))
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// #3462-v3 RED-B: the waiter returning `Some(target)` is not authority to
+    /// write. Between that return and `inject_with_target_gated` the worker locks
+    /// the core, reads the crash reason and formats the notice, and never looks at
+    /// `shutdown` again — so a shutdown landing in that span still puts the notice
+    /// into the PTY of an agent the daemon is tearing down.
+    ///
+    /// That span has no runtime seam: nothing can observe the instant between the
+    /// waiter's return and the inject without adding one, and this correction is
+    /// explicitly refactor-free. So it is pinned structurally, in the same
+    /// body-scoped style as the R1 ordering guard, and
+    /// `red_b_guard_kills_missing_fence_mutation_3462` proves the scan is not
+    /// vacuous.
+    #[test]
+    fn respawn_notice_is_fenced_by_a_final_shutdown_check_3462() {
+        let body = respawn_worker_body(include_str!("crash_respawn.rs"));
+        let wait = body
+            .find("wait_for_respawn_inject_target(")
+            .expect("the respawn worker must wait for readiness");
+        let inject = body
+            .find("inject_with_target_gated(")
+            .expect("the respawn worker must inject through the gated injector");
+        assert!(wait < inject, "the readiness wait must precede the inject");
+        assert!(
+            body[wait..inject].contains("shutdown.load("),
+            "#3462-v3 F1/B: a final shutdown check must stand between the readiness \
+             wait and the gated inject — a target snapshotted before shutdown is not \
+             permission to write after it"
+        );
+    }
+
+    /// Non-vacuity control for the guard above: run the SAME scan against a body
+    /// with no fence and require it to find nothing. Without this, a scan that
+    /// could never fail would read as proof.
+    #[test]
+    fn red_b_guard_kills_missing_fence_mutation_3462() {
+        let mutated = r#"
+fn respawn_agent_worker(shutdown: &AtomicBool) {
+    let ready = wait_for_respawn_inject_target(reg, id, name, home, t, Some(shutdown));
+    if let Some(tgt) = ready {
+        let msg = respawn_notice("reason");
+        let _ = inject_with_target_gated(&tgt, name, msg.as_bytes(), true, None);
+    }
+}
+"#;
+        let body = respawn_worker_body(mutated);
+        let wait = body
+            .find("wait_for_respawn_inject_target(")
+            .expect("mutant keeps the wait call");
+        let inject = body
+            .find("inject_with_target_gated(")
+            .expect("mutant keeps the inject call");
+        assert!(
+            !body[wait..inject].contains("shutdown.load("),
+            "the between-calls scan must find NO fence in an unfenced body; if it \
+             does, the guard above proves nothing"
+        );
+    }
+
+    /// #3462-v3 RED-C: the backoff is a bare `std::thread::sleep(delay)` with
+    /// `shutdown` read only AFTER it.
+    ///
+    /// `ctx.shutdown` is not a monotonic death latch. `daemon/mod.rs` stores
+    /// `false` back into it on the self-respawn abort path and on the
+    /// recover-as-primary path, and the latter then re-spawns the fleet and keeps
+    /// serving. A worker already asleep for the whole backoff — up to `BACKOFF_MAX`
+    /// (300s), 80s within one default retry budget — sleeps through that entire
+    /// true-window and wakes to a flag that has been reset, so it proceeds to spawn
+    /// a replacement for an agent the daemon has already re-created.
+    ///
+    /// Sampling after a blocking wait cannot see an edge that opened and closed
+    /// during it. The wait itself has to observe it, which is why a truthful
+    /// comment is not an equivalent fix here.
+    #[test]
+    fn respawn_backoff_observes_shutdown_instead_of_sampling_after_it_3462() {
+        let body = respawn_worker_body(include_str!("crash_respawn.rs"));
+        assert!(
+            !body.contains("std::thread::sleep(delay)"),
+            "#3462-v3 F2: the bare uninterruptible backoff sleep must be gone — it \
+             cannot observe a shutdown edge that closes before it wakes"
+        );
+        assert!(
+            body.contains("wait_out_backoff_or_shutdown("),
+            "#3462-v3 F2: the backoff must run through a wait that observes the \
+             shutdown flag while it waits"
+        );
+    }
+
+    /// The spawn-site rationale asserts that "both the backoff and that wait
+    /// observe the shutdown flag". While the backoff is a bare sleep that sentence
+    /// is simply false. This stack has already been rejected once over a false
+    /// causal claim in a comment; a second one in the same file would be the same
+    /// defect twice.
+    #[test]
+    fn respawn_spawn_rationale_does_not_overclaim_the_backoff_3462() {
+        let production = production_source(include_str!("crash_respawn.rs"));
+        assert!(
+            !production.contains("both the backoff and that wait observe"),
+            "#3462-v3: the spawn rationale must describe what the backoff actually \
+             does, not claim an observation it did not perform"
+        );
+    }
+
     /// Structural: the notice must leave through the backend-aware injector,
     /// never a direct PTY write. A future edit reinstating `write_to_pty` here
     /// silently reinstates the whole bypass.

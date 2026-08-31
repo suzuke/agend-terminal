@@ -4708,6 +4708,69 @@ fn wait_for_idle_inject_target_already_registered_absence_aborts_without_wall_cl
     assert_eq!(logical_now.get(), Duration::ZERO);
 }
 
+/// #3462-v3 RED-A: shutdown is observed ONLY at this waiter's loop top. Once the
+/// readiness break happens the waiter still sleeps the 500ms settle, then
+/// snapshots and returns a live `InjectTarget` — so a shutdown that lands during
+/// the settle still hands the caller a target and the caller writes into an agent
+/// the daemon is tearing down.
+///
+/// The settle must be fenced. This drives the production waiter with an injected
+/// clock (no wall-clock time passes) and flips the flag from inside the settle
+/// sleep; the result must be the `Shutdown` terminal, not a target.
+///
+/// The fence belongs HERE, not in `wait_for_respawn_inject_target`: this waiter
+/// has three callers (instructions bootstrap, self-kick bootstrap, crash-respawn
+/// notice) and all three inherit the window.
+#[test]
+fn wait_for_idle_inject_target_fences_shutdown_during_the_settle_delay() {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    registry.lock().insert(id, mk_handle_1441("boot", id));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let logical_now = Cell::new(Duration::ZERO);
+    let shutdown_for_sleep = Arc::clone(&shutdown);
+    let mut now = || logical_now.get();
+    let mut sleep = |interval: Duration| {
+        logical_now.set(logical_now.get() + interval);
+        // `StructuredTransport` + an already-registered handle is ready on the
+        // first iteration, so the settle is the ONLY sleep reached. Pinning the
+        // interval keeps this test honest if that ever stops being true.
+        assert_eq!(
+            interval,
+            Duration::from_millis(500),
+            "the settle delay must be the only sleep this policy reaches"
+        );
+        shutdown_for_sleep.store(true, Ordering::Relaxed);
+    };
+
+    let result = wait_for_bootstrap_inject_target_with_clock(
+        &registry,
+        id,
+        Duration::from_secs(10),
+        BootstrapWaitPolicy::StructuredTransport(BootstrapRegistrationState::AlreadyRegistered),
+        Some(&shutdown),
+        &mut now,
+        &mut sleep,
+    );
+
+    assert!(
+        result.target.is_none(),
+        "a shutdown observed during the settle must not yield an inject target"
+    );
+    assert_eq!(
+        result.terminal,
+        Some(IdleInjectWaitTerminal::Shutdown),
+        "the settle window must end in the Shutdown terminal, not a live target"
+    );
+    for handle in registry.lock().values() {
+        let _ = handle.child.lock().kill();
+    }
+}
+
 /// (1) Invariant: after a managed spawn, `registry key == handle.id ==
 /// resolve_uuid(name)` — the three identities share one fleet.yaml source.
 #[test]
