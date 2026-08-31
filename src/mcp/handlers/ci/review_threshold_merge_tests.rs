@@ -243,6 +243,83 @@ fn stale_review_receipt_refuses_with_stale_head() {
     std::fs::remove_dir_all(home).ok();
 }
 
+/// RED 7: an old-head receipt from a DIFFERENT review class is not evidence
+/// against this class, while an old-head receipt from the active class remains
+/// an explicit stale-head refusal.
+#[test]
+fn stale_receipt_from_other_class_is_ignored_same_class_is_fatal() {
+    let other_class_home = home("other-class-old-head");
+    let other_recorded = Arc::new(Mutex::new(None));
+    let _other_guard = install_provider(other_recorded.clone());
+    seed(
+        &other_class_home,
+        &state(
+            crate::daemon::pr_state::ReviewClass::Dual,
+            vec![
+                receipt(
+                    "reviewer-1",
+                    HEAD,
+                    crate::daemon::pr_state::ReviewClass::Dual,
+                ),
+                receipt(
+                    "reviewer-2",
+                    HEAD,
+                    crate::daemon::pr_state::ReviewClass::Dual,
+                ),
+                receipt(
+                    "single-reviewer",
+                    OTHER_HEAD,
+                    crate::daemon::pr_state::ReviewClass::Single,
+                ),
+            ],
+        ),
+    );
+    let other_result = super::handle_merge_repo(&other_class_home, &args(), "lead");
+    assert_eq!(
+        other_result["merged"], true,
+        "other-class stale receipt must be ignored: {other_result}"
+    );
+    assert!(
+        other_recorded.lock().unwrap().is_some(),
+        "other-class stale receipt must not block merge"
+    );
+    std::fs::remove_dir_all(other_class_home).ok();
+
+    let same_class_home = home("same-class-old-head");
+    let same_recorded = Arc::new(Mutex::new(None));
+    let _same_guard = install_provider(same_recorded.clone());
+    seed(
+        &same_class_home,
+        &state(
+            crate::daemon::pr_state::ReviewClass::Dual,
+            vec![
+                receipt(
+                    "reviewer-1",
+                    HEAD,
+                    crate::daemon::pr_state::ReviewClass::Dual,
+                ),
+                receipt(
+                    "reviewer-2",
+                    HEAD,
+                    crate::daemon::pr_state::ReviewClass::Dual,
+                ),
+                receipt(
+                    "dual-reviewer-stale",
+                    OTHER_HEAD,
+                    crate::daemon::pr_state::ReviewClass::Dual,
+                ),
+            ],
+        ),
+    );
+    let same_result = super::handle_merge_repo(&same_class_home, &args(), "lead");
+    assert_eq!(same_result["code"], "stale_head", "{same_result}");
+    assert!(
+        same_recorded.lock().unwrap().is_none(),
+        "same-class stale receipt must block merge"
+    );
+    std::fs::remove_dir_all(same_class_home).ok();
+}
+
 /// GREEN 5: two distinct exact-head VERIFIED receipts satisfy Dual and reach
 /// the existing merge write, which still receives the exact-head pin.
 #[test]
