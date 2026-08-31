@@ -952,6 +952,113 @@ mod tests {
             "#1744-H4 once-off: an already-paged terminal self-orch must not re-page"
         );
     }
+
+    // ── #3462 backend-aware respawn-notice submit ──────────────────────────
+    //
+    // Appending a hardcoded `\r` and writing straight to the PTY bypasses
+    // everything the respawned handle knows about its backend: `inject_prefix`,
+    // `submit_key`, the typed readback/contamination fence, the deleted-generation
+    // check and post-submit observability. Codex 0.150.1 showed the whole notice
+    // sitting unsent in the composer under [DISCONNECTED] — payload landed,
+    // submit did not.
+
+    /// The notice is PAYLOAD ONLY. A submit byte baked into the text is the same
+    /// bug wearing a different hat: it submits with a key the handle never chose.
+    #[test]
+    fn respawn_notice_carries_no_hardcoded_submit_byte_3462() {
+        let notice = super::respawn_notice("a test reason");
+        assert!(
+            !notice.contains('\r') && !notice.contains('\n'),
+            "#3462: the notice must be payload text only, got {notice:?}"
+        );
+    }
+
+    struct CapturingWriter(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Submit proof with a NON-CR submit key: the bytes reaching the PTY must be
+    /// the notice followed by the HANDLE's key. A hardcoded `\r` in the payload
+    /// cannot masquerade as this, which is exactly the point.
+    #[test]
+    fn respawn_notice_submits_with_the_handles_submit_key_3462() {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer: crate::agent::PtyWriter = std::sync::Arc::new(parking_lot::Mutex::new(
+            Box::new(CapturingWriter(std::sync::Arc::clone(&seen))),
+        ));
+        let core =
+            std::sync::Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
+                vterm: crate::vterm::VTerm::with_pty_writer(80, 24, std::sync::Arc::clone(&writer)),
+                subscribers: Vec::new(),
+                state: crate::state::StateTracker::new(None),
+                health: crate::health::HealthTracker::new(),
+                api_activity: crate::agent::ApiActivity::default(),
+                observed_status: None,
+            }));
+        let target = crate::agent::InjectTarget {
+            instance_id: crate::types::InstanceId::default(),
+            name: "respawn-submit-test".to_string(),
+            generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+            pty_writer: std::sync::Arc::clone(&writer),
+            inject_prefix: String::new(),
+            // Deliberately NOT "\r" — a CR baked into the payload cannot pass this.
+            submit_key: "\u{4}".to_string(),
+            typed_inject: false,
+            typed_inject_contaminated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            deleted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            core,
+        };
+
+        let notice = super::respawn_notice("a test reason");
+        crate::agent::inject_with_target_gated(
+            &target,
+            "respawn-submit-test",
+            notice.as_bytes(),
+            true,
+            None,
+        )
+        .expect("#3462: the respawn notice must inject cleanly");
+
+        let written = String::from_utf8_lossy(&seen.lock()).to_string();
+        assert!(
+            written.contains("a test reason"),
+            "#3462: the notice payload must reach the PTY: {written:?}"
+        );
+        assert!(
+            written.ends_with('\u{4}'),
+            "#3462: submit must be the HANDLE's submit_key, not a hardcoded CR: {written:?}"
+        );
+        assert!(
+            !written.contains('\r'),
+            "#3462: no hardcoded CR may reach the PTY: {written:?}"
+        );
+    }
+
+    /// Structural: the notice must leave through the backend-aware injector,
+    /// never a direct PTY write. A future edit reinstating `write_to_pty` here
+    /// silently reinstates the whole bypass.
+    #[test]
+    fn respawn_notice_uses_backend_aware_injection_not_direct_pty_write_3462() {
+        let production = production_source(include_str!("crash_respawn.rs"));
+        assert!(
+            production.contains("inject_with_target_gated"),
+            "#3462: the notice must be sent through the backend-aware injector"
+        );
+        assert!(
+            !production.contains("write_to_pty"),
+            "#3462: the respawn notice must not be written directly to the PTY"
+        );
+    }
 }
 
 /// #1913: the delete-vs-crash-respawn gate. `delete_transaction` Stores
