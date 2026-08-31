@@ -2831,7 +2831,7 @@ fn inject_handle_footgun_removed_uses_snapshots_f1() {
 /// moment the ban's file set stops naming a source the surface lives in.
 #[test]
 fn inject_footgun_ban_covers_the_extracted_bootstrap_wait_sibling_f1() {
-    let suite = include_str!("tests.rs");
+    let suite = include_str!("tests.rs").replace('\r', "");
     let start = suite
         .find("fn inject_handle_footgun_removed_uses_snapshots_f1()")
         .expect("the #1530/F1 footgun guard must exist");
