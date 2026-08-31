@@ -1061,6 +1061,40 @@ mod tests {
         );
     }
 
+    /// #3462-v2: a fixed 2s sleep is not readiness. It races a slow backend —
+    /// the notice lands in a composer that is not accepting input yet — and it
+    /// wastes 2s on a fast one. The respawned handle is already registered, so
+    /// the existing raw-prompt Idle/bootstrap waiter is the right authority,
+    /// bounded by the backend preset ready timeout.
+    #[test]
+    fn respawn_notice_waits_for_prompt_readiness_not_a_fixed_sleep_3462() {
+        let production = production_source(include_str!("crash_respawn.rs"));
+        assert!(
+            !production.contains("from_secs(2)"),
+            "#3462-v2: the fixed 2s pre-injection sleep must be gone"
+        );
+        assert!(
+            production.contains("wait_for_respawn_inject_target"),
+            "#3462-v2: the notice must wait on real prompt readiness before injecting"
+        );
+    }
+
+    /// #3462-v2: the first cut justified the fix with a FALSE mechanism — that
+    /// the backend does not submit on CR. Every shipped preset submits `\r`
+    /// (`backend.rs` pins `submit_key == "\r"` for all of them), so the
+    /// hardcoded byte and the handle's key were identical. The real value is
+    /// paced payload, a SEPARATE submit write, and the readback/fences/
+    /// observation the direct write skipped. A comment that misstates the cause
+    /// teaches the next reader the wrong lesson.
+    #[test]
+    fn respawn_notice_comment_states_the_real_mechanism_3462() {
+        let production = production_source(include_str!("crash_respawn.rs")).to_lowercase();
+        assert!(
+            !production.contains("does not submit on cr"),
+            "#3462-v2: the CR causal claim is false — every preset submits CR"
+        );
+    }
+
     /// Structural: the notice must leave through the backend-aware injector,
     /// never a direct PTY write. A future edit reinstating `write_to_pty` here
     /// silently reinstates the whole bypass.
