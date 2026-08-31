@@ -196,24 +196,30 @@ pub fn create(
                         path = %wt_dir.display(),
                         "reattached clean drifted/detached worktree to requested branch — reusing (#2010 2b)"
                     );
-                    // #2115: `checkout_branch` (git switch) already lands the
-                    // tree on the branch tip from a clean drift, but force-sync
-                    // for uniformity with the same-branch path below — a clean
-                    // tree is a no-op (see sync_worktree_to_head early return).
-                    sync_worktree_to_head(&wt_dir);
-                    // #2755 follow-up A: a REUSED tree is verified, never repaired
-                    // — `init_submodules_strict` mutates, and this path must not
-                    // touch an occupant's tree. Read-only proof, reject on failure.
+                    // #2755 follow-up A r2: verify BEFORE the sync below. The
+                    // check is read-only and never repairs (`init_submodules_strict`
+                    // mutates and must not run over an occupant's tree), but the
+                    // ORDER is the point: `sync_worktree_to_head` is
+                    // `reset --hard` + `clean -fd`, so verifying after it would
+                    // reject only once the parent's tracked AND untracked WIP had
+                    // already been destroyed — a guard that reports "no" after
+                    // taking the work is worse than no guard.
                     if let Err(e) = verify_submodules_at_gitlinks(&wt_dir) {
                         tracing::warn!(
                             instance = instance_name,
                             path = %wt_dir.display(),
                             error = %e,
                             "reused worktree submodules are not at their recorded \
-                             gitlinks — rejecting (verify-only, tree left untouched)"
+                             gitlinks — rejecting BEFORE the destructive sync (WIP intact)"
                         );
                         return None;
                     }
+                    // #2115: `checkout_branch` (git switch) already lands the
+                    // tree on the branch tip from a clean drift, but force-sync
+                    // for uniformity with the same-branch path below — a clean
+                    // tree is a no-op (see sync_worktree_to_head early return).
+                    // Unchanged semantics: a SUCCESSFUL verify still syncs.
+                    sync_worktree_to_head(&wt_dir);
                     return Some(WorktreeInfo {
                         path: wt_dir,
                         source_repo: repo_dir.to_path_buf(),
@@ -240,22 +246,24 @@ pub fn create(
             branch = %branch,
             "reusing existing worktree (branch verified)"
         );
-        // #2115: the branch ref may have been fast-forwarded (#869 update-ref)
-        // since this worktree was last synced, leaving a stale (dirty) tree on
-        // hand-off. Force-sync to HEAD before returning so the new occupant gets
-        // a clean tree at the current SHA.
-        sync_worktree_to_head(&wt_dir);
-        // #2755 follow-up A: verify-only on reuse (see the drifted-reattach path).
+        // #2755 follow-up A r2: verify BEFORE the sync (see the drifted-reattach
+        // path above for why the order, not just the check, is the fix).
         if let Err(e) = verify_submodules_at_gitlinks(&wt_dir) {
             tracing::warn!(
                 instance = instance_name,
                 path = %wt_dir.display(),
                 error = %e,
                 "reused worktree submodules are not at their recorded gitlinks — \
-                 rejecting (verify-only, tree left untouched)"
+                 rejecting BEFORE the destructive sync (WIP intact)"
             );
             return None;
         }
+        // #2115: the branch ref may have been fast-forwarded (#869 update-ref)
+        // since this worktree was last synced, leaving a stale (dirty) tree on
+        // hand-off. Force-sync to HEAD before returning so the new occupant gets
+        // a clean tree at the current SHA. Unchanged semantics: a SUCCESSFUL
+        // verify still syncs.
+        sync_worktree_to_head(&wt_dir);
         return Some(WorktreeInfo {
             path: wt_dir,
             source_repo: repo_dir.to_path_buf(),
@@ -582,6 +590,18 @@ pub(crate) fn verify_submodules_at_gitlinks(wt_dir: &Path) -> Result<(), String>
     Ok(())
 }
 
+pub(crate) fn verify_reused_submodules(wt_dir: PathBuf) -> Result<PathBuf, String> {
+    verify_submodules_at_gitlinks(&wt_dir).map_err(|error| {
+        format!(
+            "reused worktree '{}' has submodules not at their recorded gitlinks: {error} \
+             (not repaired here — that would overwrite uncommitted work; release_worktree and \
+             re-provision, or fix the submodules in place)",
+            wt_dir.display()
+        )
+    })?;
+    Ok(wt_dir)
+}
+
 /// #2755 R3 (root review / decision d-…37): FAIL-CLOSED variant of
 /// [`sync_worktree_to_head`] for idempotent reuse — the reused tree must be synced to
 /// the FINAL HEAD (an externally advanced branch may change gitlinks) BEFORE recursive
@@ -635,15 +655,23 @@ pub fn wants_auto_worktree(resolved: &crate::fleet::ResolvedInstance) -> bool {
 /// decision launch-idempotent: an agent that started plain stays plain, and an
 /// agent the operator pointed at a real repo (or a branch-mode deploy whose
 /// `working_directory` is already a repo) still gets its worktree.
+/// #2755 follow-up A r2: `Ok(None)` = auto-worktree NOT APPLICABLE (opted out,
+/// no working_directory, daemon-managed workspace dir, not a git repo) — the
+/// caller keeps its own directory, exactly as before. `Err` = the worktree was
+/// wanted but could NOT be provisioned; the caller must fail closed rather than
+/// silently fall back to the source repo. Collapsing both into `None` was the
+/// defect: boot could not tell "you don't need one" from "I could not build it".
 pub fn resolve_auto_worktree(
     home: &Path,
     name: &str,
     resolved: &crate::fleet::ResolvedInstance,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>, String> {
     if !wants_auto_worktree(resolved) {
-        return None;
+        return Ok(None);
     }
-    let base_dir = resolved.working_directory.as_ref()?;
+    let Some(base_dir) = resolved.working_directory.as_ref() else {
+        return Ok(None);
+    };
     // #1858: the daemon-managed default workspace dir is never a legitimate
     // worktree source — it only becomes a "repo" via ensure_project_root's
     // git-init. Skip it regardless of is_git_repo so the decision can't drift
@@ -675,21 +703,31 @@ pub fn resolve_auto_worktree(
                     src,
                     resolved.git_branch.as_deref(),
                 ) {
-                    Ok(path) => return Some(path),
+                    Ok(path) => return Ok(Some(path)),
                     Err(e) => {
                         tracing::error!(agent = name, error = %e,
                             "#2234 (B) reconcile failed — falling back to non-worktree workspace (drift-WARN net)");
-                        return None;
+                        // Deliberately still NOT-APPLICABLE, not a failure: this
+                        // fail-safe predates r2 and its documented contract is to
+                        // degrade to the plain workspace. Narrowing r2 to the
+                        // create path leaves it byte-identical.
+                        return Ok(None);
                     }
                 }
             }
         }
-        return None;
+        return Ok(None);
     }
     if !is_git_repo(base_dir) {
-        return None;
+        return Ok(None);
     }
-    create(home, base_dir, name, resolved.git_branch.as_deref()).map(|info| info.path)
+    match create(home, base_dir, name, resolved.git_branch.as_deref()) {
+        Some(info) => Ok(Some(info.path)),
+        None => Err(format!(
+            "worktree provisioning failed for '{name}' from '{}'",
+            base_dir.display()
+        )),
+    }
 }
 
 /// Run `git worktree prune` on a repo to clean stale worktree entries.

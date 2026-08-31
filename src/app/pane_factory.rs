@@ -858,8 +858,18 @@ pub(super) fn run_attach(
             // a worktree here (default OFF), and RESTART is idempotent — so not fixed
             // in this PR.
             let mut working_dir = resolved.working_directory.clone();
-            if let Some(wt) = crate::worktree::resolve_auto_worktree(home, &fleet_name, &resolved) {
-                working_dir = Some(wt);
+            // #2755 follow-up A r2: a WANTED-but-unprovisionable worktree fails the
+            // attach instead of silently starting on the source repo.
+            match crate::worktree::resolve_auto_worktree(home, &fleet_name, &resolved) {
+                Ok(Some(wt)) => working_dir = Some(wt),
+                Ok(None) => {}
+                Err(e) => {
+                    return AttachOutcome::Failed {
+                        pane_id,
+                        name: fleet_name.to_string(),
+                        err: format!("worktree provisioning failed (fail-closed): {e}"),
+                    };
+                }
             }
             let mut args = resolved.args.clone();
             if let Some(ref model) = resolved.model {
@@ -1090,8 +1100,14 @@ pub(super) fn create_pane_from_resolved(
     // can't drift. Opts in on `source_repo` / `git_branch` (#888) but only for
     // an explicit real-repo `working_directory`, never the daemon-managed
     // `workspace/<name>` default (which `ensure_project_root` git-inits).
-    if let Some(wt_path) = crate::worktree::resolve_auto_worktree(home, fleet_name, resolved) {
-        working_dir = Some(wt_path);
+    // #2755 follow-up A r2: same fail-closed contract as the boot path — never
+    // fall back to the source repo when a worktree was wanted.
+    match crate::worktree::resolve_auto_worktree(home, fleet_name, resolved) {
+        Ok(Some(wt_path)) => working_dir = Some(wt_path),
+        Ok(None) => {}
+        Err(e) => {
+            anyhow::bail!("worktree provisioning failed for '{fleet_name}' (fail-closed): {e}");
+        }
     }
 
     let mut args = resolved.args.clone();

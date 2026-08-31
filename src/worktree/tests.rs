@@ -2345,6 +2345,8 @@ fn resolve_auto_worktree_skips_workspace_default_allows_explicit_repo_1858() {
     assert!(
         got_b
             .as_ref()
+            .ok()
+            .and_then(|inner| inner.as_ref())
             .is_some_and(|p| p.to_string_lossy().contains("worktrees")),
         "#1858 (b): explicit real-repo working_directory must still auto-worktree, got {got_b:?}"
     );
@@ -2363,7 +2365,10 @@ fn resolve_auto_worktree_skips_workspace_default_allows_explicit_repo_1858() {
     assert!(is_git_repo(&work_dir), "fixture: workspace dir git-init'd");
     let resolved_c = mk_resolved(work_dir.clone(), Some(home_c.join("realrepo")), None, None);
     assert!(
-        resolve_auto_worktree(&home_c, "team-dev", &resolved_c).is_none(),
+        matches!(
+            resolve_auto_worktree(&home_c, "team-dev", &resolved_c),
+            Ok(None)
+        ),
         "#1858 (c): deploy non-branch (source_repo + default workspace dir) must not auto-worktree"
     );
 
@@ -2390,7 +2395,7 @@ fn resolve_auto_worktree_skips_workspace_default_allows_explicit_repo_1858() {
     );
     let resolved_d = mk_resolved(nested.clone(), Some(home_d.join("realrepo")), None, None);
     assert!(
-            resolve_auto_worktree(&home_d, "member1", &resolved_d).is_none(),
+            matches!(resolve_auto_worktree(&home_d, "member1", &resolved_d), Ok(None)),
             "#1919 (d): team-nested default workspace (workspace/<team>/<instance>) must not auto-worktree"
         );
 
@@ -2409,7 +2414,7 @@ fn resolve_auto_worktree_flag_off_workspace_none_2234() {
     let ws = crate::paths::workspace_dir(&home).join("agent");
     let resolved = mk_resolved(ws.clone(), Some(repo.clone()), None, None);
     assert!(
-        resolve_auto_worktree(&home, "agent", &resolved).is_none(),
+        matches!(resolve_auto_worktree(&home, "agent", &resolved), Ok(None)),
         "flag OFF → workspace stays a non-worktree (byte-identical)"
     );
     std::fs::remove_dir_all(&home).ok();
@@ -2432,7 +2437,7 @@ fn resolve_auto_worktree_flag_on_workspace_reconciles_2234() {
     };
 
     assert_eq!(
-        got.as_deref(),
+        got.as_ref().ok().and_then(|inner| inner.as_deref()),
         Some(ws.as_path()),
         "flag ON → gate returns the workspace path itself (cwd == worktree)"
     );

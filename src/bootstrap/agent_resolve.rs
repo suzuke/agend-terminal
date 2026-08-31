@@ -66,7 +66,24 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
     // that both this boot path and `app::pane_factory` (live spawn) call so the
     // decision can't drift between them. Redirects `resolved.working_directory`
     // to the worktree path for the rest of the pipeline.
-    if let Some(wt_path) = crate::worktree::resolve_auto_worktree(ctx.home, name, &resolved) {
+    // #2755 follow-up A r2: `Err` = the worktree was WANTED and could not be
+    // provisioned. Boot must not continue on the source repo — that silently
+    // launches the agent on the wrong tree. Returning None here means the agent
+    // is neither launched nor persisted. `Ok(None)` (not applicable) keeps the
+    // original branch structure below byte-identical.
+    let auto_worktree = match crate::worktree::resolve_auto_worktree(ctx.home, name, &resolved) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::error!(
+                instance = name,
+                error = %e,
+                "FATAL: worktree provisioning failed — refusing to start this instance \
+                 on its source repo (fail-closed)"
+            );
+            return None;
+        }
+    };
+    if let Some(wt_path) = auto_worktree {
         resolved.working_directory = Some(wt_path);
     } else if resolved.worktree == Some(false) {
         if let Some(ref base_dir) = resolved.working_directory {
