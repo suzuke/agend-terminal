@@ -703,6 +703,7 @@ pub fn merge_readiness(state: &PrState) -> Result<(), MergeDeficit> {
             receipt.repo == state.repo
                 && receipt.pr_number == state.pr_number
                 && receipt.branch == state.branch
+                && receipt.review_class == state.review_class
                 && receipt.reviewed_head != state.head_sha
         })
         .map(|receipt| receipt.reviewed_head.clone())
