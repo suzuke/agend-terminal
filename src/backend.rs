@@ -452,6 +452,17 @@ impl Backend {
                         label: r"(?m)^[^A-Za-z\n]*WARNING: Loading development channels",
                         sequence: b"\r",
                     },
+                    // t-…-65: current Claude parks the `❯` cursor on
+                    // `No, exit`, where the generic `Yes, I trust` entry's bare
+                    // `\r` confirms the exit — so this ordered-first entry steps
+                    // off with Down+Enter (first match wins). Real `❯` only:
+                    // ASCII `>` would also match quoted transcript text. Tail
+                    // stays literal — `dismiss_literal_hint` uses it as a
+                    // `screen.contains` pre-check.
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]{0,8}❯ No, exit",
+                        sequence: b"\x1b[B\r",
+                    },
                     DismissPattern {
                         label: r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust",
                         sequence: b"\r",

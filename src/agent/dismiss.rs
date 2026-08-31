@@ -189,6 +189,11 @@ fn dismiss_literal_hint(pattern: &str) -> &str {
 /// one place.
 const REARM_PAST_LATCH_TRUST_HINTS: &[&str] = &[
     "Yes, I trust",
+    // t-…-65: the SAME trust modal with the cursor on `No, exit` — listed so a
+    // post-latch re-arm keeps it eligible instead of falling through to the
+    // `Yes, I trust` entry, whose bare Enter confirms the exit on that shape.
+    // Marker-qualified: the bare literal `No, exit` is kiro's hint too.
+    "❯ No, exit",
     "Run Grok Build in a project directory",
     "Do you trust the contents of this directory",
 ];
@@ -2095,8 +2100,8 @@ WARNING: Loading development channels
             .filter(|p| p.rearm_past_latch)
             .count();
         assert_eq!(
-            trust_count, 1,
-            "claude must have exactly ONE re-arm-eligible (workspace-trust) dismiss pattern"
+            trust_count, 2,
+            "claude's re-arm-eligible set is exactly the two cursor positions of the ONE workspace-trust modal (`Yes, I trust` and `❯ No, exit`) — `Yes, proceed` and the dev-channel modal must stay out"
         );
 
         let grok: Vec<(String, Vec<u8>)> = crate::backend::Backend::Grok
