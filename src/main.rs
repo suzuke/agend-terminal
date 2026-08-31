@@ -78,6 +78,7 @@ mod protected_refs;
 mod protocol;
 mod provider_detect;
 mod quickstart;
+mod ready;
 mod render;
 #[cfg_attr(windows, allow(dead_code))]
 mod reply_ledger;
