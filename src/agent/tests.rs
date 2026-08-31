@@ -4039,6 +4039,64 @@ fn pty_read_loop_keeps_non_dev_prompt_inside_trust_cooldown_3314() {
     );
 }
 
+/// t-…-72553-65 / d-…-14 — CURRENT Claude renders the trust modal with the Yes
+/// row UNSELECTED and the cursor on `No, exit`. The shipped preset matched any
+/// `Yes, I trust` line and sent a bare Enter, which on this shape CONFIRMS
+/// `No, exit` and makes Claude exit (operator saw the pane go Crashed).
+/// Transcribed from the operator screenshot.
+#[test]
+fn pty_read_loop_moves_off_selected_no_on_current_trust_prompt_65() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n   Yes, I trust this folder\r\n \xe2\x9d\xaf No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![(trust, std::time::Duration::ZERO)]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\x1b[B\r",
+        "a SELECTED `No, exit` must be stepped off before confirming — a bare Enter here confirms No and exits Claude"
+    );
+}
+
+/// Control: the OLD shape (cursor already on the numbered Yes row) must keep the
+/// single-Enter path #996 established. The new pattern must not disturb it.
+#[test]
+fn pty_read_loop_keeps_single_enter_for_old_selected_yes_trust_prompt_65() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![(trust, std::time::Duration::ZERO)]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "the old selected-Yes shape must still confirm with a single Enter"
+    );
+}
+
+/// Negative control: `No, exit` appearing WITHOUT a leading selection marker —
+/// quoted prose, or the unselected row of the old shape — must not make the new
+/// pattern send anything. Nothing on this screen is a live modal.
+#[test]
+fn pty_read_loop_ignores_quoted_or_unselected_no_exit_65() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let quoted = b"\x1b[2J\x1b[H operator: the prompt offered No, exit and I declined\r\n   2. No, exit\r\n done\r\n";
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![(quoted, std::time::Duration::ZERO)]);
+
+    assert!(
+        written.lock().is_empty(),
+        "an unselected or quoted `No, exit` is not a live modal and must send nothing: {:?}",
+        written.lock().as_slice()
+    );
+}
+
 #[test]
 fn pty_read_loop_does_not_reanswer_trust_without_complete_dev_modal_3314() {
     let _guard = R8_DISMISS_TEST_LOCK
