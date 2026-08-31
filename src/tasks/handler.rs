@@ -2399,4 +2399,7 @@ pub fn register_subscriber() {
 mod tests;
 
 #[cfg(test)]
+mod reopened_notify_tests;
+
+#[cfg(test)]
 mod review_repro_tasks;
