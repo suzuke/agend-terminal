@@ -377,11 +377,7 @@ fn serve_inner(
     // Daemon mode writes `.ready` later (after spawn loop) with richer semantics.
     if notifier.is_some() {
         if let Err(e) = crate::ready::write(&run_dir) {
-            tracing::warn!(
-                path = %run_dir.join(crate::ready::FILENAME).display(),
-                error = %e,
-                "failed to write .ready marker"
-            );
+            tracing::warn!(error = %e, "failed to write .ready marker");
         }
     }
 
