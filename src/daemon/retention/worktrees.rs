@@ -131,11 +131,42 @@ fn try_archive(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
+#[allow(dead_code)] // Compatibility wrapper for direct unit/test callers.
 pub(crate) fn maybe_remove_candidate(
     home: &Path,
     candidate: &crate::worktree_pool::GcCandidate,
 ) -> RemovalOutcome {
+    if crate::agent::validate_name(&candidate.agent).is_err() {
+        return RemovalOutcome::Skipped {
+            reason: "invalid managed worktree owner".to_string(),
+        };
+    }
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        &candidate.agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return RemovalOutcome::Skipped {
+                reason: format!("lifecycle permit unavailable: {error}"),
+            };
+        }
+    };
+    maybe_remove_candidate_with_permit(home, candidate, &permit)
+}
+
+pub(crate) fn maybe_remove_candidate_with_permit(
+    home: &Path,
+    candidate: &crate::worktree_pool::GcCandidate,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> RemovalOutcome {
     let agent = candidate.agent.as_str();
+    if crate::agent::validate_name(agent).is_err() || !permit.authorizes(home, agent) {
+        return RemovalOutcome::Skipped {
+            reason: "invalid lifecycle permit or managed worktree owner".to_string(),
+        };
+    }
     let force_reclaim = candidate.kind == crate::worktree_pool::GcKind::ForceReclaim;
     // t-worktree-leak PR-2: a force-reclaim's binding is still present (never
     // released) — capture branch/repo from it BEFORE archive for the post-archive
@@ -332,7 +363,7 @@ pub(crate) fn maybe_remove_candidate(
             // t-worktree-leak PR-2: a force-reclaim's binding is still present
             // (never released) → clear it now, then LOUD-classify + ALERT.
             if force_reclaim {
-                crate::binding::unbind(home, agent);
+                let _ = crate::binding::unbind_with_permit(home, agent, permit);
                 let branch = pre_binding
                     .as_ref()
                     .and_then(|b| b.get("branch").and_then(|v| v.as_str()));
@@ -506,17 +537,23 @@ pub(crate) fn archive_fallback_enabled() -> bool {
 /// `gc_candidates()` scan already covers every candidate every tick, so a
 /// second independent scan added nothing but the ~1h phase lag decision Q2
 /// fixed (P3-2550-SPIKE.md §2a, decision d-20260703062722787157-1).
-pub(crate) fn archive_fallthrough(
+pub(crate) fn archive_fallthrough_with_permit(
     home: &Path,
     candidate: &crate::worktree_pool::GcCandidate,
     hard_delete_skip_reason: String,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> RemovalOutcome {
+    if !permit.authorizes(home, &candidate.agent) {
+        return RemovalOutcome::Skipped {
+            reason: "invalid lifecycle permit".to_string(),
+        };
+    }
     if !archive_fallback_enabled() {
         return RemovalOutcome::Skipped {
             reason: hard_delete_skip_reason,
         };
     }
-    match maybe_remove_candidate(home, candidate) {
+    match maybe_remove_candidate_with_permit(home, candidate, permit) {
         RemovalOutcome::Removed => {
             tracing::info!(
                 agent = %candidate.agent,

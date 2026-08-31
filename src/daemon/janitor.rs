@@ -49,6 +49,7 @@ pub(crate) enum DispositionOutcome {
 /// `agent` is used by the `Release` arm; `candidate` by the `Archive` arm;
 /// `delete` by the `Delete` arm — each arm reads only what it needs, so a caller
 /// that never reaches an arm passes an inert value (`""` / `None` / `|| Ok(())`).
+#[allow(dead_code)] // Compatibility wrapper for direct unit/test callers.
 pub(crate) fn dispose(
     home: &Path,
     disposition: Disposition,
@@ -56,24 +57,96 @@ pub(crate) fn dispose(
     candidate: Option<&GcCandidate>,
     delete: impl FnOnce() -> Result<(), String>,
 ) -> DispositionOutcome {
+    if matches!(disposition, Disposition::Keep) {
+        return DispositionOutcome::Kept;
+    }
+    if matches!(disposition, Disposition::Archive) && candidate.is_none() {
+        tracing::error!(
+            agent,
+            "janitor::dispose: Archive disposition without a GcCandidate — \
+             keeping (fail-closed); this is a caller bug"
+        );
+        return DispositionOutcome::Kept;
+    }
+    let permit_agent = candidate.map(|c| c.agent.as_str()).unwrap_or(agent);
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        permit_agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return match disposition {
+                Disposition::Release => DispositionOutcome::Released(ReleaseOutcome {
+                    error: Some(format!("release refused: {error}")),
+                    ..ReleaseOutcome::default()
+                }),
+                Disposition::Delete => {
+                    DispositionOutcome::Deleted(Err(format!("delete refused: {error}")))
+                }
+                Disposition::Archive => DispositionOutcome::Archived(
+                    crate::daemon::retention::worktrees::RemovalOutcome::Skipped {
+                        reason: format!("archive refused: {error}"),
+                    },
+                ),
+                Disposition::Keep => unreachable!("Keep returned before permit acquisition"),
+            };
+        }
+    };
+    dispose_with_permit(home, disposition, agent, candidate, delete, &permit)
+}
+
+/// Execute a disposition while the caller holds the per-agent lifecycle
+/// permit. This is the shared route for cleanup actors that must keep the
+/// authority through every preflight and mutation.
+pub(crate) fn dispose_with_permit(
+    home: &Path,
+    disposition: Disposition,
+    agent: &str,
+    candidate: Option<&GcCandidate>,
+    delete: impl FnOnce() -> Result<(), String>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> DispositionOutcome {
     match disposition {
         Disposition::Keep => DispositionOutcome::Kept,
         // Binding present + terminal → the full managed release (WIP-preserve →
         // remove → unbind → branch cleanup; fail-closed on unpreservable WIP,
         // #2672). Shared verbatim.
         Disposition::Release => {
-            DispositionOutcome::Released(crate::worktree_pool::release_full(home, agent, false))
+            if !permit.authorizes(home, agent) {
+                return DispositionOutcome::Released(ReleaseOutcome {
+                    error: Some("release refused: invalid lifecycle permit".to_string()),
+                    ..ReleaseOutcome::default()
+                });
+            }
+            DispositionOutcome::Released(crate::worktree_pool::release_full_with_permit(
+                home, agent, false, permit,
+            ))
         }
         // No binding, confirmed-clean terminal → the caller's dir-remover. The
         // wrapper choice stays with the caller (D5-Q3 ruling B).
-        Disposition::Delete => DispositionOutcome::Deleted(delete()),
+        Disposition::Delete => {
+            if !permit.authorizes(home, agent) {
+                return DispositionOutcome::Deleted(Err(
+                    "delete refused: invalid lifecycle permit".to_string(),
+                ));
+            }
+            DispositionOutcome::Deleted(delete())
+        }
         // Reclaim-worthy but untrustworthy git state → atomic `.trash` archive.
         // Shared verbatim. Only the GC tier produces `Archive`, and it always
         // carries its candidate; a missing candidate is a caller bug → fail toward
         // NOT destroying (keep + LOUD), never archive a phantom.
         Disposition::Archive => match candidate {
+            Some(c) if !permit.authorizes(home, &c.agent) => DispositionOutcome::Archived(
+                crate::daemon::retention::worktrees::RemovalOutcome::Skipped {
+                    reason: "archive refused: invalid lifecycle permit".to_string(),
+                },
+            ),
             Some(c) => DispositionOutcome::Archived(
-                crate::daemon::retention::worktrees::maybe_remove_candidate(home, c),
+                crate::daemon::retention::worktrees::maybe_remove_candidate_with_permit(
+                    home, c, permit,
+                ),
             ),
             None => {
                 tracing::error!(

@@ -90,6 +90,33 @@ fn write_source_repo_binding(home: &Path, agent: &str, source_repo: &Path) {
     .unwrap();
 }
 
+fn write_managed_marker(worktree: &Path, agent: &str, branch: &str) {
+    let common_dir = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git common dir")
+        .stdout;
+    let common_dir = PathBuf::from(String::from_utf8_lossy(&common_dir).trim());
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        worktree.join(common_dir)
+    };
+    let exclude = common_dir.join("info").join("exclude");
+    std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !existing.lines().any(|line| line == ".agend-managed") {
+        std::fs::write(&exclude, format!("{existing}\n.agend-managed\n")).unwrap();
+    }
+    std::fs::write(
+        worktree.join(crate::worktree_pool::MANAGED_MARKER),
+        format!("agent={agent}\nbranch={branch}\n"),
+    )
+    .unwrap();
+}
+
 #[test]
 fn test_flag_disabled_default() {
     let _lock = ENV_LOCK.lock();
@@ -234,6 +261,7 @@ fn sweep_ignores_retired_prune_live_and_runs_live_d6() {
         &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
     );
     git_in(&repo, &["merge", "feat/done"]);
+    write_managed_marker(&wt, "done-agent", "feat/done");
 
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     // Retired var set to its old "dry-run" value — must have NO effect now.
@@ -306,6 +334,7 @@ fn test_v2_merged_worktree_removed() {
         &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
     );
     git_in(&repo, &["merge", "feat/done"]);
+    write_managed_marker(&wt, "done-agent", "feat/done");
 
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1"); // exercise real deletion
@@ -554,6 +583,7 @@ fn sweep_still_removes_when_no_binding_json_exists_at_all() {
         &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
     );
     git_in(&repo, &["merge", "feat/done"]);
+    write_managed_marker(&wt, "done-agent", "feat/done");
 
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
@@ -813,6 +843,7 @@ fn test_v2_remote_gone_worktree_removed() {
         &repo,
         &["worktree", "add", wt.to_str().unwrap(), "feat/squashed"],
     );
+    write_managed_marker(&wt, "squashed-agent", "feat/squashed");
 
     // Simulate: remote branch deleted (squash-merged on GitHub)
     git_in(&remote_dir, &["branch", "-D", "feat/squashed"]);
@@ -1503,6 +1534,7 @@ fn remove_failure_upserts_hygiene_task_v1() {
         &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
     );
     git_in(&repo, &["merge", "feat/done"]);
+    write_managed_marker(&wt, "done-agent", "feat/done");
     // Sabotage: strip write permission so the eligible worktree cannot be
     // removed (children can't be unlinked from a non-writable dir).
     std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o555)).unwrap();

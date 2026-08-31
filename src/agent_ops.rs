@@ -931,6 +931,21 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) -> Optio
     conflict
 }
 
+/// Cleanup entry point for a caller that already owns the per-agent lifecycle
+/// permit. The permit covers the identity check and all path mutations below;
+/// a missing or mismatched permit fails closed without touching the directory.
+pub(crate) fn cleanup_working_dir_with_permit(
+    home: &Path,
+    name: &str,
+    working_dir: &Path,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> Option<String> {
+    if !permit.authorizes(home, name) {
+        return Some("working-directory cleanup refused: invalid lifecycle permit".to_string());
+    }
+    cleanup_working_dir(home, name, working_dir)
+}
+
 /// Apply a pre-delete admission derived from the FleetConfig snapshot.
 /// `Preserve` is intentionally a complete path-local no-op: the shared
 /// directory must not even enter the backend scrub path.

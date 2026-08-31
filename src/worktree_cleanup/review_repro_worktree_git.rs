@@ -198,6 +198,21 @@ fn phase1_remote_gone_worktree_keeps_unpushed_branch_ref_worktree_git() {
         ],
     );
 
+    // The destructive sweep now requires the marker's owner as authoritative
+    // identity. Keep the daemon marker out of porcelain dirt, matching the
+    // production worktree fixture, then stamp the exact owner used by the
+    // source-repo inventory below.
+    let exclude = repo.join(".git").join("info").join("exclude");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !existing.lines().any(|line| line == ".agend-managed") {
+        std::fs::write(&exclude, format!("{existing}\n.agend-managed\n")).expect("write exclude");
+    }
+    std::fs::write(
+        wt.join(crate::worktree_pool::MANAGED_MARKER),
+        "agent=other\nbranch=feat/unpushed-wt\n",
+    )
+    .expect("write managed marker");
+
     // Remote head deleted (PR closed / branch removed), then prune so the local
     // remote-tracking ref disappears → is_remote_gone() == true.
     git(&remote, &["branch", "-D", "feat/unpushed-wt"]);

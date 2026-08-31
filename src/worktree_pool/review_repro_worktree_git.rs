@@ -9,7 +9,7 @@
 
 #![allow(clippy::expect_used)]
 
-use super::{cleanup_merged_branch, evaluate_candidate, GcKind, MANAGED_MARKER};
+use super::{cleanup_merged_branch, evaluate_candidate, MANAGED_MARKER};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -74,18 +74,15 @@ fn cleanup_merged_branch_uses_true_default_not_main_worktree_git() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Finding #6 (low): evaluate_candidate's agent-name fallback (when the
-// `.agend-managed` marker is corrupt and lacks an `agent=` line) reads
-// `wt_path.parent().file_name()`. For a SLASH branch (the common case,
-// `feat/<x>`), the worktree path is `<home>/worktrees/<agent>/feat/<x>`, so
-// the parent's file_name is `feat`, NOT the real agent. The force-reclaim /
-// liveness / binding decision is then evaluated against agent `feat` rather
-// than the real agent. CORRECT: derive the agent from the FIRST path
-// component under the worktree root.
+// Finding #6 (low): evaluate_candidate must not infer ownership from the
+// worktree path when the `.agend-managed` marker lacks an `agent=` line. For a
+// SLASH branch (the common case), path-derived ownership could be ambiguous or
+// point at the wrong instance. CORRECT: destructive GC fails closed without the
+// marker's authoritative owner.
 // ──────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn evaluate_candidate_derives_real_agent_for_slash_branch_worktree_git() {
+fn evaluate_candidate_without_authoritative_owner_fails_closed_worktree_git() {
     let home = scratch("gc-agent-slash");
     let real_agent = "agent-real";
     // New-layout slash-branch worktree: <home>/worktrees/<agent>/feat/track-x
@@ -95,10 +92,8 @@ fn evaluate_candidate_derives_real_agent_for_slash_branch_worktree_git() {
         .join("track-x");
     std::fs::create_dir_all(&wt).expect("mkdir worktree");
 
-    // CORRUPT marker: NO `agent=` line (the only case the parent-dir fallback
-    // fires). `leased_at` is well past the force-reclaim age cap and there is
-    // NO `released_at`, so this routes through the force-reclaim backstop and
-    // yields a candidate whose `.agent` we can inspect.
+    // CORRUPT marker: NO `agent=` line. Even though the worktree is old enough
+    // for force-reclaim, the missing authoritative owner must suppress it.
     let old = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
     std::fs::write(
         wt.join(MANAGED_MARKER),
@@ -106,22 +101,12 @@ fn evaluate_candidate_derives_real_agent_for_slash_branch_worktree_git() {
     )
     .expect("write marker");
 
-    // No live agents, no daemon run dir (so not in boot grace), no binding for
-    // either `agent-real` or `feat` → the force-reclaim arm is reached.
+    // No live agents, no daemon run dir (so not in boot grace), and no binding;
+    // the age/liveness gates would otherwise make this force-reclaim eligible.
     let live: HashSet<String> = HashSet::new();
-    let cand = evaluate_candidate(&home, &wt, &live)
-        .expect("an abandoned corrupt-marker slash-branch worktree must be a candidate");
-    assert_eq!(
-        cand.kind,
-        GcKind::ForceReclaim,
-        "no released_at + past-cap leased_at → force-reclaim path"
-    );
-    assert_eq!(
-        cand.agent, real_agent,
-        "agent must be derived from the FIRST component under the worktrees root \
-         (`{real_agent}`), not the immediate parent dir of a slash branch (`feat`). \
-         Got: {:?}",
-        cand.agent
+    assert!(
+        evaluate_candidate(&home, &wt, &live).is_none(),
+        "GC must fail closed when the marker has no authoritative owner"
     );
 
     std::fs::remove_dir_all(&home).ok();

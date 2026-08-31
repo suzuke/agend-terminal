@@ -157,10 +157,12 @@ pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
 pub(crate) fn managed_marker_agent(worktree: &Path) -> Option<String> {
     let content =
         std::fs::read_to_string(worktree.join(crate::worktree_pool::MANAGED_MARKER)).ok()?;
-    content
+    let agent = content
         .lines()
         .find_map(|l| l.strip_prefix("agent="))
-        .map(|s| s.trim().to_string())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && crate::agent::validate_name(s).is_ok())?;
+    Some(agent.to_string())
 }
 
 /// #2496: does `agent` hold an active CI watch on `branch`? A stale branch
@@ -309,8 +311,7 @@ pub(crate) fn bind_full_with_provenance(
     // indistinguishability: it stops a transient helper silently moving the primary's
     // live binding to a branch it never chose (#2158). Verified free: every legit
     // rebind flow is fresh-lease / same-branch-early-return / cross-branch-rejected
-    // upstream (dispatch_hook LeaseConflict), so none does a live cross-branch
-    // bind-over.
+    // upstream (dispatch_hook LeaseConflict), so none does a live cross-branch bind-over.
     if let Some(ref ex) = existing {
         let ex_branch = ex
             .get("branch")
@@ -527,8 +528,7 @@ fn notify_operator_out_of_dispatch_bind(
         Some(r) => r,
         None => return,
     };
-    // Best-effort, file-based inbox to the resolved recipient — mirrors
-    // `canonical_auto_stash`.
+    // Best-effort, file-based inbox to the resolved recipient — mirrors `canonical_auto_stash`.
     let text = out_of_dispatch_notify_body(agent, branch, prev_branch);
     crate::inbox::notify_agent(
         home,

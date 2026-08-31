@@ -3691,6 +3691,88 @@ fn gc_run_force_reclaim_archives_never_hard_deletes() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Lifecycle race coverage: GC acquiring the permit first must exclude a
+/// competing release/delete attempt until archive completion. The hook is a
+/// deterministic rendezvous; this test uses no sleep or timing assumption.
+#[test]
+fn gc_remove_one_holds_lifecycle_permit_through_archive() {
+    let home = tmp_home("gc-permit-first");
+    let repo = tmp_repo("gc-permit-first-repo");
+    let lease = lease(&home, &repo, "gc-permit-agent", "feat/x").expect("lease");
+    backdate_lease(&lease.path, force_reclaim_age_days() + 5);
+    let live = std::collections::HashSet::new();
+    let candidate = evaluate_candidate(&home, &lease.path, &live)
+        .expect("backdated lease is a force-reclaim candidate");
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *super::gc::PERMIT_ACQUIRED_HOOK.lock() = Some((
+        home.clone(),
+        Box::new(move || {
+            entered_tx.send(()).expect("GC acquired lifecycle permit");
+            resume_rx.recv().expect("resume GC archive");
+        }),
+    ));
+    let home_for_gc = home.clone();
+    let gc_thread = std::thread::spawn(move || gc_remove_one(&home_for_gc, &candidate));
+
+    entered_rx.recv().expect("GC reached permit rendezvous");
+    let competing = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &home,
+        "gc-permit-agent",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
+    );
+    assert!(
+        competing
+            .as_ref()
+            .is_err_and(|error| error.contains("lifecycle transaction already in flight")),
+        "release/delete must wait behind GC's permit: {competing:?}"
+    );
+    resume_tx.send(()).expect("resume GC");
+    let result = gc_thread.join().expect("GC thread");
+    assert!(result.removed, "GC archive should complete: {result:?}");
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Reverse race order: an existing lifecycle actor must make GC fail closed
+/// before it can inspect or remove the candidate.
+#[test]
+fn gc_remove_one_refuses_when_lifecycle_permit_is_already_held() {
+    let home = tmp_home("gc-permit-contended");
+    let repo = tmp_repo("gc-permit-contended-repo");
+    let lease = lease(&home, &repo, "gc-contended-agent", "feat/x").expect("lease");
+    backdate_lease(&lease.path, force_reclaim_age_days() + 5);
+    let live = std::collections::HashSet::new();
+    let candidate = evaluate_candidate(&home, &lease.path, &live)
+        .expect("backdated lease is a force-reclaim candidate");
+    let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &home,
+        "gc-contended-agent",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Bind,
+    )
+    .expect("contending permit");
+
+    let result = gc_remove_one(&home, &candidate);
+    assert!(
+        !result.removed,
+        "GC must not remove under contention: {result:?}"
+    );
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("lifecycle permit unavailable")),
+        "GC contention must be reported: {result:?}"
+    );
+    assert!(
+        lease.path.exists(),
+        "contended GC must preserve the worktree"
+    );
+    drop(permit);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
 /// PR-D·D4 (spike-vet, NON-NEGOTIABLE): the UNCONDITIONAL `gc_remove_one`
 /// archive-only invariant for ForceReclaim. t-worktree-leak PR-2's load-bearing
 /// safety property — a ForceReclaim MUST NEVER be hard-deleted — currently rests
@@ -3889,17 +3971,15 @@ fn agent_from_layout_is_layout_aware_2234() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// RED→GREEN end-to-end: a clean-released cure-(B) `workspace/<agent>` worktree
-/// whose marker lacks `agent=` (forces the fallback) must yield a GcCandidate
-/// whose `agent` is the workspace dir name — RED (old parent-file_name): the
-/// candidate's agent was `"workspace"`, so the force-reclaim liveness guard
-/// would key on a non-agent and could reclaim a LIVE agent's workspace cwd.
+/// A clean-released cure-(B) `workspace/<agent>` worktree whose marker lacks
+/// `agent=` has no authoritative owner and must fail closed. A destructive GC
+/// path must not derive an owner from the directory layout.
 #[test]
-fn evaluate_candidate_workspace_worktree_resolves_real_agent_2234() {
+fn evaluate_candidate_workspace_worktree_without_marker_owner_fails_closed() {
     let home = tmp_home("eval-ws-agent");
     let repo = tmp_repo("eval-ws-agent-repo");
     let wt = managed_workspace_worktree(&home, &repo, "devw", "fix/x");
-    // Clean-released past grace, NO agent= field → exercises the path fallback.
+    // Clean-released past grace, NO agent= field → no authoritative owner.
     let old = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
     std::fs::write(
         wt.join(MANAGED_MARKER),
@@ -3907,11 +3987,9 @@ fn evaluate_candidate_workspace_worktree_resolves_real_agent_2234() {
     )
     .unwrap();
     let live = std::collections::HashSet::new();
-    let cand =
-        evaluate_candidate(&home, &wt, &live).expect("clean-released worktree is a candidate");
-    assert_eq!(
-        cand.agent, "devw",
-        "#2234: agent must resolve to the workspace dir name 'devw', NOT the parent 'workspace'"
+    assert!(
+        evaluate_candidate(&home, &wt, &live).is_none(),
+        "markerless owner identity must fail closed"
     );
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();

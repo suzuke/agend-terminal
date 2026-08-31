@@ -206,6 +206,23 @@ fn spawn_single_instance_impl_inner(
         }
     };
     let name: &str = &name_owned;
+    // Branch-backed creation is a lifecycle actor: hold the same per-agent
+    // authority used by bind/release/delete before any worktree mutation and
+    // through registration plus the SPAWN transaction.
+    let lifecycle_permit = if args.get("branch").and_then(|v| v.as_str()).is_some() {
+        Some(
+            match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+                home,
+                name,
+                crate::mcp::handlers::dispatch_hook::LifecycleOperation::Bind,
+            ) {
+                Ok(permit) => permit,
+                Err(error) => return json!({"error": format!("create refused: {error}")}),
+            },
+        )
+    } else {
+        None
+    };
     let command = args["backend"].as_str().unwrap_or("claude");
     let mut cmd_args = args
         .get("args")
@@ -382,11 +399,20 @@ fn spawn_single_instance_impl_inner(
         // Only roll back filesystem state that THIS attempt created. A
         // pre-existing dir (reused worktree or occupied workspace) must survive.
         if !work_dir_preexisted {
-            let _ = crate::agent_ops::cleanup_working_dir(
-                home,
-                name,
-                &std::path::PathBuf::from(&work_dir),
-            );
+            if let Some(permit) = lifecycle_permit.as_ref() {
+                let _ = crate::agent_ops::cleanup_working_dir_with_permit(
+                    home,
+                    name,
+                    &std::path::PathBuf::from(&work_dir),
+                    permit,
+                );
+            } else {
+                let _ = crate::agent_ops::cleanup_working_dir(
+                    home,
+                    name,
+                    &std::path::PathBuf::from(&work_dir),
+                );
+            }
         }
         return json!({"error": format!("failed to register instance in fleet.yaml: {e}")});
     }

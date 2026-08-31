@@ -484,6 +484,41 @@ pub fn sweep_from_registry(
         };
         for entry in &entries {
             let wt_path = Path::new(&entry.path);
+            let Some(agent) = crate::binding::managed_marker_agent(wt_path) else {
+                tracing::debug!(
+                    branch = %entry.branch,
+                    path = %entry.path,
+                    "skipping managed-worktree cleanup without authoritative marker owner"
+                );
+                continue;
+            };
+            let lifecycle_permit =
+                match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+                    home,
+                    &agent,
+                    crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+                ) {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        tracing::debug!(
+                            agent = %agent,
+                            branch = %entry.branch,
+                            path = %entry.path,
+                            %error,
+                            "skipping managed-worktree cleanup while lifecycle transaction is active"
+                        );
+                        continue;
+                    }
+                };
+            if crate::binding::managed_marker_agent(wt_path).as_deref() != Some(agent.as_str()) {
+                tracing::debug!(
+                    agent = %agent,
+                    branch = %entry.branch,
+                    path = %entry.path,
+                    "skipping managed-worktree cleanup after authoritative owner changed"
+                );
+                continue;
+            }
 
             // PR-D·D3: occupancy/marker protection (L0) delegated to the shared
             // `disposition::l0_protected` — the SAME fail-direction the classifier
@@ -540,10 +575,10 @@ pub fn sweep_from_registry(
             );
             // Route Delete through janitor with the caller-local remover, retaining
             // retry behavior and final command diagnostics.
-            let outcome = crate::daemon::janitor::dispose(
+            let outcome = crate::daemon::janitor::dispose_with_permit(
                 home,
                 crate::worktree::disposition::Disposition::Delete,
-                "",
+                &agent,
                 None,
                 || {
                     remove_worktree(
@@ -554,6 +589,7 @@ pub fn sweep_from_registry(
                         false,
                     )
                 },
+                &lifecycle_permit,
             );
             match outcome {
                 crate::daemon::janitor::DispositionOutcome::Deleted(Ok(())) => {

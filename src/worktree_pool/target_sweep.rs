@@ -1,7 +1,7 @@
 //! `target/` retention sweep for daemon-managed worktrees.
 
 use super::{
-    agent_from_layout, collect_managed_worktrees, daemon_managed_worktree_root, is_daemon_managed,
+    collect_managed_worktrees, daemon_managed_worktree_root, is_daemon_managed,
     MARKER_WALK_MAX_DEPTH,
 };
 use std::path::{Path, PathBuf};
@@ -219,7 +219,7 @@ pub(crate) fn validate_target_for_delete(home: &Path, target: &Path) -> Result<P
 ///   caller holds the bind lock).
 /// - in roster, binding UNREADABLE/malformed: PROTECT (fail-closed).
 fn predicate_protects(home: &Path, wt: &Path, roster: &std::collections::HashSet<String>) -> bool {
-    let Some(owner) = agent_from_layout(home, wt) else {
+    let Some(owner) = crate::binding::managed_marker_agent(wt) else {
         return true; // unresolvable owner ⇒ fail-closed protect
     };
     if !roster.contains(&owner) {
@@ -311,7 +311,9 @@ pub(crate) fn target_sweep_candidates_with_roster(
             .and_then(|m| now.duration_since(m).ok())
             .map(|d| d.as_secs())
             .unwrap_or_default();
-        let agent = agent_from_layout(home, &wt).unwrap_or_default();
+        let Some(agent) = crate::binding::managed_marker_agent(&wt) else {
+            continue;
+        };
         out.push(TargetSweepCandidate {
             worktree: wt,
             target,
@@ -358,11 +360,19 @@ pub(crate) fn target_sweep_run_with_roster(
             freed_bytes: 0,
             error: Some(reason),
         };
-        let Some(owner) = agent_from_layout(home, &c.worktree) else {
-            results.push(skip(
-                "skipped: unresolvable owner (fail-closed)".to_string(),
-            ));
-            continue;
+        let owner = c.agent.as_str();
+        let _lifecycle_permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+            home,
+            owner,
+            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                results.push(skip(format!(
+                    "skipped: lifecycle transaction already in flight: {error}"
+                )));
+                continue;
+            }
         };
         // Hold the owner's binding lock through {predicate → recheck → delete}.
         // bind_full holds this same lock while writing binding.json, so while we
@@ -370,7 +380,7 @@ pub(crate) fn target_sweep_run_with_roster(
         // reads and making a rebind-to-here-vs-delete race impossible. Non-blocking:
         // a held lock = an active bind/release in flight ⇒ skip this tick (fail-safe).
         let lock_path = crate::paths::runtime_dir(home)
-            .join(&owner)
+            .join(owner)
             .join(".binding.json.lock");
         let _lock = match crate::store::try_acquire_file_lock(&lock_path) {
             Ok(Some(l)) => l,
@@ -398,6 +408,12 @@ pub(crate) fn target_sweep_run_with_roster(
         if !is_daemon_managed(&c.worktree) {
             results.push(skip(
                 "skipped: worktree no longer .agend-managed".to_string(),
+            ));
+            continue;
+        }
+        if crate::binding::managed_marker_agent(&c.worktree).as_deref() != Some(owner) {
+            results.push(skip(
+                "skipped: authoritative marker owner changed".to_string(),
             ));
             continue;
         }

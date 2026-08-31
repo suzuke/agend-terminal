@@ -3,6 +3,13 @@
 use super::{daemon_managed_worktree_root, is_daemon_managed, is_pinned, MANAGED_MARKER};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+type PermitAcquiredHook = (PathBuf, Box<dyn Fn() + Send>);
+
+#[cfg(test)]
+pub(crate) static PERMIT_ACQUIRED_HOOK: parking_lot::Mutex<Option<PermitAcquiredHook>> =
+    parking_lot::Mutex::new(None);
+
 /// Grace period before a released worktree becomes a GC candidate.
 const GC_GRACE_HOURS: i64 = 24;
 
@@ -467,18 +474,11 @@ pub(crate) fn evaluate_candidate(
     if is_pinned(wt_path) {
         return None;
     }
-    // Resolve agent name: read from .agend-managed marker (authoritative),
-    // else derive layout-aware from the path (#2234 Phase 2).
+    // Resolve agent name from the .agend-managed marker (authoritative). A
+    // destructive GC path must never infer ownership from a directory layout.
     let marker = wt_path.join(MANAGED_MARKER);
     let marker_content = std::fs::read_to_string(&marker).unwrap_or_default();
-    let agent_name = marker_content
-        .lines()
-        .find(|l| l.starts_with("agent="))
-        .and_then(|l| l.strip_prefix("agent="))
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .or_else(|| agent_from_layout(home, wt_path))
-        .unwrap_or_default();
+    let agent_name = crate::binding::managed_marker_agent(wt_path).unwrap_or_default();
     // #2234: unresolvable agent → NOT a GC candidate (fail-toward-alive). Never
     // reclaim a worktree whose owner we can't name.
     if agent_name.is_empty() {
@@ -744,6 +744,44 @@ pub fn gc_run(home: &Path) -> Vec<GcResult> {
 
 pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     let wt_path = &candidate.path;
+    if crate::agent::validate_name(&candidate.agent).is_err() {
+        return GcResult {
+            path: wt_path.clone(),
+            agent: candidate.agent.clone(),
+            removed: false,
+            error: Some("invalid managed worktree owner".to_string()),
+        };
+    }
+    if crate::binding::managed_marker_agent(wt_path).as_deref() != Some(&candidate.agent) {
+        return GcResult {
+            path: wt_path.clone(),
+            agent: candidate.agent.clone(),
+            removed: false,
+            error: Some("managed worktree owner marker mismatch".to_string()),
+        };
+    }
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        &candidate.agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return GcResult {
+                path: wt_path.clone(),
+                agent: candidate.agent.clone(),
+                removed: false,
+                error: Some(format!("lifecycle permit unavailable: {error}")),
+            };
+        }
+    };
+    #[cfg(test)]
+    if let Some((_hook_home, hook)) = PERMIT_ACQUIRED_HOOK
+        .lock()
+        .take_if(|(hook_home, _)| hook_home == home)
+    {
+        hook();
+    }
 
     // t-worktree-leak PR-2 (codex gap ① CRITICAL): a force-reclaim candidate MUST
     // NEVER be hard-deleted. Route it through the SINGLE safe deletion path
@@ -758,15 +796,16 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
         // now expressed as the disposition switch. `maybe_remove_candidate`
         // (archive-only: liveness re-check + atomic `.trash` + unbind + ALERT) is
         // unchanged behind it.
-        use crate::daemon::janitor::{dispose, DispositionOutcome};
+        use crate::daemon::janitor::{dispose_with_permit, DispositionOutcome};
         use crate::daemon::retention::worktrees::RemovalOutcome;
         use crate::worktree::disposition::Disposition;
-        let DispositionOutcome::Archived(outcome) = dispose(
+        let DispositionOutcome::Archived(outcome) = dispose_with_permit(
             home,
             Disposition::Archive,
             &candidate.agent,
             Some(candidate),
             || Ok(()),
+            &permit,
         ) else {
             unreachable!("Archive disposition yields Archived");
         };
@@ -800,6 +839,7 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
                 home,
                 candidate,
                 format!("skipped: binding lock acquisition failed: {e}"),
+                &permit,
             );
         }
     };
@@ -841,6 +881,7 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
             "skipped: owning source repo unresolved — refusing to run \
              `git worktree remove` without the owning-repo cwd"
                 .to_string(),
+            &permit,
         );
     };
 
@@ -856,10 +897,14 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     // fallback path) or `Err(reason)`; this wrapper keeps the #2550 archive-
     // fallthrough on `Err` (deliberate fail-closed pre/post, D5-Q1). Every reason
     // string is preserved byte-for-byte.
-    use crate::daemon::janitor::{dispose, DispositionOutcome};
+    use crate::daemon::janitor::{dispose_with_permit, DispositionOutcome};
     use crate::worktree::disposition::Disposition;
-    let outcome = dispose(home, Disposition::Delete, &candidate.agent, None, || {
-        match crate::git_worktree::remove_force(&source_repo, &wt_path.display().to_string()) {
+    let outcome = dispose_with_permit(
+        home,
+        Disposition::Delete,
+        &candidate.agent,
+        None,
+        || match crate::git_worktree::remove_force(&source_repo, &wt_path.display().to_string()) {
             Ok(o) if o.status.success() => Ok(()),
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
@@ -889,8 +934,9 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
                 );
                 Err(format!("git command failed: {e}"))
             }
-        }
-    });
+        },
+        &permit,
+    );
     match outcome {
         DispositionOutcome::Deleted(Ok(())) => GcResult {
             path: wt_path.clone(),
@@ -899,7 +945,7 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
             error: None,
         },
         DispositionOutcome::Deleted(Err(reason)) => {
-            archive_fallthrough_result(home, candidate, reason)
+            archive_fallthrough_result(home, candidate, reason, &permit)
         }
         _ => unreachable!("Delete disposition yields Deleted"),
     }
@@ -912,9 +958,10 @@ fn archive_fallthrough_result(
     home: &Path,
     candidate: &GcCandidate,
     hard_delete_skip_reason: String,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> GcResult {
-    use crate::daemon::retention::worktrees::{archive_fallthrough, RemovalOutcome};
-    let outcome = archive_fallthrough(home, candidate, hard_delete_skip_reason);
+    use crate::daemon::retention::worktrees::{archive_fallthrough_with_permit, RemovalOutcome};
+    let outcome = archive_fallthrough_with_permit(home, candidate, hard_delete_skip_reason, permit);
     GcResult {
         path: candidate.path.clone(),
         agent: candidate.agent.clone(),
