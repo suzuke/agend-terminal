@@ -1893,6 +1893,39 @@ fn wait_for_bootstrap_inject_target(
     result.target
 }
 
+/// #3462-v2: crash-respawn's readiness wait. The smallest reuse of the existing
+/// bootstrap waiter: the respawned handle is ALREADY registered, so this only
+/// selects the same transport-derived policy `spawn_self_kick_bootstrap` uses and
+/// delegates. It adds no polling loop, no retry and no transport of its own —
+/// every terminal outcome (timeout, disappearance, shutdown) already returns
+/// `None` and is already logged by `wait_for_bootstrap_inject_target`, so the
+/// caller simply does not inject and nothing is written.
+pub(crate) fn wait_for_respawn_inject_target(
+    registry: &AgentRegistry,
+    instance_id: crate::types::InstanceId,
+    name: &str,
+    home: &std::path::Path,
+    timeout: std::time::Duration,
+    shutdown: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> Option<InjectTarget> {
+    let policy = if crate::transport::mode_for_instance(home, name)
+        == crate::transport::TransportMode::LegacyPty
+    {
+        BootstrapWaitPolicy::RawPromptIdle(BootstrapRegistrationState::AlreadyRegistered)
+    } else {
+        BootstrapWaitPolicy::StructuredTransport(BootstrapRegistrationState::AlreadyRegistered)
+    };
+    wait_for_bootstrap_inject_target(
+        registry,
+        instance_id,
+        name,
+        timeout,
+        policy,
+        shutdown,
+        "crash-respawn-notice",
+    )
+}
+
 fn spawn_instructions_bootstrap(
     registry: AgentRegistry,
     instance_id: crate::types::InstanceId,

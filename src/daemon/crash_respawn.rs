@@ -589,24 +589,46 @@ fn respawn_agent_worker(
                     core.health.respawn_ok(is_alive);
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
             {
-                // #1530/F1: snapshot the writer + crash reason under the
-                // registry lock, then RELEASE it before the blocking PTY write.
-                let snap = {
-                    let r = reg.lock();
-                    respawned_id.and_then(|id| r.get(&id)).map(|handle| {
-                        let reason = handle.core.lock().health.crash_reason().to_string();
-                        (agent::InjectTarget::from_handle(handle), reason)
-                    })
-                };
-                if let Some((tgt, reason)) = snap {
+                // #3462-v2: wait for the respawned prompt to actually accept input
+                // instead of guessing with a fixed sleep. The handle is already
+                // registered, so this reuses the existing bootstrap readiness
+                // waiter, bounded by this backend's own ready timeout plus the
+                // same bootstrap margin the spawn path uses. Every terminal
+                // outcome — timeout, disappearance, shutdown — yields None and is
+                // already logged there, so we simply never inject: no draft is
+                // written and no typed-inject contamination can latch.
+                let ready_timeout = std::time::Duration::from_secs(
+                    config
+                        .backend
+                        .map(|b| b.preset().ready_timeout_secs)
+                        .unwrap_or(30)
+                        .saturating_add(15),
+                );
+                let ready = respawned_id.and_then(|id| {
+                    agent::wait_for_respawn_inject_target(
+                        reg,
+                        id,
+                        &config.name,
+                        home,
+                        ready_timeout,
+                        Some(shutdown),
+                    )
+                });
+                // The waiter snapshots the target under the registry lock and
+                // releases it before returning (#1530/F1), so the inject below
+                // never runs with the registry held.
+                if let Some(tgt) = ready {
+                    let reason = tgt.core.lock().health.crash_reason().to_string();
                     let msg = respawn_notice(&reason);
                     // #3462: go through the respawned handle's own injector so
-                    // inject_prefix / submit_key / typed readback + contamination
-                    // fence / deleted-generation check / post-submit observation all
-                    // apply. A hardcoded submit byte silently strands the notice in
-                    // the composer of any backend that does not submit on CR.
+                    // inject_prefix / typed readback + contamination fence /
+                    // deleted-generation check / post-submit observation all apply.
+                    // NOT because the submit byte differs — every shipped preset
+                    // submits `\r`, so the hardcoded byte was identical. What the
+                    // direct write skipped is the PACING: payload and submit went
+                    // out as one fused buffer, so a composer that had not finished
+                    // accepting the text never consumed the submit.
                     if let Err(e) = agent::inject_with_target_gated(
                         &tgt,
                         &config.name,
