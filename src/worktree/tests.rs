@@ -253,7 +253,7 @@ fn create_initializes_nested_submodules_recursively() {
 /// (optional/private/offline), `create` must still return `Some` with a
 /// managed worktree — never hard-fail the lease. Nested content stays empty.
 #[test]
-fn create_soft_fails_when_submodule_source_unavailable() {
+fn create_fails_closed_when_submodule_source_unavailable() {
     let home = tmp_home("submod-soft");
     let root = std::env::temp_dir().join(format!(
         "agend-wt-soft-root-{}-{}",
@@ -282,20 +282,102 @@ fn create_soft_fails_when_submodule_source_unavailable() {
     // Make the recorded submodule URL unusable BEFORE production create.
     std::fs::remove_dir_all(&sub).expect("remove submodule source");
 
-    let info = create(&home, &super_repo, "agent-soft", Some("feat/submod-soft"))
-        .expect("create must soft-warn and still return Some when submodule init fails");
-
+    // #2755 follow-up A: a tree whose nested content cannot be provisioned is not
+    // build-ready, so `create` now FAILS CLOSED instead of soft-warning to success.
+    let wt_dir = crate::worktree::worktree_path(&home, "agent-soft", "feat/submod-soft");
+    let info = create(&home, &super_repo, "agent-soft", Some("feat/submod-soft"));
     assert!(
-        info.path.join(".agend-managed").is_file(),
-        "managed marker must still land on soft-fail path"
+        info.is_none(),
+        "create must fail closed when submodule init fails, not return a half-provisioned tree"
+    );
+    // Rollback proven by the DIRECTORY being gone, not merely by the return value:
+    // a `None` that leaked a half-managed dir would still be a leak.
+    assert!(
+        !wt_dir.exists(),
+        "the fresh worktree this attempt created must be rolled back, not left behind: {}",
+        wt_dir.display()
     );
     assert!(
-        !info.path.join("vendor/dep/payload.txt").is_file(),
-        "nested content must remain unavailable when source is gone"
+        !wt_dir.join(".agend-managed").is_file(),
+        "no managed-marker orphan may survive the rollback"
     );
 
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// Positive control for the fail-closed matrix: a HEALTHY submodule source must
+/// still provision normally. Without this, the negatives above and below could
+/// all be passing because `create` broke for some unrelated reason.
+#[test]
+fn create_succeeds_and_populates_healthy_submodule() {
+    let home = tmp_home("submod-healthy");
+    let super_repo = tmp_super_with_nested_submodules("failclosed-healthy");
+    let info = create(&home, &super_repo, "agent-ok", Some("feat/submod-ok"))
+        .expect("healthy submodule source must still provision");
+    assert!(
+        info.path.join(".agend-managed").is_file(),
+        "managed marker must land on the success path"
+    );
+    assert!(
+        info.path.join(".gitmodules").is_file(),
+        "fixture must actually carry submodules, or this control proves nothing"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Blast-radius guard for the overwhelmingly common case: a repo with NO
+/// `.gitmodules` must be byte-identically unaffected — both primitives early
+/// return `Ok`, so nothing about this path may change.
+#[test]
+fn create_without_gitmodules_is_unaffected() {
+    let home = tmp_home("submod-none");
+    let repo = tmp_repo_with_file("failclosed-plain", "a.txt", "hello\n");
+    let info = create(&home, &repo, "agent-plain", Some("feat/plain"))
+        .expect("a repo without submodules must be unaffected by the fail-closed contract");
+    assert!(!info.path.join(".gitmodules").exists(), "fixture sanity");
+    assert!(info.path.join(".agend-managed").is_file());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// REUSE is verify-only: an already-provisioned tree whose submodule sits at a
+/// DIFFERENT commit than the superproject gitlink must be REJECTED rather than
+/// silently reused — and rejection must not delete the reused tree, which
+/// belongs to whoever provisioned it (`WorktreeProvenance::Reused`).
+#[test]
+fn reuse_rejects_submodule_not_at_gitlink_and_keeps_the_tree() {
+    let home = tmp_home("submod-reuse");
+    let super_repo = tmp_super_with_nested_submodules("failclosed-reuse");
+    let first = create(&home, &super_repo, "agent-reuse", Some("feat/submod-reuse"))
+        .expect("first create must provision");
+    let wt = first.path.clone();
+
+    // Desync the submodule: empty its checkout so `submodule status --recursive`
+    // reports `-` (not initialized) against the recorded gitlink.
+    let sub_dir = wt.join("vendor/mid");
+    assert!(
+        sub_dir.exists(),
+        "fixture must have provisioned the submodule"
+    );
+    for entry in std::fs::read_dir(&sub_dir).unwrap().flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p).ok();
+        } else {
+            std::fs::remove_file(&p).ok();
+        }
+    }
+
+    let again = create(&home, &super_repo, "agent-reuse", Some("feat/submod-reuse"));
+    assert!(
+        again.is_none(),
+        "a reused tree whose submodules are not at their gitlinks must be rejected"
+    );
+    assert!(
+        wt.exists(),
+        "rejection must NOT delete a reused tree — it is not this attempt's to remove"
+    );
+    std::fs::remove_dir_all(&home).ok();
 }
 
 // ── #2158-adjacent: dirty-WIP preservation helpers ──────────────────
