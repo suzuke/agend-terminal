@@ -2784,6 +2784,16 @@ fn teams_json_migration_preserves_existing_fleet_yaml_source_repo() {
 /// worktree branches off `main` so subsequent commits land in
 /// `origin/main..HEAD`. Returns `(repo_dir, worktree_dir)`.
 fn setup_repo_and_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    setup_repo_and_worktree_on(tag, "main")
+}
+
+/// t-20260831221907643452-32048-13: trunk-parametrized variant of the #814
+/// fixture — the default≠main REDs need a master-default repo whose ONLY
+/// remote-tracking trunk is `refs/remotes/origin/master` (no origin/main).
+fn setup_repo_and_worktree_on(
+    tag: &str,
+    trunk: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let base = std::env::temp_dir().join(format!("agend-814-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&base).ok();
     let repo = base.join("repo");
@@ -2800,7 +2810,7 @@ fn setup_repo_and_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf
             .output()
             .expect("git ran")
     };
-    git_run(&repo, &["init", "-b", "main"]);
+    git_run(&repo, &["init", "-b", trunk]);
     // #1452: disable git auto-gc/maintenance in the fixture repo. The SUT runs
     // a `git rebase` over 50+ loose-object commits; under llvm-cov's slow,
     // heavily-parallel CI run an auto-gc repack can fire mid-rebase and race
@@ -2820,10 +2830,8 @@ fn setup_repo_and_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf
     let main_sha = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
         .trim()
         .to_string();
-    git_run(
-        &repo,
-        &["update-ref", "refs/remotes/origin/main", &main_sha],
-    );
+    let trunk_ref = format!("refs/remotes/origin/{trunk}");
+    git_run(&repo, &["update-ref", &trunk_ref, &main_sha]);
     let worktree = base.join("wt");
     git_run(
         &repo,
@@ -2987,6 +2995,88 @@ fn clean_empty_init_commits_handles_50_interleaved_inits() {
         elapsed < std::time::Duration::from_secs(30),
         "high-count must complete in < 30s, took {elapsed:?}"
     );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
+
+// ── t-20260831221907643452-32048-13: default≠main trunk resolution ──
+//
+// At the RED commit, `clean_empty_init_commits` hardcodes `origin/main` at all
+// three operational sites (log enumeration, soft reset, rebase), so on a
+// master-default repo with no origin/main ref every call errors before any
+// cleanup — the two master REDs below FAIL there. The dual-trunk test also
+// fails at RED (the old code blindly uses origin/main instead of refusing).
+
+/// RED (all-empty arm): master-default repo, no origin/main — the soft-reset
+/// path must resolve the real trunk and clean everything.
+#[test]
+fn clean_empty_init_commits_cleans_all_empty_on_master_default_repo() {
+    let (_repo, worktree) = setup_repo_and_worktree_on("master_all_empty", "master");
+    create_interleaved_commit_chain(&worktree, 3, 0);
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(
+        result.is_ok(),
+        "cleanup must work on a master-default repo, got: {result:?}"
+    );
+    assert_eq!(result.unwrap(), 3, "all 3 empty inits should be dropped");
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
+
+/// RED (mixed/rebase arm): master-default repo, no origin/main — the rebase
+/// path must resolve the real trunk, drop only the inits and keep the real
+/// commit.
+#[test]
+fn clean_empty_init_commits_cleans_mixed_on_master_default_repo() {
+    let (_repo, worktree) = setup_repo_and_worktree_on("master_mixed", "master");
+    create_interleaved_commit_chain(&worktree, 2, 1);
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(
+        result.is_ok(),
+        "mixed cleanup must work on a master-default repo, got: {result:?}"
+    );
+    assert_eq!(result.unwrap(), 2, "both empty inits should be dropped");
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
+
+/// Both conventional trunks present and origin/HEAD unset → AMBIGUOUS: the
+/// helper must refuse (Err) rather than guess a base for a history rewrite
+/// (same #2662 rationale as the vendored pre-push cleanup's resolver). At the
+/// RED commit the old code blindly picks origin/main here, so this fails too.
+#[test]
+fn clean_empty_init_commits_refuses_ambiguous_dual_trunk() {
+    let (_repo, worktree) = setup_repo_and_worktree("dual_trunk");
+    // Second conventional trunk alongside the fixture's origin/main.
+    let sha = String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&worktree)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git ran")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    std::process::Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/master", &sha])
+        .current_dir(&worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git ran");
+    create_interleaved_commit_chain(&worktree, 1, 0);
+
+    let result = super::clean_empty_init_commits(&worktree);
+    match result {
+        Err(msg) => assert!(
+            msg.contains("ambiguous"),
+            "refusal must name the ambiguity, got: {msg}"
+        ),
+        Ok(n) => panic!("dual-trunk repo must refuse, not rewrite (cleaned {n})"),
+    }
 
     std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
 }
