@@ -192,14 +192,55 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                 }
                 task_class.map(|class| class.as_token().to_string())
             }
-            // Some legacy exact-head and post-merge callers retain a task
-            // correlation before the task board record is available. Keep
-            // those watches on their explicit class; once a task resolves,
-            // the strict authority path above governs it.
-            Err(crate::tasks::TaskRouteError::NotFound) => args["review_class"]
-                .as_str()
-                .filter(|class| !class.is_empty())
-                .map(String::from),
+            // A task id that routes to NO board carries no authority, so an
+            // identified caller must not supply the class itself — that was the
+            // fail-open here: any agent could name a phantom task and stamp its
+            // own class (e.g. `single` onto a dual-required subject).
+            //
+            // The transient the previous comment invoked ("record not yet
+            // available") cannot reach this arm: `route_task` resolves through
+            // the cross-board catalog, whose `route_with_revision` calls
+            // `ensure_fresh()` and reports a not-yet-Ready board as `Unreadable`
+            // — handled by the reject arm below. `NotFound` here means the task
+            // exists nowhere.
+            Err(crate::tasks::TaskRouteError::NotFound) => {
+                let explicit_class = args["review_class"]
+                    .as_str()
+                    .filter(|class| !class.is_empty())
+                    .map(String::from);
+                match (instance_name.is_empty(), explicit_class) {
+                    // The fail-open this arm used to be: an identified caller
+                    // names a task that routes to NO board and stamps its own
+                    // class (e.g. `single` onto a dual-required subject). The
+                    // task carries no authority, so neither does the caller.
+                    (false, Some(_)) => {
+                        return json!({
+                            "error": "task-linked CI watch names a task that routes to no board",
+                            "code": "watch_task_link_unresolved",
+                            "task_id": task_id,
+                        })
+                    }
+                    // Deliberately still allowed: with no class supplied nothing
+                    // is asserted — `review_class` is written below only when
+                    // `Some`, so the sidecar carries none and the merge gate
+                    // still fails closed on the PR state's own Unresolved class.
+                    // Narrowing the gate to the stamping case keeps it surgical.
+                    (false, None) => None,
+                    // Operator override (empty caller) keeps its explicit class,
+                    // but never silently: record who retained which class for
+                    // which task.
+                    (true, Some(class)) => {
+                        crate::event_log::log(
+                            home,
+                            "ci_watch_taskless_class_override",
+                            instance_name,
+                            &format!("task_id={task_id} review_class={class}"),
+                        );
+                        Some(class)
+                    }
+                    (true, None) => None,
+                }
+            }
             Err(error) => {
                 return json!({
                     "error": format!("task-linked CI watch route is unresolved: {error}"),
