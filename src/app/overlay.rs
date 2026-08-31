@@ -91,6 +91,11 @@ pub(super) enum Overlay {
     ConfirmClose {
         target: CloseTarget,
     },
+    ConfirmDeleteInstance {
+        name: String,
+        input: String,
+        notice: Option<String>,
+    },
     TabList {
         selected: usize,
     },
@@ -438,6 +443,42 @@ pub(super) fn handle_key(
             _ => {
                 *overlay = Overlay::None;
             }
+        },
+        Overlay::ConfirmDeleteInstance {
+            name,
+            input,
+            notice,
+        } => match key.code {
+            KeyCode::Enter => {
+                if input == name {
+                    match crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
+                        ctx.home,
+                        name,
+                        None,
+                    ) {
+                        Ok(()) => {
+                            ctx.layout.remove_fleet_instance_views(name);
+                            *overlay = Overlay::None;
+                            outcome.needs_resize = true;
+                        }
+                        Err(error) => {
+                            *notice = Some(error);
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                *overlay = Overlay::None;
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                *notice = None;
+            }
+            KeyCode::Char(c) => {
+                input.push(c);
+                *notice = None;
+            }
+            _ => {}
         },
         Overlay::TabList { ref mut selected } => match key.code {
             KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
@@ -1193,7 +1234,7 @@ mod tests {
             input: "manage".to_string(),
             notice: None,
         };
-        let task_rpc_tx = test_task_channel().0;
+        let task_rpc_tx = test_task_channel().0.clone();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1206,7 +1247,6 @@ mod tests {
         };
 
         handle_key(&mut overlay, press(KeyCode::Enter), &mut ctx);
-        drop(ctx);
         assert!(matches!(
             overlay,
             Overlay::ConfirmDeleteInstance {

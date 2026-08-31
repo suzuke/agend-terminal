@@ -31,6 +31,7 @@ pub enum Action {
     ResizeRight,
     ClosePane,
     CloseTab,
+    DeleteInstance,
     ToggleZoom,
     /// #917: Flip the split direction (H↔V) for the focused pane pair.
     FlipSplit,
@@ -179,6 +180,8 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char('"') => Action::SplitHorizontal,
         KeyCode::Char('%') => Action::SplitVertical,
         KeyCode::Char('o') => Action::CycleFocus,
+        KeyCode::Char('X') => Action::DeleteInstance,
+        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::SHIFT) => Action::DeleteInstance,
         KeyCode::Char('x') => Action::ClosePane,
         KeyCode::Char('z') => Action::ToggleZoom,
         KeyCode::Char(' ') => Action::NextLayout,

@@ -211,7 +211,8 @@ mod tests {
     #[test]
     fn ui_state_routes_shift_x_to_delete_and_plain_x_to_view_close() {
         let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let home = std::env::temp_dir().join(format!("agend-uistate-delete-{}", std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("agend-uistate-delete-{}", std::process::id()));
         std::fs::create_dir_all(&home).ok();
         let fleet_path = home.join("fleet.yaml");
         let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded::<usize>();
@@ -259,7 +260,10 @@ mod tests {
 
         let ctrl_b = KeyEvent::new(KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL);
         ui.handle_key_event(ctrl_b, &mut deps);
-        ui.handle_key_event(KeyEvent::new(KeyCode::Char('X'), crossterm::event::KeyModifiers::NONE), &mut deps);
+        ui.handle_key_event(
+            KeyEvent::new(KeyCode::Char('X'), crossterm::event::KeyModifiers::NONE),
+            &mut deps,
+        );
         assert!(matches!(
             ui.overlay,
             Overlay::ConfirmDeleteInstance { name, input, notice: None }
@@ -269,7 +273,10 @@ mod tests {
         ui.overlay = Overlay::None;
         ui.key_handler = KeyHandler::new();
         ui.handle_key_event(ctrl_b, &mut deps);
-        ui.handle_key_event(KeyEvent::new(KeyCode::Char('x'), crossterm::event::KeyModifiers::NONE), &mut deps);
+        ui.handle_key_event(
+            KeyEvent::new(KeyCode::Char('x'), crossterm::event::KeyModifiers::NONE),
+            &mut deps,
+        );
         assert!(matches!(ui.overlay, Overlay::ConfirmClose { .. }));
 
         std::fs::remove_dir_all(&home).ok();

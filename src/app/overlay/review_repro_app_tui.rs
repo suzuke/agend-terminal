@@ -13,7 +13,7 @@
 //!
 //! The behavioral tests in `overlay.rs` drive the real close entry point with a
 //! registry-backed PTY and fleet fixture. These source invariants additionally
-//! keep destructive lifecycle APIs out of the overlay module and require the
+//! keep destructive lifecycle APIs out of the ConfirmClose arm and require the
 //! unmanaged path to use the pane's authoritative `instance_id`.
 
 #[test]
@@ -56,18 +56,14 @@ fn confirmclose_kills_nonfleet_pane_agent_app_tui() {
 #[test]
 fn confirmclose_never_full_deletes_fleet_instance_app_tui() {
     let src = include_str!("../overlay.rs");
-    let production = src
-        .split("#[cfg(test)]\nmod tests")
-        .next()
-        .expect("overlay production section");
 
     let start = src
         .find("Overlay::ConfirmClose { target } => match key.code {")
         .expect("ConfirmClose handler arm must exist in overlay.rs");
-    let rel_end = src[start..]
-        .find("Overlay::TabList { ref mut selected } => match key.code {")
-        .expect("TabList arm must follow ConfirmClose and bound its block");
-    let block = &src[start..start + rel_end];
+    let delete_start = src
+        .find("Overlay::ConfirmDeleteInstance {\n            name,\n            input,\n            notice,")
+        .expect("ConfirmDeleteInstance handler arm must follow ConfirmClose");
+    let block = &src[start..delete_start];
 
     assert!(block.contains("fleet_instance_name"), "slice sanity");
     for forbidden in [
@@ -79,12 +75,20 @@ fn confirmclose_never_full_deletes_fleet_instance_app_tui() {
         "kill_agent(",
     ] {
         assert!(
-            !production.contains(forbidden),
-            "destructive lifecycle bug: app/overlay.rs must not reference \
-             `{forbidden}` anywhere. A helper outside the ConfirmClose block \
-             could otherwise hide destructive fleet deletion behind one-hop \
-             indirection. Permanent deletion belongs only to the explicit \
-             delete_instance control surface."
+            !block.contains(forbidden),
+            "destructive lifecycle bug: ConfirmClose must not reference \
+             `{forbidden}`. Permanent deletion belongs only to the separate \
+             ConfirmDeleteInstance control surface."
         );
     }
+
+    assert!(
+        delete_start > start,
+        "delete handler must be a separate arm after ConfirmClose"
+    );
+    let delete_block = &src[delete_start..];
+    assert!(
+        delete_block.contains("full_delete_instance_with_runtime"),
+        "the explicit delete arm must call the canonical lifecycle helper"
+    );
 }

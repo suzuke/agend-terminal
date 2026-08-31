@@ -50,7 +50,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
         }
         Action::NewTab => {
             out.new_overlay = Some(Overlay::NewTabMenu {
-                items: super::build_menu_items(ctx.fleet_path, ctx.registry),
+                items: super::build_menu_items(ctx.fleet_path, ctx.registry, ctx.layout),
                 selected: 0,
             });
         }
@@ -130,14 +130,14 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
         }
         Action::SplitVertical => {
             out.new_overlay = Some(Overlay::SplitMenu {
-                items: super::build_menu_items(ctx.fleet_path, ctx.registry),
+                items: super::build_menu_items(ctx.fleet_path, ctx.registry, ctx.layout),
                 selected: 0,
                 dir: SplitDir::Vertical,
             });
         }
         Action::SplitHorizontal => {
             out.new_overlay = Some(Overlay::SplitMenu {
-                items: super::build_menu_items(ctx.fleet_path, ctx.registry),
+                items: super::build_menu_items(ctx.fleet_path, ctx.registry, ctx.layout),
                 selected: 0,
                 dir: SplitDir::Horizontal,
             });
@@ -165,6 +165,20 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             out.new_overlay = Some(Overlay::ConfirmClose {
                 target: CloseTarget::Tab,
             });
+        }
+        Action::DeleteInstance => {
+            if let Some(name) = ctx
+                .layout
+                .active_tab()
+                .and_then(|tab| tab.focused_pane())
+                .and_then(|pane| pane.fleet_instance_name.clone())
+            {
+                out.new_overlay = Some(Overlay::ConfirmDeleteInstance {
+                    name,
+                    input: String::new(),
+                    notice: None,
+                });
+            }
         }
         Action::FocusUp => {
             if let Some(tab) = ctx.layout.active_tab_mut() {

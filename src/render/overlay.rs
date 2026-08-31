@@ -256,6 +256,7 @@ pub fn render_help(frame: &mut Frame) {
         "    Drag title     Swap pane position",
         "    Drag → tab bar Move pane across tabs (drop on tab or [+])",
         "    Ctrl+B x       Close pane",
+        "    Ctrl+B X       Delete fleet instance (type exact name)",
         "    Ctrl+B z       Toggle zoom",
         "    Ctrl+B Space   Next layout preset",
         "    Ctrl+B .       Rename pane",

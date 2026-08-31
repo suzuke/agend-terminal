@@ -8,14 +8,18 @@ use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
 use crate::layout::{Layout, Pane};
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 const FUGU_BACKEND_MENU_LABEL: &str = "[backend] Codex(Sakana)";
 
 /// Build menu items for new-tab selection.
 /// Fleet instances already running in the registry are excluded.
-pub(super) fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> Vec<MenuItem> {
+pub(super) fn build_menu_items(
+    fleet_path: &Path,
+    registry: &AgentRegistry,
+    layout: &Layout,
+) -> Vec<MenuItem> {
     let mut items = Vec::new();
 
     // Collect already-running agent names
@@ -23,6 +27,7 @@ pub(super) fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> V
         let reg = agent::lock_registry(registry);
         reg.values().map(|h| h.name.to_string()).collect()
     };
+    let attached = attached_fleet_names(layout);
 
     if let Ok(fleet) = crate::fleet::FleetConfig::load(fleet_path) {
         let mut names = fleet.instance_names();
@@ -32,7 +37,7 @@ pub(super) fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> V
             let already_open = running
                 .iter()
                 .any(|r| r == &name || r.starts_with(&format!("{name}-")));
-            if already_open {
+            if already_open || attached.contains(&name) {
                 continue;
             }
             let label = if let Some(resolved) = fleet.resolve_instance(&name) {
@@ -73,6 +78,22 @@ pub(super) fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> V
     });
 
     items
+}
+
+/// Collect exact fleet instance names attached to panes across every tab.
+/// Local shells have no fleet name and therefore never suppress a menu entry.
+pub(super) fn attached_fleet_names(layout: &Layout) -> HashSet<String> {
+    layout
+        .tabs
+        .iter()
+        .flat_map(|tab| {
+            tab.root()
+                .pane_ids()
+                .into_iter()
+                .filter_map(|id| tab.root().find_pane(id))
+                .filter_map(|pane| pane.fleet_instance_name.clone())
+        })
+        .collect()
 }
 
 /// Create a pane from a menu item selection (shared by NewTab and Split handlers).

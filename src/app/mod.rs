@@ -308,6 +308,18 @@ fn render_active_overlay(
             };
             render::render_confirm(frame, msg);
         }
+        Overlay::ConfirmDeleteInstance {
+            name,
+            input,
+            notice,
+        } => {
+            let mut msg = format!("Type '{name}' to delete: {input}");
+            if let Some(notice) = notice {
+                msg.push_str(" — ");
+                msg.push_str(notice);
+            }
+            render::render_confirm(frame, &msg);
+        }
         Overlay::TabList { selected } => {
             render::render_tab_list(frame, layout, *selected);
         }

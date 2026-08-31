@@ -134,7 +134,7 @@ fn handle_down(
             }
             Some(TabBarClick::NewTab) => {
                 out.new_overlay = Some(Overlay::NewTabMenu {
-                    items: super::build_menu_items(fleet_path, registry),
+                    items: super::build_menu_items(fleet_path, registry, layout),
                     selected: 0,
                 });
             }

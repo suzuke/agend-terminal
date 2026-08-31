@@ -249,6 +249,40 @@ impl Layout {
         Some(tab)
     }
 
+    /// Remove every view of an exact fleet instance name across all tabs.
+    /// Target-only tabs disappear; mixed tabs retain their other panes.
+    pub fn remove_fleet_instance_views(&mut self, name: &str) -> bool {
+        let mut removed = false;
+        for tab_idx in (0..self.tabs.len()).rev() {
+            let matching_ids: Vec<usize> = self.tabs[tab_idx]
+                .root()
+                .pane_ids()
+                .into_iter()
+                .filter(|&id| {
+                    self.tabs[tab_idx]
+                        .root()
+                        .find_pane(id)
+                        .and_then(|pane| pane.fleet_instance_name.as_deref())
+                        == Some(name)
+                })
+                .collect();
+            if matching_ids.is_empty() {
+                continue;
+            }
+            if matching_ids.len() == self.tabs[tab_idx].root().pane_count() {
+                self.close_tab(tab_idx);
+                removed = true;
+                continue;
+            }
+            for pane_id in matching_ids {
+                if self.tabs[tab_idx].close_pane_by_id(pane_id).is_some() {
+                    removed = true;
+                }
+            }
+        }
+        removed
+    }
+
     /// Move a pane from one tab to another, preserving its VTerm, scrollback,
     /// and PTY subscription (unlike close + attach, which rebuilds state).
     pub fn move_pane_across_tabs(
@@ -711,7 +745,10 @@ mod tests {
         assert!(layout.remove_fleet_instance_views("managed"));
         assert_eq!(layout.tabs.len(), 1);
         assert_eq!(layout.tabs[0].root().pane_count(), 1);
-        assert_eq!(layout.tabs[0].root().first_pane().agent_name.as_str(), "shell");
+        assert_eq!(
+            layout.tabs[0].root().first_pane().agent_name.as_str(),
+            "shell"
+        );
         assert!(layout
             .tabs
             .iter()

@@ -5,7 +5,7 @@
 //!
 //! Public surface:
 //! - `full_delete_instance` — used by the MCP `delete_instance` handler
-//!   (`super::handle_delete_instance`) and the TUI close
+//!   (`super::handle_delete_instance`) and the TUI's explicit instance-delete
 //!   path (`crate::app::overlay`). Returns `Result<(), String>`; `Err`
 //!   carries the residual-store audit so callers can surface partial
 //!   state instead of letting `auto_start_fleet` resurrect the
@@ -81,11 +81,11 @@ pub(crate) fn delete_with_runtime_or_legacy(
 }
 
 /// Sprint 53 Smoke 2 r1: shared full single-instance teardown used by both
-/// the MCP `delete_instance` handler and the TUI close path
-/// (`app/overlay.rs::Overlay::ConfirmClose`). Covers everything
+/// the MCP `delete_instance` handler and the TUI explicit instance-delete
+/// path (`app/overlay.rs::Overlay::ConfirmDeleteInstance`). Covers everything
 /// `handle_delete_instance` historically did EXCEPT the channel-singleton
-/// guard, which stays MCP-only — TUI close is operator-driven and we don't
-/// want to refuse a close because of channel routing.
+/// guard, which stays MCP-only — TUI deletion is operator-driven and we don't
+/// want to refuse it because of channel routing.
 ///
 /// Side effects, all expected for both call sites:
 /// - **PTY kill + child-tree reap** via `daemon::lifecycle::delete_transaction`
