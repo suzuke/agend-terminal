@@ -549,6 +549,19 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         raw: Some(msg),
     };
     let wt_path = if let Some(wt) = reuse_live_worktree {
+        // #2755 follow-up A: this tree is REUSED VERBATIM, so it may hold the
+        // occupant's uncommitted work. Never repair it here — `init_submodules_strict`
+        // MUTATES, which is the very wipe #2158 exists to prevent. Prove it instead,
+        // read-only, and reject if its submodules are not at the recorded gitlinks.
+        if let Err(e) = crate::worktree::verify_submodules_at_gitlinks(&wt) {
+            return Err(lease_err(
+                false,
+                format!(
+                    "reused worktree '{}' has submodules not at their recorded gitlinks: {e}                      (not repaired here — that would overwrite uncommitted work;                      release_worktree and re-provision, or fix the submodules in place)",
+                    wt.display()
+                ),
+            ));
+        }
         wt // #2158 partial-skip: reuse verbatim — NO lease/`sync_worktree_to_head` reset (wipe)
     } else if workspace_b {
         // (B): reconcile → free `branch` from stale legacy holders (work-at-risk

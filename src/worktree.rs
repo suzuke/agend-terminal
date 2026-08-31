@@ -201,6 +201,19 @@ pub fn create(
                     // for uniformity with the same-branch path below — a clean
                     // tree is a no-op (see sync_worktree_to_head early return).
                     sync_worktree_to_head(&wt_dir);
+                    // #2755 follow-up A: a REUSED tree is verified, never repaired
+                    // — `init_submodules_strict` mutates, and this path must not
+                    // touch an occupant's tree. Read-only proof, reject on failure.
+                    if let Err(e) = verify_submodules_at_gitlinks(&wt_dir) {
+                        tracing::warn!(
+                            instance = instance_name,
+                            path = %wt_dir.display(),
+                            error = %e,
+                            "reused worktree submodules are not at their recorded \
+                             gitlinks — rejecting (verify-only, tree left untouched)"
+                        );
+                        return None;
+                    }
                     return Some(WorktreeInfo {
                         path: wt_dir,
                         source_repo: repo_dir.to_path_buf(),
@@ -232,6 +245,17 @@ pub fn create(
         // hand-off. Force-sync to HEAD before returning so the new occupant gets
         // a clean tree at the current SHA.
         sync_worktree_to_head(&wt_dir);
+        // #2755 follow-up A: verify-only on reuse (see the drifted-reattach path).
+        if let Err(e) = verify_submodules_at_gitlinks(&wt_dir) {
+            tracing::warn!(
+                instance = instance_name,
+                path = %wt_dir.display(),
+                error = %e,
+                "reused worktree submodules are not at their recorded gitlinks — \
+                 rejecting (verify-only, tree left untouched)"
+            );
+            return None;
+        }
         return Some(WorktreeInfo {
             path: wt_dir,
             source_repo: repo_dir.to_path_buf(),
@@ -312,8 +336,31 @@ pub fn create(
                 return None;
             }
             // Fresh worktree: `git worktree add` copies gitlinks + .gitmodules
-            // but does NOT populate submodule content — init recursively here.
-            init_submodules_after_create(&wt_dir);
+            // but does NOT populate submodule content — init recursively, then
+            // PROVE the result. #2755 follow-up A: fail-closed for EVERY caller,
+            // deliberately including `instance_state/spawn.rs` boot — a tree whose
+            // nested content is missing is not build-ready, and the previous
+            // soft-warn let exactly that reach dispatch. Single contract, no
+            // strictness flag: free today because no managed source repo carries
+            // `.gitmodules`; revisit this if one ever does.
+            if let Err(e) = provision_submodules_fresh(&wt_dir) {
+                tracing::warn!(
+                    instance = instance_name,
+                    path = %wt_dir.display(),
+                    error = %e,
+                    "submodule provisioning failed — rolling back fresh worktree (fail-closed)"
+                );
+                let _ = git_cmd(
+                    repo_dir,
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        &wt_dir.display().to_string(),
+                    ],
+                );
+                return None;
+            }
             Some(WorktreeInfo {
                 path: wt_dir,
                 source_repo: repo_dir.to_path_buf(),
@@ -377,7 +424,25 @@ pub fn create(
                         );
                         return None;
                     }
-                    init_submodules_after_create(&wt_dir);
+                    // Same fail-closed contract as the -b path above.
+                    if let Err(e) = provision_submodules_fresh(&wt_dir) {
+                        tracing::warn!(
+                            instance = instance_name,
+                            path = %wt_dir.display(),
+                            error = %e,
+                            "submodule provisioning failed — rolling back fresh worktree (fail-closed)"
+                        );
+                        let _ = git_cmd(
+                            repo_dir,
+                            &[
+                                "worktree",
+                                "remove",
+                                "--force",
+                                &wt_dir.display().to_string(),
+                            ],
+                        );
+                        return None;
+                    }
                     Some(WorktreeInfo {
                         path: wt_dir,
                         source_repo: repo_dir.to_path_buf(),
@@ -441,29 +506,17 @@ fn warn_worktree_add_spawn_err(e: &std::io::Error) {
 /// `-c protocol.file.allow=always` is intentional: git's submodule clone helper
 /// ignores the superproject's local `protocol.file.allow` config (security
 /// default post-2.38), so hermetic file-path submodule fixtures — and rare
-/// local-path submodules — need the command-line override. https/ssh remotes
-/// are unaffected (file protocol only).
-fn init_submodules_after_create(wt_dir: &Path) {
-    if !wt_dir.join(".gitmodules").is_file() {
-        return;
-    }
-    match init_submodules_strict(wt_dir) {
-        Ok(()) => {
-            tracing::info!(
-                path = %wt_dir.display(),
-                "initialized submodules after worktree create"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %wt_dir.display(),
-                error = %e,
-                "submodule update --init --recursive failed after worktree create \
-                 (soft-warn: lease still succeeds; nested content may be missing — \
-                 run: git -C <worktree> submodule update --init --recursive)"
-            );
-        }
-    }
+/// #2755 follow-up A: fresh-tree submodule provisioning, FAIL-CLOSED.
+///
+/// Init recursively, then PROVE the tree is at the superproject's recorded
+/// gitlinks. Returns the git reason on failure; the caller rolls the fresh
+/// worktree back through the same path a failed managed-marker write uses.
+/// This replaced a soft-warn wrapper whose own message conceded the outcome
+/// ("lease still succeeds; nested content may be missing") — that warning was
+/// the bug: a half-provisioned tree reached dispatch as a success.
+fn provision_submodules_fresh(wt_dir: &Path) -> Result<(), String> {
+    init_submodules_strict(wt_dir)?;
+    verify_submodules_at_gitlinks(wt_dir)
 }
 
 /// #2755: recursively initialize submodules in a freshly-added worktree, returning
