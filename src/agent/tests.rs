@@ -2810,6 +2810,34 @@ fn inject_handle_footgun_removed_uses_snapshots_f1() {
     );
 }
 
+/// t-…-75305-27 RED: the footgun ban above reads ONE file. `bootstrap_wait.rs`
+/// was extracted out of `mod.rs` carrying exactly this surface — the readiness
+/// waiters that hand back an `InjectTarget` — so `pub fn inject_to_agent(` can be
+/// re-homed into that sibling and the ban stays green while the footgun is back.
+/// Pin the COVERAGE, not just the absence: the ban must read every agent-module
+/// source that carries the surface. Explicit list, no directory walk.
+///
+/// Structural and deterministic: it reads the guard's own body, so it fails the
+/// moment the ban's file set stops naming a source the surface lives in.
+#[test]
+fn inject_footgun_ban_covers_the_extracted_bootstrap_wait_sibling_f1() {
+    let suite = include_str!("tests.rs");
+    let start = suite
+        .find("fn inject_handle_footgun_removed_uses_snapshots_f1()")
+        .expect("the #1530/F1 footgun guard must exist");
+    let rest = &suite[start..];
+    let end = rest.find("\n}\n").expect("guard body is brace-terminated");
+    let guard_body = &rest[..end];
+    for source in ["mod.rs", "bootstrap_wait.rs"] {
+        assert!(
+            guard_body.contains(&format!("include_str!(\"{source}\")")),
+            "#1530/F1 coverage: the footgun ban must scan `{source}` — a source \
+             carrying the inject-target surface that is not scanned is a free \
+             re-home for the banned `pub fn inject_to_agent(`"
+        );
+    }
+}
+
 /// #1146 reviewer fix: inject_with_target must skip if the agent
 /// was deleted between snapshot and inject (delete/reuse race).
 /// The deleted flag is an Arc<AtomicBool> shared with AgentHandle,
