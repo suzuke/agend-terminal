@@ -2307,9 +2307,14 @@ fn create_instance_relative_path_rejection() {
 fn create_instance_explicit_working_directory_used() {
     let _g = fleet_test_guard();
     let (_rec, _home) = setup_recorder("explicit-wd");
+    let working_directory = if cfg!(windows) {
+        r"C:\tmp\my-workspace"
+    } else {
+        "/tmp/my-workspace"
+    };
     let r = super::handle_tool(
         "create_instance",
-        &json!({"name": "test-explicit", "backend": "claude", "working_directory": "/tmp/my-workspace"}),
+        &json!({"name": "test-explicit", "backend": "claude", "working_directory": working_directory}),
         "operator",
     );
     // Explicit valid path must pass validation (.. and absolute checks)
