@@ -151,6 +151,13 @@ mod exact_head_watch_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod exact_head_merge_tests;
 
+// Canonical merge review-threshold enforcement — real-entry RED/GREEN tests in
+// a sibling file so the handler remains focused on the production path.
+#[cfg(test)]
+#[path = "review_threshold_merge_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod review_threshold_merge_tests;
+
 // #2812 notification-only watch — guard and contract tests in a sibling file.
 #[cfg(test)]
 #[path = "notification_only_watch_tests.rs"]
