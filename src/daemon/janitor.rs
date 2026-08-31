@@ -112,6 +112,10 @@ mod tests {
     // signals)" is locked by the GC/sweep/auto caller pins staying green through
     // the D5 refactor; these lock the switch's internal routing directly. The
     // Keep/Delete/Archive-None arms exercised here perform no I/O, so `home` is inert.
+    // The Delete arm acquires the per-agent lifecycle permit, whose identity is
+    // `(home, agent)`. `inert_home()` is shared, so every Delete-arm test here
+    // MUST pass a distinct agent name or the two would contend under the default
+    // thread-parallel harness and one would fail closed on the other's permit.
     fn inert_home() -> std::path::PathBuf {
         std::path::PathBuf::from("/nonexistent-d5-janitor-test")
     }
@@ -119,10 +123,16 @@ mod tests {
     #[test]
     fn dispose_delete_runs_only_the_caller_remover() {
         let called = Cell::new(false);
-        let out = dispose(&inert_home(), Disposition::Delete, "", None, || {
-            called.set(true);
-            Ok(())
-        });
+        let out = dispose(
+            &inert_home(),
+            Disposition::Delete,
+            "janitor-delete-runs-remover",
+            None,
+            || {
+                called.set(true);
+                Ok(())
+            },
+        );
         assert!(called.get(), "Delete must invoke the caller's remover");
         assert!(matches!(out, DispositionOutcome::Deleted(Ok(()))));
     }
@@ -130,9 +140,13 @@ mod tests {
     #[test]
     fn dispose_delete_forwards_remover_error_verbatim() {
         // GC's #2550 archive-fallthrough keys on this exact reason string.
-        let out = dispose(&inert_home(), Disposition::Delete, "", None, || {
-            Err("git worktree remove failed: boom".to_string())
-        });
+        let out = dispose(
+            &inert_home(),
+            Disposition::Delete,
+            "janitor-delete-forwards-err",
+            None,
+            || Err("git worktree remove failed: boom".to_string()),
+        );
         match out {
             DispositionOutcome::Deleted(Err(reason)) => {
                 assert_eq!(reason, "git worktree remove failed: boom");
@@ -170,5 +184,33 @@ mod tests {
             matches!(out, DispositionOutcome::Kept),
             "Archive without a candidate → fail-closed Keep"
         );
+    }
+
+    #[test]
+    fn dispose_delete_refuses_when_lifecycle_permit_is_already_held() {
+        let home =
+            std::env::temp_dir().join(format!("agend-janitor-permit-{}", std::process::id()));
+        let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+            &home,
+            "janitor-agent",
+            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+        )
+        .expect("test permit");
+        let called = Cell::new(false);
+        let out = dispose(&home, Disposition::Delete, "janitor-agent", None, || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(
+            !called.get(),
+            "a contended lifecycle transaction must not delete"
+        );
+        match out {
+            DispositionOutcome::Deleted(Err(reason)) => {
+                assert!(reason.contains("lifecycle transaction already in flight"));
+            }
+            _ => panic!("contended janitor delete must fail closed"),
+        }
+        drop(permit);
     }
 }

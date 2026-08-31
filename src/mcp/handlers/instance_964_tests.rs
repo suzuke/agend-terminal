@@ -36,6 +36,35 @@ fn tmp_home(slug: &str) -> std::path::PathBuf {
     dir
 }
 
+fn git_source_repo(home: &Path, slug: &str) -> std::path::PathBuf {
+    let repo = home.join(format!("source-{slug}"));
+    std::fs::create_dir_all(&repo).unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git init failed");
+    let status = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@test",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git commit failed");
+    repo
+}
+
 /// T1 (load-bearing): MCP create_instance must persist `topic_id` to
 /// topics.json on the happy path. The mock `spawn_fn` mimics
 /// `handle_spawn`'s `register_topic` chain: it calls
@@ -167,6 +196,105 @@ fn t2b_api_unavailable_rolls_back_fleet_yaml_entry() {
         cfg.instance_names()
     );
 
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The create path is a lifecycle actor: it must acquire its per-agent permit
+/// before creating the branch worktree. This is the reverse start order of the
+/// create-first race below, and deliberately has no timing dependence.
+#[test]
+fn create_instance_branch_refuses_when_release_holds_lifecycle_permit() {
+    let home = tmp_home("lifecycle-create-contended");
+    let source = git_source_repo(&home, "contended");
+    let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &home,
+        "contended-agent",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    )
+    .expect("test permit");
+    let called = std::cell::Cell::new(false);
+    let spawn_fn = |_h: &Path, _req: &Value| -> anyhow::Result<Value> {
+        called.set(true);
+        Ok(json!({"ok": true, "result": {}}))
+    };
+
+    let result = spawn_single_instance_impl(
+        &home,
+        "test-spawner",
+        &json!({
+            "name": "contended-agent",
+            "backend": "claude",
+            "branch": "feat/contended",
+            "working_directory": source,
+        }),
+        &spawn_fn,
+        None,
+    );
+
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("lifecycle transaction already in flight")),
+        "create must fail before worktree creation when the permit is held: {result}"
+    );
+    assert!(!called.get(), "contended create must not reach SPAWN");
+    assert!(
+        !crate::worktree::worktree_path(&home, "contended-agent", "feat/contended").exists(),
+        "contended create must not create a worktree"
+    );
+    drop(permit);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The create-first direction must hold the same permit through worktree
+/// creation and registration. The injected SPAWN callback is the deterministic
+/// rendezvous: no sleeps or timing assumptions are involved.
+#[test]
+fn create_instance_branch_holds_lifecycle_permit_through_spawn() {
+    let home = tmp_home("lifecycle-create-first");
+    let source = git_source_repo(&home, "create-first");
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let home_for_thread = home.clone();
+    let source_for_thread = source.clone();
+    let creator = std::thread::spawn(move || {
+        let spawn_fn = move |_h: &Path, _req: &Value| -> anyhow::Result<Value> {
+            entered_tx.send(()).expect("creator reached SPAWN");
+            resume_rx.recv().expect("resume creator");
+            Ok(json!({"ok": true, "result": {}}))
+        };
+        spawn_single_instance_impl(
+            &home_for_thread,
+            "test-spawner",
+            &json!({
+                "name": "create-first-agent",
+                "backend": "claude",
+                "branch": "feat/create-first",
+                "working_directory": source_for_thread,
+            }),
+            &spawn_fn,
+            None,
+        )
+    });
+
+    entered_rx.recv().expect("creator entered SPAWN");
+    let competing = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &home,
+        "create-first-agent",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
+    );
+    assert!(
+        competing
+            .as_ref()
+            .is_err_and(|error| error.contains("lifecycle transaction already in flight")),
+        "release/delete must be refused while create owns the permit: {competing:?}"
+    );
+    resume_tx.send(()).expect("resume creator");
+    let result = creator.join().expect("creator thread");
+    assert!(
+        result["error"].is_null(),
+        "creator should succeed: {result}"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 

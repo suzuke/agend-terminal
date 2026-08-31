@@ -48,6 +48,11 @@
 
 use std::path::{Path, PathBuf};
 
+// Shared with `spawn_rationale_audit` — see that file's note. `#[path]` pulls in
+// ONLY this helper, not the rest of `tests/common/`.
+#[path = "common/test_module_decl.rs"]
+mod test_module_decl;
+
 const SRC_DIR: &str = "src";
 const CFG_TEST: &str = "#[cfg(test)]";
 const GIT_CMD: &str = "Command::new(\"git\")";
@@ -160,6 +165,11 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
             // prod-boundary heuristic can't see it's test-only).
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             if stem == "tests" || stem == "test" {
+                continue;
+            }
+            // …and a sibling test module under any other name, declared
+            // `#[cfg(test)] mod <stem>;` by its owning module.
+            if test_module_decl::is_cfg_test_module_file(&path) {
                 continue;
             }
             out.push(path);

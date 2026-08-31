@@ -21,6 +21,12 @@
 
 use std::path::{Path, PathBuf};
 
+// Shared with `tty_leak_invariant`: both exempt test code and both previously
+// missed a plain `#[cfg(test)] mod <stem>;` sibling module. `#[path]` pulls in ONLY
+// this helper, not the rest of `tests/common/` (the daemon harness).
+#[path = "common/test_module_decl.rs"]
+mod test_module_decl;
+
 /// Files exempted from the rule because their spawn sites are pre-existing
 /// legacy (not covered by Sprint 21 Phase 5 dispatch scope, which targets
 /// `src/daemon/`, `src/agent.rs`, `src/instance_monitor.rs`,
@@ -121,6 +127,12 @@ fn is_exempted_file(rel_path: &str) -> bool {
 /// Test-only file detection: files loaded via `#[cfg(test)] #[path = "file.rs"]`
 /// in a parent module are entirely test code and should be skipped.
 fn is_test_only_file(path: &Path) -> bool {
+    // A sibling test module under any name — the owning module declares it
+    // `#[cfg(test)] mod <stem>;`, so the file itself carries no inline cfg for the
+    // heuristics below to find.
+    if test_module_decl::is_cfg_test_module_file(path) {
+        return true;
+    }
     // Conventional `foo.rs` + `foo/tests.rs` split: a `tests.rs` submodule is
     // entirely test code (declared `#[cfg(test)] mod tests;` in the owning
     // module file one directory up — not a sibling, so the `#[path]` heuristic
