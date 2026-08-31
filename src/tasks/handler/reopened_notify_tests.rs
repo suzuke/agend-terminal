@@ -24,10 +24,7 @@ fn tmp_home(name: &str) -> std::path::PathBuf {
 }
 
 /// Drain `agent`'s inbox and keep only `task_reopened` rows.
-fn reopened_rows(
-    home: &std::path::Path,
-    agent: &str,
-) -> Vec<crate::inbox::message::InboxMessage> {
+fn reopened_rows(home: &std::path::Path, agent: &str) -> Vec<crate::inbox::message::InboxMessage> {
     crate::inbox::storage::drain(home, agent)
         .into_iter()
         .filter(|m| m.kind.as_deref() == Some("task_reopened"))
@@ -71,12 +68,7 @@ fn create_task(home: &std::path::Path, assignee: Option<&str>) -> String {
         .to_string()
 }
 
-fn set_status(
-    home: &std::path::Path,
-    caller: &str,
-    id: &str,
-    status: &str,
-) -> serde_json::Value {
+fn set_status(home: &std::path::Path, caller: &str, id: &str, status: &str) -> serde_json::Value {
     handle(
         home,
         caller,
@@ -136,7 +128,11 @@ fn owned_done_to_open_enqueues_exactly_one_row_15764_33() {
     assert_updated(&set_status(&home, "dev-agent", &id, "done"));
     assert_updated(&set_status(&home, "dev-agent", &id, "open"));
     let second = reopened_rows(&home, "dev-agent");
-    assert_eq!(second.len(), 1, "fresh row per reopen generation: {second:?}");
+    assert_eq!(
+        second.len(),
+        1,
+        "fresh row per reopen generation: {second:?}"
+    );
     assert_ne!(
         second[0].id, row.id,
         "second generation must be a NEW durable row, not a reuse"
@@ -313,12 +309,19 @@ fn team_owned_reopen_routes_to_orchestrator_15764_33() {
             "orchestrator": "orch-1",
         }),
     );
-    assert!(created.get("error").is_none(), "team create failed: {created}");
+    assert!(
+        created.get("error").is_none(),
+        "team create failed: {created}"
+    );
     let id = create_task(&home, Some("team-x"));
     assert_updated(&set_status(&home, "orch-1", &id, "done"));
     assert_updated(&set_status(&home, "orch-1", &id, "open"));
     let orch_rows = reopened_rows(&home, "orch-1");
-    assert_eq!(orch_rows.len(), 1, "orchestrator gets the row: {orch_rows:?}");
+    assert_eq!(
+        orch_rows.len(),
+        1,
+        "orchestrator gets the row: {orch_rows:?}"
+    );
     assert!(
         orch_rows[0].text.contains("team-x"),
         "row names the preserved team owner: {}",
