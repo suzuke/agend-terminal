@@ -152,14 +152,15 @@ gh run view <run-id> --log-failed
 ### 3.12 判定外部化（原 §3.5.13）
 Fleet 內部判定 MUST 透過作用中的 SCM 提供者同步至 PR（GitHub 上使用 `gh pr comment`）。套用 §3.5 的合併權限矩陣：作者／實作者自行合併需要雙重 VERIFIED；協調器合併則使用該任務的審查類別；§3.6 僅文件的操作員例外仍須明確列出。CI 綠燈 + 必要的判定同步永遠是必要條件。
 
-**標準合併步驟：`repo({action:"merge", pr:<N>, repository:"<owner/repo>"})`**（MCP `repo` 工具 → `handle_merge_repo`，`src/mcp/handlers/ci/mod.rs`）。它發出的合併與原始 `gh` 呼叫在位元組層級**完全相同**（`gh pr merge <N> --repo R --admin --squash --delete-branch`，由 `scm::tests::pr_merge_args_match_existing_gh_call` 鎖定），但包覆了原始命令欠缺的三層安全網：
+**標準合併步驟：`repo({action:"merge", pr:<N>, repository:"<owner/repo>"})`**（MCP `repo` 工具 → `handle_merge_repo`，`src/mcp/handlers/ci/mod.rs`）。它發出的合併與原始 `gh` 呼叫在位元組層級**完全相同**（`gh pr merge <N> --repo R --admin --squash --delete-branch`，由 `scm::tests::pr_merge_args_match_existing_gh_call` 鎖定），但包覆了原始命令欠缺的四層安全網：
 1. **安全的儲存庫解析（#1619）** — 透過 `resolve_repo_or_error` 解析目標 `owner/repo`；偵測失敗時會報錯，而不是默默對硬編碼／維護者的儲存庫執行合併。
 2. **CI 失敗即關閉閘門** — 先執行 `pr checks`（透過 `ScmProvider`）；任何非 `SUCCESS`/`SKIPPED` 的檢查，或任何無法判定的結果，都會拒絕合併。僅能用 `force=true` + 非空的 `force_reason` 繞過（稽核記錄於 `fleet_events.jsonl`）。
 3. **`verify_merge_landed`（#1467）** — `gh pr merge` 以 0 結束是必要條件，但並不充分（合併佇列／最終一致性可能在尚未實際合併時就以 0 結束）；它會再次 `view` PR，並回報 `merged:false, pending:true`，而非誤報成功，讓呼叫端重新查詢，而不是盲目再次合併。
+4. **精確 head 審查門檻閘門（#3419）** — 非 force 的 CI、base-drift 與 freshness 閘門接受精確取得的 head 後，載入相同 repo／PR／branch／head 的持久化 `PrState` 主體；若審查鏈結、類別／指派權威或當前 head 的 VERIFIED receipt 不符合門檻，便以 typed `MergeDeficit` 結果拒絕。`force=true` 且 `force_reason` 非空，是此審查閘門唯一經稽核的繞過方式；精確 head/base 取得與合併前 identity recheck 仍不可繞過。
 
 它也會透過 `ScmProvider` 路由（平台無關 — 並未硬接至 `gh`）。
 
-⚠ **閘門的範圍：** `repo action=merge` 會對 **CI 失敗即關閉**設閘，而不是對審查判定設閘。上述雙重 VERIFIED 要求仍是由協調器強制執行的 **fleet 慣例**（派發審查者 → 等候 `VERIFIED` → 接著執行 `repo action=merge`）— 此變更並不會讓審查成為合併原語的硬性前置條件。
+⚠ **閘門的範圍：** 標準的非 force `repo action=merge` 會受到 CI 失敗即關閉、base-drift/freshness 與精確 head 審查門檻的約束；審查是硬性前置條件，不只是 fleet 慣例。`force=true` + 非空 `force_reason` 路徑是上文所述、經稽核的審查門檻繞過方式。原始 `gh` 備援仍在此常駐程式審查閘門之外，因此不受此原語的審查閘門約束；僅依下文記載的緊急／分支保護規則使用。
 
 **備援（緊急情況／MCP 無法使用）：** 原始 `gh pr merge <N>` — `--auto --squash --delete-branch` 形式（§3.12.1，伺服器端佇列；需要嚴格的分支保護）或同步的 `--admin --squash --delete-branch` 形式（佇列競爭復原／管理員繞過，依 #985/#988 的偏離先例）。優先使用 MCP 原語；僅在 MCP 路徑無法執行時才降級使用原始 `gh`。
 
