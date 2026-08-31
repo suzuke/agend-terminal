@@ -171,3 +171,42 @@ fn inline_module_body_does_not_exempt_a_sibling_file() {
         "an inline module with a body owns that body and does not declare the sibling file"
     );
 }
+
+#[test]
+fn dual_cfg_split_declaration_is_not_test_only() {
+    // The shape this correction exists for: the SAME file declared twice, split by
+    // cfg and visibility. The `not(test)` arm compiles it into every production
+    // build, so the file is production and must stay in the invariant scan even
+    // though a test-only declaration of the same name also exists.
+    assert!(
+        !probe(
+            "#[cfg(not(test))]\npub(super) mod sibling_probe;\n\
+             #[cfg(test)]\npub(crate) mod sibling_probe;\n"
+        ),
+        "a cfg-split pair compiles the file in production builds"
+    );
+    assert!(
+        !probe(
+            "#[cfg(test)]\npub(crate) mod sibling_probe;\n\
+             #[cfg(not(test))]\npub(super) mod sibling_probe;\n"
+        ),
+        "declaration order must not change the verdict"
+    );
+}
+
+#[test]
+fn production_spawn_module_stays_in_invariant_scope() {
+    // Real entry rather than a fixture: `mcp/handlers/instance_state/mod.rs`
+    // declares `spawn.rs` under BOTH cfg arms, so it ships in production builds.
+    // It holds the create_instance SPAWN path, which is exactly the kind of file
+    // the consuming invariants exist to police — it must never be exempted.
+    let spawn = Path::new("src/mcp/handlers/instance_state/spawn.rs");
+    assert!(
+        spawn.exists(),
+        "production spawn module must exist: {spawn:?}"
+    );
+    assert!(
+        !is_cfg_test_module_file(spawn),
+        "the production create_instance SPAWN path must stay in the invariant scan"
+    );
+}
