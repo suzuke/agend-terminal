@@ -376,9 +376,12 @@ fn serve_inner(
     // #1189: write `.ready` in app (TUI) mode after confirmed bind success.
     // Daemon mode writes `.ready` later (after spawn loop) with richer semantics.
     if notifier.is_some() {
-        let ready_path = run_dir.join(".ready");
-        if let Err(e) = std::fs::write(&ready_path, chrono::Utc::now().to_rfc3339()) {
-            tracing::warn!(path = %ready_path.display(), error = %e, "failed to write .ready marker");
+        if let Err(e) = crate::ready::write(&run_dir) {
+            tracing::warn!(
+                path = %run_dir.join(crate::ready::FILENAME).display(),
+                error = %e,
+                "failed to write .ready marker"
+            );
         }
     }
 

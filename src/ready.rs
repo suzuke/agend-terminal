@@ -17,6 +17,124 @@
 //! identity (liveness, PID reuse, on-disk `--version`) and acting on a mismatch
 //! are deliberately NOT here.
 
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// The historical marker filename. Unchanged — existence consumers depend on it.
+pub const FILENAME: &str = ".ready";
+
+/// Current marker schema. A reader that sees anything higher reports
+/// [`UnknownReason::FutureSchema`] rather than guessing.
+pub const SCHEMA_VERSION: u8 = 1;
+
+/// Identity of the process that published the marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyMarker {
+    pub schema_version: u8,
+    pub pid: u32,
+    /// OS process-start identity token for the recorded `pid`, so a later
+    /// reader can tell the same process from a PID reuse. `0` means the token
+    /// was not determinable when the marker was written — never a match.
+    pub started_at: u64,
+    /// Absolute path of the executable that was running. Empty means
+    /// `current_exe()` failed; the marker is still published, because
+    /// existence semantics matter more than identity completeness.
+    pub exe: PathBuf,
+    pub build_sha: String,
+    pub build_dirty: bool,
+    pub version: String,
+}
+
+/// Why a marker on disk carries no usable identity.
+///
+/// The reader half below is consumed by tests in this slice; its production
+/// consumer is the doctor gate, which is deliberately a separate slice. Pinned
+/// here as the stable surface that gate will read, mirroring the same
+/// `#[allow(dead_code)]` rationale on `cli::HelperStaleness::as_str`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnknownReason {
+    /// A pre-schema marker: the RFC3339 timestamp both writers used before
+    /// this slice, or the literal `ready` fixture payload.
+    LegacyText,
+    /// Present but unparseable as the schema it claims.
+    Malformed,
+    /// Written by a newer build than this one.
+    FutureSchema(u8),
+    /// Absent, or unreadable.
+    Unreadable,
+}
+
+/// What the marker on disk proves about the process that wrote it.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadyProvenance {
+    V1(ReadyMarker),
+    Unknown(UnknownReason),
+}
+
+/// Probe just enough to route on the declared schema, so a future version is
+/// reported as future rather than as a malformed v1.
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct SchemaProbe {
+    schema_version: u8,
+}
+
+fn current_marker() -> ReadyMarker {
+    let pid = std::process::id();
+    ReadyMarker {
+        schema_version: SCHEMA_VERSION,
+        pid,
+        started_at: crate::process::process_start_token(pid).unwrap_or(0),
+        exe: std::env::current_exe().unwrap_or_default(),
+        build_sha: option_env!("AGEND_BUILD_SHA")
+            .unwrap_or("unknown")
+            .to_owned(),
+        build_dirty: option_env!("AGEND_BUILD_DIRTY") == Some("1"),
+        version: env!("AGEND_CLI_VERSION").to_owned(),
+    }
+}
+
+/// Publish this process's identity to `run_dir/.ready`.
+///
+/// Atomic: a crashed or racing write cannot leave a half-written marker that a
+/// reader would classify as malformed. The previous hand-rolled
+/// `std::fs::write` at both call sites had no such guarantee.
+pub fn write(run_dir: &Path) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(&current_marker())?;
+    crate::store::atomic_write(&run_dir.join(FILENAME), &bytes)
+}
+
+/// Classify whatever is at `run_dir/.ready`. Never errors and never guesses:
+/// anything that is not a complete current-schema marker is `Unknown`.
+#[allow(dead_code)]
+pub fn read(run_dir: &Path) -> ReadyProvenance {
+    let Ok(bytes) = std::fs::read(run_dir.join(FILENAME)) else {
+        return ReadyProvenance::Unknown(UnknownReason::Unreadable);
+    };
+    match serde_json::from_slice::<SchemaProbe>(&bytes) {
+        Ok(probe) if probe.schema_version == SCHEMA_VERSION => {
+            match serde_json::from_slice::<ReadyMarker>(&bytes) {
+                Ok(marker) => ReadyProvenance::V1(marker),
+                Err(_) => ReadyProvenance::Unknown(UnknownReason::Malformed),
+            }
+        }
+        Ok(probe) => ReadyProvenance::Unknown(UnknownReason::FutureSchema(probe.schema_version)),
+        // Not JSON at all — either a legacy text marker or garbage. Both are
+        // Unknown; the distinction is diagnostic only.
+        Err(_) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let text = text.trim();
+            if text == "ready" || chrono::DateTime::parse_from_rfc3339(text).is_ok() {
+                ReadyProvenance::Unknown(UnknownReason::LegacyText)
+            } else {
+                ReadyProvenance::Unknown(UnknownReason::Malformed)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

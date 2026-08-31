@@ -1249,9 +1249,13 @@ fn spawn_fleet_agents(home: &Path, agents: &[AgentDef], ctx: &DaemonContext) {
     });
 
     crate::bootstrap::time_step("ready_marker_write", || {
-        let ready_path = run_dir(home).join(".ready");
-        if let Err(e) = std::fs::write(&ready_path, chrono::Utc::now().to_rfc3339()) {
-            tracing::warn!(path = %ready_path.display(), error = %e, "failed to write .ready marker");
+        let dir = run_dir(home);
+        if let Err(e) = crate::ready::write(&dir) {
+            tracing::warn!(
+                path = %dir.join(crate::ready::FILENAME).display(),
+                error = %e,
+                "failed to write .ready marker"
+            );
         }
     });
 }
