@@ -65,9 +65,10 @@ fn confirmclose_never_full_deletes_fleet_instance_app_tui() {
     let start = production
         .find("Overlay::ConfirmClose { target } => match key.code {")
         .expect("ConfirmClose handler arm must exist in overlay.rs");
-    let delete_start = production
-        .find("Overlay::ConfirmDeleteInstance {\n            name,\n            input,\n            notice,")
-        .expect("ConfirmDeleteInstance handler arm must follow ConfirmClose");
+    let delete_start = start
+        + production[start..]
+            .find("Overlay::ConfirmDeleteInstance {")
+            .expect("ConfirmDeleteInstance handler arm must follow ConfirmClose");
     let rel_delete_end = production[delete_start..]
         .find("Overlay::TabList { ref mut selected } => match key.code {")
         .expect("TabList arm must follow ConfirmDeleteInstance and bound its block");
