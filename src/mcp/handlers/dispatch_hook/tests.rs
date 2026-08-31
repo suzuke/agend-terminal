@@ -2790,10 +2790,7 @@ fn setup_repo_and_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf
 /// t-20260831221907643452-32048-13: trunk-parametrized variant of the #814
 /// fixture — the default≠main REDs need a master-default repo whose ONLY
 /// remote-tracking trunk is `refs/remotes/origin/master` (no origin/main).
-fn setup_repo_and_worktree_on(
-    tag: &str,
-    trunk: &str,
-) -> (std::path::PathBuf, std::path::PathBuf) {
+fn setup_repo_and_worktree_on(tag: &str, trunk: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let base = std::env::temp_dir().join(format!("agend-814-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&base).ok();
     let repo = base.join("repo");
