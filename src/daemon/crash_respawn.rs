@@ -1165,6 +1165,23 @@ mod tests {
              otherwise a respawn that never reaches Idle stays unattachable for the \
              whole ready_timeout + 15s budget"
         );
+        // Naming `serve_agent_tui` earlier is not publication: binding the closure
+        // above the wait and calling `.spawn` below it would satisfy the assertion
+        // above while the socket still appears only after readiness. Pin the spawn
+        // CALL. The worker body has exactly one thread spawn — the TUI server's —
+        // so the count keeps this unambiguous instead of pinning the wrong one.
+        assert_eq!(
+            body.matches(".spawn(").count(),
+            1,
+            "the respawn worker must contain exactly one thread spawn (the TUI server); \
+             a second one makes the ordering assertion below ambiguous"
+        );
+        let spawn_call = body.find(".spawn(").expect("counted exactly one above");
+        assert!(
+            spawn_call < wait,
+            "#3462-v2 R1: the .spawn() that starts the TUI server must itself run before \
+             the readiness wait, not merely be mentioned before it"
+        );
     }
 
     /// Structural: the notice must leave through the backend-aware injector,
