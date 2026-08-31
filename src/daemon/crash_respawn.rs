@@ -360,7 +360,7 @@ fn fresh_respawn_args(
 fn respawn_notice(reason: &str) -> String {
     format!(
         "[system] Agent restarted due to {reason}. This is a new session: rebuild anything \
-         in flight from the authoritative sources rather than recalling it.\r"
+         in flight from the authoritative sources rather than recalling it."
     )
 }
 
@@ -602,7 +602,24 @@ fn respawn_agent_worker(
                 };
                 if let Some((tgt, reason)) = snap {
                     let msg = respawn_notice(&reason);
-                    let _ = agent::write_to_pty(&tgt.pty_writer, msg.as_bytes());
+                    // #3462: go through the respawned handle's own injector so
+                    // inject_prefix / submit_key / typed readback + contamination
+                    // fence / deleted-generation check / post-submit observation all
+                    // apply. A hardcoded submit byte silently strands the notice in
+                    // the composer of any backend that does not submit on CR.
+                    if let Err(e) = agent::inject_with_target_gated(
+                        &tgt,
+                        &config.name,
+                        msg.as_bytes(),
+                        true,
+                        None,
+                    ) {
+                        tracing::warn!(
+                            agent = %config.name,
+                            error = %e,
+                            "#3462: crash-respawn notice injection failed"
+                        );
+                    }
                 }
             }
             let rdir = run_dir(home);
@@ -884,8 +901,8 @@ mod tests {
             "#3415: the production slice must include the notice call at the real write site"
         );
         assert!(
-            production.contains("write_to_pty"),
-            "#3415: the production slice must include the real PTY write site"
+            production.contains("inject_with_target_gated"),
+            "#3415/#3462: the production slice must include the real notice send site"
         );
         assert!(
             offenders.is_empty(),
