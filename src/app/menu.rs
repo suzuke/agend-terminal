@@ -310,4 +310,59 @@ mod tests {
         assert!(names.contains("attached"));
         assert!(!names.contains("shell"));
     }
+
+    #[test]
+    fn build_menu_items_filters_attached_fleet_in_non_active_tab() {
+        let home = std::env::temp_dir().join(format!("agend-menu-filter-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("create menu fixture home");
+        let fleet_path = home.join("fleet.yaml");
+        std::fs::write(
+            &fleet_path,
+            "instances:\n  attached:\n    backend: claude\n  available:\n    backend: claude\n",
+        )
+        .expect("write fleet fixture");
+
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("local".into(), menu_test_pane(1, None)));
+        layout.add_tab(Tab::new(
+            "attached".into(),
+            menu_test_pane(2, Some("attached")),
+        ));
+        layout.active = 0;
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+
+        let items = build_menu_items(&fleet_path, &registry, &layout);
+        assert!(!items.iter().any(|item| {
+            matches!(&item.kind, MenuItemKind::FleetInstance(name) if name == "attached")
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(&item.kind, MenuItemKind::FleetInstance(name) if name == "available")
+        }));
+
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    fn menu_test_pane(id: usize, fleet_instance_name: Option<&str>) -> Pane {
+        Pane {
+            agent_name: "menu-test".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: crate::vterm::VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: fleet_instance_name.map(str::to_string),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: crate::layout::PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        }
+    }
 }
