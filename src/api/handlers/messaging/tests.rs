@@ -2812,6 +2812,34 @@ fn seed_review_task(home: &std::path::Path, task_id: &str, reviewer: &str) {
     .expect("seed review task");
 }
 
+fn seed_review_task_owned_by(home: &std::path::Path, task_id: &str, owner: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let emitter = InstanceName::from("test:seed");
+    let tid = TaskId(task_id.into());
+    crate::task_events::append_batch(
+        home,
+        &emitter,
+        vec![TaskEvent::Created {
+            task_id: tid,
+            title: "review PR".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: Some(InstanceName::from(owner)),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: vec![],
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+        }],
+    )
+    .expect("seed owned review task");
+}
+
 fn task_status_of(home: &std::path::Path, task_id: &str) -> Option<crate::task_events::TaskStatus> {
     crate::task_events::replay(home)
         .unwrap_or_default()
@@ -3838,6 +3866,110 @@ fn forged_foreign_aba_and_revoked_assignments_fail_before_delivery_2760() {
         assert!(!home.join("auto_release_queue").exists(), "{case}");
         std::fs::remove_dir_all(&home).ok();
     }
+}
+
+/// A task owner without the exact active review assignment must not gain review
+/// authority, and rejection must happen before every side effect.
+#[test]
+fn owner_without_assignment_self_review_rejects_before_delivery_pr_mutation_and_release() {
+    use crate::daemon::pr_state;
+    let home = tmp_home("residual1-owner-self-review");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    let owner_id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  fixup-lead:\n    backend: claude\n    id: {}\n  typed-reviewer:\n    backend: claude\n    id: {}\n  pr-author:\n    backend: claude\n    id: {}\nteams:\n  fixup:\n    members: [fixup-lead, typed-reviewer, pr-author]\n    orchestrator: fixup-lead\n",
+            lead_id.full(),
+            reviewer_id.full(),
+            owner_id.full(),
+        ),
+    )
+    .unwrap();
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+    seed_review_task_owned_by(&home, "t-code-review-2760", "pr-author");
+    let owner_self_review = json!({
+        "from": "pr-author",
+        "target": "fixup-lead",
+        "text": crate::mcp::handlers::build_report_text(
+            "VERIFIED — exact review\n\n### Evidence\nran: cargo test → passed",
+            Some("t-code-review-2760"),
+            None,
+        ),
+        "kind": "report",
+        "correlation_id": "t-code-review-2760",
+        "reviewed_head": "display-only-caller-value",
+        "report_purpose": "code_review",
+        "code_review": {
+            "assignment_id": assignment.assignment_id,
+            "verdict": "verified",
+            "evidence_digest": "a".repeat(64),
+        }
+    });
+    let result = handle_send(&owner_self_review, &test_ctx(&home));
+    assert_eq!(
+        result["ok"], false,
+        "owner self-review must reject: {result}"
+    );
+    assert_eq!(result["code"], "report_authority_rejected", "{result}");
+    assert_eq!(crate::inbox::unread_count(&home, "fixup-lead").0, 0);
+    let state = pr_state::load(&home, "owner/repo", "fix/typed").expect("subject pr_state");
+    assert!(state.validated_review_receipts.is_empty());
+    assert!(!home.join("auto_release_queue").exists());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Applying a receipt to generation B must leave a prefix-sharing persisted
+/// generation A byte-identical.
+#[test]
+fn typed_receipt_for_b_leaves_prefix_sharing_pr_state_a_byte_identical() {
+    use crate::daemon::pr_state;
+    let home = tmp_home("residual2-prefix-cross-apply");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+
+    let head_a = format!("{}cc", &RECEIPT_HEAD_2760[..38]);
+    assert_ne!(head_a, RECEIPT_HEAD_2760);
+    assert_eq!(&head_a[..38], &RECEIPT_HEAD_2760[..38]);
+    pr_state::record_ci_result(
+        &home,
+        "owner/repo",
+        "fix/typed-sibling",
+        &head_a,
+        pr_state::CiConclusion::Green,
+        vec!["fixup-lead".into()],
+        pr_state::ReviewClass::Single,
+    );
+    pr_state::with_pr_state(&home, "owner/repo", "fix/typed-sibling", |state| {
+        state.pr_number = 4242;
+    })
+    .unwrap();
+
+    let path_a = pr_state::pr_state_dir(&home).join(pr_state::pr_state_filename(
+        "owner/repo",
+        "fix/typed-sibling",
+    ));
+    let before_a = std::fs::read(&path_a).expect("state A must be persisted");
+    let result = handle_send(
+        &typed_review_params(assignment.assignment_id, "verified", "VERIFIED"),
+        &test_ctx(&home),
+    );
+    assert_eq!(
+        result["ok"], true,
+        "generation-B receipt must apply: {result}"
+    );
+
+    let state_b = pr_state::load(&home, "owner/repo", "fix/typed").expect("state B");
+    assert_eq!(state_b.validated_review_receipts.len(), 1);
+    let after_a = std::fs::read(&path_a).expect("state A must still be persisted");
+    assert_eq!(before_a, after_a, "state A must remain byte-identical");
+    std::fs::remove_dir_all(&home).ok();
 }
 
 /// The external request contains only assignment_id, explicit enum, and evidence
