@@ -1117,6 +1117,45 @@ mod tests {
         );
     }
 
+    /// R1 of the c7accc1a review: publishing the respawned agent's TUI socket must
+    /// NOT sit behind the readiness wait. `serve_agent_tui` is the only publisher of
+    /// `run/<pid>/<name>.port` on the respawn path, so while the wait runs the port
+    /// file still names the dead pre-crash listener and nothing can attach — for the
+    /// whole `ready_timeout + 15s` budget in exactly the case that matters, a
+    /// respawned prompt that never reaches Idle. `spawn_one` already publishes first
+    /// and leaves readiness waiting off the critical path.
+    ///
+    /// Scoped to `respawn_agent_worker`'s body, like the #3414 guard: a file-level
+    /// scan is vacuous here because `serve_agent_tui` also appears in this module's
+    /// `use super::{...}` import, which precedes everything.
+    #[test]
+    fn respawn_publishes_tui_socket_before_the_readiness_wait_3462() {
+        let source = include_str!("crash_respawn.rs");
+        let start = source
+            .find("fn respawn_agent_worker(")
+            .expect("respawn worker present");
+        let rest = &source[start..];
+        let cfg_test = ["\n#[cfg(", "test)]"].concat();
+        let end = ["\nfn ", "\nmod ", &cfg_test]
+            .iter()
+            .filter_map(|marker| rest[1..].find(*marker).map(|offset| offset + 1))
+            .min()
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        let publish = body
+            .find("serve_agent_tui(")
+            .expect("the respawn worker must start the per-agent TUI server");
+        let wait = body
+            .find("wait_for_respawn_inject_target(")
+            .expect("the respawn worker must wait for readiness before injecting");
+        assert!(
+            publish < wait,
+            "#3462-v2 R1: the TUI socket must be published BEFORE the readiness wait — \
+             otherwise a respawn that never reaches Idle stays unattachable for the \
+             whole ready_timeout + 15s budget"
+        );
+    }
+
     /// Structural: the notice must leave through the backend-aware injector,
     /// never a direct PTY write. A future edit reinstating `write_to_pty` here
     /// silently reinstates the whole bypass.
