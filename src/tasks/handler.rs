@@ -37,6 +37,14 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         Some(a) => a,
         None => return serde_json::json!({"error": "missing 'action'"}),
     };
+    if matches!(action, "done" | "update")
+        && args.get("force").and_then(Value::as_bool) == Some(true)
+    {
+        return serde_json::json!({
+            "error": "force=true is not supported for public task done/update",
+            "code": "force_not_supported",
+        });
+    }
     let emitter = crate::task_events::InstanceName::from(instance_name);
 
     match action {
@@ -679,23 +687,12 @@ fn handle_get(home: &Path, _caller: &str, args: &Value) -> Value {
 /// mutation resolves its board from the task_id, so a caller can name a task that
 /// lives on ANOTHER project's board. Deny unless the caller acts in that board's
 /// project — `super::acl::can_mutate_on_board` (system identities bypass; a hard
-/// fleet read failure fail-closes). `force` — the audited operator override, the
-/// SAME axis as the owner-ACL `can_mutate_record` — bypasses it on the paths that
-/// carry it. Single-project → caller project == task board project (both DEFAULT)
+/// fleet read failure fail-closes). Single-project → caller project == task board project (both DEFAULT)
 /// → allow → byte-identical (no new denial). Returns `Some(error)` when denied.
 // #2760: `board_project` is the caller's ALREADY-resolved authoritative board
 // (from `super::load_routed`), so the mutation routes ONCE and this gate never
 // re-resolves (nor silently defaults). `None` = allowed.
-fn cross_board_denied(
-    home: &Path,
-    caller: &str,
-    id: &str,
-    board_project: &str,
-    force: bool,
-) -> Option<Value> {
-    if force {
-        return None;
-    }
+fn cross_board_denied(home: &Path, caller: &str, id: &str, board_project: &str) -> Option<Value> {
     if super::acl::can_mutate_on_board(home, caller, board_project) {
         return None;
     }
@@ -738,7 +735,7 @@ fn handle_claim(
     // #2117 P3a: board-isolation gate — a caller may only claim tasks on its own
     // project's board (claim has no `force`/owner-ACL — an open task is claimable
     // by anyone, but only within the board). Single-project → allow.
-    if let Some(deny) = cross_board_denied(home, &iname, &id, routed.board().project(), false) {
+    if let Some(deny) = cross_board_denied(home, &iname, &id, routed.board().project()) {
         return deny;
     }
     // #t-21: validate + append in ONE critical section to close the
@@ -881,23 +878,11 @@ fn handle_done(
     };
     let board = routed.board().path().to_path_buf();
     let record = routed.record().clone();
-    // #808: force flag bypasses the ACL gate for historical
-    // ghost-owned cleanup. Validator mirrors comms.rs:200-218.
-    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    let force_reason = args
-        .get("force_reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if force && force_reason.is_empty() {
-        return serde_json::json!({
-            "error": "force=true requires a non-empty 'force_reason'"
-        });
-    }
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project(), force) {
+    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project()) {
         return deny;
     }
-    if !force && !can_mutate_record(home, &caller, &record) {
+    if !can_mutate_record(home, &caller, &record) {
         return serde_json::json!({
             "error": format!(
                 "task '{id}' owned by '{}', caller '{caller}' not authorized",
@@ -905,17 +890,13 @@ fn handle_done(
             )
         });
     }
-    let completion_receipt = if force {
-        None
-    } else {
-        match super::assignee_completion_guard(home, &id, &caller, &record) {
-            Ok(receipt) => receipt,
-            Err(reason) => {
-                return serde_json::json!({
-                    "error": reason,
-                    "code": "assignee_completion_blocked",
-                })
-            }
+    let completion_receipt = match super::assignee_completion_guard(home, &id, &caller, &record) {
+        Ok(receipt) => receipt,
+        Err(reason) => {
+            return serde_json::json!({
+                "error": reason,
+                "code": "assignee_completion_blocked",
+            })
         }
     };
     // #1265: transition enforcement for done action.
@@ -932,38 +913,11 @@ fn handle_done(
             "code": "illegal_transition",
         });
     }
-    if force {
-        crate::event_log::log(
-            home,
-            "task_force_done",
-            &caller,
-            &format!(
-                "task={id} owner={} reason={force_reason}",
-                record
-                    .owner
-                    .as_ref()
-                    .map(|o| o.0.as_str())
-                    .unwrap_or("none")
-            ),
-        );
-    }
     let by = record
         .owner
         .as_ref()
         .map(|o| o.0.clone())
         .unwrap_or_else(|| caller.clone());
-    // #808: when force is set, prefix the result with an
-    // audit marker so the persisted event itself names the
-    // caller + reason (event_log carries the same record for
-    // cross-board audit).
-    let result_text = if force {
-        Some(format!(
-            "[forced by '{caller}': {force_reason}] {}",
-            result_text.unwrap_or_default()
-        ))
-    } else {
-        result_text
-    };
     let event = crate::task_events::TaskEvent::Done {
         task_id: crate::task_events::TaskId(id.clone()),
         by: crate::task_events::InstanceName(by),
@@ -1085,8 +1039,7 @@ fn handle_done(
 /// it is the AUTHORITATIVE gate the out-of-lock ACL/transition checks only
 /// fast-reject. Fails closed when, since the out-of-lock read:
 /// - the task vanished;
-/// - ownership drifted so `caller` is no longer authorized (`force` bypasses,
-///   mirroring the out-of-lock gate at :633) — this covers BOTH status and
+/// - ownership drifted so `caller` is no longer authorized — this covers BOTH status and
 ///   non-status updates (the latter had no in-lock guard at all before);
 /// - the status transition became illegal (the prior #1868 guard); or
 /// - the owner moved out from under a Claimed/InProgress/Done event whose `by`
@@ -1204,7 +1157,6 @@ fn update_batch_precondition(
     home: &Path,
     caller: &str,
     upd_id: &str,
-    force: bool,
     target_status: Option<crate::task_events::TaskStatus>,
     stale_owner: &Option<crate::task_events::InstanceName>,
 ) -> Result<(), String> {
@@ -1212,9 +1164,8 @@ fn update_batch_precondition(
         .tasks
         .get(&crate::task_events::TaskId(upd_id.to_string()))
         .ok_or_else(|| format!("task '{upd_id}' not found"))?;
-    // (1) Ownership ACL re-check against fresh state — same `can_mutate_record`
-    //     + force semantics as the out-of-lock gate (:633).
-    if !force && !can_mutate_record(home, caller, fresh) {
+    // (1) Ownership ACL re-check against fresh state.
+    if !can_mutate_record(home, caller, fresh) {
         return Err(format!(
             "task '{upd_id}' ownership changed since authorization; \
              caller '{caller}' no longer authorized (retry)"
@@ -1296,23 +1247,11 @@ fn handle_update(
     };
     let board = routed.board().path().to_path_buf();
     let record = routed.record().clone();
-    // #808: force flag bypasses the ACL gate for historical
-    // ghost-owned cleanup. Validator mirrors comms.rs:200-218.
-    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    let force_reason = args
-        .get("force_reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if force && force_reason.is_empty() {
-        return serde_json::json!({
-            "error": "force=true requires a non-empty 'force_reason'"
-        });
-    }
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project(), force) {
+    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project()) {
         return deny;
     }
-    if !force && !can_mutate_record(home, &caller, &record) {
+    if !can_mutate_record(home, &caller, &record) {
         return serde_json::json!({
             "error": format!(
                 "task '{id}' owned by '{}', caller '{caller}' not authorized",
@@ -1320,32 +1259,6 @@ fn handle_update(
             )
         });
     }
-    if force {
-        crate::event_log::log(
-            home,
-            "task_force_update",
-            &caller,
-            &format!(
-                "task={id} owner={} reason={force_reason}",
-                record
-                    .owner
-                    .as_ref()
-                    .map(|o| o.0.as_str())
-                    .unwrap_or("none")
-            ),
-        );
-    }
-    // #808: when force is set, embed the caller + reason
-    // directly in the emitted event's `reason` field so the
-    // per-task replay trail also carries the audit (in
-    // addition to the event_log entry above).
-    let reason_text = |base: &str| -> String {
-        if force {
-            format!("{base} [forced by '{caller}': {force_reason}]")
-        } else {
-            base.to_string()
-        }
-    };
     // F3: `depends_on` is set at `Created` and is immutable via `update` — there
     // is no post-create event that carries it, by design (circular-dependency
     // containment; see the contract in `tasks/tests.rs`). Reject it explicitly
@@ -1489,11 +1402,11 @@ fn handle_update(
                 (_, "cancelled") => Some(crate::task_events::TaskEvent::Cancelled {
                     task_id: crate::task_events::TaskId(id.clone()),
                     by: crate::task_events::InstanceName::from(caller.as_str()),
-                    reason: reason_text("operator update"),
+                    reason: "operator update".to_string(),
                 }),
                 (_, "blocked") => Some(crate::task_events::TaskEvent::Blocked {
                     task_id: crate::task_events::TaskId(id.clone()),
-                    reason: reason_text("operator update"),
+                    reason: "operator update".to_string(),
                 }),
                 (crate::task_events::TaskStatus::Blocked, "open") => {
                     Some(crate::task_events::TaskEvent::Unblocked {
@@ -1509,12 +1422,12 @@ fn handle_update(
                 | (crate::task_events::TaskStatus::InProgress, "open") => {
                     Some(crate::task_events::TaskEvent::Released {
                         task_id: crate::task_events::TaskId(id.clone()),
-                        reason: reason_text("operator update (status → open)"),
+                        reason: "operator update (status → open)".to_string(),
                     })
                 }
                 (_, "open") => Some(crate::task_events::TaskEvent::Reopened {
                     task_id: crate::task_events::TaskId(id.clone()),
-                    reason: reason_text("operator update"),
+                    reason: "operator update".to_string(),
                     source_evidence: format!("status {} → open", status_to_legacy_str(prev_status)),
                 }),
                 (_, "backlog") => Some(crate::task_events::TaskEvent::MovedToBacklog {
@@ -1657,7 +1570,6 @@ fn handle_update(
                     home,
                     &caller,
                     &upd_id,
-                    force,
                     target_status,
                     &stale_owner,
                 )
@@ -1964,8 +1876,7 @@ fn handle_metadata_set(
     let record = routed.record().clone();
     // #2117 P3a: board-isolation gate (no force on metadata_set — mirror its
     // unconditional owner-ACL below).
-    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project(), false)
-    {
+    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project()) {
         return deny;
     }
     // #2760 R2 (root+independent REJECT of a542517b): evaluate the plan-governance /
@@ -2210,8 +2121,7 @@ fn handle_ack_plan(
         }
     };
     let record = routed.record().clone();
-    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project(), false)
-    {
+    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project()) {
         return deny;
     }
     if record.owner.as_ref().map(|o| o.0.as_str()) == Some(instance_name) {

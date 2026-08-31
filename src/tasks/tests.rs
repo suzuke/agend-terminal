@@ -4258,16 +4258,114 @@ fn task_done_cleans_post_lease_empty_init_commits() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-// ── #808 ghost-owner ACL deadlock: auto-orphan + force flag tests ──
+// ── Public task force denial (#808 cleanup) ──
+
+fn protected_force_store_bytes(home: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut paths = vec![
+        (
+            "task_events.jsonl".to_string(),
+            home.join("task_events.jsonl"),
+        ),
+        (
+            "task_events_seq.json".to_string(),
+            home.join("task_events_seq.json"),
+        ),
+        ("event-log.jsonl".to_string(), home.join("event-log.jsonl")),
+        (
+            "dispatch_tracking.json".to_string(),
+            crate::store::store_path(home, "dispatch_tracking.json"),
+        ),
+    ];
+    if let Ok(entries) = std::fs::read_dir(home.join("dispatch_idle")) {
+        paths.extend(entries.flatten().filter_map(|entry| {
+            let path = entry.path();
+            path.is_file()
+                .then(|| (path.strip_prefix(home).unwrap().display().to_string(), path))
+        }));
+    }
+    paths.sort_by(|(left, _), (right, _)| left.cmp(right));
+    paths
+        .into_iter()
+        .filter_map(|(label, path)| std::fs::read(path).ok().map(|bytes| (label, bytes)))
+        .collect()
+}
+
+fn seed_protected_force_stores(home: &std::path::Path) {
+    std::fs::create_dir_all(home.join("dispatch_idle")).unwrap();
+    for (path, contents) in [
+        ("task_events.jsonl", b"task-event-sentinel\n".as_slice()),
+        ("task_events_seq.json", b"task-seq-sentinel\n".as_slice()),
+        ("event-log.jsonl", b"audit-sentinel\n".as_slice()),
+        ("dispatch_tracking.json", b"dispatch-sentinel\n".as_slice()),
+        (
+            "dispatch_idle/pending.json",
+            b"dispatch-idle-sentinel\n".as_slice(),
+        ),
+    ] {
+        std::fs::write(home.join(path), contents).unwrap();
+    }
+}
 
 #[test]
-fn test_ghost_owner_update_without_force_errors_with_acl() {
-    // Baseline regression: today operator cannot cancel a task
-    // whose owner is no longer in the fleet (ghost-owner ACL
-    // deadlock the issue describes). The #808 force flag must NOT
-    // change this behavior when force=false / absent — the ACL
-    // gate stays load-bearing so accidental cancels still require
-    // an explicit force opt-in.
+fn test_public_force_rejected_before_route_or_protected_write() {
+    let home = tmp_home("public-force-boundary");
+    seed_protected_force_stores(&home);
+    let before = protected_force_store_bytes(&home);
+
+    for action in ["update", "done"] {
+        let r = handle(
+            &home,
+            "forged-operator",
+            &serde_json::json!({
+                "action": action,
+                "id": "t-does-not-exist",
+                "status": "cancelled",
+                "force": true,
+                "force_reason": "public boundary probe",
+            }),
+        );
+        assert_eq!(
+            r["code"], "force_not_supported",
+            "{action} force must be rejected at the public boundary: {r}"
+        );
+        assert!(
+            !r["error"].as_str().unwrap_or("").contains("not found"),
+            "force denial must precede task route/existence lookup: {r}"
+        );
+    }
+    assert_eq!(
+        protected_force_store_bytes(&home),
+        before,
+        "repeated public force denial must leave protected stores byte-identical"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_public_force_denial_is_identity_independent() {
+    let home = tmp_home("public-force-identities");
+    for caller in ["owner", "creator", "orchestrator", "forged-operator", ""] {
+        let r = handle(
+            &home,
+            caller,
+            &serde_json::json!({
+                "action": "update",
+                "id": "t-does-not-exist",
+                "status": "cancelled",
+                "force": true,
+                "force_reason": "identity probe",
+            }),
+        );
+        assert_eq!(
+            r["code"], "force_not_supported",
+            "caller identity must not authorize public force: {caller:?} → {r}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_force_false_preserves_ghost_owner_acl() {
     let home = tmp_home("ghost_acl_baseline");
     write_fleet_yaml(&home, &["operator"]);
     let r = handle(
@@ -4287,6 +4385,7 @@ fn test_ghost_owner_update_without_force_errors_with_acl() {
             "action": "update",
             "id": id,
             "status": "cancelled",
+            "force": false,
         }),
     );
     assert!(
@@ -4300,53 +4399,27 @@ fn test_ghost_owner_update_without_force_errors_with_acl() {
 }
 
 #[test]
-fn test_force_update_true_without_force_reason_rejected() {
-    // Force-flag contract (mirrors comms.rs:200-218): force=true
-    // without a non-empty force_reason must surface a validator
-    // error, NOT fall through to ACL or succeed silently. The
-    // grammar match is "force_reason" (the validator message names
-    // the missing field) — pre-fix the handler ignores force and
-    // returns the regular ACL error, so this test is RED until C2
-    // ships.
+fn test_public_force_update_without_reason_rejected() {
     let home = tmp_home("force_no_reason");
-    write_fleet_yaml(&home, &["operator"]);
-    let r = handle(
-        &home,
-        "operator",
-        &serde_json::json!({
-            "action": "create",
-            "title": "stuck",
-            "assignee": "ghost-instance",
-        }),
-    );
-    let id = r["id"].as_str().expect("id").to_string();
     let r = handle(
         &home,
         "operator",
         &serde_json::json!({
             "action": "update",
-            "id": id,
+            "id": "t-does-not-exist",
             "status": "cancelled",
             "force": true,
         }),
     );
-    assert!(
-        r["error"]
-            .as_str()
-            .map(|e| e.contains("force_reason"))
-            .unwrap_or(false),
-        "force=true without force_reason must surface validator error, got: {r}"
+    assert_eq!(
+        r["code"], "force_not_supported",
+        "force=true is denied regardless of force_reason: {r}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
-fn test_force_update_with_reason_cancels_ghost_and_logs_audit() {
-    // GREEN test 1: force=true + non-empty force_reason on
-    // `action=update status=cancelled` bypasses the ACL gate AND
-    // pushes a `task_force_update` entry into event-log.jsonl
-    // (cross-board audit) AND embeds the force_reason into the
-    // per-task event's reason field (per-task replay audit).
+fn test_public_force_update_with_reason_is_rejected() {
     let home = tmp_home("force_cancel_ghost");
     write_fleet_yaml(&home, &["operator"]);
     let r = handle(
@@ -4359,6 +4432,7 @@ fn test_force_update_with_reason_cancels_ghost_and_logs_audit() {
         }),
     );
     let id = r["id"].as_str().expect("id").to_string();
+    let before = protected_force_store_bytes(&home);
     let r = handle(
         &home,
         "operator",
@@ -4371,45 +4445,24 @@ fn test_force_update_with_reason_cancels_ghost_and_logs_audit() {
         }),
     );
     assert_eq!(
-        r["status"], "updated",
-        "force=true + force_reason must succeed despite ghost owner, got: {r}"
+        r["code"], "force_not_supported",
+        "public force=true + force_reason must be rejected: {r}"
     );
-    let tasks = list_all(&home);
-    let t = tasks
-        .iter()
-        .find(|t| t.id == id)
-        .expect("task still present");
     assert_eq!(
-        t.status,
-        crate::task_events::TaskStatus::Cancelled,
-        "task must be cancelled"
+        protected_force_store_bytes(&home),
+        before,
+        "rejected public force must not write audit or protected stores"
     );
-    // Cross-board audit: event-log.jsonl records the force action.
-    let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
-    assert!(
-        log.contains("task_force_update"),
-        "event-log.jsonl must record task_force_update entry, got: {log}"
-    );
-    assert!(
-        log.contains("post-#808 board hygiene"),
-        "event-log.jsonl must capture the force_reason, got: {log}"
-    );
-    // Per-task replay audit: the Cancelled event's reason field
-    // carries the forced marker.
-    let task_log = std::fs::read_to_string(home.join("task_events.jsonl")).unwrap_or_default();
-    assert!(
-        task_log.contains("forced by 'operator'"),
-        "Cancelled event reason must carry forced marker, got: {task_log}"
-    );
+    let task = list_all(&home)
+        .into_iter()
+        .find(|task| task.id == id)
+        .expect("task still present");
+    assert_eq!(task.status, crate::task_events::TaskStatus::Open);
     std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
-fn test_force_done_with_reason_succeeds_on_done_arm() {
-    // BONUS test (mandatory per dispatch spec): force flag must
-    // also gate the `action=done` arm — operators sometimes close
-    // ghost-owned tasks as Done rather than Cancelled when the
-    // work was effectively completed before the owner disbanded.
+fn test_public_force_done_with_reason_is_rejected() {
     let home = tmp_home("force_done_ghost");
     write_fleet_yaml(&home, &["operator"]);
     let r = handle(
@@ -4422,21 +4475,7 @@ fn test_force_done_with_reason_succeeds_on_done_arm() {
         }),
     );
     let id = r["id"].as_str().expect("id").to_string();
-    // Without force, the done arm rejects (mirrors RED1 behavior).
-    let r_blocked = handle(
-        &home,
-        "operator",
-        &serde_json::json!({"action": "done", "id": id}),
-    );
-    assert!(
-        r_blocked["error"]
-            .as_str()
-            .map(|e| e.contains("not authorized"))
-            .unwrap_or(false),
-        "done arm without force must reject ghost-owned task, got: {r_blocked}"
-    );
-    // With force + reason, the done arm proceeds and event-log
-    // records the cross-board audit (task_force_done).
+    let before = protected_force_store_bytes(&home);
     let r = handle(
         &home,
         "operator",
@@ -4449,13 +4488,21 @@ fn test_force_done_with_reason_succeeds_on_done_arm() {
         }),
     );
     assert_eq!(
-        r["status"], "done",
-        "force=true done must succeed, got: {r}"
+        r["code"], "force_not_supported",
+        "public force=true done must be rejected: {r}"
     );
-    let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
     assert!(
-        log.contains("task_force_done"),
-        "event-log.jsonl must record task_force_done entry, got: {log}"
+        list_all(&home)
+            .into_iter()
+            .find(|task| task.id == id)
+            .map(|task| task.status == crate::task_events::TaskStatus::Open)
+            .unwrap_or(false),
+        "rejected force done must leave task open"
+    );
+    assert_eq!(
+        protected_force_store_bytes(&home),
+        before,
+        "rejected public force done must not write audit or protected stores"
     );
     std::fs::remove_dir_all(&home).ok();
 }

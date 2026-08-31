@@ -280,8 +280,6 @@ pub(crate) fn def_task() -> Value {
             "limit": {"type": "integer", "description": "#806: cap `list` response to N newest-first entries (sort by updated_at desc)."},
             "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},
             "branch": {"type": "string", "description": "Git branch the implementer should work on"},
-            "force": {"type": "boolean", "description": "#808: bypass ownership ACL on done/update for historical ghost-owned cleanup. Requires non-empty force_reason."},
-            "force_reason": {"type": "string", "description": "#808: required when force=true. Logged to event-log.jsonl and embedded in the per-task event's reason field for audit."},
             "apply": {"type": "boolean", "description": "#806 sweep: when false (default), returns dry-run plan; when true, emits Cancelled for the confirm_ids subset."},
             "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#806 sweep apply=true: subset of candidate_ids from prior dry-run to actually cancel."},
             "audit_reason": {"type": "string", "description": "#806 sweep apply=true: required audit text recorded in event-log.jsonl + per-task Cancelled.reason."},
@@ -539,6 +537,18 @@ mod tests {
                 .expect("desc")
                 .contains("claude"),
             "backend description should list available CLI names"
+        );
+    }
+
+    #[test]
+    fn task_schema_does_not_advertise_public_force_override() {
+        let definition = def_task();
+        let props = definition["inputSchema"]["properties"]
+            .as_object()
+            .expect("task properties");
+        assert!(
+            !props.contains_key("force") && !props.contains_key("force_reason"),
+            "public task done/update must not advertise the removed force override: {props:?}"
         );
     }
 
@@ -984,6 +994,10 @@ mod tests {
                 "internal: delegate_task force metadata, set by dispatch path",
             ),
             (
+                "force",
+                "internal: public task done/update boundary rejects caller-supplied force; intentionally not advertised",
+            ),
+            (
                 "provenance",
                 "internal: delegate_task provenance metadata, set by dispatch path",
             ),
@@ -1176,8 +1190,6 @@ mod tests {
             ("task", "limit", "tasks/handler.rs list cap"),
             ("task", "due_at", "tasks/handler.rs create deadline"),
             ("task", "branch", "tasks/handler.rs create event"),
-            ("task", "force", "tasks/handler.rs done/update ACL bypass"),
-            ("task", "force_reason", "tasks/handler.rs force audit"),
             ("task", "apply", "tasks/sweep.rs dry-run vs apply"),
             ("task", "confirm_ids", "tasks/sweep.rs apply subset"),
             ("task", "audit_reason", "tasks/sweep.rs apply audit"),

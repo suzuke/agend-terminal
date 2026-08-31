@@ -992,17 +992,15 @@ fn write_fleet(home: &Path, agent: &str) {
 
 /// REAL task-done entry: the MCP handler (`task action=done`) — exercises the
 /// handler→enqueue wiring (codex gap ③ / §3.9). These policy fixtures model
-/// root's operator-forced terminalization, because their synthetic worktrees
-/// are often deliberately dirty, unpushed, or cross-leased. Asserts no error.
+/// system cleanup terminalization, because their synthetic worktrees are often
+/// deliberately dirty, unpushed, or cross-leased. Asserts no error.
 fn task_done_via_handler(home: &Path, task_id: &str) {
     let r = crate::tasks::handle(
         home,
-        "operator",
+        "system:auto_close",
         &serde_json::json!({
             "action": "done",
-            "id": task_id,
-            "force": true,
-            "force_reason": "auto-release policy fixture"
+            "id": task_id
         }),
     );
     assert!(r.get("error").is_none(), "task action=done failed: {r}");
@@ -1624,8 +1622,8 @@ fn cross_lease_done_no_release_when_binding_task_mismatch() {
     itest_lease(&home, &repo, "dev-1", "feat/new", "t-new", false);
     // An OLD task (t-old / feat/old) also exists, owned by dev-1
     seed_task(&home, "t-old", "dev-1", "feat/old", false);
-    // Root marks t-old done (the stale cleanup scenario) through the shared
-    // operator-forced handler fixture.
+    // System cleanup marks t-old done (the stale cleanup scenario) through the
+    // shared handler fixture.
     task_done_via_handler(&home, "t-old");
     assert_eq!(
             queue_len(&home),

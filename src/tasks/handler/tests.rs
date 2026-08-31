@@ -348,7 +348,6 @@ fn inlock_precond_rejects_unauthorized_nonstatus_update_231() {
         &home,
         "intruder",
         "t-231-a",
-        false,
         None,
         &Some(crate::task_events::InstanceName::from("dev-agent")),
     );
@@ -374,7 +373,6 @@ fn inlock_precond_rejects_status_update_after_owner_reassign_231() {
         &home,
         "dev-agent",
         "t-231-b",
-        false,
         Some(crate::task_events::TaskStatus::InProgress),
         &Some(crate::task_events::InstanceName::from("dev-agent")),
     );
@@ -401,7 +399,6 @@ fn inlock_precond_rejects_done_when_by_owner_drifted_231() {
         &home,
         "system:task_sweep", // ACL bypassed → only the drift check can reject
         "t-231-c",
-        false,
         Some(crate::task_events::TaskStatus::Done),
         &Some(crate::task_events::InstanceName::from("dev-agent")),
     );
@@ -425,7 +422,6 @@ fn inlock_precond_allows_legitimate_authorized_update_231() {
         &home,
         "dev-agent",
         "t-231-d",
-        false,
         Some(crate::task_events::TaskStatus::InProgress),
         &Some(crate::task_events::InstanceName::from("dev-agent")),
     );
@@ -3681,8 +3677,12 @@ fn task_done_assignee_completion_controls_s1() {
         &serde_json::json!({"action":"done","id":id,"force":true,"force_reason":"S1"}),
     );
     assert!(
-        result.get("error").is_none(),
-        "force bypass denied: {result}"
+        result.get("error").is_some(),
+        "public force bypass must be denied: {result}"
+    );
+    assert_eq!(
+        result["code"], "force_not_supported",
+        "public force bypass must fail at the task boundary: {result}"
     );
     std::fs::remove_dir_all(&home).ok();
 
