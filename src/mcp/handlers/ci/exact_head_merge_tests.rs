@@ -81,6 +81,7 @@ impl ScmProvider for MergeMock {
             return Ok(PrSummary {
                 head_ref_oid: Some(self.heads[i.min(self.heads.len() - 1)].to_string()),
                 base_ref_oid: Some(self.bases[i.min(self.bases.len() - 1)].to_string()),
+                head_ref: Some("feat/review-threshold".into()),
                 merge_state_status: Some(self.merge_state.into()),
                 ..Default::default()
             });
@@ -148,6 +149,39 @@ fn force_args() -> serde_json::Value {
     json!({"pr": 4242, "repository": "suzuke/agend-terminal", "force": true, "force_reason": "emergency"})
 }
 
+fn seed_merge_ready_state(home: &Path) {
+    let mut state = crate::daemon::pr_state::new_for_branch(
+        "suzuke/agend-terminal",
+        "feat/review-threshold",
+        H0,
+        crate::daemon::pr_state::ReviewClass::Single,
+    );
+    state.pr_number = 4242;
+    state.ci_state = crate::daemon::pr_state::CiState::Green {
+        sha: H0.into(),
+        observed_at: "2026-08-31T00:00:00Z".into(),
+    };
+    state
+        .validated_review_receipts
+        .push(crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: "review-receipt:exact-head-merge".into(),
+            source_id: "exact-head-merge".into(),
+            evidence_digest: "a".repeat(64),
+            assignment_id: uuid::Uuid::new_v4(),
+            reviewer_instance_id: crate::types::InstanceId::new(),
+            reviewer_name: "reviewer".into(),
+            repo: "suzuke/agend-terminal".into(),
+            pr_number: 4242,
+            branch: "feat/review-threshold".into(),
+            task_id: "t-exact-head-merge".into(),
+            reviewed_head: H0.into(),
+            review_class: crate::daemon::pr_state::ReviewClass::Single,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict: crate::review_receipt::ReviewVerdict::Verified,
+        });
+    crate::daemon::pr_state::save(home, &state).unwrap();
+}
+
 // All four are valid FULL 40-hex commit OIDs (`is_full_commit_sha`), distinct so
 // a head/base move is detected by EXACT identity. #merge-exact-head r1: the
 // pre-r1 fixtures padded with non-hex 'h'/'ADVANCE', which masked the full-
@@ -174,6 +208,7 @@ fn refused(r: &serde_json::Value) -> bool {
 #[test]
 fn normal_merge_pins_expected_head_sha() {
     let home = tmp_home("pin");
+    seed_merge_ready_state(&home);
     let recorded = Arc::new(Mutex::new(None));
     let _g = crate::scm::set_test_scm_provider(Arc::new(MergeMock::new(recorded.clone())));
     let r = super::handle_merge_repo(&home, &base_args(), "dev");
@@ -199,6 +234,7 @@ fn normal_merge_pins_expected_head_sha() {
 #[test]
 fn normal_merge_reuses_pre_merge_metadata_queries_3022() {
     let home = tmp_home("metadata-reuse");
+    seed_merge_ready_state(&home);
     let recorded = Arc::new(Mutex::new(None));
     let view_calls = Arc::new(Mutex::new(Vec::new()));
     let mock = MergeMock::new(recorded).with_view_calls(view_calls.clone());

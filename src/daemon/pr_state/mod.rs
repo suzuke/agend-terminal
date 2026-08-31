@@ -614,68 +614,163 @@ pub(crate) fn sha_prefix_match(full: &str, asserted: &str) -> bool {
         && full.starts_with(asserted)
 }
 
+/// Typed explanations for why a persisted PR state cannot authorize merge.
+/// The canonical repo merge handler uses this after its exact-head and
+/// freshness policy gates; the daemon scanner and reducer can continue to use
+/// the boolean compatibility wrapper below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeDeficit {
+    /// The merge request has no exact persisted PR-state subject to consult.
+    NoLinkage,
+    /// The assignment authority could not be read reliably.
+    AuthorityUnknown,
+    /// One or more required reviewer assignments are still reserved.
+    ReservedAssignments { count: usize },
+    /// The review threshold was absent, unknown, or mismatched at arm time.
+    UnresolvedClass,
+    /// GitHub still reports a draft PR.
+    Draft,
+    /// CI has not supplied a green result.
+    CiNotGreen,
+    /// CI supplied a green result for another head.
+    CiHeadMismatch,
+    /// A current typed receipt is not a VERIFIED receipt.
+    NonVerifiedReceipt { reviewers: Vec<String> },
+    /// Fewer distinct current-head VERIFIED receipts exist than the class
+    /// requires.
+    InsufficientVerified { have: usize, need: usize },
+    /// One or more typed receipts are pinned to an older head.
+    StaleHead { receipt_heads: Vec<String> },
+}
+
+impl MergeDeficit {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoLinkage => "no_linkage",
+            Self::AuthorityUnknown => "authority_unknown",
+            Self::ReservedAssignments { .. } => "review_assignment_pending",
+            Self::UnresolvedClass => "unresolved_class",
+            Self::Draft => "draft",
+            Self::CiNotGreen => "ci_not_green",
+            Self::CiHeadMismatch => "ci_head_mismatch",
+            Self::NonVerifiedReceipt { .. } => "non_verified_receipt",
+            Self::InsufficientVerified { .. } => "insufficient_verified",
+            Self::StaleHead { .. } => "stale_head",
+        }
+    }
+}
+
 /// §4.2 stale-head invariant — CI's green SHA AND every reviewer's
 /// reviewed_head MUST equal the current PR head_sha. If `head_sha`
 /// advanced after VERIFIED, the verdict is stale; refuse to fire
 /// merge-ready.
 ///
-/// Also gates on:
-/// - Draft state — `gh pr merge` rejects drafts; refuse to mark ready
-/// - Threshold per `review_class` (Single=1 / Dual=2)
-pub fn is_merge_ready(state: &PrState) -> bool {
+/// Also gates on draft state and the threshold for `review_class`.
+pub fn merge_readiness(state: &PrState) -> Result<(), MergeDeficit> {
     // t-…-17 B4 (codex m-…-322): the assignment authority was UNREADABLE at the last
-    // A6 drain (a corrupt/unreadable record, an exists-but-unreadable branch dir, or a
-    // required assignment-lock failure), so the reserved derivation could NOT be
-    // trusted. FAIL CLOSED. This is the explicit "authority unreadable ⇒ close" state
-    // that closes the sole-corrupt-record fail-open: a branch whose only record is
-    // corrupt looks assignment-free to the lossy `has_active`, so the drain would
-    // otherwise derive an EMPTY reserved set on a fresh state and OPEN this gate.
+    // A6 drain, so the reserved derivation could NOT be trusted. FAIL CLOSED.
     if state.authority_unknown {
-        return false;
+        return Err(MergeDeficit::AuthorityUnknown);
     }
     // t-…-17 C13: a required reviewer whose assignment is RESERVED-but-unverified
-    // holds the PR closed. Reserved entries are DERIVED (excl. Satisfied) by the
-    // reconciler and are NEVER counted toward `required_verified_count` / pushed
-    // into `VerdictState::Verified` — they only gate here (plan §3(l)/I17).
+    // holds the PR closed. Reserved entries never count toward the threshold.
     if !state.reserved_assignments.is_empty() {
-        return false;
+        return Err(MergeDeficit::ReservedAssignments {
+            count: state.reserved_assignments.len(),
+        });
     }
-    // #2745 fail-closed: an `Unresolved` review_class (intent ABSENT / UNKNOWN /
-    // MISMATCHED at arm time) is NEVER merge-ready — no verdict count can satisfy
-    // it. The scanner raises an actionable diagnostic in place of pr-ready.
+    // #2745 fail-closed: an unresolved review class is never satisfiable.
     if matches!(state.review_class, ReviewClass::Unresolved) {
-        return false;
+        return Err(MergeDeficit::UnresolvedClass);
     }
     if matches!(state.draft_state, DraftState::Draft) {
-        return false;
+        return Err(MergeDeficit::Draft);
     }
     let CiState::Green { sha: ci_sha, .. } = &state.ci_state else {
-        return false;
+        return Err(MergeDeficit::CiNotGreen);
     };
     if ci_sha != &state.head_sha {
-        return false;
+        return Err(MergeDeficit::CiHeadMismatch);
     }
+
+    // Keep stale receipts distinguishable from an N-of-M deficit. A receipt
+    // carrying the same repo/PR/branch subject but an older head is evidence
+    // of a review that must not authorize this merge attempt.
+    let stale_heads: Vec<String> = state
+        .validated_review_receipts
+        .iter()
+        .filter(|receipt| {
+            receipt.repo == state.repo
+                && receipt.pr_number == state.pr_number
+                && receipt.branch == state.branch
+                && receipt.reviewed_head != state.head_sha
+        })
+        .map(|receipt| receipt.reviewed_head.clone())
+        .collect();
+    if !stale_heads.is_empty() {
+        return Err(MergeDeficit::StaleHead {
+            receipt_heads: stale_heads,
+        });
+    }
+
     let current: Vec<_> = state
         .validated_review_receipts
         .iter()
-        .filter(|r| r.matches_state(state))
+        .filter(|receipt| receipt.matches_state(state))
         .collect();
-    if current
+    let non_verified: Vec<String> = current
         .iter()
-        .any(|r| !matches!(r.verdict, crate::review_receipt::ReviewVerdict::Verified))
-    {
-        return false;
+        .filter(|receipt| {
+            !matches!(
+                receipt.verdict,
+                crate::review_receipt::ReviewVerdict::Verified
+            )
+        })
+        .map(|receipt| receipt.reviewer_name.clone())
+        .collect();
+    if !non_verified.is_empty() {
+        return Err(MergeDeficit::NonVerifiedReceipt {
+            reviewers: non_verified,
+        });
     }
+
     let distinct_reviewers: std::collections::HashSet<_> = current
         .iter()
-        .filter(|r| matches!(r.verdict, crate::review_receipt::ReviewVerdict::Verified))
-        .map(|r| r.reviewer_instance_id)
+        .filter(|receipt| {
+            matches!(
+                receipt.verdict,
+                crate::review_receipt::ReviewVerdict::Verified
+            )
+        })
+        .map(|receipt| receipt.reviewer_instance_id)
         .collect();
-    if distinct_reviewers.len() < state.review_class.required_verified_count() {
-        return false;
+    let required = state.review_class.required_verified_count();
+    if distinct_reviewers.len() < required {
+        return Err(MergeDeficit::InsufficientVerified {
+            have: distinct_reviewers.len(),
+            need: required,
+        });
     }
-    // Receipt validation is exact-full-head; prefixes are never authoritative.
-    current.iter().all(|r| r.reviewed_head == state.head_sha)
+    // Receipt validation is exact-full-head; this final assertion remains a
+    // defensive backstop if the subject filter changes later.
+    if !current
+        .iter()
+        .all(|receipt| receipt.reviewed_head == state.head_sha)
+    {
+        return Err(MergeDeficit::StaleHead {
+            receipt_heads: current
+                .iter()
+                .map(|receipt| receipt.reviewed_head.clone())
+                .filter(|head| head != &state.head_sha)
+                .collect(),
+        });
+    }
+    Ok(())
+}
+
+/// Compatibility predicate retained for all scanner/reducer callers.
+pub fn is_merge_ready(state: &PrState) -> bool {
+    merge_readiness(state).is_ok()
 }
 
 /// #2749 read-only freshness gate outcome (decision d-20260712092257798199-17).

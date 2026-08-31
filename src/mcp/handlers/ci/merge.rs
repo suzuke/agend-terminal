@@ -324,6 +324,95 @@ fn acquire_head_base(
     Some((head, base, branch, s.merge_state_status))
 }
 
+fn load_exact_merge_state(
+    home: &Path,
+    repo: &str,
+    pr: u64,
+    branch: &str,
+    head: &str,
+) -> Option<crate::daemon::pr_state::PrState> {
+    let state = crate::daemon::pr_state::load(home, repo, branch)?;
+    (state.repo == repo
+        && state.pr_number == pr
+        && state.branch == branch
+        && state.head_sha == head)
+        .then_some(state)
+}
+
+fn review_deficit_response(deficit: crate::daemon::pr_state::MergeDeficit) -> Value {
+    let code = deficit.code();
+    let mut response = json!({
+        "error": "review threshold not satisfied — merge refused",
+        "code": code,
+    });
+    if let Some(object) = response.as_object_mut() {
+        match deficit {
+            crate::daemon::pr_state::MergeDeficit::InsufficientVerified { have, need } => {
+                object.insert("verified_count".into(), json!(have));
+                object.insert("required_verified_count".into(), json!(need));
+            }
+            crate::daemon::pr_state::MergeDeficit::StaleHead { receipt_heads } => {
+                object.insert("receipt_heads".into(), json!(receipt_heads));
+            }
+            crate::daemon::pr_state::MergeDeficit::ReservedAssignments { count } => {
+                object.insert("reserved_assignment_count".into(), json!(count));
+            }
+            crate::daemon::pr_state::MergeDeficit::NonVerifiedReceipt { reviewers } => {
+                object.insert("non_verified_reviewers".into(), json!(reviewers));
+            }
+            _ => {}
+        }
+    }
+    response
+}
+
+fn review_audit_fields(state: Option<&crate::daemon::pr_state::PrState>) -> Value {
+    let Some(state) = state else {
+        return json!({
+            "review_class": "unlinked",
+            "verified_count": 0,
+            "required_verified_count": 0,
+            "reviewer_identities": [],
+            "reviewer_instance_ids": [],
+            "reviewer_assignment_ids": [],
+            "receipt_heads": [],
+        });
+    };
+    let verified = state.validated_review_receipts.iter().filter(|receipt| {
+        receipt.repo == state.repo
+            && receipt.pr_number == state.pr_number
+            && receipt.branch == state.branch
+            && receipt.review_class == state.review_class
+            && matches!(
+                receipt.verdict,
+                crate::review_receipt::ReviewVerdict::Verified
+            )
+    });
+    let mut reviewer_identities = Vec::new();
+    let mut reviewer_instance_ids = Vec::new();
+    let mut reviewer_assignment_ids = Vec::new();
+    let mut receipt_heads = Vec::new();
+    let mut seen_reviewers = std::collections::HashSet::new();
+    for receipt in verified {
+        if !seen_reviewers.insert(receipt.reviewer_instance_id) {
+            continue;
+        }
+        reviewer_identities.push(receipt.reviewer_name.clone());
+        reviewer_instance_ids.push(receipt.reviewer_instance_id.full());
+        reviewer_assignment_ids.push(receipt.assignment_id.to_string());
+        receipt_heads.push(receipt.reviewed_head.clone());
+    }
+    json!({
+        "review_class": state.review_class.as_token(),
+        "verified_count": reviewer_identities.len(),
+        "required_verified_count": state.review_class.required_verified_count(),
+        "reviewer_identities": reviewer_identities,
+        "reviewer_instance_ids": reviewer_instance_ids,
+        "reviewer_assignment_ids": reviewer_assignment_ids,
+        "receipt_heads": receipt_heads,
+    })
+}
+
 pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let pr = match args["pr"].as_u64() {
         Some(n) => n,
@@ -441,8 +530,24 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         }
     }
 
+    // Canonical merge authority: after the non-force CI/base/freshness policy
+    // gates have accepted the exact acquired head, require the persisted
+    // PrState subject and its typed review evidence to match that same head.
+    // Force is the explicit policy bypass below; exact head/base acquisition
+    // and recheck remain non-bypassable.
+    let review_state = load_exact_merge_state(home, &repo, pr, &pr_branch, &gated_head);
+    if !force {
+        let Some(state) = review_state.as_ref() else {
+            return review_deficit_response(crate::daemon::pr_state::MergeDeficit::NoLinkage);
+        };
+        if let Err(deficit) = crate::daemon::pr_state::merge_readiness(state) {
+            return review_deficit_response(deficit);
+        }
+    }
+
     if force {
-        let event = serde_json::json!({
+        let review_evidence = review_audit_fields(review_state.as_ref());
+        let mut event = serde_json::json!({
             "kind": "merge_force_bypass",
             "agent": instance_name,
             "pr": pr,
@@ -450,6 +555,15 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
             "force_reason": force_reason,
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
+        if let (Some(event), Some(review_evidence)) =
+            (event.as_object_mut(), review_evidence.as_object())
+        {
+            event.extend(
+                review_evidence
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
         // #3416: goes through the one serialized appender. This is a destructive
         // fail-closed gate, so it uses bounded retry and then refuses — never an
         // unlocked fallback. `Err` means no TRUSTWORTHY record exists, which is why
