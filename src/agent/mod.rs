@@ -1852,6 +1852,13 @@ where
     }
     // Small settle delay for prompt paint or structured-session publication.
     sleep(settle_delay);
+    // #3462-v3/F1: the loop-top check is the last shutdown observation before this
+    // settle, so one landing during it would still hand back a live target and the
+    // caller would write into an agent the daemon is tearing down. All three
+    // callers of this waiter inherit the fence.
+    if shutdown.is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
+        return IdleInjectWaitResult::terminal(IdleInjectWaitTerminal::Shutdown);
+    }
     // #1530/F1: snapshot the inject target under the registry lock, release it,
     // THEN inject (caller side) — never hold the registry across the blocking write.
     let reg = lock_registry(registry);

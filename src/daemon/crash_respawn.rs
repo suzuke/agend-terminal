@@ -191,8 +191,12 @@ pub(super) fn handle_crash_observation(
     // fire-and-forget: respawn worker runs the whole respawn (backoff, spawn_agent,
     // restore health, start the TUI server, then wait for prompt readiness before
     // the notice). Bounded: the readiness wait ends at `ready_timeout_secs + 15`,
-    // and both the backoff and that wait observe the shutdown flag, so the thread
-    // always ends on its own.
+    // and the backoff SAMPLES the shutdown flag on a bounded 100ms slice instead
+    // of sleeping through the whole delay, so the thread always ends on its own.
+    // Nothing joins it — shutdown never waits on this thread, so that sampling is
+    // about not acting on a stale flag (#3462-v3/F2), not about shutdown latency.
+    // Bounded sampling, not edge latching: see `wait_out_backoff_or_shutdown` for
+    // the minimum-window assumption it rests on.
     if let Err(e) = std::thread::Builder::new()
         .name(format!("{crashed_name}_respawn"))
         .spawn(move || {
@@ -366,6 +370,53 @@ fn respawn_notice(reason: &str) -> String {
     )
 }
 
+/// #3462-v3/F2: wait out the crash-respawn backoff by SAMPLING `shutdown` on a
+/// bounded 100ms slice, returning true on the first slice that sees it true.
+///
+/// This is bounded sampling, NOT edge latching: a true→false window that opens
+/// and closes entirely inside one slice is missed by construction, and no polling
+/// wait can promise otherwise. What it does buy is the difference that matters
+/// here — a bare `sleep(delay)` samples once, after up to `BACKOFF_MAX` (300s), so
+/// it misses every window narrower than the whole backoff.
+///
+/// Why sampling is sufficient at this width. `ctx.shutdown` is reset to false
+/// in-process: `daemon/mod.rs:226` (self-respawn abort) and `daemon/mod.rs:989`
+/// (recover-as-primary, which then re-spawns the fleet and keeps serving). On the
+/// recover-as-primary path the flag stays true across
+/// `std::thread::sleep(self_respawn_settle())` before the reset —
+/// `self_respawn_settle()` is 1s by default (`daemon/mod.rs:245-249`), i.e. at
+/// least ten slices. The assumption this wait rests on is therefore explicit: the
+/// production shutdown window is >= one slice. It holds by construction on that
+/// path; `AGEND_SELF_RESPAWN_SETTLE_SECS` is a test-only override that could
+/// shrink it, and the abort path's width is not independently measured here.
+///
+/// Deliberately not a channel or `Condvar`: the worker is handed an `AtomicBool`,
+/// and plumbing a stop channel down to it is the refactor this correction
+/// excludes.
+fn wait_out_backoff_or_shutdown(delay: std::time::Duration, shutdown: &AtomicBool) -> bool {
+    wait_out_backoff_or_shutdown_with_sleep(delay, shutdown, &mut std::thread::sleep)
+}
+
+/// Injected-sleep seam so the edge-latching above is provable without wall-clock
+/// time; production passes `std::thread::sleep`.
+fn wait_out_backoff_or_shutdown_with_sleep<S: FnMut(std::time::Duration)>(
+    delay: std::time::Duration,
+    shutdown: &AtomicBool,
+    sleep: &mut S,
+) -> bool {
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut waited = std::time::Duration::ZERO;
+    while waited < delay {
+        if shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
+        let step = SLICE.min(delay - waited);
+        sleep(step);
+        waited += step;
+    }
+    shutdown.load(Ordering::Relaxed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn respawn_agent_worker(
     home: &Path,
@@ -388,12 +439,10 @@ fn respawn_agent_worker(
     #[cfg(not(test))]
     let _test_done: Option<()> = None;
     #[cfg(test)]
-    if test_done.is_none() {
-        std::thread::sleep(delay);
-    }
+    let shutdown_seen = test_done.is_none() && wait_out_backoff_or_shutdown(delay, shutdown);
     #[cfg(not(test))]
-    std::thread::sleep(delay);
-    if shutdown.load(Ordering::Relaxed) {
+    let shutdown_seen = wait_out_backoff_or_shutdown(delay, shutdown);
+    if shutdown_seen || shutdown.load(Ordering::Relaxed) {
         if let Some(token) = claim {
             agent::crash_disposition::owner_ledger().discard(token.key());
         }
@@ -642,7 +691,16 @@ fn respawn_agent_worker(
                 // The waiter snapshots the target under the registry lock and
                 // releases it before returning (#1530/F1), so the inject below
                 // never runs with the registry held.
-                if let Some(tgt) = ready {
+                // #3462-v3/F1: a target snapshotted before shutdown is not
+                // permission to write after it. The waiter now fences its own
+                // settle, but the span from its return to the inject below —
+                // core lock, crash-reason read, notice format — is ours.
+                if shutdown.load(Ordering::Relaxed) {
+                    tracing::info!(
+                        agent = %config.name,
+                        "shutdown after the readiness wait — not injecting the respawn notice"
+                    );
+                } else if let Some(tgt) = ready {
                     let reason = tgt.core.lock().health.crash_reason().to_string();
                     let msg = respawn_notice(&reason);
                     // #3462: go through the respawned handle's own injector so
@@ -1285,6 +1343,60 @@ fn respawn_agent_worker(shutdown: &AtomicBool) {
             body.contains("wait_out_backoff_or_shutdown("),
             "#3462-v3 F2: the backoff must run through a wait that observes the \
              shutdown flag while it waits"
+        );
+    }
+
+    /// #3462-v3 RED-C, behavioural half: the wait must see a shutdown window
+    /// WIDER THAN ONE SLICE, which is exactly what `sleep(delay)` + one `load`
+    /// cannot do.
+    ///
+    /// Scope of the claim, stated so it is not read as more: this proves bounded
+    /// sampling, not edge latching. A window that opens and closes inside a single
+    /// slice is missed by construction and this test does not pretend otherwise.
+    ///
+    /// The injected sleep models the real shape: the flag goes up when the wait
+    /// starts and comes back down only for a caller that slept longer than the
+    /// window. The 1s threshold below is not arbitrary — it is
+    /// `self_respawn_settle()`'s default (`daemon/mod.rs:245-249`), the sleep the
+    /// recover-as-primary path holds shutdown true across before storing `false`.
+    /// So the modelled window is the narrowest one this code actually faces.
+    ///
+    /// Non-vacuity was verified by mutation, not assumed: degrading the helper to
+    /// `sleep(delay); load()` makes this test fail. An earlier fixture survived
+    /// that mutation and was replaced.
+    #[test]
+    fn backoff_wait_sees_a_shutdown_window_wider_than_one_slice_3462() {
+        use std::cell::Cell;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let shutdown = AtomicBool::new(false);
+        let slices = Cell::new(0u32);
+        let mut sleep = |step: std::time::Duration| {
+            slices.set(slices.get() + 1);
+            shutdown.store(true, Ordering::Relaxed);
+            if step >= std::time::Duration::from_secs(1) {
+                // The caller chose to sleep longer than the window is open, so it
+                // is asleep for the whole of it and wakes to the reset value.
+                shutdown.store(false, Ordering::Relaxed);
+            }
+        };
+
+        let observed = super::wait_out_backoff_or_shutdown_with_sleep(
+            std::time::Duration::from_secs(300),
+            &shutdown,
+            &mut sleep,
+        );
+
+        assert!(
+            observed,
+            "#3462-v3 F2: a shutdown window at least one slice wide must be sampled \
+             during the backoff — reading the flag afterwards reads the reset"
+        );
+        assert_eq!(
+            slices.get(),
+            1,
+            "the wait must return on the first slice that sees it, not after the \
+             full 300s backoff"
         );
     }
 
