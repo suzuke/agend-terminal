@@ -254,7 +254,7 @@ fn spawn_single_instance_impl_inner(
         {
             return json!({"error": "working_directory must not contain '..'"});
         }
-        if !dir.starts_with('/') {
+        if !std::path::Path::new(dir).is_absolute() {
             return json!({"error": "working_directory must be an absolute path"});
         }
     }
