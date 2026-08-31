@@ -1172,6 +1172,53 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
+    #[test]
+    fn delete_instance_requires_exact_name_before_lifecycle() {
+        let home = dec_home("delete_exact_name");
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(crate::layout::Tab::new(
+            "managed".to_string(),
+            close_test_pane(
+                crate::types::InstanceId::default(),
+                "managed",
+                Some("managed"),
+            ),
+        ));
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let mut overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "manage".to_string(),
+            notice: None,
+        };
+        let task_rpc_tx = test_task_channel().0;
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            reap_workers: &mut reap_workers,
+        };
+
+        handle_key(&mut overlay, press(KeyCode::Enter), &mut ctx);
+        drop(ctx);
+        assert!(matches!(
+            overlay,
+            Overlay::ConfirmDeleteInstance {
+                name,
+                input,
+                notice: None,
+            } if name == "managed" && input == "manage"
+        ));
+        assert_eq!(layout.tabs.len(), 1, "mismatch must preserve all views");
+        std::fs::remove_dir_all(home).ok();
+    }
+
     fn task_overlay() -> Overlay {
         Overlay::Tasks {
             items: Vec::new(),

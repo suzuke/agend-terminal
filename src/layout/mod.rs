@@ -693,6 +693,35 @@ mod tests {
         assert_eq!(layout.active, 0, "right-of-active close leaves focus put");
     }
 
+    #[test]
+    fn remove_fleet_instance_views_across_tabs_preserves_other_panes() {
+        let mut layout = Layout::new();
+        let mut target = leaf(1, "target-label");
+        target.fleet_instance_name = Some("managed".into());
+        let mut local = leaf(2, "shell");
+        local.fleet_instance_name = None;
+        layout.add_tab(Tab::new("mixed".into(), target));
+        layout.tabs[0].split_focused(SplitDir::Vertical, local);
+
+        let mut second_target = leaf(3, "target-label-2");
+        second_target.fleet_instance_name = Some("managed".into());
+        layout.add_tab(Tab::new("target-only".into(), second_target));
+        layout.active = 0;
+
+        assert!(layout.remove_fleet_instance_views("managed"));
+        assert_eq!(layout.tabs.len(), 1);
+        assert_eq!(layout.tabs[0].root().pane_count(), 1);
+        assert_eq!(layout.tabs[0].root().first_pane().agent_name.as_str(), "shell");
+        assert!(layout
+            .tabs
+            .iter()
+            .all(|tab| tab.root().pane_ids().into_iter().all(|id| tab
+                .root()
+                .find_pane(id)
+                .and_then(|pane| pane.fleet_instance_name.as_deref())
+                != Some("managed"))));
+    }
+
     /// #1939: all remembered sibling agents gone by respawn time → fall back
     /// to the pre-#1939 behavior (split the tab's focused pane); no panic.
     #[test]

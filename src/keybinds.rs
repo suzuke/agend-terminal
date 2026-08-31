@@ -444,4 +444,40 @@ mod tests {
         let action = handler.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(matches!(action, Action::Forward(_)));
     }
+
+    #[test]
+    fn ctrl_b_shift_x_deletes_but_plain_x_closes_view() {
+        // RED: Ctrl+B X is currently unmapped, while lowercase x is the
+        // established view-only close action.
+        assert_eq!(
+            prefix_action(KeyCode::Char('X'), KeyModifiers::NONE),
+            Action::DeleteInstance
+        );
+        assert_eq!(
+            prefix_action(KeyCode::Char('x'), KeyModifiers::SHIFT),
+            Action::DeleteInstance
+        );
+        assert_eq!(
+            prefix_action(KeyCode::Char('x'), KeyModifiers::NONE),
+            Action::ClosePane
+        );
+    }
+
+    #[test]
+    fn ctrl_b_shift_x_is_one_shot() {
+        let mut handler = KeyHandler::new();
+        assert_eq!(
+            handler.handle(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            Action::None
+        );
+        assert_eq!(
+            handler.handle(key(KeyCode::Char('X'), KeyModifiers::NONE)),
+            Action::DeleteInstance
+        );
+        assert!(!handler.in_repeat(), "destructive action must not repeat");
+        assert!(matches!(
+            handler.handle(key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Action::Forward(_)
+        ));
+    }
 }

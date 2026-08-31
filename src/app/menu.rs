@@ -232,9 +232,61 @@ pub(super) fn pane_from_menu_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Tab;
 
     #[test]
     fn fugu_menu_label_is_backend_style() {
         assert_eq!(FUGU_BACKEND_MENU_LABEL, "[backend] Codex(Sakana)");
+    }
+
+    #[test]
+    fn attached_fleet_names_scan_every_tab_and_ignore_local_shells() {
+        let mut layout = Layout::new();
+        let local = Pane {
+            agent_name: "shell".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: crate::vterm::VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: crate::layout::PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        layout.add_tab(Tab::new("local".into(), local));
+        let attached = Pane {
+            agent_name: "label".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: crate::vterm::VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 2,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: Some("attached".into()),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: crate::layout::PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        layout.add_tab(Tab::new("attached".into(), attached));
+
+        let names = attached_fleet_names(&layout);
+        assert!(names.contains("attached"));
+        assert!(!names.contains("shell"));
     }
 }
