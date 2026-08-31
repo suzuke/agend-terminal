@@ -20,8 +20,8 @@
 
 use std::path::Path;
 
-/// True when `path`'s owning module declares it as a body-less `mod <stem>;` carrying a
-/// cfg that cannot hold outside a test build.
+/// True when `path`'s owning module declares it as a body-less `mod <stem>;` and EVERY
+/// such declaration carries a cfg that cannot hold outside a test build.
 pub fn is_cfg_test_module_file(path: &Path) -> bool {
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
         return false;
@@ -47,14 +47,24 @@ fn owner_declares_test_module(owner: &Path, stem: &str) -> bool {
     let Ok(file) = syn::parse_file(&source) else {
         return false;
     };
-    file.items.iter().any(|item| match item {
-        // `content.is_none()` keeps this to DECLARATIONS (`mod foo;`); an inline
-        // `mod foo { .. }` owns its own body and is not this file.
-        syn::Item::Mod(m) => {
-            m.content.is_none() && m.ident == stem && m.attrs.iter().any(is_test_only_cfg_attr)
-        }
-        _ => false,
-    })
+    // `content.is_none()` keeps this to DECLARATIONS (`mod foo;`); an inline
+    // `mod foo { .. }` owns its own body and is not this file.
+    let declarations: Vec<&syn::ItemMod> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(m) if m.content.is_none() && m.ident == stem => Some(m),
+            _ => None,
+        })
+        .collect();
+    // EVERY matching declaration must be test-only, not merely one of them. A
+    // cfg-SPLIT pair (`#[cfg(not(test))] mod x;` beside `#[cfg(test)] mod x;`)
+    // declares the SAME file twice and the `not(test)` arm compiles it into
+    // production, so a single non-test declaration disqualifies the file.
+    !declarations.is_empty()
+        && declarations
+            .iter()
+            .all(|m| m.attrs.iter().any(is_test_only_cfg_attr))
 }
 
 fn is_test_only_cfg_attr(attr: &syn::Attribute) -> bool {
