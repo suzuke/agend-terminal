@@ -280,27 +280,138 @@ mod tests {
         std::fs::remove_dir_all(&run_dir).ok();
     }
 
-    /// Source pin for "BOTH real writers". Booting the daemon and the TUI to
-    /// observe their writes is disproportionate for a marker change, so this
-    /// asserts at the source level that neither call site still hand-writes an
-    /// RFC3339 payload and that both go through the shared atomic writer.
-    /// The sibling idiom is `daemon::supervisor::tests`' brace-matched anchor.
+    /// The exact production functions that own a `.ready` write, with the
+    /// evasion fixture used to prove the scan actually bites.
+    ///
+    /// Named functions, not whole files: a file-wide scan would be satisfied by
+    /// a `ready::write` call anywhere in `api/mod.rs`, including one this slice
+    /// never put there.
+    const READY_WRITERS: [(&str, &str, &str, &str, &str); 2] = [
+        (
+            "daemon",
+            "src/daemon/mod.rs",
+            "spawn_fleet_agents",
+            "crate::ready::write(&dir)",
+            "{ /* re-inlined by hand */ let out_target = dir.join(\".ready\"); std::fs::write(&out_target, b\"ready\") }",
+        ),
+        (
+            "app/TUI",
+            "src/api/mod.rs",
+            "serve_inner",
+            "crate::ready::write(&run_dir)",
+            "{ /* re-inlined by hand */ let zz_target = run_dir.join(\".ready\"); std::fs::write(&zz_target, b\"ready\") }",
+        ),
+    ];
+
+    /// Calls found inside ONE function body.
+    #[derive(Default)]
+    struct WriterCalls {
+        shared: usize,
+        raw_fs: usize,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for WriterCalls {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*node.func {
+                let segs: Vec<String> = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                // Match the final two segments, so `std::fs::write` and a
+                // `use std::fs`-shortened `fs::write` are both caught, and so a
+                // renamed local variable changes nothing.
+                let tail_is = |a: &str, b: &str| {
+                    segs.len() >= 2 && segs[segs.len() - 2] == a && segs[segs.len() - 1] == b
+                };
+                if tail_is("ready", "write") {
+                    self.shared += 1;
+                }
+                if tail_is("fs", "write") {
+                    self.raw_fs += 1;
+                }
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+    }
+
+    /// Walk ONLY the named function's body, closures included.
+    ///
+    /// A missing function is a hard failure, not an empty result: a scan that
+    /// silently finds nothing would pass forever the moment someone renames or
+    /// re-homes the writer, which is the exact way a source pin goes vacuous.
+    fn scan_writer(src: &str, fn_name: &str) -> WriterCalls {
+        use syn::visit::Visit;
+        let file = syn::parse_file(src).unwrap_or_else(|e| panic!("parse {fn_name} source: {e}"));
+        let func = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(f) if f.sig.ident == fn_name => Some(f),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("fn {fn_name} not found — the writer invariant cannot be enforced")
+            });
+        let mut calls = WriterCalls::default();
+        calls.visit_block(&func.block);
+        calls
+    }
+
+    fn writer_source(rel: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    }
+
+    /// Source pin for "BOTH real writers", as a `syn` AST walk scoped to each
+    /// exact production function. Booting the daemon and the TUI to observe
+    /// their writes is disproportionate for a marker change; a string scan is
+    /// the other extreme and loses to a renamed variable, which is what the
+    /// companion test below demonstrates.
     #[test]
     fn both_real_writers_route_through_the_shared_atomic_writer() {
-        for (label, src) in [
-            ("daemon", include_str!("daemon/mod.rs")),
-            ("app/TUI", include_str!("api/mod.rs")),
-        ] {
+        for (label, rel, fn_name, _, _) in READY_WRITERS {
+            let calls = scan_writer(&writer_source(rel), fn_name);
             assert!(
-                src.contains("crate::ready::write("),
-                "{label} writer must publish through crate::ready::write"
+                calls.shared >= 1,
+                "{label}: {fn_name} must publish the marker through crate::ready::write"
             );
-            // Anchored on the ready path specifically: `daemon/mod.rs` still
-            // writes an RFC3339 payload for the SEPARATE `.daemon` control-plane
-            // marker, which this slice must not touch.
+            assert_eq!(
+                calls.raw_fs, 0,
+                "{label}: {fn_name} must not hand-write the marker with fs::write"
+            );
+        }
+    }
+
+    /// The reason the scan is an AST walk. Each writer is reverted to an inline
+    /// `fs::write` under an arbitrary local name and a comment — the shape the
+    /// previous `src.contains("std::fs::write(&ready_path,")` guard could not
+    /// see. The AST walk must catch it for EVERY writer.
+    #[test]
+    fn an_evasive_fs_write_revert_is_caught_in_each_writer() {
+        for (label, rel, fn_name, needle, evasion) in READY_WRITERS {
+            let real = writer_source(rel);
             assert!(
-                !src.contains("std::fs::write(&ready_path,"),
-                "{label} writer must no longer hand-write the .ready marker"
+                real.contains(needle),
+                "{label}: evasion fixture is stale — {needle:?} no longer appears in {rel}"
+            );
+            let evasive = real.replacen(needle, evasion, 1);
+
+            // The old string guard keyed on this literal; the revert avoids it.
+            assert!(
+                !evasive.contains("std::fs::write(&ready_path,"),
+                "{label}: the fixture must evade the retired string guard"
+            );
+
+            let calls = scan_writer(&evasive, fn_name);
+            assert!(
+                calls.raw_fs >= 1,
+                "{label}: the AST walk must catch an evasive fs::write revert in {fn_name}"
+            );
+            assert_eq!(
+                calls.shared, 0,
+                "{label}: the fixture must actually remove the shared-writer call"
             );
         }
     }
