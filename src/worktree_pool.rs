@@ -1121,6 +1121,22 @@ fn release_full_guarded(
             Ok(lock) => lock,
             Err(e) => return opaque_release(format!("branch lease lock failed: {e}")),
         };
+    // t-…-87866-27: every other lock here is keyed by BRANCH (above) or by AGENT
+    // (below), so a DIFFERENT agent mutating the SAME worktree path sees none of
+    // them. `checkout_txn::acquire_path_lock` is the canonical shared domain for a
+    // path — `ci/checkout.rs` provisions under it and its doc names repo-release as
+    // the next consumer — so take it here and hold it (RAII) across the teardown.
+    // Fleet order preserved: branch lease → this per-path flock → per-agent binding
+    // lock. No caller of this function holds the path lock, so it cannot re-enter.
+    let _path_lock = if wt.is_empty() {
+        None
+    } else {
+        match crate::mcp::handlers::ci::checkout_txn::acquire_path_lock(home, Path::new(wt), agent)
+        {
+            Ok(guard) => Some(guard),
+            Err(e) => return opaque_release(format!("worktree path lock failed: {e}")),
+        }
+    };
     let _agent_lock = match crate::binding::acquire_agent_mutation_lock(home, agent) {
         Ok(lock) => lock,
         Err(e) => return opaque_release(e),
@@ -1279,6 +1295,10 @@ fn release_full_guarded(
     // branch cleanup, or release event runs with a flock held.
     drop(_binding_lock);
     drop(_agent_lock);
+    // Inner→outer, mirroring the acquisition order (branch → path → agent →
+    // binding): the per-path flock drops with the other transaction locks so the
+    // S1 invariant holds — notice dispatch still begins with NO flock held.
+    drop(_path_lock);
     drop(_branch_lock);
 
     for notice in locked.notices.drain(..) {
