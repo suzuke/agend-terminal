@@ -380,6 +380,64 @@ fn reuse_rejects_submodule_not_at_gitlink_and_keeps_the_tree() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// r2 correction 1: on the REUSE path the submodule verify must run BEFORE the
+/// destructive `sync_worktree_to_head` (`reset --hard` + `clean -fd`). Rejecting
+/// AFTER the reset still destroys the occupant's work, which makes the guard
+/// worse than useless: the caller is told "no" and has already lost the WIP.
+///
+/// Both kinds of parent WIP are asserted, because `reset --hard` and `clean -fd`
+/// destroy different things: a TRACKED modification and an UNTRACKED file.
+#[test]
+fn reuse_verify_precedes_sync_so_parent_wip_survives_rejection() {
+    let home = tmp_home("submod-reuse-wip");
+    let super_repo = tmp_super_with_nested_submodules("failclosed-reuse-wip");
+    let first = create(&home, &super_repo, "agent-wip", Some("feat/submod-wip"))
+        .expect("first create must provision");
+    let wt = first.path.clone();
+
+    // Parent WIP of both kinds. `.gitmodules` is the fixture's only TRACKED
+    // regular file (the super repo commits just it plus the gitlink), so it is
+    // what a `reset --hard` would revert; an appended comment keeps the file
+    // valid for `submodule status`. The untracked file is what `clean -fd`
+    // would delete. Both are needed: the two halves of the destructive sync
+    // destroy different things.
+    let tracked = wt.join(".gitmodules");
+    let tracked_before = std::fs::read_to_string(&tracked).expect("fixture tracks .gitmodules");
+    let tracked_wip = format!("{tracked_before}# PARENT WIP tracked edit\n");
+    std::fs::write(&tracked, &tracked_wip).expect("write tracked WIP");
+    let untracked = wt.join("scratch-wip.txt");
+    std::fs::write(&untracked, "PARENT WIP untracked\n").expect("write untracked WIP");
+
+    // Desync the submodule so the read-only verify must reject.
+    let sub_dir = wt.join("vendor/mid");
+    assert!(
+        sub_dir.exists(),
+        "fixture must have provisioned the submodule"
+    );
+    for entry in std::fs::read_dir(&sub_dir).unwrap().flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p).ok();
+        } else {
+            std::fs::remove_file(&p).ok();
+        }
+    }
+
+    let again = create(&home, &super_repo, "agent-wip", Some("feat/submod-wip"));
+    assert!(again.is_none(), "an invalid reused submodule must reject");
+
+    assert!(
+        untracked.is_file(),
+        "untracked parent WIP must survive a rejection — `clean -fd` must not have run"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tracked).unwrap_or_default(),
+        tracked_wip,
+        "tracked parent WIP must be byte-identical — `reset --hard` must not have run"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ── #2158-adjacent: dirty-WIP preservation helpers ──────────────────
 // (reuses the module's existing `git_out`/`git_run` bypass helpers below)
 

@@ -307,6 +307,96 @@ mod tests {
     /// After #888 the gate ALSO requires `source_repo.is_some()` OR
     /// `git_branch.is_some()` so we set `source_repo` here to
     /// preserve the test's positive-path intent.
+    /// r2 correction 2 (bootstrap half): when the auto-worktree cannot be
+    /// PROVISIONED, `resolve_one` must fail closed — the agent is not resolved,
+    /// so boot neither launches it nor persists it. Before this fix a create
+    /// failure was indistinguishable from "auto-worktree not applicable": both
+    /// surfaced as `None`, and boot silently fell back to the SOURCE REPO as the
+    /// agent's working directory.
+    #[test]
+    fn resolve_one_fails_closed_when_worktree_provisioning_fails() {
+        let dir = tmp_dir("wt-provision-fail");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
+        init_git_repo(&dir);
+
+        let git = |d: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(d)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        // A submodule whose source is deleted afterwards → strict init fails →
+        // `worktree::create` fail-closes.
+        let sub = dir.join("sub-src");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(git(&sub, &["init", "-b", "main"]));
+        std::fs::write(sub.join("payload.txt"), "nested\n").unwrap();
+        assert!(git(&sub, &["add", "payload.txt"]));
+        assert!(git(
+            &sub,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init"
+            ]
+        ));
+        assert!(git(
+            &dir,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &sub.display().to_string(),
+                "vendor/dep"
+            ]
+        ));
+        assert!(git(
+            &dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "super"
+            ]
+        ));
+        std::fs::remove_dir_all(&sub).expect("remove submodule source");
+
+        let yaml = format!(
+            "defaults:\n  backend: claude\ninstances:\n  test-agent:\n    command: /bin/true\n    working_directory: {dir}\n    source_repo: {dir}\n",
+            dir = dir.display()
+        );
+        let config: FleetConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        let peers: Vec<(String, Option<String>)> = config
+            .instances
+            .iter()
+            .map(|(n, c)| (n.clone(), c.role.clone()))
+            .collect();
+        let ctx = ResolveContext {
+            fleet_dir: &dir,
+            home: &dir,
+            peers,
+        };
+
+        let result = resolve_one(&config, &ctx, "test-agent");
+        assert!(
+            result.is_none(),
+            "provisioning failed, so the agent must NOT resolve — falling back to \
+             the source repo would boot the agent on the wrong tree"
+        );
+    }
+
     #[test]
     fn resolve_one_creates_worktree_when_source_repo_set() {
         let dir = tmp_dir("wt-source-repo");
