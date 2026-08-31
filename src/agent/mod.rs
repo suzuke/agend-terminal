@@ -2001,6 +2001,18 @@ pub(crate) fn spawn_self_kick_bootstrap(
                 }
                 Err(error) => {
                     tracing::warn!(agent = %name, error = %error, "fresh-restart self-kick delivery failed");
+                    // The kick failed CLOSED — one attempt, no retry, no PTY
+                    // fallback — and a warn alone left an unattended restart
+                    // silently stranded. Record it where the operator looks.
+                    crate::event_log::log(
+                        &home,
+                        "self_kick_delivery_failed",
+                        &name,
+                        &format!(
+                            "fresh-restart self-kick delivery failed: {error}; no retry, no \
+                             fallback — inspect the agent and resume it manually"
+                        ),
+                    );
                 }
             }
         }
