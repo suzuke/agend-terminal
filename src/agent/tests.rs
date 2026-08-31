@@ -766,6 +766,86 @@ fn self_kick_structured_error_or_ambiguity_never_falls_back_or_retries() {
     }
 }
 
+/// A self-kick that fails CLOSED on the transport used to leave only a
+/// `tracing::warn!` behind, so the recurring "restarted overnight and just sat
+/// there" failure was invisible to an absent operator. The terminal failure must
+/// leave exactly one durable record — without becoming a retry or a PTY write.
+#[test]
+fn self_kick_transport_failure_records_one_durable_event() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _test_guard = SelfKickTestGuard::acquire();
+    let fixture = self_kick_fixture("failure-event");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_hook = Arc::clone(&calls);
+    let expected_home = fixture.home.clone();
+    let expected_name = fixture.name.clone();
+    crate::transport::test_support::set_delivery_hook(Some(Arc::new(move |home, name, body| {
+        if home != expected_home || name != expected_name {
+            return None;
+        }
+        calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        Some(Ok(self_kick_test_receipt(
+            name,
+            body,
+            DeliveryState::Failed,
+        )))
+    })));
+    fixture
+        .registry
+        .lock()
+        .get(&fixture.id)
+        .expect("fixture handle")
+        .core
+        .lock()
+        .state
+        .current = crate::state::AgentState::Idle;
+    crate::daemon::hook_shadow::record_event(&fixture.name, "UserPromptSubmit", None);
+
+    spawn_self_kick_bootstrap(
+        Arc::clone(&fixture.registry),
+        fixture.id,
+        fixture.name.clone(),
+        fixture.home.clone(),
+        std::time::Duration::from_secs(2),
+        BootstrapRegistrationState::AlreadyRegistered,
+        None,
+    )
+    .expect("self-kick bootstrap thread")
+    .join()
+    .expect("self-kick bootstrap");
+
+    // Reaching the transport exactly once is what makes the record above
+    // non-vacuous: a bootstrap that never got past the readiness wait would
+    // leave this at 0 rather than silently passing.
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no transport retry");
+    assert!(fixture.written.lock().is_empty(), "no PTY fallback");
+    assert!(
+        !crate::daemon::inject_delivery::is_armed_for_test(&fixture.name),
+        "a failed self-kick must not arm delivery verification"
+    );
+    let log = std::fs::read_to_string(fixture.home.join("event-log.jsonl"))
+        .expect("failed self-kick must leave a durable event log");
+    // Match the exact `kind` field rather than counting a substring of the
+    // line: a superstring kind is a DIFFERENT event and must not satisfy this.
+    let recorded: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("event log line must be JSON"))
+        .filter(|event: &serde_json::Value| event["kind"] == "self_kick_delivery_failed")
+        .collect();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "a failed self-kick must record exactly one operator-visible event"
+    );
+    assert_eq!(
+        recorded[0]["instance"],
+        fixture.name.as_str(),
+        "the record must name the stranded agent"
+    );
+    clear_self_kick_fixture(&fixture);
+}
+
 #[test]
 fn self_kick_structured_readiness_cannot_downgrade_to_legacy_pty() {
     let _test_guard = SelfKickTestGuard::acquire();
