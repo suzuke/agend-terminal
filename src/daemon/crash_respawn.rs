@@ -695,34 +695,36 @@ fn respawn_agent_worker(
                 // permission to write after it. The waiter now fences its own
                 // settle, but the span from its return to the inject below —
                 // core lock, crash-reason read, notice format — is ours.
-                if shutdown.load(Ordering::Relaxed) {
-                    tracing::info!(
-                        agent = %config.name,
-                        "shutdown after the readiness wait — not injecting the respawn notice"
-                    );
-                } else if let Some(tgt) = ready {
+                if let Some(tgt) = ready {
                     let reason = tgt.core.lock().health.crash_reason().to_string();
                     let msg = respawn_notice(&reason);
-                    // #3462: go through the respawned handle's own injector so
-                    // inject_prefix / typed readback + contamination fence /
-                    // deleted-generation check / post-submit observation all apply.
-                    // NOT because the submit byte differs — every shipped preset
-                    // submits `\r`, so the hardcoded byte was identical. What the
-                    // direct write skipped is the PACING: payload and submit went
-                    // out as one fused buffer, so a composer that had not finished
-                    // accepting the text never consumed the submit.
-                    if let Err(e) = agent::inject_with_target_gated(
-                        &tgt,
-                        &config.name,
-                        msg.as_bytes(),
-                        true,
-                        None,
-                    ) {
-                        tracing::warn!(
+                    if shutdown.load(Ordering::Relaxed) {
+                        tracing::info!(
                             agent = %config.name,
-                            error = %e,
-                            "#3462: crash-respawn notice injection failed"
+                            "shutdown after the readiness wait — not injecting the respawn notice"
                         );
+                    } else {
+                        // #3462: go through the respawned handle's own injector so
+                        // inject_prefix / typed readback + contamination fence /
+                        // deleted-generation check / post-submit observation all apply.
+                        // NOT because the submit byte differs — every shipped preset
+                        // submits `\r`, so the hardcoded byte was identical. What the
+                        // direct write skipped is the PACING: payload and submit went
+                        // out as one fused buffer, so a composer that had not finished
+                        // accepting the text never consumed the submit.
+                        if let Err(e) = agent::inject_with_target_gated(
+                            &tgt,
+                            &config.name,
+                            msg.as_bytes(),
+                            true,
+                            None,
+                        ) {
+                            tracing::warn!(
+                                agent = %config.name,
+                                error = %e,
+                                "#3462: crash-respawn notice injection failed"
+                            );
+                        }
                     }
                 }
             }
@@ -1281,11 +1283,21 @@ mod tests {
             .find("inject_with_target_gated(")
             .expect("the respawn worker must inject through the gated injector");
         assert!(wait < inject, "the readiness wait must precede the inject");
+        let final_fence = body[..inject]
+            .rfind("shutdown.load(")
+            .expect("a final shutdown fence must precede the inject");
+        let reason_read = body[..inject]
+            .rfind("tgt.core.lock()")
+            .expect("the crash reason must be read before the inject");
+        let notice_format = body[..inject]
+            .rfind("respawn_notice(")
+            .expect("the respawn notice must be formatted before the inject");
         assert!(
-            body[wait..inject].contains("shutdown.load("),
+            wait < final_fence && reason_read < final_fence && notice_format < final_fence,
             "#3462-v3 F1/B: a final shutdown check must stand between the readiness \
-             wait and the gated inject — a target snapshotted before shutdown is not \
-             permission to write after it"
+             work (including crash-reason read and notice formatting) and the gated \
+             inject — a target snapshotted before shutdown is not permission to write \
+             after it"
         );
     }
 
