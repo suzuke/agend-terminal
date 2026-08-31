@@ -451,20 +451,26 @@ pub(super) fn handle_key(
         } => match key.code {
             KeyCode::Enter => {
                 if input == name {
-                    match crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
-                        ctx.home,
-                        name,
-                        None,
-                    ) {
-                        Ok(()) => {
-                            ctx.layout.remove_fleet_instance_views(name);
-                            *overlay = Overlay::None;
-                            outcome.needs_resize = true;
-                        }
-                        Err(error) => {
-                            *notice = Some(error);
+                    if crate::daemon::find_active_run_dir(ctx.home).is_none() {
+                        *notice = Some("delete refused: no active daemon".to_string());
+                    } else {
+                        match crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
+                            ctx.home,
+                            name,
+                            None,
+                        ) {
+                            Ok(()) => {
+                                ctx.layout.remove_fleet_instance_views(name);
+                                *overlay = Overlay::None;
+                                outcome.needs_resize = true;
+                            }
+                            Err(error) => {
+                                *notice = Some(error);
+                            }
                         }
                     }
+                } else {
+                    *notice = Some(format!("type exact name to delete '{name}'"));
                 }
             }
             KeyCode::Esc => {
