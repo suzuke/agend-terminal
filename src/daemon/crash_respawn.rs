@@ -397,8 +397,8 @@ fn wait_out_backoff_or_shutdown(delay: std::time::Duration, shutdown: &AtomicBoo
     wait_out_backoff_or_shutdown_with_sleep(delay, shutdown, &mut std::thread::sleep)
 }
 
-/// Injected-sleep seam so the edge-latching above is provable without wall-clock
-/// time; production passes `std::thread::sleep`.
+/// Injected-sleep seam so the bounded sampling above is provable without
+/// wall-clock time; production passes `std::thread::sleep`.
 fn wait_out_backoff_or_shutdown_with_sleep<S: FnMut(std::time::Duration)>(
     delay: std::time::Duration,
     shutdown: &AtomicBool,

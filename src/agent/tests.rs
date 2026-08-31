@@ -2793,13 +2793,23 @@ fn broadcast_registry_releases_lock_before_inject_1146() {
 /// re-open the freeze class (registry held across inject), so this pins it gone.
 #[test]
 fn inject_handle_footgun_removed_uses_snapshots_f1() {
+    // The ban covers every agent-module source carrying this surface: 31e14e16
+    // extracted the readiness waiters into `bootstrap_wait.rs`, and a mod.rs-only
+    // scan is evaded by re-homing the banned fn there (measured). Explicit list —
+    // no directory walk; `inject_footgun_ban_covers_…` pins the list itself.
+    for (source, text) in [
+        ("mod.rs", include_str!("mod.rs")),
+        ("bootstrap_wait.rs", include_str!("bootstrap_wait.rs")),
+    ] {
+        assert!(
+            !text.contains("pub fn inject_to_agent("),
+            "#1530/F1: inject_to_agent(&AgentHandle) must stay removed — found in \
+             `{source}`. It lets a caller hold the registry across a blocking \
+             inject; use inject_with_target_gated (snapshot under lock → drop → \
+             inject)"
+        );
+    }
     let src = include_str!("mod.rs");
-    assert!(
-        !src.contains("pub fn inject_to_agent("),
-        "#1530/F1: inject_to_agent(&AgentHandle) must stay removed — it lets a caller \
-         hold the registry across a blocking inject; use inject_with_target_gated \
-         (snapshot under lock → drop → inject)"
-    );
     assert!(
         src.contains("pub(crate) fn inject_with_target_gated("),
         "#1530/F1: the snapshot inject API inject_with_target_gated must exist"
