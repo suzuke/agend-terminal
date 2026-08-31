@@ -1,11 +1,28 @@
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 
+fn on_block(workflow: &str) -> Vec<&str> {
+    let mut lines = workflow.lines().skip_while(|line| *line != "on:");
+    let _ = lines.next();
+    lines
+        .take_while(|line| line.is_empty() || line.starts_with(' '))
+        .collect()
+}
+
 fn has_manual_trigger(workflow: &str) -> bool {
-    workflow.contains("\n  workflow_dispatch:\n")
+    on_block(workflow).contains(&"  workflow_dispatch:")
 }
 
 fn push_branches_include_main(workflow: &str) -> bool {
-    workflow.contains("\n  push:\n    branches: [main,")
+    let block = on_block(workflow);
+    let Some(push_index) = block.iter().position(|line| *line == "  push:") else {
+        return false;
+    };
+    block[push_index + 1..]
+        .iter()
+        .take_while(|line| line.starts_with("    ") || line.is_empty())
+        .find_map(|line| line.trim().strip_prefix("branches: ["))
+        .and_then(|branches| branches.strip_suffix(']'))
+        .is_some_and(|branches| branches.split(',').any(|branch| branch.trim() == "main"))
 }
 
 #[test]
