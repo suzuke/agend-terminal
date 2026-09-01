@@ -296,9 +296,10 @@ mod tests {
         include_str!("../../../tests/fixtures/grok-s1-usage-limit-updates.jsonl");
 
     /// Line 3 is BYTE-IDENTICAL to a real captured Grok record (402 Payment
-    /// Required). Lines 1-2 are SYNTHESIZED from that exact shape with only the
-    /// status token changed: no auth-class record exists in any local capture (43
-    /// `updates.jsonl` plus `~/.grok/logs/unified.jsonl` scanned, zero hits),
+    /// Required). Lines 1-2 are SYNTHESIZED from the two captured retry envelopes:
+    /// line 1 mirrors the 429 `retrying`/`reason` shape, while line 2 mirrors line
+    /// 3's `failed`/`message` shape. No auth-class record exists in any local
+    /// capture (43 `updates.jsonl` plus `~/.grok/logs/unified.jsonl` scanned, zero hits),
     /// because Grok probes the credential at startup and refuses to create a
     /// session at all when it is unusable — so only a MID-SESSION 401/403 can ever
     /// reach this file.
