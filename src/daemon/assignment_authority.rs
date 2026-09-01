@@ -1257,9 +1257,13 @@ pub(crate) fn revoke_all_for_target(home: &Path, name: &str, now: &str) -> usize
     revoked
 }
 
-/// A9 — transfer old→new atomically under ONE branch lock: {revoke old} + {persist
-/// a fresh record for new with a NEW `assignment_id` + nonce, SAME `pr_number`,
-/// authority carried over}. Other targets untouched.
+/// A9 — transfer old→new atomically under ONE branch lock: {persist a fresh record
+/// for new with a NEW `assignment_id` + nonce, SAME `pr_number`, authority carried
+/// over, `supersedes` linking the old exact `assignment_id`} + {revoke old}. The
+/// linked successor is durable BEFORE the predecessor is retired (A11
+/// create-before-retire), so an interruption between the two steps leaves a
+/// reconciler-convergent double-assignment — never a zero-assignment window.
+/// Other targets untouched.
 // t-…-17: reviewer REASSIGNMENT primitive (A9). Slice-4 wires dispatch (A1), terminal
 // (A7), reconcile (A2/A3/A4/A10) and the teardown REVOKE (A8) — but an operator
 // reviewer-REASSIGNMENT command (the sole caller of A9) is a distinct future feature,
@@ -1281,18 +1285,14 @@ pub(crate) fn transfer(
         let old = read_record(&record_file(home, repo, branch, old_target))?.ok_or_else(|| {
             anyhow::anyhow!("assignment_authority::transfer: no active assignment for old target")
         })?;
-        // {revoke old} under the held lock.
-        revoke_under_lock(
-            home,
-            repo,
-            branch,
-            old_target,
-            now,
-            Some(old.task_id.as_str()),
-            &mut cleanup_task,
-        )?;
-        // {persist new} — fresh assignment_id + nonce, SAME pr_number, authority
-        // carried over. Written directly (persist would re-lock the same branch).
+        // Records are keyed by target, so a same-target "transfer" would make the
+        // create-before-retire steps below operate on ONE file — the retire step
+        // would revoke the just-persisted successor. Not a transfer; fail closed.
+        if old_target == new_target {
+            anyhow::bail!("assignment_authority::transfer: old and new target must differ");
+        }
+        // Build the successor — fresh assignment_id + nonce, SAME pr_number,
+        // authority carried over, `supersedes` linking the old exact id (A11).
         let mut new_record = ActiveAssignment::new_pending(
             repo,
             branch,
@@ -1322,8 +1322,81 @@ pub(crate) fn transfer(
             new_record.reviewed_head = old.reviewed_head;
             new_record.review_slot = old.review_slot;
         }
+        new_record.supersedes = Some(old.assignment_id);
+        // {persist new} BEFORE {revoke old} (A11 create-before-retire): an
+        // interruption after this write leaves a LINKED double-assignment the
+        // reconciler deterministically converges; the reverse ordering left a
+        // ZERO-assignment window. Written directly (persist would re-lock the
+        // same branch).
         atomic_write_json(&record_file(home, repo, branch, new_target), &new_record)?;
+        // {revoke old} under the same held lock. The successor carries the same
+        // task forward, so the task is preserved.
+        revoke_under_lock(
+            home,
+            repo,
+            branch,
+            old_target,
+            now,
+            Some(new_record.task_id.as_str()),
+            &mut cleanup_task,
+        )?;
         Ok(())
+    })();
+    if let Some(task_id) = cleanup_task {
+        crate::tasks::task_terminal_cleanup(home, &task_id);
+    }
+    result
+}
+
+/// A11 — crash-repair for [`transfer`]'s retire step: a durable successor record
+/// carries `supersedes = Some(predecessor assignment_id)`; when that exact
+/// predecessor is STILL active on the same branch, complete the interrupted
+/// replace by retiring it — its row superseded, its record CAS-removed, the
+/// SHARED task preserved (the successor carries it forward, mirroring
+/// [`transfer`]'s own `preserve_task_id`). Both sides are re-verified under the
+/// branch lock (the reconciler's scan is lock-free); a missing successor, a
+/// link/id mismatch, a self-link, a cross-task link, or a corrupt read fails
+/// closed (no retire). Returns whether the predecessor was retired.
+pub(crate) fn retire_linked_predecessor(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    successor_target: &str,
+    expected_predecessor_id: uuid::Uuid,
+    now: &str,
+) -> anyhow::Result<bool> {
+    let mut cleanup_task = None;
+    let result = (|| {
+        let _lock = lock_branch(home, repo, branch)?;
+        // B4: `?` propagates a corrupt successor read (fail closed).
+        let Some(successor) = read_record(&record_file(home, repo, branch, successor_target))?
+        else {
+            return Ok(false);
+        };
+        if successor.supersedes != Some(expected_predecessor_id) {
+            return Ok(false);
+        }
+        // Address the predecessor by its exact assignment_id, never by key alone
+        // (UUID-CAS): an id no longer active means the replace already completed.
+        let Some(predecessor) = list_active(home, repo, branch)
+            .into_iter()
+            .find(|record| record.assignment_id == expected_predecessor_id)
+        else {
+            return Ok(false);
+        };
+        // A self-link or a cross-task link is ambiguous/corrupt — fail closed.
+        if predecessor.target == successor.target || predecessor.task_id != successor.task_id {
+            return Ok(false);
+        }
+        revoke_under_lock(
+            home,
+            repo,
+            branch,
+            &predecessor.target,
+            now,
+            Some(successor.task_id.as_str()),
+            &mut cleanup_task,
+        )
     })();
     if let Some(task_id) = cleanup_task {
         crate::tasks::task_terminal_cleanup(home, &task_id);

@@ -6,6 +6,10 @@
 //!   - **A10a** terminal restart-repair: CAS-tombstone any record whose stored
 //!     `pr_number` is already in the RETAINED terminal-marker set (catches the A7
 //!     crash-gap and old-generation replays — I18/I19).
+//!   - **A11** transfer restart-repair: a durable successor still linking an
+//!     ACTIVE exact predecessor (`supersedes`) retires that predecessor — the
+//!     interrupted create-before-retire replace converges (never zero, briefly
+//!     double, then exactly one).
 //!   - **A2** row recovery: `durable_enqueue` any `Pending` record (idempotent).
 //!   - **A3/A4** nudge + repair: a record classifying `Unengaged` whose FIXED-
 //!     interval lease is due gets an append-only row repair (A4) and a best-effort
@@ -17,7 +21,8 @@
 //!
 //! ## Lock discipline (I11/I15 — assignment-lock OUTER of pr_state-flock)
 //! Every store op called here (`durable_enqueue`, `repair_row`,
-//! `tombstone_terminal_matches`, `redrive_reserved`) takes the per-`(repo,branch)`
+//! `tombstone_terminal_matches`, `retire_linked_predecessor`, `redrive_reserved`)
+//! takes the per-`(repo,branch)`
 //! assignment lock INTERNALLY and releases it before returning; they are invoked
 //! sequentially (never nested), so a same-process `flock` re-acquisition can never
 //! deadlock. `redrive_reserved` alone additionally takes the pr_state flock — INNER
@@ -227,6 +232,41 @@ fn reconcile_branch(
     // A10a: terminal restart-repair FIRST — tombstoned records are then excluded
     // from the A2/A3/A4 sweep (the `list_active` read below runs after).
     store::tombstone_terminal_matches(home, repo, branch);
+
+    // A11: crash-repair for an interrupted `transfer` — a durable successor that
+    // still links an ACTIVE exact predecessor retires that predecessor, so the
+    // temporary double-assignment converges before the A2/A3/A4 sweep (the
+    // `list_active` read below re-reads after the repair). Fail closed: an error
+    // preserves both records.
+    let snapshot = store::list_active(home, repo, branch);
+    for successor in &snapshot {
+        let Some(predecessor_id) = successor.supersedes else {
+            continue;
+        };
+        if !snapshot
+            .iter()
+            .any(|record| record.assignment_id == predecessor_id)
+        {
+            continue;
+        }
+        if let Err(error) = store::retire_linked_predecessor(
+            home,
+            repo,
+            branch,
+            &successor.target,
+            predecessor_id,
+            now,
+        ) {
+            tracing::error!(
+                successor_target = %successor.target,
+                predecessor_id = %predecessor_id,
+                repo = %repo,
+                branch = %branch,
+                %error,
+                "linked-predecessor retirement failed (both records preserved)"
+            );
+        }
+    }
 
     let mut wakes = ReconcileWakes::default();
     // Load PrState ONCE per branch (shared across all records on this branch).
@@ -875,8 +915,8 @@ mod tests {
             store::get(&home, "o/r", "feat/x", "rev-old").is_none(),
             "linked predecessor deterministically retired"
         );
-        let survivor = store::get(&home, "o/r", "feat/x", "rev-new")
-            .expect("successor assignment preserved");
+        let survivor =
+            store::get(&home, "o/r", "feat/x", "rev-new").expect("successor assignment preserved");
         assert_eq!(survivor.assignment_id, new.assignment_id);
         assert_eq!(survivor.supersedes, Some(old.assignment_id));
         assert!(
@@ -891,6 +931,60 @@ mod tests {
             task_status(&home, "t-rev-1"),
             crate::task_events::TaskStatus::Open,
             "the SHARED task is carried by the successor — never cancelled by the repair"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A11 negative (ABA/unrelated): a `supersedes` link naming an id that is NOT
+    /// active on the branch (the replace already completed, or the link is stale)
+    /// retires NOTHING — an unrelated co-resident assignment with a different
+    /// exact id is never matched by key or inference.
+    #[test]
+    fn a11_unlinked_predecessor_id_retires_nothing() {
+        let home = tmp_home("a11-aba");
+        seed_open_task_owned(&home, "t-rev-1", "rev-old");
+        let unrelated = mk("o/r", "feat/x", "rev-old", 21, "2026-07-13T00:00:00Z");
+        store::persist(&home, &unrelated).unwrap();
+        let mut new = mk("o/r", "feat/x", "rev-new", 21, "2026-07-13T00:00:10Z");
+        new.supersedes = Some(uuid::Uuid::new_v4());
+        store::persist(&home, &new).unwrap();
+
+        reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+
+        assert!(
+            store::get(&home, "o/r", "feat/x", "rev-old").is_some(),
+            "unrelated assignment preserved — the link matches by exact id only"
+        );
+        assert!(
+            store::get(&home, "o/r", "feat/x", "rev-new").is_some(),
+            "successor preserved"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A11 negative (fail closed): a link whose predecessor carries a DIFFERENT
+    /// task_id is ambiguous — a real transfer always carries the task over — so
+    /// the repair retires nothing and both records survive.
+    #[test]
+    fn a11_cross_task_link_fails_closed() {
+        let home = tmp_home("a11-cross");
+        seed_open_task_owned(&home, "t-rev-1", "rev-old");
+        let old = mk("o/r", "feat/x", "rev-old", 21, "2026-07-13T00:00:00Z");
+        store::persist(&home, &old).unwrap();
+        let mut new = mk("o/r", "feat/x", "rev-new", 21, "2026-07-13T00:00:10Z");
+        new.task_id = "t-rev-other".into();
+        new.supersedes = Some(old.assignment_id);
+        store::persist(&home, &new).unwrap();
+
+        reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+
+        assert!(
+            store::get(&home, "o/r", "feat/x", "rev-old").is_some(),
+            "cross-task predecessor preserved (fail closed)"
+        );
+        assert!(
+            store::get(&home, "o/r", "feat/x", "rev-new").is_some(),
+            "successor preserved"
         );
         std::fs::remove_dir_all(&home).ok();
     }

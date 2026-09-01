@@ -415,7 +415,10 @@ fn t35_transfer_interruption_preserves_old_assignment() {
 
     let survivor = get(&home, "o/r", "feat/x", "reviewer")
         .expect("interrupted transfer must preserve the old assignment (never zero)");
-    assert_eq!(survivor.assignment_id, old.assignment_id, "same record, untouched");
+    assert_eq!(
+        survivor.assignment_id, old.assignment_id,
+        "same record, untouched"
+    );
     assert!(
         crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &old.delivery_nonce),
         "old row still actionable — no mutation before the interruption point"
