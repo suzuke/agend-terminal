@@ -430,6 +430,44 @@ fn t35_transfer_interruption_preserves_old_assignment() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// T35b (A11 ordering pin): a failure of the {persist new} step itself must
+/// leave the OLD assignment fully intact — {persist new} runs BEFORE {revoke
+/// old}, so nothing has been retired yet. A directory squatting on the
+/// successor's record path makes the atomic write fail deterministically at
+/// exactly the point between the two steps; the retire-before-persist ordering
+/// would have already revoked the old target here (ZERO assignments).
+#[test]
+fn t35b_transfer_persist_failure_preserves_old_assignment() {
+    let home = tmp_home("t35b");
+    let old = mk_record("o/r", "feat/x", "rev-a", 21, "2026-07-13T00:00:00Z");
+    persist(&home, &old).unwrap();
+    durable_enqueue(&home, "o/r", "feat/x", "rev-a", "2026-07-13T00:00:05Z").unwrap();
+    // Block the successor's record path so {persist new} fails.
+    std::fs::create_dir_all(record_file(&home, "o/r", "feat/x", "rev-b")).unwrap();
+
+    let result = transfer(
+        &home,
+        "o/r",
+        "feat/x",
+        "rev-a",
+        "rev-b",
+        "2026-07-13T00:00:10Z",
+    );
+    assert!(result.is_err(), "unwritable successor record must error");
+
+    let survivor = get(&home, "o/r", "feat/x", "rev-a")
+        .expect("persist-step failure must preserve the old assignment (never zero)");
+    assert_eq!(
+        survivor.assignment_id, old.assignment_id,
+        "same record, untouched"
+    );
+    assert!(
+        crate::inbox::storage::nonce_present_actionable(&home, "rev-a", &old.delivery_nonce),
+        "old row still actionable — the retire step never ran"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// T36 (A11): a completed transfer stamps the DURABLE exact predecessor link —
 /// the new record carries `supersedes == old.assignment_id`, so a crash between
 /// {persist new} and {retire old} leaves a linked state the reconciler can
