@@ -145,3 +145,6 @@ switch ($Case) {
 finally {
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# Do not leak the expected hung-case timeout code to the CI shell.
+exit 0
