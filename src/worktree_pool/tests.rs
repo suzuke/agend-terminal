@@ -6079,3 +6079,395 @@ fn release_reaps_branch_already_in_fetched_origin_default_despite_stale_local_ma
     std::fs::remove_dir_all(&source).ok();
     std::fs::remove_dir_all(&origin).ok();
 }
+
+// ── B1/B2 (t-…-43938-5, d-20260901132326253721-16): owner-facing retention
+// obligation + escheatment. A branch that survives release with real work can
+// never acquire the ledger's only settlement authority (`merged == true`) when
+// its lane is dispatched local-only, so the release must ASK the recorded owner
+// instead of leaving the intent immortal and unattributed.
+
+/// Make `runtime::list_agents_with_fallback` report exactly `agents` as live.
+/// `find_active_run_dir` accepts `run/<pid>/` when the pid is alive and the
+/// `.daemon` file's first field matches it, so the test process's own pid is a
+/// valid, deterministic stand-in for a running daemon.
+fn plant_live_agents(home: &Path, agents: &[&str]) {
+    let run = home.join("run").join(std::process::id().to_string());
+    std::fs::create_dir_all(&run).expect("run dir");
+    std::fs::write(run.join(".daemon"), format!("{}:0", std::process::id())).expect(".daemon");
+    for a in agents {
+        std::fs::write(run.join(format!("{a}.port")), "1234").expect("port file");
+    }
+}
+
+fn retention_tasks(home: &Path) -> Vec<crate::task_events::TaskRecord> {
+    crate::task_events::replay(home)
+        .map(|state| {
+            state
+                .tasks
+                .into_values()
+                .filter(|t| t.tags.iter().any(|tag| tag == "branch-retention"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// RED B1: a branch preserved at release with real work must leave exactly ONE
+/// owner-assigned retention obligation on the board, carrying the repo, branch,
+/// originating task id and exact head so the owner can answer without guessing.
+#[test]
+fn release_records_one_owner_assigned_branch_retention_obligation() {
+    let home = tmp_home("retention-b1");
+    let repo = tmp_repo("retention-b1-repo");
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/keepme");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+    let head = String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+    assert!(
+        !outcome.branch_deleted,
+        "pre: a branch carrying real work must be preserved, not reaped"
+    );
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "exactly one retention obligation must be recorded, got {}",
+        obligations.len()
+    );
+    let t = &obligations[0];
+    assert_eq!(
+        t.owner.as_ref().map(|o| o.0.as_str()),
+        Some("agent-own"),
+        "the live recorded owner is accountable"
+    );
+    for needle in [repo.display().to_string().as_str(), "feat/keepme", &head] {
+        assert!(
+            t.description.contains(needle),
+            "obligation description must carry {needle}: {}",
+            t.description
+        );
+    }
+    assert!(t.due_at.is_some(), "obligation must carry a due date");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED B1 idempotency: releasing the same (repo, branch, head) twice must never
+/// create a second row — the board already holds thousands and a duplicate per
+/// release would make the mechanism worse than the problem.
+#[test]
+fn second_release_creates_no_duplicate_retention_obligation() {
+    let home = tmp_home("retention-b1-idem");
+    let repo = tmp_repo("retention-b1-idem-repo");
+    plant_live_agents(&home, &["agent-idem"]);
+    let lease = lease_bound(&home, &repo, "agent-idem", "feat/twice");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+    release_full(&home, "agent-idem", false);
+    let after_first = retention_tasks(&home).len();
+
+    // Re-lease the same branch at the same head and release again.
+    let _l2 = lease_bound(&home, &repo, "agent-idem", "feat/twice");
+    release_full(&home, "agent-idem", false);
+
+    assert_eq!(after_first, 1, "first release records one obligation");
+    assert_eq!(
+        retention_tasks(&home).len(),
+        1,
+        "a second release at the same head must not duplicate the obligation"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED B2 escheatment: agents are ephemeral. When the recorded owner is no
+/// longer live, accountability falls to the orchestrator that created the
+/// originating task — never silently to nobody.
+#[test]
+fn retention_obligation_escheats_to_originating_created_by_when_owner_not_live() {
+    let home = tmp_home("retention-b2-esch");
+    let repo = tmp_repo("retention-b2-esch-repo");
+    // The orchestrator is live; the branch owner is NOT in the live set.
+    plant_live_agents(&home, &["orch-live"]);
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName("orch-live".into()),
+        crate::task_events::TaskEvent::Created {
+            task_id: crate::task_events::TaskId("t-origin-esch".into()),
+            title: "origin".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: Some(crate::task_events::InstanceName("agent-dead".into())),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some("feat/esch".into()),
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+        },
+    )
+    .expect("seed originating task");
+
+    let lease = lease(&home, &repo, "agent-dead", "feat/esch").expect("lease");
+    crate::binding::bind_full(
+        &home,
+        "agent-dead",
+        "t-origin-esch",
+        "feat/esch",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("bind_full");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+
+    release_full(&home, "agent-dead", false);
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "one obligation must still be recorded"
+    );
+    assert_eq!(
+        obligations[0].owner.as_ref().map(|o| o.0.as_str()),
+        Some("orch-live"),
+        "a dead owner escheats to the originating task's created_by"
+    );
+    assert!(
+        !obligations[0]
+            .tags
+            .iter()
+            .any(|t| t == "branch-retention-orphan"),
+        "an escheated obligation has an owner and must NOT be tagged orphan"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED B2 orphan: neither the owner nor the originating orchestrator is live —
+/// the obligation must surface in board hygiene rather than vanish or be
+/// silently immortal.
+#[test]
+fn retention_obligation_is_orphan_tagged_when_neither_owner_nor_orchestrator_live() {
+    let home = tmp_home("retention-b2-orphan");
+    let repo = tmp_repo("retention-b2-orphan-repo");
+    // Someone unrelated is live; neither the owner nor the task creator is.
+    plant_live_agents(&home, &["someone-else"]);
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName("orch-gone".into()),
+        crate::task_events::TaskEvent::Created {
+            task_id: crate::task_events::TaskId("t-origin-orphan".into()),
+            title: "origin".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: Some(crate::task_events::InstanceName("agent-gone".into())),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some("feat/orphan".into()),
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+        },
+    )
+    .expect("seed originating task");
+
+    let lease = lease(&home, &repo, "agent-gone", "feat/orphan").expect("lease");
+    crate::binding::bind_full(
+        &home,
+        "agent-gone",
+        "t-origin-orphan",
+        "feat/orphan",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("bind_full");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+
+    release_full(&home, "agent-gone", false);
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "one obligation must still be recorded"
+    );
+    assert!(
+        obligations[0].owner.is_none(),
+        "with neither owner nor orchestrator live the obligation stays unassigned"
+    );
+    assert!(
+        obligations[0]
+            .tags
+            .iter()
+            .any(|t| t == "branch-retention-orphan"),
+        "an unassignable obligation must be tagged for board hygiene: {:?}",
+        obligations[0].tags
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED B1 (key scope): the idempotency key is over (repo, branch, HEAD), not
+/// (repo, branch). New commits on the same branch are new work the owner has
+/// not attested to, so a release at a DIFFERENT head must raise a fresh
+/// obligation. Without this the previous test passes even if `head` is dropped
+/// from the key — it only ever releases at one head.
+#[test]
+fn release_at_a_new_head_raises_a_fresh_retention_obligation() {
+    fn commit(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), "work\n").expect("write");
+        for args in [
+            vec!["add", name],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                name,
+            ],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("git");
+        }
+    }
+
+    let home = tmp_home("retention-newhead");
+    let repo = tmp_repo("retention-newhead-repo");
+    plant_live_agents(&home, &["agent-nh"]);
+
+    let l1 = lease_bound(&home, &repo, "agent-nh", "feat/moving");
+    commit(&l1.path, "a.txt");
+    release_full(&home, "agent-nh", false);
+    assert_eq!(
+        retention_tasks(&home).len(),
+        1,
+        "first head raises one obligation"
+    );
+
+    // Same branch, one more commit → a head the owner has never attested to.
+    let l2 = lease_bound(&home, &repo, "agent-nh", "feat/moving");
+    commit(&l2.path, "b.txt");
+    release_full(&home, "agent-nh", false);
+
+    assert_eq!(
+        retention_tasks(&home).len(),
+        2,
+        "a release at a NEW head is new unattested work and must raise its own obligation"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}

@@ -739,6 +739,120 @@ fn disposable_review_task_terminal(home: &Path, task_id: &str) -> Option<bool> {
     }
 }
 
+/// t-…-43938-5 (d-20260901132326253721-16): tags carried by an owner-facing
+/// branch-retention obligation.
+const RETENTION_TAG: &str = "branch-retention";
+const RETENTION_ORPHAN_TAG: &str = "branch-retention-orphan";
+const RETENTION_DUE_DAYS: i64 = 14;
+
+/// Stable idempotency key over the EXACT (repo, branch, head) triple, mirroring
+/// `cleanup_intents::intent_key`'s shape. Carried as a TAG rather than task
+/// metadata deliberately: `TaskEvent::Created` accepts tags but not metadata, so
+/// a metadata key would need a second event and a crash between the two would
+/// leave a keyless obligation that the next release could not recognise —
+/// producing the duplicate row this key exists to prevent.
+fn retention_key(repo: &str, branch: &str, head: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    repo.hash(&mut h);
+    branch.hash(&mut h);
+    head.hash(&mut h);
+    format!("retention-key:{:016x}", h.finish())
+}
+
+/// Record ONE owner-facing obligation for a branch that survived release with
+/// work the ledger can never settle by merge. Idempotent on (repo, branch,
+/// head): the bounded `branch-retention` tag scan plus the exact key tag makes a
+/// second release at the same head a no-op.
+///
+/// Escheatment, because agents are ephemeral: the recorded owner takes it when
+/// live; otherwise the originating task's `created_by` orchestrator; otherwise
+/// nobody, tagged for board hygiene. Liveness that cannot be determined at all
+/// (empty live set — daemon unreachable) is treated as "owner is live": the
+/// operator's rule makes the branch opener accountable, and reassigning on
+/// ignorance would silently move that accountability.
+fn record_retention_obligation(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    head: &str,
+    origin_task_id: &str,
+    owner: &str,
+) {
+    if owner.is_empty() || head.is_empty() {
+        return;
+    }
+    let key_tag = retention_key(repo, branch, head);
+    // Bounded by the `branch-retention` tag, and read from the SAME board
+    // `task_events::append` writes to below — a different board would make the
+    // key invisible and duplicate the row on every release.
+    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+    let existing = crate::tasks::list_all_at_checked(home, &board)
+        .map(|tasks| {
+            tasks
+                .iter()
+                .any(|t| t.tags.iter().any(|tag| tag == RETENTION_TAG) && t.tags.contains(&key_tag))
+        })
+        .unwrap_or(false);
+    if existing {
+        return;
+    }
+
+    let live = crate::runtime::list_agents_with_fallback(home);
+    let is_live = |name: &str| live.is_empty() || live.iter().any(|a| a == name);
+    let created_by = (!origin_task_id.is_empty())
+        .then(|| crate::tasks::load_routed(home, origin_task_id).ok())
+        .flatten()
+        .map(|routed| routed.task.created_by);
+    let assignee = if is_live(owner) {
+        Some(owner.to_string())
+    } else {
+        created_by.filter(|orchestrator| is_live(orchestrator))
+    };
+
+    let mut tags = vec![RETENTION_TAG.to_string(), key_tag];
+    if assignee.is_none() {
+        tags.push(RETENTION_ORPHAN_TAG.to_string());
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static RETENTION_SEQ: AtomicU64 = AtomicU64::new(0);
+    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
+    let seq = RETENTION_SEQ.fetch_add(1, Ordering::Relaxed);
+    let id = format!("t-{ts}-{}-{seq}", std::process::id());
+    let event = crate::task_events::TaskEvent::Created {
+        task_id: crate::task_events::TaskId(id),
+        title: format!("branch-retention: confirm '{branch}' is still needed"),
+        description: format!(
+            "Released with unmerged work and no merge authority is possible on this lane, \
+             so the cleanup intent can never settle by merge.\n\n\
+             repo: {repo}\nbranch: {branch}\noriginating task: {origin_task_id}\nhead: {head}\n\n\
+             Answer with `task action=done` and a `result` beginning `keep:` or `delete:`."
+        ),
+        priority: "normal".to_string(),
+        owner: assignee.map(crate::task_events::InstanceName),
+        due_at: Some(
+            (chrono::Utc::now() + chrono::Duration::days(RETENTION_DUE_DAYS)).to_rfc3339(),
+        ),
+        depends_on: Vec::new(),
+        routed_to: None,
+        branch: Some(branch.to_string()),
+        bind: None,
+        eta_secs: None,
+        tags,
+        parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
+    };
+    if let Err(error) = crate::task_events::append(
+        home,
+        &crate::task_events::InstanceName("system:branch-retention".to_string()),
+        event,
+    ) {
+        tracing::warn!(%repo, %branch, %error, "branch-retention obligation could not be recorded");
+    }
+}
+
 fn resolve_branch_cleanup(
     home: &Path,
     binding: &serde_json::Value,
@@ -888,6 +1002,21 @@ fn resolve_branch_cleanup(
         if !deleted && !was_dirty && !dry_run {
             out.intent_persist_error =
                 crate::cleanup_intents::persist_release_intent(home, sr_str, branch, task_id);
+            // t-…-43938-5: the intent above can only ever be settled by `merged`,
+            // which a local-only lane never produces — so ask the recorded owner.
+            // Runs in the post-lock notice phase (every flock is already dropped
+            // above), so the task-board write takes no worktree/branch/binding lock.
+            let head = crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
+                .map(|tip| tip.trim().to_string())
+                .unwrap_or_default();
+            record_retention_obligation(
+                home,
+                sr_str,
+                branch,
+                &head,
+                task_id,
+                binding["agent"].as_str().unwrap_or(""),
+            );
         }
     } else if branch.is_empty() {
         out.branch_cleanup_skipped_reason = Some("no branch in binding".to_string());
