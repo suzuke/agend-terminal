@@ -327,6 +327,59 @@ fn restart_rescan_settles_when_ledger_already_emitted() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3470 recovery: an older daemon may already have emitted the merge event
+/// and removed PR state before the task was repaired/relinked. Re-observing the
+/// same terminal generation must still settle the structured task.
+#[test]
+fn terminal_merge_replay_closes_late_structured_task() {
+    use crate::task_events::{append_batch, InstanceName, TaskEvent, TaskId, TaskStatus};
+
+    let home = tmp_home("merged-task-replay");
+    let repo = "owner/repo";
+    let branch = "feat/external-merge-replay";
+    let head = "abc1234def5678";
+    let task_id = "t-external-merge-replay";
+
+    write_merged_pr_state(&home, repo, branch, head);
+    tests::write_team_fleet(&home, "lead", &["dev"]);
+    run_scan(&home);
+
+    append_batch(
+        &home,
+        &InstanceName::from("test:seed"),
+        vec![TaskEvent::Created {
+            task_id: TaskId(task_id.into()),
+            title: "external merge replay".into(),
+            description: "work".into(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: vec![],
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+        }],
+    )
+    .expect("seed late task");
+    crate::tasks::link_branch_to_task(&home, task_id, branch).expect("link late task branch");
+    write_merged_pr_state(&home, repo, branch, head);
+
+    run_scan(&home);
+
+    let task = crate::tasks::list_all(&home)
+        .into_iter()
+        .find(|task| task.id.as_str() == task_id)
+        .expect("task present");
+    assert_eq!(task.status, TaskStatus::Done);
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// R6: New generation watch on same branch after removal — the JSON-only
 /// removal under lock must not corrupt a newly written watch file for a
 /// different head (stale flush regression).

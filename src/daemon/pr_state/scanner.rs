@@ -883,6 +883,12 @@ pub fn scan_and_emit_with(
         // release-invariant recompute lock-free. t-worktree-leak (PR-1): merge
         // keeps the named entry (the #1617 invariant test pins it); close-unmerged
         // enqueues through the same HYBRID path with its own event kind.
+        // #3470: PR-state can win the race with the CI poller and remove the
+        // feature watch first. Settle structured branch tasks on every merged
+        // observation, including ledger-suppressed replay after a restart.
+        if matches!(snapshot.merge_state, MergeState::Merged { .. }) {
+            crate::status_summary::auto_close_merged_tasks(home, &branch);
+        }
         if let Some((branch, event_kind)) = release_after_unlock {
             match event_kind {
                 "merge" => crate::daemon::auto_release::auto_release_for_merged_branch(
