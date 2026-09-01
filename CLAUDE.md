@@ -39,9 +39,22 @@ Without `cargo-xwin` the Windows step SKIPs with a hint (never false-fails);
 CI's `windows-latest` runner stays the backstop. The preflight is intentionally
 *not* a git hook — the full matrix takes a few minutes; run it manually.
 
-A pre-commit hook at `.git/hooks/pre-commit` auto-formats staged `.rs` files
-and re-stages them. It does NOT run clippy — clippy is too slow for a
-pre-commit path. Run clippy yourself before `git push`.
+**Which hooks actually fire depends on `core.hooksPath`, and there are two
+regimes.** In a daemon-managed worktree — and in any clone whose
+`core.hooksPath` points at `$AGEND_HOME/hooks` — the active hooks are the
+daemon-owned ones written there: `prepare-commit-msg` (plus
+`prepare-commit-msg.ps1`) and `reference-transaction`. The tracked
+`scripts/hooks` assets described below (`pre-commit`, `pre-push`, `post-merge`)
+are NOT active in that regime, and `.git/hooks/*` is shadowed by
+`core.hooksPath` entirely. The descriptions that follow apply to the other
+regime: a clone whose `core.hooksPath` points at `scripts/hooks`, which is what
+`scripts/install-hooks.sh` switches a clone to. Check which regime a clone is in
+with `git config --get core.hooksPath`.
+
+In the `scripts/hooks` regime, a pre-commit hook (`scripts/hooks/pre-commit`)
+auto-formats staged `.rs` files and re-stages them. It does NOT run clippy —
+clippy is too slow for a pre-commit path. Run clippy yourself before
+`git push`.
 
 The pre-push hook (`scripts/hooks/pre-push`) runs **two gates**:
 
@@ -60,13 +73,15 @@ The pre-push hook (`scripts/hooks/pre-push`) runs **two gates**:
 Override either with `git push --no-verify` in emergencies (the daemon-side gate
 and CI still apply, so `--no-verify` is not a free pass).
 
-A post-merge hook triggers a background `cargo build --release` when `src/`
-files change. Desktop notification on completion. Does not auto-restart the
-daemon — operator decides restart timing. Disable with
+In the `scripts/hooks` regime, a post-merge hook triggers a background
+`cargo build --release` when `src/` files change, with a desktop notification on
+completion. It does not auto-restart the daemon — operator decides restart
+timing. Under the `$AGEND_HOME/hooks` regime this hook is not installed, so no
+automatic rebuild happens there. Disable with
 `git config core.hooksPath /dev/null` only in an operator-owned standalone
 clone, with the understanding that this disables every tracked hook. Never
-change `core.hooksPath` in a daemon-managed agent worktree; it also carries the
-provenance and pre-push safety hooks.
+change `core.hooksPath` in a daemon-managed agent worktree; it carries the
+provenance hooks the daemon owns.
 
 ### If the hook isn't installed
 
@@ -76,15 +91,20 @@ Hooks are per-clone. After a fresh `git clone`, install with:
 scripts/install-hooks.sh   # idempotent — safe to re-run
 ```
 
-**Fleet-agent coexistence**: the daemon sets each managed worktree's
-`core.hooksPath` to `$AGEND_HOME/hooks` (`src/binding.rs::install_hooks`) and
-writes only `prepare-commit-msg` there — it does *not* clear the directory. So
-`install-hooks.sh` *copies* the tracked `pre-push` into `$AGEND_HOME/hooks/pre-push`,
-where it coexists and fires for agent pushes (one copy covers every current and
-future worktree, since they share that dir). Agent pushes DO run the hook: the
-The active agent git guard ultimately invokes real `git`, which honours
-`core.hooksPath`. This coexistence relies on the daemon not deleting
-`$AGEND_HOME/hooks/pre-push`; if that changes, re-run `install-hooks.sh`.
+**Fleet-agent coexistence, and its unresolved half**: the daemon sets each
+managed worktree's `core.hooksPath` to `$AGEND_HOME/hooks`
+(`src/binding.rs::install_hooks`) and writes only the daemon-owned hooks there —
+it does *not* clear the directory. `install-hooks.sh` therefore also *copies* the
+tracked `pre-push` into `$AGEND_HOME/hooks/pre-push` so it can coexist with them
+(one copy covers every current and future worktree, since they share that dir).
+Agent pushes do reach real `git`, which honours `core.hooksPath` — so whether
+that hook runs depends only on what is in that directory right now. A `pre-push`
+that is absent, or renamed aside (e.g. `pre-push.disabled-*`), does not run, and
+nothing automatically re-installs it; verify with `ls "$AGEND_HOME/hooks"` rather than
+assuming. Whether agent pushes should be gated by this hook at all is an
+unresolved fleet policy question (t-20260712073154879622-40783-31): this document
+records the mechanism, not a decision. Mutation hooks must never be silently
+enabled in that directory.
 
 ## Test fidelity: feed consumers the producer's real output (#1493)
 

@@ -29,7 +29,9 @@ cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc
 
 若沒有 `cargo-xwin`，Windows 步驟會附提示並 SKIP（絕不 false-fail）；CI 的 `windows-latest` runner 仍是後援。Preflight 刻意*不是* git hook——完整 matrix 需要幾分鐘，請手動執行。
 
-`.git/hooks/pre-commit` 的 pre-commit hook 會自動格式化 staged `.rs` 檔並重新 stage。它不會執行 clippy——clippy 對 pre-commit 路徑而言太慢。`git push` 前請自行執行 clippy。
+**哪些 hook 真的會觸發取決於 `core.hooksPath`，而且有兩種 regime。** 在 daemon-managed worktree——以及任何 `core.hooksPath` 指向 `$AGEND_HOME/hooks` 的 clone——中，實際生效的是 daemon 寫在該目錄的自有 hook：`prepare-commit-msg`（以及 `prepare-commit-msg.ps1`）與 `reference-transaction`。下文描述的 tracked `scripts/hooks` 資產（`pre-commit`、`pre-push`、`post-merge`）在該 regime **並未生效**，且 `.git/hooks/*` 會被 `core.hooksPath` 整個遮蔽。以下描述適用於另一種 regime：`core.hooksPath` 指向 `scripts/hooks` 的 clone，也就是 `scripts/install-hooks.sh` 會把 clone 切換過去的那一種。用 `git config --get core.hooksPath` 確認目前屬於哪一種。
+
+在 `scripts/hooks` regime 下，pre-commit hook（`scripts/hooks/pre-commit`）會自動格式化 staged `.rs` 檔並重新 stage。它不會執行 clippy——clippy 對 pre-commit 路徑而言太慢。`git push` 前請自行執行 clippy。
 
 Pre-push hook（`scripts/hooks/pre-push`）會執行**兩道 gate**：
 
@@ -38,7 +40,7 @@ Pre-push hook（`scripts/hooks/pre-push`）會執行**兩道 gate**：
 
 緊急情況可用 `git push --no-verify` 覆寫任一 gate（daemon-side gate 與 CI 仍會套用，所以 `--no-verify` 不是免死金牌）。
 
-當 `src/` 檔案變更時，post-merge hook 會在背景觸發 `cargo build --release`，完成後顯示桌面通知。它不會自動重啟 daemon——由 operator 決定重啟時機。只有 operator 擁有的獨立 clone 才可用 `git config core.hooksPath /dev/null` 停用，且必須理解這會停用每一個 tracked hook。絕不要在 daemon-managed agent worktree 中變更 `core.hooksPath`；該路徑也承載 provenance 與 pre-push safety hook。
+在 `scripts/hooks` regime 下，當 `src/` 檔案變更時，post-merge hook 會在背景觸發 `cargo build --release`，完成後顯示桌面通知。它不會自動重啟 daemon——由 operator 決定重啟時機。在 `$AGEND_HOME/hooks` regime 下這個 hook 並未安裝，因此不會有任何自動 rebuild。只有 operator 擁有的獨立 clone 才可用 `git config core.hooksPath /dev/null` 停用，且必須理解這會停用每一個 tracked hook。絕不要在 daemon-managed agent worktree 中變更 `core.hooksPath`；該路徑承載 daemon 自有的 provenance hook。
 
 ### 若尚未安裝 hook
 
@@ -48,7 +50,7 @@ Hook 是 per-clone 的。Fresh `git clone` 後請安裝：
 scripts/install-hooks.sh   # idempotent——可安全重複執行
 ```
 
-**與 fleet agent 共存**：daemon 會將每個 managed worktree 的 `core.hooksPath` 設為 `$AGEND_HOME/hooks`（`src/binding.rs::install_hooks`），並只在其中寫入 `prepare-commit-msg`——它*不會*清空目錄。因此 `install-hooks.sh` 會把 tracked `pre-push` *複製*到 `$AGEND_HOME/hooks/pre-push`，讓它共存並在 agent push 時觸發（因所有目前與未來的 worktree 共用該目錄，一份 copy 即可涵蓋全部）。Agent push 確實會執行 hook：active agent git guard 最終呼叫真正的 `git`，而 git 會遵守 `core.hooksPath`。此共存機制仰賴 daemon 不刪除 `$AGEND_HOME/hooks/pre-push`；若行為改變，請重新執行 `install-hooks.sh`。
+**與 fleet agent 共存，以及其中未決的一半**：daemon 會將每個 managed worktree 的 `core.hooksPath` 設為 `$AGEND_HOME/hooks`（`src/binding.rs::install_hooks`），並只在其中寫入 daemon 自有的 hook——它*不會*清空目錄。因此 `install-hooks.sh` 也會把 tracked `pre-push` *複製*到 `$AGEND_HOME/hooks/pre-push`，讓它與那些 hook 共存（因所有目前與未來的 worktree 共用該目錄，一份 copy 即可涵蓋全部）。Agent push 確實會走到真正的 `git`，而 git 會遵守 `core.hooksPath`——所以該 hook 會不會執行，只取決於此刻那個目錄裡有什麼。若 `pre-push` 不存在、或被改名擱置（例如 `pre-push.disabled-*`），它就不會執行，也不會自動重新安裝；請用 `ls "$AGEND_HOME/hooks"` 確認，不要用猜的。至於 agent push 究竟該不該由這個 hook 把關，是尚未決定的 fleet policy 問題（t-20260712073154879622-40783-31）：本文件只記錄機制，不做決定。絕不可在該目錄中靜默啟用會產生變更的 mutation hook。
 
 ## 測試忠實度：將 producer 的真實輸出餵給 consumer（#1493）
 
