@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 mod auto_watch;
 mod branch_start_point;
+mod cleanup_trunk;
 mod from_ref;
 mod lifecycle_permit;
 mod live_binding;
@@ -496,15 +497,9 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // auto_created_branch / fetch_attempted) and shares one decision
     // tree with `repo action=checkout bind:true` (the #784 entry).
     //
-    // #2703: `from_ref` is the repo's DEFAULT branch (`origin/<default_branch>`
-    // via `git_helpers::default_branch`), NOT a hard-coded `origin/main` (the
-    // #784 default, which mis-based every dispatched branch in a dev-default
-    // repo). Precise chain (git_helpers.rs): `origin/HEAD` when set → the
-    // repo's own current HEAD branch → literal "main" only when HEAD is
-    // detached/unreadable. The byte-identical invariant therefore binds the
-    // main-default and fully-blind cases (pinned by
-    // `dispatch_auto_create_main_default_invariance_2703`), not every
-    // origin/HEAD-less repo.
+    // #2703: use `origin/<default_branch>`, not hard-coded `origin/main`.
+    // `git_helpers::default_branch` checks origin/HEAD, then local HEAD, then
+    // falls back to main. The main-default invariant remains byte-identical.
     //
     // Strict error contract (#781 Phase 3 r1, Path A — restored after
     // initial fail-soft fix was found to weaken Piece 7's structured-
@@ -520,10 +515,8 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     let (auto_created_branch, fetch_attempted) = if reused {
         (false, false)
     } else {
-        // #2703: base on the repo's default branch (origin/HEAD), not a literal
-        // origin/main. `default_branch` returns a bare branch name; qualify it with
-        // the push remote (`origin`, per #2047) so `resolve_from_ref_remote` splits
-        // it correctly for both the create base and the #1755 pre-create fetch.
+        // #2703: qualify the bare default branch with the push remote so both
+        // branch creation and the pre-create fetch use the same remote.
         let base = format!(
             "origin/{}",
             crate::git_helpers::default_branch(&source_repo)
@@ -1182,56 +1175,7 @@ fn run_git_idempotent(args: &[&str], cwd: &Path) -> std::io::Result<std::process
     Ok(last.expect("loop runs at least once"))
 }
 
-/// t-20260831221907643452-32048-13 (#2703 side branch): the trunk base the
-/// init-commit cleanup enumerates and REWRITES against. Same three-leg
-/// contract as the vendored pre-push cleanup's `resolve_default_branch_base`
-/// (#2390/#2662 — `pub(crate)` in agentic-git, so replicated here): an
-/// explicitly-set `origin/HEAD`; else EXACTLY ONE conventional trunk
-/// (origin/main XOR origin/master); else `Err` — the caller surfaces/no-ops
-/// and never guesses a base for a history rewrite. Deliberately NOT
-/// `git_helpers::default_branch`: its local-HEAD fallback returns the
-/// WORKTREE's own feature branch, which is never a valid rewrite base.
-/// Main-default repos resolve to `origin/main` — byte-identical to the
-/// pre-fix literal (pinned by the #814 suite running unchanged).
-fn resolve_cleanup_trunk(worktree: &Path) -> Result<String, String> {
-    if let Ok(head) = crate::git_helpers::git_cmd(
-        worktree,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    ) {
-        if !head.is_empty() {
-            return Ok(head);
-        }
-    }
-    let trunk_exists = |rev: &str| {
-        crate::git_helpers::git_ok(
-            worktree,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{rev}^{{commit}}"),
-            ],
-        )
-    };
-    match (trunk_exists("origin/main"), trunk_exists("origin/master")) {
-        (true, false) => Ok("origin/main".to_string()),
-        (false, true) => Ok("origin/master".to_string()),
-        (true, true) => Err(
-            "ambiguous default branch: both origin/main and origin/master exist and \
-             origin/HEAD is unset — refusing to pick a rewrite base (run \
-             `git remote set-head origin -a`)"
-                .to_string(),
-        ),
-        (false, false) => Err(
-            "cannot resolve the trunk for init-commit cleanup: origin/HEAD is unset \
-             and neither origin/main nor origin/master exists"
-                .to_string(),
-        ),
-    }
-}
-
-/// Remove empty commits with message "init" between the repo's trunk
-/// ([`resolve_cleanup_trunk`]) and HEAD.
+/// Remove empty "init" commits between [`cleanup_trunk::resolve`] and HEAD.
 /// These come from BACKEND session checkpoints (claude-code / kiro-cli)
 /// that fire heartbeats every ~90s; not from agend-terminal production
 /// code (worktree.rs uses message "init (agend-terminal)" which the
@@ -1260,10 +1204,8 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
     // helper — worst case we get the same status 256 we had before.
     clear_stale_rebase_state(worktree);
 
-    // t-…-32048-13: resolve the trunk ONCE; every site below (log enumeration,
-    // soft reset, rebase) uses this same base. An unresolvable/ambiguous trunk
-    // is an Err before any enumeration or rewrite.
-    let trunk = resolve_cleanup_trunk(worktree)?;
+    // Resolve once so enumeration, reset, and rebase cannot disagree.
+    let trunk = cleanup_trunk::resolve(worktree)?;
 
     // #1787: retry — the confirmed #1783 windows flake was this command exiting
     // non-zero with empty stderr under scratch-repo lock contention.
