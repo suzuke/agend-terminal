@@ -1054,7 +1054,11 @@ fn launch_managed_server(
 
 #[cfg(unix)]
 fn remove_managed_socket_file(endpoint: &Path) -> std::io::Result<()> {
-    std::fs::remove_file(endpoint)
+    match std::fs::remove_file(endpoint) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -2151,6 +2155,21 @@ mod tests {
             remove_managed_socket_file(&endpoint).is_ok(),
             "a socket disappearing after validation already reached the desired end state"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_socket_final_unlink_keeps_other_errors_fail_closed() {
+        let endpoint = std::env::temp_dir().join(format!(
+            "agend-codex-non-socket-endpoint-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir(&endpoint).expect("endpoint fixture directory");
+
+        let error = remove_managed_socket_file(&endpoint)
+            .expect_err("a non-ENOENT unlink error must stay fatal");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        std::fs::remove_dir(&endpoint).expect("remove endpoint fixture directory");
     }
 
     #[test]
