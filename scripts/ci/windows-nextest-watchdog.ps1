@@ -150,6 +150,30 @@ function Write-Sink([string] $Stream, [string] $Line) {
     }
 }
 
+function Harvest-OutputDrains($StdoutTask, $StderrTask) {
+    if ($null -eq $StdoutTask -or $null -eq $StderrTask) {
+        return
+    }
+    if (-not $StdoutTask.Wait(2000)) {
+        throw "stdout drain did not complete"
+    }
+    if (-not $StderrTask.Wait(2000)) {
+        throw "stderr drain did not complete"
+    }
+    $stdout = $StdoutTask.GetAwaiter().GetResult()
+    $stderr = $StderrTask.GetAwaiter().GetResult()
+    foreach ($line in ($stdout -split "`r?`n")) {
+        if ($line.Length -gt 0) {
+            Write-Sink "stdout" $line
+        }
+    }
+    foreach ($line in ($stderr -split "`r?`n")) {
+        if ($line.Length -gt 0) {
+            Write-Sink "stderr" $line
+        }
+    }
+}
+
 function Get-TimeoutSeconds {
     $value = $env:AGEND_WATCHDOG_TIMEOUT_SECONDS
     if ([string]::IsNullOrWhiteSpace($value)) {
@@ -263,6 +287,8 @@ $treeGone = $false
 $snapshotProcesses = @()
 $exactMarkers = @()
 $failure = $null
+$stdoutTask = $null
+$stderrTask = $null
 
 try {
     $timeoutSeconds = Get-TimeoutSeconds
@@ -286,18 +312,16 @@ try {
 
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $psi
-    $process.EnableRaisingEvents = $true
-    $process.add_OutputDataReceived({ param($sender, $event) Write-Sink "stdout" $event.Data })
-    $process.add_ErrorDataReceived({ param($sender, $event) Write-Sink "stderr" $event.Data })
     if (-not $process.Start()) {
         throw "Process.Start returned false"
     }
     $rootPid = $process.Id
+    # Start both .NET drains immediately so neither full pipe can block the other.
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     if (-not [AgendWindowsJobObject]::Assign($job, $process.Handle)) {
         throw "AssignProcessToJobObject failed: $([AgendWindowsJobObject]::LastError())"
     }
-    $process.BeginOutputReadLine()
-    $process.BeginErrorReadLine()
 
     $waitMilliseconds = [int] ([Math]::Min([int]::MaxValue, [long] $timeoutSeconds * 1000))
     if ($process.WaitForExit($waitMilliseconds)) {
@@ -363,8 +387,7 @@ finally {
             }
             [void] $process.WaitForExit(2000)
             if ($process.HasExited) {
-                # The parameterless wait drains pending async stdout/stderr callbacks.
-                $process.WaitForExit()
+                Harvest-OutputDrains $stdoutTask $stderrTask
             }
         }
         catch {
