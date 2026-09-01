@@ -69,6 +69,12 @@ pub(crate) struct ActiveAssignment {
     /// MANDATORY generation binding (B18/B19). The SOLE terminal-match key. Never
     /// zero (rejected at [`persist`]) and never `Option`.
     pub pr_number: u64,
+    /// Durable EXACT predecessor link (A11): the `assignment_id` this record
+    /// replaced via [`transfer`]. Persisted BEFORE the predecessor is retired, so
+    /// a crash between the two steps leaves a linked double-assignment the
+    /// reconciler deterministically converges — never a zero-assignment window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<uuid::Uuid>,
     // ── authority (set at dispatch, immutable thereafter) ──
     pub sender: String,
     pub task_id: String,
@@ -146,6 +152,7 @@ impl ActiveAssignment {
             schema_version: 1,
             assignment_id: uuid::Uuid::new_v4(),
             pr_number,
+            supersedes: None,
             sender: sender.into(),
             task_id: task_id.into(),
             review_class,

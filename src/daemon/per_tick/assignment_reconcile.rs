@@ -823,6 +823,78 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// Seed an OPEN review task owned by `owner` (the reviewer target), mirroring
+    /// a real dispatch-created review task. Used by the A11 tests so the
+    /// task-preservation assertions exercise the ownership-matched cancel path.
+    fn seed_open_task_owned(home: &Path, task_id: &str, owner: &str) {
+        crate::task_events::append(
+            home,
+            &InstanceName::from("system:test"),
+            TaskEvent::Created {
+                task_id: TaskId::from(task_id),
+                title: "review task".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(InstanceName::from(owner)),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some("feat/x".into()),
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// A11 — restart repair of an interrupted [`store::transfer`]: the durable
+    /// successor (persisted FIRST, linking its exact predecessor) plus the
+    /// not-yet-retired predecessor form a temporary double-assignment. One
+    /// reconcile pass must retire EXACTLY the linked predecessor: its record
+    /// removed, its row superseded, the successor and the SHARED task preserved.
+    #[test]
+    fn interrupted_transfer_double_assignment_converges_on_reconcile() {
+        let home = tmp_home("a11-converge");
+        seed_open_task_owned(&home, "t-rev-1", "rev-old");
+        let old = mk("o/r", "feat/x", "rev-old", 21, "2026-07-13T00:00:00Z");
+        store::persist(&home, &old).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "rev-old", "2026-07-13T00:00:05Z").unwrap();
+        // The crash state transfer leaves behind: successor durably persisted with
+        // the exact predecessor link, predecessor not yet retired.
+        let mut new = mk("o/r", "feat/x", "rev-new", 21, "2026-07-13T00:00:10Z");
+        new.supersedes = Some(old.assignment_id);
+        store::persist(&home, &new).unwrap();
+
+        reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+
+        assert!(
+            store::get(&home, "o/r", "feat/x", "rev-old").is_none(),
+            "linked predecessor deterministically retired"
+        );
+        let survivor = store::get(&home, "o/r", "feat/x", "rev-new")
+            .expect("successor assignment preserved");
+        assert_eq!(survivor.assignment_id, new.assignment_id);
+        assert_eq!(survivor.supersedes, Some(old.assignment_id));
+        assert!(
+            !crate::inbox::storage::nonce_present_actionable(&home, "rev-old", &old.delivery_nonce),
+            "predecessor's row superseded"
+        );
+        assert!(
+            crate::inbox::storage::nonce_present_actionable(&home, "rev-new", &new.delivery_nonce),
+            "successor's row delivered by the same pass (A2)"
+        );
+        assert_eq!(
+            task_status(&home, "t-rev-1"),
+            crate::task_events::TaskStatus::Open,
+            "the SHARED task is carried by the successor — never cancelled by the repair"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// B2 (A4 guard) — the FIRST reconcile tick must NOT rotate/supersede a HEALTHY,
     /// still-actionable (unread) delivery row. The row stays intact (no nonce
     /// rotation, no supersede), but a pure WAKE fires so the reviewer notices it.

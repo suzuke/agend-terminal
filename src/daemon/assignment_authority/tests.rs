@@ -390,6 +390,73 @@ fn t33_transfer_atomic_other_targets_untouched() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// T35 (A11): an interruption INSIDE transfer must never produce a
+/// zero-assignment state. A typed old record transferred to a target with no
+/// resolvable InstanceId errors at the resolve step — that error must abort
+/// BEFORE any mutation: the old record stays active and its inbox row stays
+/// actionable. (The old retire-before-persist ordering revoked the old target
+/// first, so this exact interruption left the branch with ZERO assignments.)
+#[test]
+fn t35_transfer_interruption_preserves_old_assignment() {
+    let home = tmp_home("t35");
+    let old = typed_record("a".repeat(40).as_str());
+    persist(&home, &old).unwrap();
+    durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:05Z").unwrap();
+
+    let result = transfer(
+        &home,
+        "o/r",
+        "feat/x",
+        "reviewer",
+        "ghost",
+        "2026-07-13T00:00:10Z",
+    );
+    assert!(result.is_err(), "unresolvable new target must error");
+
+    let survivor = get(&home, "o/r", "feat/x", "reviewer")
+        .expect("interrupted transfer must preserve the old assignment (never zero)");
+    assert_eq!(survivor.assignment_id, old.assignment_id, "same record, untouched");
+    assert!(
+        crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &old.delivery_nonce),
+        "old row still actionable — no mutation before the interruption point"
+    );
+    assert!(
+        get(&home, "o/r", "feat/x", "ghost").is_none(),
+        "no successor record was persisted"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// T36 (A11): a completed transfer stamps the DURABLE exact predecessor link —
+/// the new record carries `supersedes == old.assignment_id`, so a crash between
+/// {persist new} and {retire old} leaves a linked state the reconciler can
+/// deterministically converge.
+#[test]
+fn t36_transfer_links_exact_predecessor() {
+    let home = tmp_home("t36");
+    let a = mk_record("o/r", "feat/x", "rev-a", 21, "2026-07-13T00:00:00Z");
+    persist(&home, &a).unwrap();
+    durable_enqueue(&home, "o/r", "feat/x", "rev-a", "2026-07-13T00:00:05Z").unwrap();
+
+    transfer(
+        &home,
+        "o/r",
+        "feat/x",
+        "rev-a",
+        "rev-b",
+        "2026-07-13T00:00:10Z",
+    )
+    .unwrap();
+
+    let b = get(&home, "o/r", "feat/x", "rev-b").expect("new target persisted");
+    assert_eq!(
+        b.supersedes,
+        Some(a.assignment_id),
+        "new record must durably link its exact predecessor"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// B18/B19/I18: a terminal marker tombstones ONLY records whose stored
 /// pr_number matches; a DIFFERENT-generation record on the same branch
 /// SURVIVES (no force-bind by branch, no unbound window). Assignment cleanup
