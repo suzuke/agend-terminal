@@ -379,6 +379,7 @@ fn cleanup_merged_branch(
     // a dry-run release must be observation-only. The non-dry-run path keeps the
     // fresh fetch so `is_merged` / `squash` below are accurate; the dry-run
     // preview falls back to the existing local refs (best-effort "would delete").
+    let mut fetched = false;
     if !dry_run {
         let remote = crate::git_helpers::primary_remote(source_repo);
         // #2004: fail-direction is safe (stale remote refs → `is_merged`/`squash`
@@ -402,19 +403,44 @@ fn cleanup_merged_branch(
                     "fetch --prune could not run during merged-branch cleanup — merge/gone checks run on possibly-stale local refs (branch kept = safe direction)"
                 );
             }
-            Ok(_) => {}
+            Ok(_) => fetched = true,
         }
     }
 
     let default = crate::git_helpers::default_branch(source_repo);
+    // t-…-43938-5 (d-20260901132326253721-16): the fetch above refreshes
+    // `refs/remotes/<remote>/*` and NEVER `refs/heads/<default>`, so judging
+    // ancestry against the LOCAL default asks a stale question — every daemon
+    // worktree is provisioned at the CURRENT protected head, at or ahead of that
+    // lagging ref, so a branch whose work is already in the fetched default was
+    // reported "not merged" and kept forever. Judge against the ref the fetch
+    // just refreshed. A repo with no remote-tracking default keeps the local ref
+    // (there it IS the authority, and a remote-less repo must stay reapable); a
+    // repo that HAS one but could not refresh it judges nothing, so `is_merged`
+    // stays false and the branch is preserved fail-closed.
+    let remote_default = format!(
+        "refs/remotes/{}/{default}",
+        crate::git_helpers::primary_remote(source_repo)
+    );
+    let has_remote_default = crate::git_helpers::git_ok(
+        source_repo,
+        &["rev-parse", "--verify", "--quiet", &remote_default],
+    );
+    let merge_target = match (has_remote_default, fetched || dry_run) {
+        (true, true) => Some(remote_default.as_str()),
+        (true, false) => None,
+        (false, _) => Some(default.as_str()),
+    };
     // W6: converged onto git_helpers::git_ok — byte-identical to the prior
     // git_bypass(...).map(|o| o.status.success()).unwrap_or(false) idiom this
     // absorbs (worktree_cleanup.rs's is_branch_merged already used it; this
     // was the one remaining manual call site).
-    let is_merged = crate::git_helpers::git_ok(
-        source_repo,
-        &["merge-base", "--is-ancestor", branch, &default],
-    );
+    let is_merged = merge_target.is_some_and(|target| {
+        crate::git_helpers::git_ok(
+            source_repo,
+            &["merge-base", "--is-ancestor", branch, target],
+        )
+    });
 
     // #P3 (branch-residue): an authoritative PR-merge (a merged PR whose head
     // SHA == this branch tip, or the tip is an ancestor of it) is MONOTONIC

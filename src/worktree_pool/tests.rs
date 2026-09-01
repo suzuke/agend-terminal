@@ -5986,3 +5986,96 @@ fn seed_task_done(home: &Path, task_id: &str) {
         },
     );
 }
+
+/// RED (t-…-43938-5, scope correction d-20260901132326253721-16): the merge
+/// check inside `cleanup_merged_branch` compares the branch against the LOCAL
+/// `refs/heads/<default>` ref, which the release path never advances — its own
+/// pre-check `fetch --prune <remote>` is refspec-less and only updates
+/// `refs/remotes/<remote>/*`. The daemon provisions every worktree at the
+/// CURRENT protected head, which is at or ahead of that lagging local ref, so a
+/// branch whose work is PROVABLY already in the freshly fetched
+/// `origin/<default>` is judged "not merged" and preserved forever.
+///
+/// Deterministic and network-free: a local `origin` repo is advanced by pushing
+/// the branch tip onto its default, so after the release's own fetch the tip is
+/// an ancestor of `refs/remotes/origin/main` while `refs/heads/main` in the
+/// source clone still points at the older commit.
+#[test]
+fn release_reaps_branch_already_in_fetched_origin_default_despite_stale_local_main() {
+    fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git")
+    }
+    fn out(o: std::process::Output) -> String {
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    let home = tmp_home("stale-local-default");
+    let origin = tmp_repo("stale-local-default-origin");
+    // Origin must accept a push to its checked-out branch (plain repo, not bare).
+    git(&origin, &["config", "receive.denyCurrentBranch", "ignore"]);
+    let source = tmp_home("stale-local-default-src");
+    git(
+        std::path::Path::new("/"),
+        &[
+            "clone",
+            &origin.display().to_string(),
+            &source.display().to_string(),
+        ],
+    );
+    let base = out(git(&source, &["rev-parse", "main"]));
+
+    // Managed lease → branch created at the clone's current HEAD.
+    let lease = lease_bound(&home, &source, "agent-stale", "feat/stale");
+    // One real commit on the branch, then publish it as origin's new default.
+    std::fs::write(lease.path.join("f.txt"), "work\n").expect("write");
+    git(&lease.path, &["add", "f.txt"]);
+    git(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    );
+    let tip = out(git(&lease.path, &["rev-parse", "HEAD"]));
+    git(&lease.path, &["push", "origin", "feat/stale:main"]);
+
+    // Pre-conditions that make this test meaningful rather than vacuous.
+    assert_ne!(tip, base, "the branch must carry a real commit");
+    assert_eq!(
+        out(git(&source, &["rev-parse", "main"])),
+        base,
+        "pre: the source clone's LOCAL main must still lag at the older commit"
+    );
+    assert_eq!(
+        out(git(&origin, &["rev-parse", "main"])),
+        tip,
+        "pre: origin's default must now contain the branch tip"
+    );
+
+    let outcome = release_full(&home, "agent-stale", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+    assert!(
+        outcome.branch_deleted,
+        "a branch whose tip is an ancestor of the freshly fetched origin default \
+         carries no unpreserved work and must be reaped; kept instead with reason {:?}",
+        outcome.branch_cleanup_skipped_reason
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&source).ok();
+    std::fs::remove_dir_all(&origin).ok();
+}
