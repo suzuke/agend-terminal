@@ -84,6 +84,9 @@ pub enum ObservedState {
     RateLimited,
     /// A durable provider quota wall, distinct from a retryable throttle.
     UsageLimit,
+    /// A provider credential failure, distinct from a quota wall: the account is
+    /// not throttled, it is rejected. Durable until genuine later progress.
+    AuthError,
 }
 
 impl ObservedState {
@@ -300,6 +303,8 @@ impl AgentRuntime {
                     self.open_episode(ev.at_ms);
                 }
             }
+            // RED scaffolding: the latch lands in GREEN.
+            EvidenceKind::AuthError => {}
             // No state effect — accounting only.
             EvidenceKind::TokenUsage { .. } => {}
         }
@@ -585,6 +590,7 @@ fn evidence_kind_tag(kind: &EvidenceKind) -> &'static str {
         EvidenceKind::ApprovalRequired => "approval_required",
         EvidenceKind::RateLimited { .. } => "rate_limited",
         EvidenceKind::UsageLimit => "usage_limit",
+        EvidenceKind::AuthError => "auth_error",
         EvidenceKind::TokenUsage { .. } => "token_usage",
         EvidenceKind::PromptReady => "prompt_ready",
         EvidenceKind::SessionExited => "session_exited",

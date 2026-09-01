@@ -57,6 +57,10 @@ pub enum EvidenceKind {
     /// A durable provider quota wall. Unlike `RateLimited`, this is not retryable
     /// by the observer; it remains in force until genuine later progress.
     UsageLimit,
+    /// A provider CREDENTIAL failure (expired/revoked token, rejected key) observed
+    /// mid-session. Durable like `UsageLimit` — no retry the observer can see fixes
+    /// it — and it clears only on genuine later progress.
+    AuthError,
     /// Token accounting for a turn (API plane).
     TokenUsage { input: u64, output: u64 },
     /// The agent is idle at a ready prompt (claude `Notification{idle_prompt}`).

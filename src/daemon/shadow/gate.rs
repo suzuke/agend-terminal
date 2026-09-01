@@ -83,6 +83,8 @@ fn observed_to_agent_state(state: ObservedState) -> Option<AgentState> {
         ObservedState::WaitingForUser => AgentState::AwaitingOperator,
         ObservedState::RateLimited => AgentState::RateLimit,
         ObservedState::UsageLimit => AgentState::UsageLimit,
+        // RED scaffolding: the surfacing arm lands in GREEN.
+        ObservedState::AuthError => return None,
         ObservedState::Idle => return None,
     })
 }
