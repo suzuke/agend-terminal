@@ -741,7 +741,7 @@ fn disposable_review_task_terminal(home: &Path, task_id: &str) -> Option<bool> {
 
 /// t-…-43938-5 (d-20260901132326253721-16): tags carried by an owner-facing
 /// branch-retention obligation.
-const RETENTION_TAG: &str = "branch-retention";
+pub(crate) const RETENTION_TAG: &str = "branch-retention";
 const RETENTION_ORPHAN_TAG: &str = "branch-retention-orphan";
 const RETENTION_DUE_DAYS: i64 = 14;
 
@@ -758,7 +758,7 @@ const RETENTION_DUE_DAYS: i64 = 14;
 /// accepts tags but not metadata, so a metadata key would need a second event and
 /// a crash between the two would leave a keyless obligation that the next release
 /// could not recognise — producing the duplicate row this key exists to prevent.
-fn retention_key(repo: &str, branch: &str, head: &str) -> String {
+pub(crate) fn retention_key(repo: &str, branch: &str, head: &str) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(format!("{repo}\0{branch}\0{head}").as_bytes());
