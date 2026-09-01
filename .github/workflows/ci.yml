@@ -173,7 +173,9 @@ jobs:
         run: cargo check --features discord --quiet
 
       # Runs unit tests (--bin) + every tests/*.rs integration file with the
-      # tray feature, via nextest on ALL platforms.
+      # tray feature, via nextest on non-Windows platforms. Windows uses the
+      # bounded Job-Object wrapper below so a descendant hang cannot outlive
+      # the test step.
       # #1784: a real `Command::new("git")` test (worktree_cleanup / branch_sweep
       # build real repos + worktrees) intermittently HANGS, timing the whole job
       # out at ~30min with NO culprit — `cargo test` only prints a test name on
@@ -216,10 +218,36 @@ jobs:
       # headless server build), catching discord code that accidentally leans on
       # a tray-gated item — which `tray,discord` here would compile straight past.
       - name: Tests (unit + integration + tray + discord) [nextest — names a hung test, #1784/#1893]
+        if: runner.os != 'Windows'
         timeout-minutes: 30
         env:
           AGEND_LOCK_AUDIT: "1"
         run: cargo nextest run --features tray,discord --profile ci
+
+      - name: Windows nextest watchdog smoke
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        run: ./scripts/ci/windows-nextest-watchdog-smoke.ps1
+
+      - name: Tests (unit + integration + tray + discord) [Windows Job-Object watchdog]
+        if: runner.os == 'Windows'
+        timeout-minutes: 30
+        shell: pwsh
+        env:
+          AGEND_LOCK_AUDIT: "1"
+          AGEND_NEXTTEST_DIAGNOSTICS_DIR: ${{ runner.temp }}/agend-nextest-watchdog
+        run: ./scripts/ci/windows-nextest-watchdog.ps1 cargo nextest run --features tray,discord --profile ci
+
+      - name: Upload Windows nextest watchdog diagnostics
+        if: always() && runner.os == 'Windows'
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v5
+        with:
+          name: nextest-watchdog-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/agend-nextest-watchdog
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: CLI smoke (Phase C.5)
         timeout-minutes: 10
