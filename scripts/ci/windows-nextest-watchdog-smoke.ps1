@@ -38,7 +38,9 @@ param(
     [Parameter(Position = 0)]
     [string] $Case,
     [Parameter(Position = 1)]
-    [string] $Marker
+    [string] $Marker,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]] $Rest
 )
 
 $ErrorActionPreference = "Stop"
