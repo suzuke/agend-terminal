@@ -1516,6 +1516,41 @@ mod tests {
         );
     }
 
+    /// #3466: since #3454 made the exact-head review threshold a hard merge
+    /// precondition with `force=true` as its sole audited bypass, the
+    /// caller-facing `force` description must enumerate all THREE bypassed
+    /// policy gates and name the two identity gates that stay non-bypassable —
+    /// the live tool description is the first authority layer an agent reads.
+    #[test]
+    fn repo_force_description_enumerates_review_threshold_bypass_3466() {
+        let d = def_repo();
+        let desc = d["inputSchema"]["properties"]["force"]["description"]
+            .as_str()
+            .expect("repo force description");
+        // The three bypassed policy gates.
+        assert!(
+            desc.contains("CI fail-closed"),
+            "force description must name the CI fail-closed gate bypass"
+        );
+        assert!(
+            desc.contains("base-staleness (BEHIND/DIRTY)"),
+            "force description must name the base-staleness (BEHIND/DIRTY) bypass"
+        );
+        assert!(
+            desc.contains("exact-head review threshold"),
+            "force description must name the exact-head review-threshold bypass (#3454)"
+        );
+        // The two non-bypassable identity gates.
+        assert!(
+            desc.contains("head/base acquisition"),
+            "force description must say exact head/base acquisition is non-bypassable"
+        );
+        assert!(
+            desc.contains("pre-merge identity recheck"),
+            "force description must say the pre-merge identity recheck is non-bypassable"
+        );
+    }
+
     #[test]
     fn instance_tool_describes_weak_observation_uncertainty_3349() {
         for tool in [def_list_instances(), def_instance()] {
