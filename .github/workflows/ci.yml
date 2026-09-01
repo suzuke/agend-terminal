@@ -237,6 +237,7 @@ jobs:
         env:
           AGEND_LOCK_AUDIT: "1"
           AGEND_NEXTTEST_DIAGNOSTICS_DIR: ${{ runner.temp }}/agend-nextest-watchdog
+          AGEND_WATCHDOG_TIMEOUT_SECONDS: "1500"
         run: ./scripts/ci/windows-nextest-watchdog.ps1 cargo nextest run --features tray,discord --profile ci
 
       - name: Upload Windows nextest watchdog diagnostics
