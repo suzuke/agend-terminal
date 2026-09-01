@@ -198,6 +198,10 @@ pub struct AgentRuntime {
     /// a `TokenUsage` props `last_observer_ms` without any real progress, which would otherwise
     /// mis-clear a still-rate-limited agent once the rate-limit latch expires (r6 repro).
     last_progress_ms: u64,
+    /// A rejected credential, latched like the quota wall above: durable until
+    /// genuine later progress proves the session recovered.
+    auth_error_active: bool,
+    auth_error_at_ms: u64,
     /// Stable-`since` bookkeeping: the last derived state + when it was entered.
     last_state: Option<ObservedState>,
     last_state_since_ms: u64,
@@ -241,6 +245,9 @@ impl AgentRuntime {
         }
         if is_progress && self.usage_limit_active && ev.at_ms > self.usage_limit_at_ms {
             self.usage_limit_active = false;
+        }
+        if is_progress && self.auth_error_active && ev.at_ms > self.auth_error_at_ms {
+            self.auth_error_active = false;
         }
         // #2470 (r6 round-3): track REAL-PROGRESS freshness separately from `last_observer_ms`.
         // Only a genuine lifecycle/progress signal advances it — NOT `TokenUsage` (accounting,
@@ -303,8 +310,14 @@ impl AgentRuntime {
                     self.open_episode(ev.at_ms);
                 }
             }
-            // RED scaffolding: the latch lands in GREEN.
-            EvidenceKind::AuthError => {}
+            EvidenceKind::AuthError => {
+                // Same anti-replay rule as the quota wall: a rewound session file
+                // must not resurrect a credential failure newer progress cleared.
+                if ev.at_ms > self.last_progress_ms {
+                    self.auth_error_active = true;
+                    self.auth_error_at_ms = self.auth_error_at_ms.max(ev.at_ms);
+                }
+            }
             // No state effect — accounting only.
             EvidenceKind::TokenUsage { .. } => {}
         }
@@ -398,6 +411,17 @@ impl AgentRuntime {
         if self.usage_limit_active {
             return (
                 ObservedState::UsageLimit,
+                self.last_observer_authority.unwrap_or(Authority::Stream),
+                Confidence::Strong,
+            );
+        }
+
+        // A rejected credential is equally durable and equally unrecoverable by the
+        // observer, so it likewise outranks the raw screen heuristic: Grok renders its
+        // resting footer with a dead token and raw Idle would look healthy.
+        if self.auth_error_active {
+            return (
+                ObservedState::AuthError,
                 self.last_observer_authority.unwrap_or(Authority::Stream),
                 Confidence::Strong,
             );

@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 const TAIL_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 const DISCOVER_RECENT: std::time::Duration = std::time::Duration::from_secs(26 * 3600);
 const FREE_USAGE_MARKER: &str = "subscription:free-usage-exhausted";
+/// The auth-class HTTP statuses Grok embeds verbatim in a `retry_state` failure
+/// text (`API error (status 401 Unauthorized): ...`). 402 (billing) and 429
+/// (throttle / free-usage quota) are deliberately NOT auth failures.
+const AUTH_STATUS_MARKERS: [&str; 2] = ["(status 401", "(status 403"];
 
 #[derive(Debug, Deserialize)]
 struct SessionRecord {
@@ -36,6 +40,8 @@ struct SessionUpdate {
     #[serde(rename = "type")]
     update_type: Option<String>,
     reason: Option<String>,
+    /// Carried instead of `reason` by a `type:"failed"` retry state.
+    message: Option<String>,
     is_rate_limited: Option<bool>,
     stop_reason: Option<String>,
 }
@@ -48,25 +54,40 @@ fn parse_record(line: &str) -> Option<SessionRecord> {
 /// normal turn completion, malformed JSON, and every unrelated update are ignored.
 pub(crate) fn record_to_evidence(line: &str, now_ms: u64) -> Option<Evidence> {
     let record = parse_record(line)?;
-    let update = record.params.update;
-    let is_quota_wall = matches!(
+    if !matches!(
         record.method.as_str(),
         "session/update" | "_x.ai/session/update"
-    ) && update.session_update == "retry_state"
-        && update.update_type.as_deref() == Some("exhausted")
+    ) {
+        return None;
+    }
+    let update = record.params.update;
+    if update.session_update != "retry_state" {
+        return None;
+    }
+    let is_quota_wall = update.update_type.as_deref() == Some("exhausted")
         && update.is_rate_limited == Some(true)
         && update
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains(FREE_USAGE_MARKER));
-    if !is_quota_wall {
+    // A rejected credential is reported through the same retry channel, in
+    // `reason` while Grok still retries and in `message` once it gives up.
+    let is_auth_failure = [update.reason.as_deref(), update.message.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|text| AUTH_STATUS_MARKERS.iter().any(|m| text.contains(m)));
+    let kind = if is_quota_wall {
+        EvidenceKind::UsageLimit
+    } else if is_auth_failure {
+        EvidenceKind::AuthError
+    } else {
         return None;
-    }
+    };
     let at_ms = record
         .timestamp
         .map(|seconds| seconds.saturating_mul(1_000))
         .unwrap_or(now_ms);
-    Some(Evidence::stream(EvidenceKind::UsageLimit, at_ms))
+    Some(Evidence::stream(kind, at_ms))
 }
 
 /// Map genuine later model progress so a durable quota wall can release after a
@@ -318,7 +339,9 @@ mod tests {
         }
         // The record timestamp, not the tail clock, stamps the evidence.
         assert_eq!(
-            record_to_evidence(lines[0], 1_783_735_760_000).unwrap().at_ms,
+            record_to_evidence(lines[0], 1_783_735_760_000)
+                .unwrap()
+                .at_ms,
             1_783_735_748_000
         );
         // The real 402 billing wall is a payment problem, NOT a credential one.
