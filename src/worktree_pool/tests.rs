@@ -6471,3 +6471,112 @@ fn release_at_a_new_head_raises_a_fresh_retention_obligation() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// AUTHORITY PROOF (required before B3 can treat a `delete:` answer as an
+/// authority to destroy a branch): completing a retention obligation is gated by
+/// the EXISTING task ACL, not by anything this feature invents. An agent that is
+/// neither the owner nor an orchestrator of the owner must be refused.
+#[test]
+fn a_third_party_cannot_answer_someone_elses_retention_obligation() {
+    let home = tmp_home("retention-authz-deny");
+    let repo = tmp_repo("retention-authz-deny-repo");
+    plant_live_agents(&home, &["agent-acct"]);
+    let lease = lease_bound(&home, &repo, "agent-acct", "feat/authz");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+    release_full(&home, "agent-acct", false);
+    let obligation = retention_tasks(&home).remove(0);
+
+    let denied = crate::tasks::handle(
+        &home,
+        "some-other-agent",
+        &serde_json::json!({"action": "done", "id": obligation.id.0, "result": "delete: not mine to give"}),
+    );
+    assert_ne!(
+        denied["status"], "done",
+        "a non-owner must not be able to stamp a delete: answer: {denied}"
+    );
+    // The negative control needs its own control: prove the refusal is an
+    // AUTHORITY refusal, not some unrelated error that would also make the
+    // assertion above pass.
+    let reason = denied["error"].as_str().unwrap_or_default().to_lowercase();
+    assert!(
+        reason.contains("not authorized"),
+        "the refusal must be an AUTHORITY refusal naming owner vs caller, not an \
+         incidental failure that would also satisfy the assertion above: {denied}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// AUTHORITY PROOF, the other direction — a gate nobody can pass is not a gate,
+/// it is a dead mechanism. The accountable owner MUST be able to answer after the
+/// worktree is gone, which is exactly why the obligation is branchless:
+/// `assignee_completion_guard` demands an exact live binding from the assignee of
+/// a BRANCH-carrying task, and the owner no longer has one at that point.
+#[test]
+fn the_accountable_owner_can_answer_the_retention_obligation_after_release() {
+    let home = tmp_home("retention-authz-allow");
+    let repo = tmp_repo("retention-authz-allow-repo");
+    plant_live_agents(&home, &["agent-acct2"]);
+    let lease = lease_bound(&home, &repo, "agent-acct2", "feat/authz2");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+    release_full(&home, "agent-acct2", false);
+    let obligation = retention_tasks(&home).remove(0);
+    assert_eq!(
+        obligation.owner.as_ref().map(|o| o.0.as_str()),
+        Some("agent-acct2"),
+        "pre: the obligation is owned by the branch opener"
+    );
+
+    let answered = crate::tasks::handle(
+        &home,
+        "agent-acct2",
+        &serde_json::json!({"action": "done", "id": obligation.id.0, "result": "keep: still needed"}),
+    );
+    assert_eq!(
+        answered["status"], "done",
+        "the accountable owner must be able to answer once the worktree is released: {answered}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}

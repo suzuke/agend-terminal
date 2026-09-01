@@ -745,19 +745,24 @@ const RETENTION_TAG: &str = "branch-retention";
 const RETENTION_ORPHAN_TAG: &str = "branch-retention-orphan";
 const RETENTION_DUE_DAYS: i64 = 14;
 
-/// Stable idempotency key over the EXACT (repo, branch, head) triple, mirroring
-/// `cleanup_intents::intent_key`'s shape. Carried as a TAG rather than task
-/// metadata deliberately: `TaskEvent::Created` accepts tags but not metadata, so
-/// a metadata key would need a second event and a crash between the two would
-/// leave a keyless obligation that the next release could not recognise —
-/// producing the duplicate row this key exists to prevent.
+/// Stable idempotency key over the EXACT (repo, branch, head) triple.
+///
+/// A FULL SHA-256 digest, not a short hash: this key is persisted in a tag and
+/// compared across processes and toolchains, so it must be stable forever.
+/// `DefaultHasher` is explicitly not — its output may change between Rust
+/// releases, which would silently stop matching and duplicate every obligation
+/// after a toolchain upgrade. Fields are separated by a NUL, which can appear in
+/// neither a path nor a git ref, so no two distinct triples share material.
+///
+/// Carried as a TAG rather than task metadata deliberately: `TaskEvent::Created`
+/// accepts tags but not metadata, so a metadata key would need a second event and
+/// a crash between the two would leave a keyless obligation that the next release
+/// could not recognise — producing the duplicate row this key exists to prevent.
 fn retention_key(repo: &str, branch: &str, head: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    repo.hash(&mut h);
-    branch.hash(&mut h);
-    head.hash(&mut h);
-    format!("retention-key:{:016x}", h.finish())
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(format!("{repo}\0{branch}\0{head}").as_bytes());
+    format!("retention-key:{}", hex::encode(hasher.finalize()))
 }
 
 /// Record ONE owner-facing obligation for a branch that survived release with
@@ -836,7 +841,13 @@ fn record_retention_obligation(
         ),
         depends_on: Vec::new(),
         routed_to: None,
-        branch: Some(branch.to_string()),
+        // Deliberately branchless. `assignee_completion_guard` gates a
+        // BRANCH-carrying task on the assignee holding an exact live binding —
+        // which the owner no longer has once the worktree is released, so a
+        // branch-carrying obligation would be unanswerable by the very agent it
+        // holds accountable. The branch is still carried in the description and
+        // in the retention key.
+        branch: None,
         bind: None,
         eta_secs: None,
         tags,
