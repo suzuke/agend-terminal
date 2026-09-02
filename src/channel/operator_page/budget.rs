@@ -58,11 +58,17 @@
 //!
 //! Every CLOSED cell has a test and every ACCEPTED cell has an honestly named
 //! pin, which must be INVERTED rather than deleted if this ever changes. The
-//! live column is `every_tampering_shape_is_closed_while_the_process_lives`; the
-//! restart column is `restart_with_absent_or_unparseable_state_fails_closed` and
-//! `restart_with_any_parseable_rewrite_is_trusted_by_design`, plus
+//! live column is `every_tampering_shape_is_closed_while_the_process_lives` for
+//! the eight on-disk shapes and `an_unwritable_snapshot_denies_and_rolls_the_claim_back`
+//! for the ninth; the restart column is
+//! `restart_with_absent_or_unparseable_state_fails_closed`,
+//! `restart_with_any_parseable_rewrite_is_trusted_by_design` (whose tail also
+//! pins the future-dated cell) and
+//! `restart_with_an_unwritable_snapshot_denies_and_rolls_the_claim_back`, plus
 //! `valid_snapshot_rewrite_plus_restart_refills_the_hour_by_design` driving the
-//! real MCP entry in `operator_page/tests.rs`.
+//! real MCP entry in `operator_page/tests.rs`. All eighteen cells were audited
+//! against these tests, not assumed: the unwritable restart cell was the only
+//! one whose claim outran its evidence, and it is now pinned.
 //!
 //! **Why there is no integrity mechanism — and why DETECTION fails too.** Start
 //! with what makes the question moot: a seat that can rewrite this file has,
@@ -893,6 +899,41 @@ mod tests {
         match claim(&home, "lead", 1_000) {
             Err(ClaimError::Unavailable { cause, .. }) => assert_eq!(cause, "snapshot_unwritable"),
             _ => panic!("a snapshot that cannot be written must deny"),
+        }
+        assert!(
+            claim(&home, "lead", 1_000).is_ok(),
+            "the refused claim must have been rolled back, not silently spent"
+        );
+        reset_for_test();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// MATRIX, RESTART COLUMN — the unwritable cell.
+    ///
+    /// The matrix claimed this shape CLOSED in BOTH columns while only the LIVE
+    /// half was pinned: the sibling test above never resets between seeding and
+    /// the forced write failure, so it proves the live persistence path and says
+    /// nothing about a restart. A PRIMARY reviewer caught the claim outrunning
+    /// its evidence — the third time on this PR that a claim was broader than
+    /// what backed it, and the first time inside the very matrix built to stop
+    /// the other two. Closed by testing the cell rather than by narrowing the
+    /// row, because ten lines is not a price worth trading honesty for.
+    #[test]
+    #[serial]
+    fn restart_with_an_unwritable_snapshot_denies_and_rolls_the_claim_back() {
+        reset_for_test();
+        let home = tmp_home("restart-unwritable");
+        seed_snapshot(&home, false).expect("operator seeds the snapshot");
+        // The restart: memory is gone, so init re-reads the file, which is
+        // READABLE — only persisting the claim back to it fails.
+        reset_for_test();
+        crate::store::fail_next_atomic_write_for_test(&snapshot_path(&home));
+        match claim(&home, "lead", 1_000) {
+            Err(ClaimError::Unavailable { cause, .. }) => assert_eq!(
+                cause, "snapshot_unwritable",
+                "an unpersistable claim must deny after a restart exactly as it does live"
+            ),
+            _ => panic!("an unwritable snapshot must deny after a restart"),
         }
         assert!(
             claim(&home, "lead", 1_000).is_ok(),
