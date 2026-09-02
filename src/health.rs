@@ -393,6 +393,22 @@ pub struct HealthTracker {
     /// `#[allow(dead_code)]` until the unpause sub-task lands.
     #[allow(dead_code)] // reserved for unpause sub-task (Stage 3 decay)
     pub(crate) last_stage3_fired_at: Option<Instant>,
+    /// t-20260902154222470714-82348-82: last pane line proving Codex refused
+    /// an MCP tool call (written ONLY by
+    /// `crate::daemon::per_tick::codex_mcp_refusal`). Deliberately NOT a
+    /// `BlockedReason` / `HealthState` change — this is evidence the
+    /// inbox-stuck watchdog quotes, never a dispatch-gating signal.
+    pub last_mcp_refusal: Option<McpRefusalEvidence>,
+}
+
+/// Evidence that Codex refused an MCP tool call: when it was seen, and the
+/// pane line that proved it. `reset()` intentionally does not clear it — that
+/// method resets crash/error state only (it never re-initialises every field),
+/// and stale evidence stays readable until the next detection overwrites it.
+#[derive(Debug, Clone)]
+pub struct McpRefusalEvidence {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub line: String,
 }
 
 /// #1744-H3: shared rate-limit predicate for a per-class notify cooldown stamp.
@@ -480,7 +496,14 @@ impl HealthTracker {
             recovery_stage_state: RecoveryStageState::None,
             last_stage1_fired_at: None,
             last_stage3_fired_at: None,
+            last_mcp_refusal: None,
         }
+    }
+
+    /// Record the pane line proving Codex refused an MCP tool call.
+    #[allow(dead_code)] // RED scaffolding: no production writer until GREEN
+    pub fn record_mcp_refusal(&mut self, at: chrono::DateTime<chrono::Utc>, line: String) {
+        self.last_mcp_refusal = Some(McpRefusalEvidence { at, line });
     }
 
     /// `#685` sub-task 7c: atomic transition into `HealthState::Paused`

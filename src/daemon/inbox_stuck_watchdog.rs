@@ -39,19 +39,29 @@ pub(crate) fn scan_and_emit(
     now: &chrono::DateTime<chrono::Utc>,
     last_alerted: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
 ) {
-    scan_and_emit_with_blocked(home, now, last_alerted, &HashMap::new());
+    scan_and_emit_with_blocked(home, now, last_alerted, &HashMap::new(), &HashMap::new());
 }
 
 /// Scan with the per-tick live usage/quota snapshot. The snapshot is produced
 /// under registry/core locks by [`InboxStuckHandler`] and is intentionally
 /// consumed only after those locks are dropped, because this function reads
 /// fleet and inbox files.
+///
+/// `mcp_refusals` (t-20260902154222470714-82348-82) is the same-pass snapshot
+/// of `health.last_mcp_refusal`. When the stuck agent has evidence, the alert
+/// text gains a sentence naming it — the incident that motivated this had the
+/// fleet learn about a 15h total MCP refusal only through THIS watchdog, whose
+/// text said nothing about why. With no evidence the message is byte-identical
+/// to what it has always been.
 pub(crate) fn scan_and_emit_with_blocked(
     home: &Path,
     now: &chrono::DateTime<chrono::Utc>,
     last_alerted: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
     usage_blocked: &HashMap<String, Option<String>>,
+    mcp_refusals: &HashMap<String, crate::health::McpRefusalEvidence>,
 ) {
+    // RED scaffolding: parameter accepted, not yet read (see RED commit body).
+    let _ = mcp_refusals;
     let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
         return;
     };
@@ -295,7 +305,13 @@ mod tests {
         usage_blocked.insert("worker".to_string(), None);
         usage_blocked.insert("lead".to_string(), None);
         let mut last = HashMap::new();
-        scan_and_emit_with_blocked(&home, &chrono::Utc::now(), &mut last, &usage_blocked);
+        scan_and_emit_with_blocked(
+            &home,
+            &chrono::Utc::now(),
+            &mut last,
+            &usage_blocked,
+            &HashMap::new(),
+        );
 
         let lead_messages = crate::inbox::drain(&home, "lead");
         assert!(
@@ -344,7 +360,13 @@ teams:
         usage_blocked.insert("lead".to_string(), None);
         usage_blocked.insert("general".to_string(), None);
         let mut last = HashMap::new();
-        scan_and_emit_with_blocked(&home, &chrono::Utc::now(), &mut last, &usage_blocked);
+        scan_and_emit_with_blocked(
+            &home,
+            &chrono::Utc::now(),
+            &mut last,
+            &usage_blocked,
+            &HashMap::new(),
+        );
 
         let lead_messages = crate::inbox::drain(&home, "lead");
         assert!(
@@ -375,7 +397,13 @@ teams:
         let mut usage_blocked = HashMap::new();
         usage_blocked.insert("worker".to_string(), None);
         let mut last = HashMap::new();
-        scan_and_emit_with_blocked(&home, &chrono::Utc::now(), &mut last, &usage_blocked);
+        scan_and_emit_with_blocked(
+            &home,
+            &chrono::Utc::now(),
+            &mut last,
+            &usage_blocked,
+            &HashMap::new(),
+        );
 
         let lead_messages = crate::inbox::drain(&home, "lead");
         assert!(
@@ -473,6 +501,88 @@ teams:
             crate::inbox::drain(&home, "lead").is_empty(),
             "re-alert within the dedup window must be suppressed"
         );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// t-20260902154222470714-82348-82 (g): when the stuck agent carries
+    /// codex MCP-refusal evidence, the alert names it — timestamp and pane
+    /// line — so the orchestrator sees WHY the agent went quiet instead of
+    /// only THAT it did. Without evidence the text stays byte-identical to
+    /// today's (pinned here as "the evidence text is exactly the old text
+    /// plus one appended sentence").
+    #[test]
+    fn stuck_alert_appends_mcp_refusal_evidence_when_present() {
+        let line = "  \u{2514} MCP tool call requires approval, but approval policy is never";
+        let at = chrono::DateTime::parse_from_rfc3339("2026-09-02T10:11:12+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // Baseline: no evidence → the historical message.
+        let base_home = tmp_home("refusal-none");
+        write_fleet(&base_home);
+        seed_unread(&base_home, "worker", 4, 45);
+        let mut last = HashMap::new();
+        scan_and_emit_with_blocked(
+            &base_home,
+            &chrono::Utc::now(),
+            &mut last,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let base = crate::inbox::drain(&base_home, "lead")
+            .into_iter()
+            .map(|m| m.text)
+            .find(|t| t.contains("[inbox_stuck_watchdog]"))
+            .expect("baseline alert must fire");
+        assert!(
+            !base.contains("Last MCP-refusal evidence:"),
+            "no evidence → no evidence sentence: {base}"
+        );
+
+        // With evidence for the stuck agent.
+        let home = tmp_home("refusal-some");
+        write_fleet(&home);
+        seed_unread(&home, "worker", 4, 45);
+        let mut refusals = HashMap::new();
+        refusals.insert(
+            "worker".to_string(),
+            crate::health::McpRefusalEvidence {
+                at,
+                line: line.to_string(),
+            },
+        );
+        let mut last = HashMap::new();
+        scan_and_emit_with_blocked(
+            &home,
+            &chrono::Utc::now(),
+            &mut last,
+            &HashMap::new(),
+            &refusals,
+        );
+        let text = crate::inbox::drain(&home, "lead")
+            .into_iter()
+            .map(|m| m.text)
+            .find(|t| t.contains("[inbox_stuck_watchdog]"))
+            .expect("evidence alert must fire");
+        assert!(
+            text.contains("Last MCP-refusal evidence:"),
+            "evidence sentence must be appended: {text}"
+        );
+        assert!(
+            text.contains(&at.to_rfc3339()),
+            "evidence timestamp must be RFC3339: {text}"
+        );
+        assert!(
+            text.contains(line),
+            "evidence pane line must appear: {text}"
+        );
+        assert!(
+            text.starts_with(&base),
+            "the evidence text must be the UNCHANGED message plus an appended \
+             sentence (byte-identical prefix)"
+        );
+
+        std::fs::remove_dir_all(base_home).ok();
         std::fs::remove_dir_all(home).ok();
     }
 }

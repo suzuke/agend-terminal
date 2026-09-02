@@ -48,6 +48,7 @@ pub(crate) mod check_schedules;
 pub(crate) mod checkout_txn_recover;
 pub(crate) mod ci_watch_poll;
 pub(crate) mod claude_self_kick;
+pub(crate) mod codex_mcp_refusal;
 pub(crate) mod context_alert;
 pub(crate) mod context_handoff;
 pub(crate) mod context_thresholds;
@@ -85,6 +86,7 @@ pub(crate) use backend_exit_detection::BackendExitDetectionHandler;
 pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use ci_watch_poll::CiWatchPollHandler;
 pub(crate) use claude_self_kick::ClaudeSelfKickHandler;
+pub(crate) use codex_mcp_refusal::CodexMcpRefusalHandler;
 pub(crate) use context_thresholds::ContextThresholdsHandler;
 pub(crate) use ephemeral_reap::EphemeralReapHandler;
 pub(crate) use external_liveness::ExternalLivenessHandler;
@@ -505,6 +507,12 @@ pub(crate) fn build_default_handlers(
         // machines, not shared) and is panic-isolated from the other inside
         // `ContextThresholdsHandler::run`. Runs in app mode (live daemon).
         Box::new(ContextThresholdsHandler::new(6, 6)),
+        // t-20260902154222470714-82348-82: codex MCP-refusal detector. Same
+        // ~1min cadence as the context handlers next to it; reads each codex
+        // pane's screen text under a short `core.lock()` and raises ONE
+        // edge-triggered orchestrator notice per appearance-episode. Detection
+        // + notification only — no restart, no keystroke, no dispatch gating.
+        Box::new(CodexMcpRefusalHandler::new(6)),
         // #2044 inject-delivery watchdog: every tick (~10s) verify that an
         // armed actionable wake produced a UserPromptSubmit; re-deliver once
         // + WARN if a dialog swallowed it. Cheap (iterates a usually-empty

@@ -120,6 +120,8 @@ impl PerTickHandler for InboxStuckHandler {
             &now,
             &mut last,
             &usage_blocked,
+            // RED scaffolding: the real per-agent evidence snapshot lands in GREEN.
+            &HashMap::new(),
         );
         last.retain(|name, _| live.contains(name));
     }
