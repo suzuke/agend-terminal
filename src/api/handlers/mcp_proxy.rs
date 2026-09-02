@@ -1965,3 +1965,8 @@ mod tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "mcp_proxy_2454_tests.rs"]
 mod mcp_proxy_2454_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "mcp_proxy_team_authority_tests.rs"]
+mod mcp_proxy_team_authority_tests;
