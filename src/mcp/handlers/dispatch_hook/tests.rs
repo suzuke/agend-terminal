@@ -507,6 +507,51 @@ fn untyped_send_nonexistent_expected_head_rejects_without_binding_3479() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn untyped_send_mismatched_remote_branch_rolls_back_binding_3479() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!("agend-3479-mismatch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "target-agent");
+    let expected = crate::git_helpers::git_cmd(&repo, &["rev-parse", "HEAD"])
+        .expect("initial HEAD")
+        .trim()
+        .to_string();
+    let remote_tip = commit_and_advance_origin_main(&repo, "remote-tip");
+    let remote_branch = "refs/remotes/origin/review/3479-mismatch";
+    crate::git_helpers::git_cmd(&repo, &["update-ref", remote_branch, &remote_tip])
+        .expect("seed remote branch");
+    let tid = create_review_class_task(&home, "single");
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result = super::super::comms::handle_unified_send(
+        &home,
+        &serde_json::json!({
+            "instance": "target-agent",
+            "request_kind": "task",
+            "message": "reject mismatched branch",
+            "task_id": tid,
+            "branch": "review/3479-mismatch",
+            "expected_head": expected,
+        }),
+        &sender,
+        Some(&minimal_runtime()),
+    );
+    assert_eq!(result["code"], "expected_head_mismatch", "{result}");
+    assert!(crate::binding::read(&home, "target-agent").is_none());
+    assert!(
+        crate::git_helpers::git_cmd(
+            &repo,
+            &["rev-parse", "--verify", "refs/heads/review/3479-mismatch"]
+        )
+        .is_err(),
+        "rollback must delete the newly-created local branch"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #3479 PR-B KISS control: omitting expected_head preserves today's default-tip
 /// branch creation behavior through the same real send entry.
 #[test]
@@ -5118,6 +5163,7 @@ fn dispatch_bind_failure_arms_no_ci_watch_3419() {
         &tid,
         "feat/3419-bindfail",
         Some("owner/repo"),
+        None,
         None,
         &[],
         Some("dual"),

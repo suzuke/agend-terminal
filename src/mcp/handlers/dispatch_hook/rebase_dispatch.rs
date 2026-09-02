@@ -32,6 +32,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain_preheld(
         branch,
         repo,
         source_repo_override,
+        None,
         &[],
         None,
         false,

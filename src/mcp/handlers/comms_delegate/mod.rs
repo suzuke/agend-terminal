@@ -181,6 +181,7 @@ fn maybe_auto_bind_lease(
     let next_after_ci =
         crate::daemon::ci_watch::watch_state::normalize_next_after_ci(&args["next_after_ci"]);
     let armed_review_class = review_class.as_token();
+    let expected_head = args["expected_head"].as_str();
     // The governing class was reloaded by `preflight_branch_authority`; only
     // that typed result is allowed to arm the watch.
     dispatch_hook::dispatch_auto_bind_lease_with_source_and_chain(
@@ -190,12 +191,26 @@ fn maybe_auto_bind_lease(
         branch,
         args["repository"].as_str(),
         None,
+        expected_head,
         &next_after_ci,
         Some(armed_review_class),
         true,
     )
     .map(|outcome| outcome.ci_watch)
-    .map_err(|e| json!({"ok": false, "error": format!("dispatch rejected: {e}")}))
+    .map_err(|e| {
+        let mut result = json!({"ok": false, "error": format!("dispatch rejected: {e}")});
+        if expected_head.is_some()
+            && matches!(
+                e.code,
+                dispatch_hook::ErrorCode::InvalidExpectedHead
+                    | dispatch_hook::ErrorCode::ExpectedHeadMismatch
+            )
+        {
+            result["code"] = serde_json::to_value(e.code).unwrap_or(Value::Null);
+            result["stage"] = serde_json::to_value(e.stage).unwrap_or(Value::Null);
+        }
+        result
+    })
 }
 
 /// Arm the typed CI watch for an explicit `bind: false` dispatch. Binding is
