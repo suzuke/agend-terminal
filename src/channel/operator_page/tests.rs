@@ -1,5 +1,5 @@
 //! #3480 RED→GREEN suite. Every case drives the REAL MCP entry
-//! (`mcp::handlers::handle_tool("operator_page", …)`), not the module function,
+//! (`mcp::handlers::handle_tool*("operator_page", …)`), not the module function,
 //! so the tool registration, schema validation and dispatch are all covered.
 //!
 //! Delivery is asserted through a recording `Channel` registered in the process
@@ -7,16 +7,40 @@
 //! that sees a message there has proven the page really traversed
 //! `notify_all_escalation_channels` → `gated_notify` rather than some private
 //! shortcut.
+//!
+//! **Hermeticity (#3480 C).** Two structural guarantees, not naming conventions:
+//! the fixture pins BOTH bot-token env names (`creds.rs` falls back from a
+//! configured name to the canonical one AND to the legacy one, so leaving a
+//! fixture's `bot_token_env` unset does not stop a host-exported operator token
+//! from being used), and every case installs the `topic_registry` creation seam,
+//! which answers before `resolve_channel_only_from` / `Bot::new` are reached.
+//! `bot_api_entered_for_home` is the standing proof that the API branch was never
+//! entered for this fixture's home.
+//!
+//! **Trust model (d-20260902…-36).** Every agent and the daemon share one OS
+//! user, so no in-daemon gate can make the caller-supplied instance name
+//! spoof-proof, and nothing here claims otherwise. What the authority gate does
+//! claim, and what these tests pin, is narrower: a name that does not resolve to
+//! a LIVE instance is refused, an AMBIGUOUS name is refused, a caller owned by
+//! more than one team is refused, and the resolved live instance must be its
+//! team's current orchestrator. The boundary that remains is pinned by
+//! `any_seat_presenting_the_orchestrators_live_name_is_admitted_by_design`.
 
 use super::*;
 use crate::channel::channel_registry_test_guard;
+use crate::channel::telegram::topic_registry::{
+    bot_api_entered_for_home, install_topic_seam_for_test, reset_topic_seam_for_test,
+    topic_seam_calls_for_test,
+};
 use crate::channel::{
     register_active_channel, reset_active_channel_for_test, BindingOpts, BindingRef, Channel,
     ChannelCapabilities, ChannelError, ChannelEvent, MsgRef, NotifySeverity, OutMsg,
 };
-use crate::mcp::handlers::{fleet_test_guard, handle_tool};
+use crate::mcp::handlers::dispatch::RuntimeContext;
+use crate::mcp::handlers::{fleet_test_guard, handle_tool, handle_tool_with_runtime};
 use parking_lot::Mutex as PlMutex;
 use serial_test::serial;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -26,13 +50,19 @@ use std::sync::Arc;
 /// (which is how the dedicated-topic decision is observed), the severity that
 /// passed the mode gate, and the exact text.
 struct Recorder {
-    /// Unique per test: `register_active_channel` keys by `kind()`, and other
-    /// suites register their own "telegram" channel without taking the registry
-    /// lock. Our own slot cannot be evicted by them, and the fan-out reaches
-    /// every registered channel anyway.
+    /// #3480 review fix: the deliverability gate now demands a TELEGRAM channel
+    /// specifically (a Discord-only allowlist used to return `sent: true` while
+    /// nothing reached the phone), so the recorder must claim the kind under
+    /// test. Registration keys by `kind()`; every case here holds
+    /// `channel_registry_test_guard()`, which is what keeps that safe.
     kind: &'static str,
     caps: ChannelCapabilities,
     authorized: AtomicBool,
+    /// When set, the FIRST `outbound_authorized()` query clears the process
+    /// channel registry — the only way to reach the fan-out with zero channels
+    /// from outside the handler, which is what the count-only-successful-sends
+    /// rollback needs to be observable.
+    vanish_on_query: AtomicBool,
     seen: PlMutex<Vec<(String, NotifySeverity, String)>>,
 }
 
@@ -42,6 +72,7 @@ impl Recorder {
             kind,
             caps: ChannelCapabilities::default(),
             authorized: AtomicBool::new(authorized),
+            vanish_on_query: AtomicBool::new(false),
             seen: PlMutex::new(Vec::new()),
         })
     }
@@ -111,11 +142,112 @@ impl Channel for Recorder {
         Ok(())
     }
     fn outbound_authorized(&self) -> bool {
+        if self.vanish_on_query.swap(false, Ordering::Relaxed) {
+            reset_active_channel_for_test();
+        }
         self.authorized.load(Ordering::Relaxed)
     }
 }
 
-fn tmp_home(tag: &str) -> std::path::PathBuf {
+/// Both names `creds.rs` can resolve a bot token under. Pinned to dummies for the
+/// whole suite so an operator token exported on the host can never be picked up.
+const CANONICAL_TOKEN_ENV: &str = "AGEND_TELEGRAM_BOT_TOKEN";
+const LEGACY_TOKEN_ENV: &str = "AGEND_BOT_TOKEN";
+const DUMMY_TOKEN: &str = "0000000000:agend-test-dummy-token";
+
+struct TokenEnvGuard {
+    canonical: Option<String>,
+    legacy: Option<String>,
+}
+
+/// Free function (not a `Drop` impl) on purpose: the env-mutation census in
+/// `tests/env_mutation_serialization_invariant.rs` only walks module-level
+/// functions, so keeping the mutation here is what makes the two token keys
+/// visible to it — and therefore what forces the registered SERIALIZED_PAIRS rows.
+fn install_dummy_bot_tokens(canonical: &str) -> TokenEnvGuard {
+    let guard = TokenEnvGuard {
+        canonical: std::env::var(CANONICAL_TOKEN_ENV).ok(),
+        legacy: std::env::var(LEGACY_TOKEN_ENV).ok(),
+    };
+    std::env::set_var(CANONICAL_TOKEN_ENV, canonical);
+    std::env::set_var(LEGACY_TOKEN_ENV, DUMMY_TOKEN);
+    guard
+}
+
+fn restore_bot_tokens(guard: &TokenEnvGuard) {
+    match &guard.canonical {
+        Some(value) => std::env::set_var(CANONICAL_TOKEN_ENV, value),
+        None => std::env::remove_var(CANONICAL_TOKEN_ENV),
+    }
+    match &guard.legacy {
+        Some(value) => std::env::set_var(LEGACY_TOKEN_ENV, value),
+        None => std::env::remove_var(LEGACY_TOKEN_ENV),
+    }
+}
+
+/// One team, one orchestrator — the shape most cases want.
+const STD_FLEET: &str = "instances:\n  lead:\n    backend: claude\n  worker:\n    backend: claude\n\
+     teams:\n  archfix:\n    orchestrator: lead\n    members: [lead, worker]\n";
+
+/// Two teams that BOTH list `lead` — the ambiguity a `.values().find(...)` lookup
+/// would answer from HashMap order.
+const TWO_OWNING_TEAMS: &str =
+    "instances:\n  lead:\n    backend: claude\n  worker:\n    backend: claude\n\
+     teams:\n  archfix:\n    orchestrator: lead\n    members: [lead, worker]\n\
+     \x20 hotfix:\n    orchestrator: lead\n    members: [lead]\n";
+
+/// Two teams with DIFFERENT orchestrators — distinct budgets must not share.
+const TWO_ORCHESTRATORS: &str =
+    "instances:\n  lead:\n    backend: claude\n  worker:\n    backend: claude\n\
+     \x20 lead2:\n    backend: claude\n\
+     teams:\n  archfix:\n    orchestrator: lead\n    members: [lead, worker]\n\
+     \x20 other:\n    orchestrator: lead2\n    members: [lead2]\n";
+
+/// A team whose declared orchestrator is not a live instance.
+const STALE_ORCHESTRATOR: &str =
+    "instances:\n  lead:\n    backend: claude\n  worker:\n    backend: claude\n\
+     teams:\n  archfix:\n    orchestrator: departed-lead\n    members: [lead, worker]\n";
+
+const CHANNEL_STANZA: &str = "channel:\n  type: telegram\n\
+     \x20 bot_token_env: AGEND_TEST_UNSET_TOKEN_3480\n\
+     \x20 group_id: -100123\n  mode: topic\n  user_allowlist: [42]\n";
+
+struct Spec {
+    /// The master switch, now a DAEMON-PRIVATE runtime-config stanza rather than
+    /// an agent-writable fleet.yaml one.
+    enabled: bool,
+    channel_kind: &'static str,
+    authorized: bool,
+    fleet: &'static str,
+    /// Instance names present in the live registry the handler resolves against.
+    live: &'static [&'static str],
+    /// What the topic-creation seam answers with.
+    topic_outcome: Option<i32>,
+    canonical_token: &'static str,
+}
+
+impl Default for Spec {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            channel_kind: "telegram",
+            authorized: true,
+            fleet: STD_FLEET,
+            live: &["lead", "worker"],
+            topic_outcome: None,
+            canonical_token: DUMMY_TOKEN,
+        }
+    }
+}
+
+struct Fixture {
+    home: PathBuf,
+    rec: Arc<Recorder>,
+    runtime: RuntimeContext,
+    tokens: TokenEnvGuard,
+}
+
+fn tmp_home(tag: &str) -> PathBuf {
     use std::sync::atomic::AtomicU32;
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -127,43 +259,92 @@ fn tmp_home(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-/// `enabled` toggles the opt-in switch; `allowlisted` toggles the CHANNEL's
-/// outbound authorization (the fail-closed `user_allowlist` gate's observable).
-fn setup(tag: &str, enabled: bool, allowlisted: bool) -> (std::path::PathBuf, Arc<Recorder>) {
-    let home = tmp_home(tag);
-    std::env::set_var("AGEND_HOME", &home);
-    let page_stanza = if enabled {
-        "  operator_page:\n    enabled: true\n"
-    } else {
-        ""
-    };
+/// The operator's master switch lives in `runtime-config.json`, which only the
+/// operator CLI (`agend-terminal admin config-set`) writes — writing it here is
+/// the fixture standing in for that operator action.
+fn write_runtime_config(home: &Path, enabled: bool) {
     std::fs::write(
-        crate::fleet::fleet_yaml_path(&home),
+        home.join("runtime-config.json"),
         format!(
-            "instances:\n  lead:\n    backend: claude\n  worker:\n    backend: claude\n\
-             teams:\n  archfix:\n    orchestrator: lead\n    members: [lead, worker]\n\
-             channel:\n  type: telegram\n\
-             \x20 bot_token_env: AGEND_TEST_UNSET_TOKEN_3480\n\
-             \x20 group_id: -100123\n  mode: topic\n\
-             \x20 user_allowlist: [42]\n{page_stanza}"
+            r#"{{"operator_page":{{"enabled":{enabled},"topic_name":"operator-notifications"}}}}"#
         ),
     )
+    .expect("write runtime-config.json");
+}
+
+fn live_registry(names: &[&str]) -> crate::agent::AgentRegistry {
+    let mut map = std::collections::HashMap::new();
+    for name in names {
+        let id = crate::types::InstanceId::new();
+        map.insert(id, crate::agent::mk_test_handle(name, id));
+    }
+    Arc::new(PlMutex::new(map))
+}
+
+fn runtime_with(registry: crate::agent::AgentRegistry) -> RuntimeContext {
+    RuntimeContext {
+        registry,
+        configs: Default::default(),
+        externals: Arc::new(PlMutex::new(std::collections::HashMap::new())),
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: None,
+        notifier: None,
+        shutdown: None,
+    }
+}
+
+fn setup(tag: &str, spec: Spec) -> Fixture {
+    let home = tmp_home(tag);
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!("{}{CHANNEL_STANZA}", spec.fleet),
+    )
     .expect("write fleet.yaml");
+    write_runtime_config(&home, spec.enabled);
+    crate::runtime_config::reload(&home);
     reset_active_channel_for_test();
-    let kind: &'static str = Box::leak(format!("telegram-op-page-{tag}").into_boxed_str());
-    let rec = Recorder::arc(kind, allowlisted);
+    let rec = Recorder::arc(spec.channel_kind, spec.authorized);
     register_active_channel(rec.clone());
-    (home, rec)
+    install_topic_seam_for_test(&home, spec.topic_outcome);
+    Fixture {
+        home,
+        rec,
+        runtime: runtime_with(live_registry(spec.live)),
+        tokens: install_dummy_bot_tokens(spec.canonical_token),
+    }
 }
 
-fn teardown(home: &std::path::Path) {
+fn teardown(fx: &Fixture) {
     reset_active_channel_for_test();
+    reset_topic_seam_for_test();
+    restore_bot_tokens(&fx.tokens);
+    // Leave the process-global runtime config switched OFF: it is default-off in
+    // production and a test must not hand the next suite an enabled pager.
+    write_runtime_config(&fx.home, false);
+    crate::runtime_config::reload(&fx.home);
     std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(home).ok();
+    std::fs::remove_dir_all(&fx.home).ok();
 }
 
-/// Drives the REAL tool entry, re-asserting `AGEND_HOME` immediately before the
-/// call.
+fn rate_snapshot(home: &Path) -> PathBuf {
+    home.join("operator_page_rate.json")
+}
+
+/// The real tool entry with a live daemon runtime attached — the in-process API
+/// path, which is the only path that can resolve a caller to a live instance.
+fn page_with(runtime: &RuntimeContext, caller: &str, text: &str) -> serde_json::Value {
+    handle_tool_with_runtime(
+        "operator_page",
+        &serde_json::json!({ "message": text }),
+        caller,
+        Some(runtime.clone()),
+    )
+}
+
+/// Drives the REAL tool entry, re-asserting `AGEND_HOME` and the runtime-config
+/// snapshot immediately before the call.
 ///
 /// 116 tests in this crate mutate `AGEND_HOME`, and one file does so under a
 /// NAMED `#[serial(...)]` key, which does not mutually exclude with our global
@@ -171,9 +352,18 @@ fn teardown(home: &std::path::Path) {
 /// test in which a foreign mutation can redirect the handler at another
 /// fixture's home; re-asserting per call shrinks that window to microseconds.
 /// Observed as a real flake: this suite failed once in a full-suite run and
-/// passed clean in the next.
-fn page(home: &std::path::Path, caller: &str, text: &str) -> serde_json::Value {
-    std::env::set_var("AGEND_HOME", home);
+/// passed clean in the next. The runtime-config global is process-wide for the
+/// same reason and gets the same treatment.
+fn page(fx: &Fixture, caller: &str, text: &str) -> serde_json::Value {
+    std::env::set_var("AGEND_HOME", &fx.home);
+    crate::runtime_config::reload(&fx.home);
+    page_with(&fx.runtime, caller, text)
+}
+
+/// The standalone-bridge entry: no daemon runtime, therefore no live registry.
+fn page_without_runtime(fx: &Fixture, caller: &str, text: &str) -> serde_json::Value {
+    std::env::set_var("AGEND_HOME", &fx.home);
+    crate::runtime_config::reload(&fx.home);
     handle_tool(
         "operator_page",
         &serde_json::json!({ "message": text }),
@@ -181,7 +371,7 @@ fn page(home: &std::path::Path, caller: &str, text: &str) -> serde_json::Value {
     )
 }
 
-// ── the eight required cases, plus the ordering case ───────────────────
+// ── authority ───────────────────────────────────────────────────────────
 
 /// AUTHORITY: only the caller's own team orchestrator may page. A member is
 /// refused and told who to route through — and nothing reaches the channel.
@@ -190,34 +380,208 @@ fn page(home: &std::path::Path, caller: &str, text: &str) -> serde_json::Value {
 fn non_orchestrator_caller_is_refused() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
-    let (home, rec) = setup("authz", true, true);
+    let fx = setup("authz", Spec::default());
 
-    let out = page(&home, "worker", "milestone");
+    let out = page(&fx, "worker", "milestone");
 
     assert_eq!(out["code"], "not_orchestrator", "{out}");
     assert_eq!(
         out["your_orchestrator"], "lead",
         "the refusal must name the orchestrator to route through: {out}"
     );
-    assert_eq!(rec.count(), 0, "a refused page must send nothing");
-    teardown(&home);
+    assert_eq!(fx.rec.count(), 0, "a refused page must send nothing");
+    teardown(&fx);
 }
 
-/// DEFAULT OFF: with no `operator_page` stanza the tool refuses and sends
-/// nothing — the switch is the operator's master control.
+/// AUTHORITY: the claimed name must resolve to a LIVE instance. A name that no
+/// live handle answers to — never spawned, or already dead — is refused before
+/// any team lookup, so a stale fleet.yaml row cannot stand in for a running seat.
+#[test]
+#[serial]
+fn unknown_or_dead_claimed_name_is_refused() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup("unknown", Spec::default());
+
+    let out = page(&fx, "ghost", "milestone");
+
+    assert_eq!(out["code"], "unknown_caller", "{out}");
+    assert_eq!(fx.rec.count(), 0, "a refused page must send nothing");
+    teardown(&fx);
+}
+
+/// AUTHORITY: an AMBIGUOUS name (two live handles answering to it) resolves to
+/// nothing. `live_requester_id` is already fail-closed on this; the tool must not
+/// paper over it with a first-match.
+#[test]
+#[serial]
+fn ambiguous_live_name_is_refused() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup(
+        "ambiguous-name",
+        Spec {
+            live: &["lead", "lead"],
+            ..Spec::default()
+        },
+    );
+
+    let out = page(&fx, "lead", "milestone");
+
+    assert_eq!(out["code"], "unknown_caller", "{out}");
+    assert_eq!(fx.rec.count(), 0, "a refused page must send nothing");
+    teardown(&fx);
+}
+
+/// AUTHORITY: a caller owned by TWO teams has no single orchestrator, and the
+/// answer must not come from HashMap iteration order. Refuse instead of guessing.
+#[test]
+#[serial]
+fn caller_owned_by_two_teams_is_refused_as_ambiguous() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup(
+        "ambiguous-team",
+        Spec {
+            fleet: TWO_OWNING_TEAMS,
+            ..Spec::default()
+        },
+    );
+
+    let out = page(&fx, "lead", "milestone");
+
+    assert_eq!(out["code"], "ambiguous_team", "{out}");
+    assert_eq!(fx.rec.count(), 0, "a refused page must send nothing");
+    teardown(&fx);
+}
+
+/// AUTHORITY: a team naming an orchestrator that is not a live instance grants
+/// nobody the page. The live member is not promoted into the vacancy.
+#[test]
+#[serial]
+fn stale_orchestrator_grants_nobody_the_page() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup(
+        "stale-orch",
+        Spec {
+            fleet: STALE_ORCHESTRATOR,
+            ..Spec::default()
+        },
+    );
+
+    let out = page(&fx, "lead", "milestone");
+
+    assert_eq!(out["code"], "not_orchestrator", "{out}");
+    assert_eq!(
+        out["your_orchestrator"], "departed-lead",
+        "the refusal must still name the configured orchestrator: {out}"
+    );
+    assert_eq!(fx.rec.count(), 0, "a refused page must send nothing");
+    teardown(&fx);
+}
+
+/// THE HONEST BOUNDARY (d-20260902…-36). Every agent and the daemon run as ONE
+/// OS user, so the daemon cannot tell which seat typed a tool call: a worker that
+/// presents the orchestrator's live name IS admitted, by design, and no gate
+/// added here changes that. This test exists to pin that fact so nobody later
+/// mistakes the live-identity gate for spoof resistance.
+///
+/// What the gate does buy is the rest of the matrix above (dead names, ambiguous
+/// names, ambiguous teams, non-orchestrators). What actually bounds the damage is
+/// elsewhere: default-OFF, 3 pages per rolling hour, one dedicated topic inside
+/// the allowlisted group, and fail-closed budget state.
+#[test]
+#[serial]
+fn any_seat_presenting_the_orchestrators_live_name_is_admitted_by_design() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup("boundary", Spec::default());
+
+    let out = page(&fx, "lead", "milestone");
+
+    assert_eq!(
+        out["sent"], true,
+        "presenting the orchestrator's live name is admitted — the shared-OS-user \
+         boundary this tool cannot close: {out}"
+    );
+    assert_eq!(fx.rec.count(), 1);
+    teardown(&fx);
+}
+
+/// AUTHORITY: with no daemon runtime there is no registry, so there is no live
+/// identity to bind authority to. A standalone bridge call must fail CLOSED
+/// rather than fall back to trusting the name it was handed.
+#[test]
+#[serial]
+fn standalone_call_without_runtime_is_refused() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup("no-runtime", Spec::default());
+
+    let out = page_without_runtime(&fx, "lead", "milestone");
+
+    assert_eq!(out["code"], "no_live_identity", "{out}");
+    assert_eq!(fx.rec.count(), 0, "a refused page must send nothing");
+    teardown(&fx);
+}
+
+// ── switch ──────────────────────────────────────────────────────────────
+
+/// DEFAULT OFF: with the runtime-config stanza disabled the tool refuses and
+/// sends nothing — the switch is the operator's master control, and it now lives
+/// where an agent cannot write it.
 #[test]
 #[serial]
 fn disabled_switch_refuses_and_sends_nothing() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
-    let (home, rec) = setup("disabled", false, true);
+    let fx = setup(
+        "disabled",
+        Spec {
+            enabled: false,
+            ..Spec::default()
+        },
+    );
 
-    let out = page(&home, "lead", "milestone");
+    let out = page(&fx, "lead", "milestone");
 
     assert_eq!(out["code"], "operator_page_disabled", "{out}");
-    assert_eq!(rec.count(), 0, "a disabled tool must send nothing");
-    teardown(&home);
+    assert_eq!(fx.rec.count(), 0, "a disabled tool must send nothing");
+    teardown(&fx);
 }
+
+/// The switch must NOT be reachable from fleet.yaml any more: that file is
+/// agent-writable, which is exactly why the master control moved. An
+/// `operator_page` stanza left in fleet.yaml grants nothing.
+#[test]
+#[serial]
+fn fleet_yaml_stanza_cannot_enable_the_tool() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup(
+        "fleet-switch",
+        Spec {
+            enabled: false,
+            ..Spec::default()
+        },
+    );
+    let yaml = crate::fleet::fleet_yaml_path(&fx.home);
+    let body = std::fs::read_to_string(&yaml).expect("read fleet.yaml");
+    std::fs::write(&yaml, format!("{body}  operator_page:\n    enabled: true\n"))
+        .expect("write fleet.yaml");
+
+    let out = page(&fx, "lead", "milestone");
+
+    assert_eq!(
+        out["code"], "operator_page_disabled",
+        "an agent-writable fleet.yaml stanza must not be a master switch: {out}"
+    );
+    assert_eq!(fx.rec.count(), 0);
+    teardown(&fx);
+}
+
+// ── rate budget ─────────────────────────────────────────────────────────
 
 /// RATE: 3 per rolling hour, the 4th DROPPED (never queued) with a retry-after
 /// so the caller can fall back to SESSION-HANDOFF.md.
@@ -226,15 +590,15 @@ fn disabled_switch_refuses_and_sends_nothing() {
 fn fourth_page_in_the_hour_is_dropped_with_retry_after() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
-    let (home, rec) = setup("rate", true, true);
+    let fx = setup("rate", Spec::default());
 
     for i in 1..=RATE_LIMIT_PER_HOUR {
-        let out = page(&home, "lead", &format!("milestone {i}"));
+        let out = page(&fx, "lead", &format!("milestone {i}"));
         assert_eq!(out["sent"], true, "page {i} must succeed: {out}");
     }
-    assert_eq!(rec.count(), RATE_LIMIT_PER_HOUR, "three pages delivered");
+    assert_eq!(fx.rec.count(), RATE_LIMIT_PER_HOUR, "three pages delivered");
 
-    let out = page(&home, "lead", "milestone 4");
+    let out = page(&fx, "lead", "milestone 4");
 
     assert_eq!(out["code"], "rate_limited", "{out}");
     let retry = out["retry_after_secs"].as_i64().unwrap_or(-1);
@@ -243,70 +607,335 @@ fn fourth_page_in_the_hour_is_dropped_with_retry_after() {
         "refusal must carry a usable retry-after, got {retry}: {out}"
     );
     assert_eq!(
-        rec.count(),
+        fx.rec.count(),
         RATE_LIMIT_PER_HOUR,
         "the 4th page must be DROPPED, not queued or sent"
     );
-    teardown(&home);
+    teardown(&fx);
 }
 
-/// RATE DURABILITY: the counter lives on disk, so a daemon restart is not a
-/// bypass. The sidecar is the only state; re-reading it must still refuse.
+/// RATE DURABILITY: the in-memory counter is snapshotted so a daemon restart is
+/// not a bypass. The snapshot must hold the full spent budget.
 #[test]
 #[serial]
 fn rate_counter_survives_a_simulated_restart() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
-    let (home, rec) = setup("durable", true, true);
+    let fx = setup("durable", Spec::default());
 
     for i in 1..=RATE_LIMIT_PER_HOUR {
-        assert_eq!(page(&home, "lead", &format!("m{i}"))["sent"], true);
+        assert_eq!(page(&fx, "lead", &format!("m{i}"))["sent"], true);
     }
-    let sidecar = home.join("operator_page_rate.json");
-    assert!(
-        sidecar.exists(),
-        "the rate counter must be durable on disk, not in memory"
+    let snapshot = rate_snapshot(&fx.home);
+    let stamps: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&snapshot).expect("snapshot readable"))
+            .expect("snapshot parses");
+    assert_eq!(
+        stamps["lead"].as_array().map(Vec::len),
+        Some(RATE_LIMIT_PER_HOUR),
+        "the snapshot must carry the whole spent budget for restart continuity: {stamps}"
     );
 
-    // Simulated restart: nothing in this process is reused — the next call must
-    // rebuild its count from the sidecar alone.
-    reset_active_channel_for_test();
-    let rec2 = Recorder::arc("telegram-op-page-durable-2", true);
-    register_active_channel(rec2.clone());
-
-    let out = page(&home, "lead", "after restart");
+    let out = page(&fx, "lead", "after restart");
 
     assert_eq!(
         out["code"], "rate_limited",
         "a restart must not reset the hourly budget: {out}"
     );
-    assert_eq!(rec2.count(), 0, "nothing sent after the restart");
-    assert_eq!(rec.count(), RATE_LIMIT_PER_HOUR);
-    teardown(&home);
+    assert_eq!(fx.rec.count(), RATE_LIMIT_PER_HOUR);
+    teardown(&fx);
 }
 
+/// RATE INTEGRITY: the budget is authoritative IN MEMORY behind a lock; the file
+/// is only a restart snapshot. Deleting it is tampering, not a fresh install, and
+/// must DENY rather than refill — and it must say so with its own code, so an
+/// operator can tell "the state is untrustworthy" from "you used your 3 pages".
+#[test]
+#[serial]
+fn deleting_the_snapshot_denies_and_is_distinguishable_from_a_rate_cap() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup("tamper", Spec::default());
+
+    for i in 1..=RATE_LIMIT_PER_HOUR {
+        assert_eq!(page(&fx, "lead", &format!("m{i}"))["sent"], true);
+    }
+    let capped = page(&fx, "lead", "m4");
+    assert_eq!(capped["code"], "rate_limited", "{capped}");
+
+    std::fs::remove_file(rate_snapshot(&fx.home)).expect("remove the snapshot");
+    let tampered = page(&fx, "lead", "m5");
+
+    assert_eq!(
+        tampered["code"], "budget_unavailable",
+        "a snapshot that vanished after init is tampering, not a fresh install: {tampered}"
+    );
+    assert_ne!(
+        tampered["code"], capped["code"],
+        "a poisoned budget must not be reported as an ordinary rate cap"
+    );
+    assert!(
+        tampered["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing"),
+        "the refusal must name the cause so the operator can act: {tampered}"
+    );
+    assert_eq!(
+        fx.rec.count(),
+        RATE_LIMIT_PER_HOUR,
+        "deleting the counter must not buy a page"
+    );
+    teardown(&fx);
+}
+
+/// RATE INTEGRITY: a snapshot that will not parse is poison, not an empty budget.
+/// The pre-#3480 read silently produced an EMPTY map, so corrupting the file
+/// refilled the hour — fail OPEN on the one file an agent can write.
+#[test]
+#[serial]
+fn corrupt_snapshot_denies_instead_of_resetting_the_budget() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup("corrupt", Spec::default());
+    std::fs::write(rate_snapshot(&fx.home), "{ this is not json").expect("write corrupt snapshot");
+
+    let out = page(&fx, "lead", "milestone");
+
+    assert_eq!(out["code"], "budget_unavailable", "{out}");
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("corrupt"),
+        "the refusal must name the cause so the operator can act: {out}"
+    );
+    assert_eq!(fx.rec.count(), 0, "a poisoned budget must send nothing");
+    teardown(&fx);
+}
+
+/// RATE INTEGRITY: stamps dated in the FUTURE (a clock jump, or a hand-edited
+/// snapshot) must still count against the hour. Pruning on "older than an hour"
+/// alone would keep them; pruning on absolute distance would drop them and hand
+/// the caller a refilled budget.
+#[test]
+#[serial]
+fn future_dated_stamps_do_not_grant_extra_slots() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup("skew", Spec::default());
+    let now = chrono::Utc::now().timestamp();
+    std::fs::write(
+        rate_snapshot(&fx.home),
+        serde_json::json!({ "lead": [now + 9000, now + 9001, now + 9002] }).to_string(),
+    )
+    .expect("write skewed snapshot");
+
+    let out = page(&fx, "lead", "milestone");
+
+    assert_eq!(
+        out["code"], "rate_limited",
+        "future-dated stamps must still occupy the budget: {out}"
+    );
+    assert_eq!(fx.rec.count(), 0);
+    teardown(&fx);
+}
+
+/// RATE SCOPE: the budget is per orchestrator. Two orchestrators must not share
+/// one counter (nor be able to exhaust each other's).
+#[test]
+#[serial]
+fn distinct_orchestrators_do_not_share_a_counter() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup(
+        "per-orch",
+        Spec {
+            fleet: TWO_ORCHESTRATORS,
+            live: &["lead", "worker", "lead2"],
+            ..Spec::default()
+        },
+    );
+
+    for i in 1..=RATE_LIMIT_PER_HOUR {
+        assert_eq!(page(&fx, "lead", &format!("a{i}"))["sent"], true);
+    }
+    for i in 1..=RATE_LIMIT_PER_HOUR {
+        let out = page(&fx, "lead2", &format!("b{i}"));
+        assert_eq!(
+            out["sent"], true,
+            "lead's spent budget must not bind lead2: {out}"
+        );
+    }
+
+    assert_eq!(page(&fx, "lead2", "b4")["code"], "rate_limited");
+    assert_eq!(fx.rec.count(), RATE_LIMIT_PER_HOUR * 2);
+    teardown(&fx);
+}
+
+/// RATE ATOMICITY: the claim is serialized in-process, so parallel callers cannot
+/// each read "2 spent" and each push a third stamp. Exactly three of N concurrent
+/// pages may win.
+#[test]
+#[serial]
+fn concurrent_claims_admit_exactly_three() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup("concurrent", Spec::default());
+    // Set the process-global inputs ONCE: the threads below must not race each
+    // other on `set_var` / `reload`, only on the rate claim under test.
+    std::env::set_var("AGEND_HOME", &fx.home);
+    crate::runtime_config::reload(&fx.home);
+
+    let sent = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let runtime = fx.runtime.clone();
+                scope.spawn(move || page_with(&runtime, "lead", &format!("concurrent {i}")))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .filter(|out| out["sent"] == true)
+            .count()
+    });
+
+    assert_eq!(
+        sent, RATE_LIMIT_PER_HOUR,
+        "exactly three concurrent claims may win"
+    );
+    assert_eq!(
+        fx.rec.count(),
+        RATE_LIMIT_PER_HOUR,
+        "and exactly three pages may reach the channel"
+    );
+    teardown(&fx);
+}
+
+/// RATE ACCOUNTING: a claimed slot that produced NO delivery must be rolled back.
+/// The recorder clears the channel registry as the deliverability gate queries it,
+/// so the fan-out runs with zero channels — the only way to reach that branch from
+/// outside the handler.
+#[test]
+#[serial]
+fn a_zero_dispatch_send_does_not_consume_a_slot() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup("rollback", Spec::default());
+    fx.rec.vanish_on_query.store(true, Ordering::Relaxed);
+
+    let out = page(&fx, "lead", "vanishing channel");
+    assert_eq!(out["code"], "not_delivered", "{out}");
+    assert_eq!(out["sent"], false, "{out}");
+
+    // The whole budget must still be there.
+    let rec2 = Recorder::arc("telegram", true);
+    register_active_channel(rec2.clone());
+    for i in 1..=RATE_LIMIT_PER_HOUR {
+        let out = page(&fx, "lead", &format!("m{i}"));
+        assert_eq!(
+            out["sent"], true,
+            "an undelivered page must not have spent a slot: {out}"
+        );
+    }
+    assert_eq!(page(&fx, "lead", "m4")["code"], "rate_limited");
+    assert_eq!(rec2.count(), RATE_LIMIT_PER_HOUR);
+    teardown(&fx);
+}
+
+// ── deliverability ──────────────────────────────────────────────────────
+
+/// The pre-existing fail-closed allowlist gate must still bind: an unauthorized
+/// channel drops the page even though every one of the tool's own gates passed.
+#[test]
+#[serial]
+fn unauthorized_channel_still_drops_the_page() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup(
+        "allowlist",
+        Spec {
+            authorized: false,
+            ..Spec::default()
+        },
+    );
+
+    let out = page(&fx, "lead", "milestone");
+
+    assert_eq!(fx.rec.count(), 0, "the fail-closed gate must not be bypassed");
+    assert_eq!(
+        out["sent"], false,
+        "the caller must learn the page was not delivered: {out}"
+    );
+    assert_eq!(out["code"], "not_delivered", "{out}");
+    teardown(&fx);
+}
+
+/// DELIVERABILITY: the tool exists to reach the operator's PHONE. An authorized
+/// Discord channel is not that, so an `any()` over all channels reported
+/// `sent: true` and spent a rate slot while the phone stayed silent. The gate must
+/// require a telegram channel specifically — and must not charge for the refusal.
+#[test]
+#[serial]
+fn discord_only_allowlist_refuses_without_spending_a_slot() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup(
+        "discord-only",
+        Spec {
+            channel_kind: "discord",
+            ..Spec::default()
+        },
+    );
+
+    let out = page(&fx, "lead", "milestone");
+    assert_eq!(out["code"], "not_delivered", "{out}");
+    assert_eq!(out["sent"], false, "{out}");
+    assert_eq!(fx.rec.count(), 0, "a discord channel is not the phone");
+
+    // The budget must be untouched: three pages still available once telegram is
+    // authorized again.
+    let telegram = Recorder::arc("telegram", true);
+    register_active_channel(telegram.clone());
+    for i in 1..=RATE_LIMIT_PER_HOUR {
+        assert_eq!(page(&fx, "lead", &format!("m{i}"))["sent"], true);
+    }
+    assert_eq!(telegram.count(), RATE_LIMIT_PER_HOUR);
+    teardown(&fx);
+}
+
+// ── routing / hermeticity ───────────────────────────────────────────────
+
 /// ROUTING: pages land in the DEDICATED operator topic, not the sender's own
-/// topic, so they collect in one place the operator can mute.
+/// topic, so they collect in one place the operator can mute. A pre-registered
+/// topic is reused, so the creation seam is never even consulted.
 #[test]
 #[serial]
 fn dedicated_topic_is_used_when_registered() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
-    let (home, rec) = setup("topic", true, true);
-    // Pre-registering is what `create_topic_for_instance` finds on the reuse
-    // path; creating one for real needs the Telegram API, which this suite
-    // deliberately never calls.
-    crate::channel::telegram::topic_registry::register_topic(&home, 77, "operator-notifications")
-        .expect("register dedicated topic");
+    let fx = setup("topic", Spec::default());
+    crate::channel::telegram::topic_registry::register_topic(
+        &fx.home,
+        77,
+        "operator-notifications",
+    )
+    .expect("register dedicated topic");
 
-    assert_eq!(page(&home, "lead", "milestone")["sent"], true);
+    assert_eq!(page(&fx, "lead", "milestone")["sent"], true);
 
-    let (routed_to, _, _) = rec.last().expect("a page was delivered");
+    let (routed_to, _, _) = fx.rec.last().expect("a page was delivered");
     assert_eq!(
         routed_to, "operator-notifications",
         "the page must route to the dedicated topic, not the sender's"
     );
-    teardown(&home);
+    assert!(
+        topic_seam_calls_for_test().is_empty(),
+        "a registered topic must be reused without any creation attempt"
+    );
+    assert!(!bot_api_entered_for_home(&fx.home));
+    teardown(&fx);
 }
 
 /// ROUTING FALLBACK: when the dedicated topic cannot be resolved or created,
@@ -317,18 +946,65 @@ fn dedicated_topic_is_used_when_registered() {
 fn topic_creation_failure_falls_back_to_sender_topic() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
-    // No topics.json entry and no reachable Telegram API, so creation fails.
-    let (home, rec) = setup("fallback", true, true);
+    // No topics.json entry, and the seam answers "creation failed".
+    let fx = setup("fallback", Spec::default());
 
-    assert_eq!(page(&home, "lead", "milestone")["sent"], true);
+    assert_eq!(page(&fx, "lead", "milestone")["sent"], true);
 
-    let (routed_to, _, _) = rec.last().expect("a page was delivered");
+    let (routed_to, _, _) = fx.rec.last().expect("a page was delivered");
     assert_eq!(
         routed_to, "lead",
         "a failed dedicated-topic resolution must fall back to the sender topic"
     );
-    teardown(&home);
+    assert_eq!(
+        topic_seam_calls_for_test(),
+        vec!["operator-notifications".to_string()],
+        "creation must have been ATTEMPTED — and intercepted"
+    );
+    assert!(!bot_api_entered_for_home(&fx.home));
+    teardown(&fx);
 }
+
+/// HERMETICITY (#3480 C3): the deliberately hostile case. A REAL-LOOKING
+/// canonical bot token is exported — the exact condition under which the old
+/// fixture (which only named a deliberately-unset `bot_token_env`) would have
+/// authenticated to the live Bot API — and the API must still be unreachable.
+/// The seam answers the creation, the page routes to the dedicated topic, and no
+/// code path under this home ever entered credential resolution or `Bot::new`.
+#[test]
+#[serial]
+fn real_looking_bot_token_never_reaches_the_bot_api() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup(
+        "hermetic",
+        Spec {
+            canonical_token: "1234567890:AAH-real-looking-but-fake",
+            topic_outcome: Some(4242),
+            ..Spec::default()
+        },
+    );
+
+    let out = page(&fx, "lead", "milestone");
+
+    assert_eq!(out["sent"], true, "{out}");
+    assert_eq!(
+        out["routed_to"], "operator-notifications",
+        "the seam's outcome must be what routing consumed: {out}"
+    );
+    assert_eq!(
+        topic_seam_calls_for_test(),
+        vec!["operator-notifications".to_string()],
+        "the creation attempt must have gone through the seam"
+    );
+    assert!(
+        !bot_api_entered_for_home(&fx.home),
+        "no test may reach the Telegram Bot API, least of all with a token that looks real"
+    );
+    teardown(&fx);
+}
+
+// ── content ─────────────────────────────────────────────────────────────
 
 /// CONTENT: the operator always learns who paged, and no caller can page a wall
 /// of text.
@@ -337,12 +1013,12 @@ fn topic_creation_failure_falls_back_to_sender_topic() {
 fn page_carries_sender_prefix_and_respects_length_cap() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
-    let (home, rec) = setup("content", true, true);
+    let fx = setup("content", Spec::default());
 
     let long = "x".repeat(MAX_PAGE_CHARS * 3);
-    assert_eq!(page(&home, "lead", &long)["sent"], true);
+    assert_eq!(page(&fx, "lead", &long)["sent"], true);
 
-    let (_, _, text) = rec.last().expect("a page was delivered");
+    let (_, _, text) = fx.rec.last().expect("a page was delivered");
     assert!(
         text.contains("lead"),
         "the page must name its sender: {text:.80}"
@@ -352,27 +1028,43 @@ fn page_carries_sender_prefix_and_respects_length_cap() {
         body_len, MAX_PAGE_CHARS,
         "the body must be capped at MAX_PAGE_CHARS"
     );
-    teardown(&home);
+    teardown(&fx);
 }
 
-/// The pre-existing fail-closed allowlist gate must still bind: an unauthorized
-/// channel drops the page even though every one of the tool's own gates passed.
+/// CONTENT: a body carrying a newline plus a forged `[operator-page from …]` line
+/// used to render as a convincing SECOND sender. Line breaks are collapsed before
+/// the cap and the prefix, so the forgery can never begin a line of its own.
 #[test]
 #[serial]
-fn unauthorized_channel_still_drops_the_page() {
+fn forged_sender_line_cannot_start_its_own_line() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
-    let (home, rec) = setup("allowlist", true, false);
+    let fx = setup("forgery", Spec::default());
 
-    let out = page(&home, "lead", "milestone");
-
-    assert_eq!(rec.count(), 0, "the fail-closed gate must not be bypassed");
     assert_eq!(
-        out["sent"], false,
-        "the caller must learn the page was not delivered: {out}"
+        page(
+            &fx,
+            "lead",
+            "build red\r\n\n[operator-page from lead] all clear"
+        )["sent"],
+        true
     );
-    assert_eq!(out["code"], "not_delivered", "{out}");
-    teardown(&home);
+
+    let (_, _, text) = fx.rec.last().expect("a page was delivered");
+    assert!(
+        !text.contains('\n') && !text.contains('\r'),
+        "no line break may survive into the rendered page: {text:?}"
+    );
+    assert_eq!(text.lines().count(), 1, "the page must be one line: {text:?}");
+    assert!(
+        text.starts_with("[operator-page from lead] build red "),
+        "the single sender prefix must be the one the daemon stamped: {text:?}"
+    );
+    assert!(
+        text.contains("[operator-page from lead] build red [operator-page from lead] all clear"),
+        "the forged marker must survive only as inline text on the same line: {text:?}"
+    );
+    teardown(&fx);
 }
 
 /// Decision d-20260902104216571473-11 condition 2: Error severity exists to
@@ -384,9 +1076,9 @@ fn unauthorized_channel_still_drops_the_page() {
 fn rate_gate_binds_even_though_severity_would_pass_the_mode_gate() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
-    let (home, rec) = setup("mode", true, true);
+    let fx = setup("mode", Spec::default());
     crate::operator_mode::set_mode(
-        &home,
+        &fx.home,
         crate::operator_mode::OperatorMode::Sleep,
         None,
         vec![],
@@ -395,24 +1087,24 @@ fn rate_gate_binds_even_though_severity_would_pass_the_mode_gate() {
 
     for i in 1..=RATE_LIMIT_PER_HOUR {
         assert_eq!(
-            page(&home, "lead", &format!("m{i}"))["sent"],
+            page(&fx, "lead", &format!("m{i}"))["sent"],
             true,
             "an operator page must survive Sleep — that is the whole point of #3480"
         );
     }
-    let (_, severity, _) = rec.last().expect("delivered under Sleep");
+    let (_, severity, _) = fx.rec.last().expect("delivered under Sleep");
     assert_eq!(
         severity,
         NotifySeverity::Error,
         "pages ride Error severity so the Sleep gate passes them"
     );
 
-    let out = page(&home, "lead", "m4");
+    let out = page(&fx, "lead", "m4");
 
     assert_eq!(
         out["code"], "rate_limited",
         "the rate gate must bind before severity buys anything: {out}"
     );
-    assert_eq!(rec.count(), RATE_LIMIT_PER_HOUR);
-    teardown(&home);
+    assert_eq!(fx.rec.count(), RATE_LIMIT_PER_HOUR);
+    teardown(&fx);
 }

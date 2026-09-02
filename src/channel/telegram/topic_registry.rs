@@ -107,6 +107,96 @@ pub fn lookup_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
         .map(|(tid, _)| tid)
 }
 
+/// #3480 (C2) — test-only interception seam for forum-topic CREATION.
+///
+/// Naming an unset `bot_token_env` in a fixture is NOT hermeticity: [`super::creds`]
+/// falls back to the canonical `AGEND_TELEGRAM_BOT_TOKEN` (and the legacy
+/// `AGEND_BOT_TOKEN`), so on a developer host that exports either one, a test
+/// reaching [`create_topic_for_instance`] would authenticate to the real Telegram
+/// Bot API with the operator's live credential. This seam removes the reachability
+/// instead of relying on a name: when installed it answers BEFORE
+/// `resolve_channel_only_from` / `Bot::new` are ever touched.
+///
+/// It is scoped to one `home` so a suite that installs it cannot change the
+/// behaviour other suites' topic tests observe. [`bot_api_entered_for_home`] is the
+/// complementary probe: the real API branch records the `home` it was entered for,
+/// so a test can assert the branch was NEVER reached for its own fixture.
+#[cfg(test)]
+mod test_seam {
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    pub(super) struct Seam {
+        pub home: PathBuf,
+        /// Outcome handed back in place of the Bot API call.
+        pub outcome: Option<i32>,
+        /// Names `create_topic_for_instance` was called with while installed.
+        pub calls: Vec<String>,
+    }
+
+    fn seam() -> &'static parking_lot::Mutex<Option<Seam>> {
+        static SEAM: OnceLock<parking_lot::Mutex<Option<Seam>>> = OnceLock::new();
+        SEAM.get_or_init(|| parking_lot::Mutex::new(None))
+    }
+
+    fn api_entries() -> &'static parking_lot::Mutex<Vec<(PathBuf, String)>> {
+        static ENTRIES: OnceLock<parking_lot::Mutex<Vec<(PathBuf, String)>>> = OnceLock::new();
+        ENTRIES.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+    }
+
+    /// Intercept a creation attempt. `Some(outcome)` means the seam answered and
+    /// the caller must return it without touching the network; `None` means no
+    /// seam is installed for this `home`, so the real path runs unchanged.
+    pub(super) fn intercept(home: &Path, instance_name: &str) -> Option<Option<i32>> {
+        let mut guard = seam().lock();
+        let installed = guard.as_mut().filter(|s| s.home == home)?;
+        installed.calls.push(instance_name.to_string());
+        Some(installed.outcome)
+    }
+
+    /// Record that the REAL Bot API branch was entered. Called unconditionally on
+    /// that branch so the probe is evidence, not decoration.
+    pub(super) fn record_api_entry(home: &Path, instance_name: &str) {
+        api_entries()
+            .lock()
+            .push((home.to_path_buf(), instance_name.to_string()));
+    }
+
+    /// Install the seam for `home`; every creation attempt under that home is
+    /// answered with `outcome` instead of reaching Telegram.
+    pub(crate) fn install_topic_seam_for_test(home: &Path, outcome: Option<i32>) {
+        *seam().lock() = Some(Seam {
+            home: home.to_path_buf(),
+            outcome,
+            calls: Vec::new(),
+        });
+    }
+
+    pub(crate) fn reset_topic_seam_for_test() {
+        *seam().lock() = None;
+    }
+
+    /// The instance names creation was attempted for while the seam was installed.
+    pub(crate) fn topic_seam_calls_for_test() -> Vec<String> {
+        seam()
+            .lock()
+            .as_ref()
+            .map(|s| s.calls.clone())
+            .unwrap_or_default()
+    }
+
+    /// Did anything enter the real Bot API branch for this `home`?
+    pub(crate) fn bot_api_entered_for_home(home: &Path) -> bool {
+        api_entries().lock().iter().any(|(at, _)| at == home)
+    }
+}
+
+#[cfg(test)]
+pub(crate) use test_seam::{
+    bot_api_entered_for_home, install_topic_seam_for_test, reset_topic_seam_for_test,
+    topic_seam_calls_for_test,
+};
+
 /// Create a forum topic for a new instance.
 pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) -> Option<i32> {
     // Idempotent: reuse existing topic from topics.json if present.
@@ -136,6 +226,15 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
         tracing::info!(instance = %instance_name, topic_id = tid, "reusing existing topic");
         return Some(tid);
     }
+    // #3480 (C2): the hermeticity seam sits HERE — before credential resolution
+    // and before `Bot::new` — so an installed seam makes the Bot API structurally
+    // unreachable rather than merely unlikely.
+    #[cfg(test)]
+    if let Some(outcome) = test_seam::intercept(home, instance_name) {
+        return outcome;
+    }
+    #[cfg(test)]
+    test_seam::record_api_entry(home, instance_name);
     let ch = super::resolve_channel_only_from(home).ok()?;
     match block_on_value(async {
         let bot = teloxide::Bot::new(&ch.token);
