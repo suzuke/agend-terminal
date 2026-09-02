@@ -77,9 +77,6 @@ impl PendingNotice {
     pub(crate) const ACK_OVERDUE: &'static str = "ack_overdue";
     pub(crate) const LATE_ACK: &'static str = "late_ack";
 
-    // SCAFFOLD (RED commit): nothing in the production path writes an intent
-    // yet, so the constructor is test-only until the GREEN commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(kind: &str, late_by_secs: Option<i64>) -> Self {
         Self {
             kind: kind.to_string(),
@@ -272,8 +269,6 @@ impl ReceiptStore {
     /// predicate — sequentially, under this same lock — and both emit the
     /// outcome. Including the markers in the predicate makes the stale
     /// scanner's CAS fail, so the outcome is produced exactly once.
-    // SCAFFOLD (RED commit): no production caller until the GREEN commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn record_if_marker(
         &self,
         delivery_id: Uuid,
@@ -282,11 +277,11 @@ impl ReceiptStore {
         expected_notice: Option<&PendingNotice>,
         next: DeliveryReceipt,
     ) -> anyhow::Result<bool> {
-        // SCAFFOLD (RED commit): the marker arguments are accepted but not yet
-        // compared — this still behaves exactly like `record_if_latest_state`,
-        // which is the defect. The GREEN commit adds the marker predicate.
-        let _ = (expected_late_ack_secs, expected_notice);
-        self.record_if(delivery_id, next, |latest| latest.state == expected)
+        self.record_if(delivery_id, next, |latest| {
+            latest.state == expected
+                && latest.late_ack_secs == expected_late_ack_secs
+                && latest.notice_pending.as_ref() == expected_notice
+        })
     }
 
     /// The shared compare-and-append body: read the latest durable receipt

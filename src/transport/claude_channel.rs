@@ -7,7 +7,7 @@
 
 use super::{
     safe_component, AgentDeliveryTransport, BackendEvent, DeliveryEnvelope, DeliveryReceipt,
-    DeliveryState, ReceiptStore, SessionLocator, TransportCapability, TransportMode,
+    DeliveryState, PendingNotice, ReceiptStore, SessionLocator, TransportCapability, TransportMode,
 };
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
@@ -1433,7 +1433,41 @@ fn self_kick_watchdog_pass_at(
         let recorded_at = DateTime::parse_from_rfc3339(&current.recorded_at)
             .map(|at| at.with_timezone(&Utc))
             .unwrap_or(now);
-        // SCAFFOLD (RED commit): no replay of an unfinished notice intent yet.
+        // PR #3495: an UNFINISHED notice from an earlier pass — the daemon died,
+        // or the enqueue returned `Err`, between the durable intent and the
+        // notice reaching the recipient's inbox. Replay it verbatim; the
+        // caller's enqueue is idempotent by key, so a replay after a crash that
+        // happened AFTER the enqueue appends nothing. The marker itself is the
+        // retry bound: it is cleared only by `clear_self_kick_notice`, and no
+        // counter is needed because the pass re-derives everything from it.
+        if let Some(pending) = current.notice_pending.clone() {
+            let kind = match pending.kind.as_str() {
+                PendingNotice::LATE_ACK => SelfKickOutcomeKind::AckLate {
+                    late_by_secs: pending.late_by_secs.unwrap_or_default(),
+                },
+                PendingNotice::ACK_OVERDUE => SelfKickOutcomeKind::AckOverdue {
+                    turn: observe(recorded_at),
+                },
+                other => {
+                    // A marker kind this binary does not know (a newer daemon
+                    // wrote it). Leave it pending for that daemon rather than
+                    // guessing a notice, and do not spin on it.
+                    tracing::warn!(
+                        agent = %instance,
+                        delivery_id = %envelope.delivery_id,
+                        kind = other,
+                        "self-kick notice marker of unknown kind left pending"
+                    );
+                    continue;
+                }
+            };
+            outcomes.push(SelfKickOutcome {
+                delivery_id: envelope.delivery_id,
+                at: recorded_at,
+                kind,
+            });
+            continue;
+        }
         match current.state {
             DeliveryState::ProtocolAccepted => {
                 if self_kick_ack_elapsed(&current.recorded_at, now)
@@ -1453,11 +1487,15 @@ fn self_kick_watchdog_pass_at(
                 // caller clears it only after the inbox notice is durably
                 // enqueued, so a crash — or a failed enqueue — in that gap
                 // cannot swallow the alert the way the pre-#3495 order could.
-                // SCAFFOLD (RED commit): no durable notice intent yet — the CAS
-                // still commits the transition BEFORE the caller notifies.
-                if !store.record_if_latest_state(
+                overdue.notice_pending = Some(PendingNotice::new(PendingNotice::ACK_OVERDUE, None));
+                // The CAS is the exactly-once latch: only the pass that moves
+                // ProtocolAccepted -> AckOverdue may alert. It is marker-aware,
+                // so a scanner holding a stale pre-intent snapshot loses.
+                if !store.record_if_marker(
                     envelope.delivery_id,
                     DeliveryState::ProtocolAccepted,
+                    current.late_ack_secs,
+                    None,
                     overdue,
                 )? {
                     continue;
@@ -1509,13 +1547,24 @@ fn self_kick_watchdog_pass_at(
                 };
                 let mut reconciled = current.clone();
                 reconciled.late_ack_secs = None;
+                reconciled.notice_pending = Some(PendingNotice::new(
+                    PendingNotice::LATE_ACK,
+                    Some(late_by_secs),
+                ));
                 reconciled.backend_event =
                     Some("claude_channel_turn_started_late_reconciled".to_string());
-                // SCAFFOLD (RED commit): the marker is CONSUMED here, before
-                // the caller's notice is enqueued — the defect under test.
-                if !store.record_if_latest_state(
+                // PR #3495: MARKER-AWARE CAS. The transition preserves
+                // `TurnStarted`, so a state-only predicate is not a
+                // linearization point: two scanners holding the same stale
+                // `late_ack_secs` snapshot would both pass it and both emit.
+                // Requiring the observed marker makes the loser fail. The
+                // marker is MOVED, not consumed: the notice intent is durable
+                // before the caller enqueues anything.
+                if !store.record_if_marker(
                     envelope.delivery_id,
                     DeliveryState::TurnStarted,
+                    Some(late_by_secs),
+                    None,
                     reconciled,
                 )? {
                     continue;
@@ -1555,9 +1604,22 @@ pub(crate) fn clear_self_kick_notice(
     instance: &str,
     delivery_id: Uuid,
 ) -> anyhow::Result<bool> {
-    // SCAFFOLD (RED commit): there is no durable intent to clear yet.
-    let _ = (home, instance, delivery_id);
-    Ok(true)
+    let store = ReceiptStore::for_instance(home, instance)?;
+    let Some(current) = store.latest(delivery_id)? else {
+        return Ok(false);
+    };
+    let Some(pending) = current.notice_pending.clone() else {
+        return Ok(true);
+    };
+    let mut cleared = current.clone();
+    cleared.notice_pending = None;
+    store.record_if_marker(
+        delivery_id,
+        current.state,
+        current.late_ack_secs,
+        Some(&pending),
+        cleared,
+    )
 }
 
 pub(crate) fn run_channel_server(home: &Path, instance: &str) -> anyhow::Result<()> {

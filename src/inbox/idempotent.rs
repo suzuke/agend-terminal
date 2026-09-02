@@ -51,10 +51,9 @@ pub(crate) fn enqueue_once_returning_unread_count(
     with_inbox_lock(home, name, move |path| {
         use std::io::Write;
         let existing = std::fs::read_to_string(path).unwrap_or_default();
-        // SCAFFOLD (RED commit): the key is stamped on the row and persisted
-        // but not yet consulted, so every call appends. The GREEN commit turns
-        // this into the `content_has_key` early return.
-        let _ = content_has_key(&existing, &key);
+        if content_has_key(&existing, &key) {
+            return Ok(None);
+        }
         let count = storage::count_unread_in_content(&existing);
         let mut f = std::fs::OpenOptions::new()
             .create(true)
