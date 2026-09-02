@@ -518,4 +518,219 @@ mod tests {
         crate::runtime_config::reload(&home);
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// t-…-82348-36 RED: the REAL captured Claude statusline (pane_snapshot of
+    /// claude-aef7c0, 2026-09-02 — rendered by the operator's ccstatusline
+    /// `context-percentage` widget) parses cleanly at 95.0% and MUST alert:
+    /// under the fleet policy ("fresh-restart at a natural boundary INSTEAD of
+    /// letting auto-compaction happen") this reading is exactly the trigger the
+    /// policy needs. The bug is the WORDING — the figure is context-WINDOW fill
+    /// of an auto-compacted window (proven 2026-09-02: a live pane read 95.0%,
+    /// auto-compaction fired, it then read 7.0%), NOT remaining session budget,
+    /// and two orchestrators misread it as budget and nearly restarted healthy
+    /// agents. The alert text must name what the number is and what to do.
+    #[test]
+    #[serial(runtime_config)]
+    fn claude_statusline_reading_alerts_with_window_fill_semantics() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-ctxalert-claude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home); // defaults: alert threshold 80
+        let old_pct = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+
+        // Fleet with a team so the alert routes to the orchestrator's inbox
+        // (same drain pattern as the #2781 text-reading test below).
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  lead:\n    backend: claude\n  cl:\n    backend: claude\n\
+             teams:\n  test:\n    members: [lead, cl]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+
+        const CAPTURED_FRAME: &str = "\
+  Model: Fable 5.1 | Ctx Used: 95.0% | ⎇ main | (+0,-0)\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents";
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_with_frame(
+            "cl",
+            &crate::backend::Backend::ClaudeCode,
+            CAPTURED_FRAME,
+        );
+        // Parse pin: the scrape itself is CORRECT — nothing about this fix
+        // touches the number, only the words wrapped around it.
+        assert_eq!(
+            handle.core.lock().state.resolved_context(),
+            Some((95.0, "pattern")),
+            "the captured frame must parse — the reading stays visible in LIST"
+        );
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = ContextAlertHandler::new(1);
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+        assert_eq!(
+            h.is_armed("cl"),
+            Some(false),
+            "a Claude window-fill reading at 95% MUST fire context_alert — it is the \
+             fleet policy's fresh-restart trigger (fired = latch disarmed)"
+        );
+
+        let msgs = crate::inbox::drain(&home, "lead");
+        let alert_msg = msgs
+            .iter()
+            .find(|m| m.text.contains("[context_alert]"))
+            .expect("the alert must reach the orchestrator inbox");
+        assert!(
+            alert_msg.text.contains("context-WINDOW fill at 95.0%"),
+            "t-…-82348-36: the alert must NAME the figure as context-window fill, not \
+             'context usage' (which two orchestrators read as session budget): {}",
+            alert_msg.text
+        );
+        assert!(
+            alert_msg.text.contains("NOT session budget"),
+            "t-…-82348-36: the alert must say the figure is NOT session budget: {}",
+            alert_msg.text
+        );
+        assert!(
+            alert_msg.text.contains("fresh-restart"),
+            "t-…-82348-36: the alert must state the fleet policy action (fresh-restart at \
+             the next natural boundary, rather than let compaction happen): {}",
+            alert_msg.text
+        );
+
+        if let Some(val) = old_pct {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t-…-82348-36 negative control: a backend whose statusline figure IS
+    /// attributable (kiro's ◔ gauge) still alerts at a genuine 82% — the
+    /// fail-safe must not blind real readings.
+    #[test]
+    #[serial(runtime_config)]
+    fn kiro_statusline_reading_still_alerts() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home = std::env::temp_dir().join(format!("agend-ctxalert-kiro-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        crate::runtime_config::reload(&home);
+
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_with_frame(
+            "k",
+            &crate::backend::Backend::KiroCli,
+            "  Kiro · auto · ◔ 82%",
+        );
+        assert_eq!(
+            handle.core.lock().state.resolved_context(),
+            Some((82.0, "pattern"))
+        );
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = ContextAlertHandler::new(1);
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+        assert_eq!(
+            h.is_armed("k"),
+            Some(false),
+            "a genuine attributable 82% must still alert (fired = latch disarmed)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t-…-82348-36 wording pin for every NON-Claude backend: the re-scope
+    /// renames only the Claude reading. Kiro's alert text must stay
+    /// byte-compatible with base — "context usage at 82.0%", no "WINDOW".
+    #[test]
+    #[serial(runtime_config)]
+    fn non_claude_alert_wording_unchanged() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-ctxalert-kirotext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home);
+        let old_pct = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  lead:\n    backend: claude\n  k:\n    backend: kiro\n\
+             teams:\n  test:\n    members: [lead, k]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_with_frame(
+            "k",
+            &crate::backend::Backend::KiroCli,
+            "  Kiro · auto · ◔ 82%",
+        );
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = ContextAlertHandler::new(1);
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+
+        let msgs = crate::inbox::drain(&home, "lead");
+        let alert_msg = msgs
+            .iter()
+            .find(|m| m.text.contains("[context_alert]"))
+            .expect("kiro's alert must reach the orchestrator inbox");
+        assert!(
+            alert_msg.text.contains("context usage at 82.0%"),
+            "non-Claude alert wording must stay as base: {}",
+            alert_msg.text
+        );
+        assert!(
+            !alert_msg.text.contains("WINDOW"),
+            "the window-fill wording is Claude-only: {}",
+            alert_msg.text
+        );
+
+        if let Some(val) = old_pct {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home);
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

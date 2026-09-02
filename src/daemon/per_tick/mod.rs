@@ -643,11 +643,32 @@ pub(crate) fn mock_live_agent_no_context(
 /// existing call sites across `per_tick`'s test suites — #2549 W5). Used by
 /// the `ContextAlertHandler`/`ContextHandoffHandler` merge's cross-
 /// independence pin, which needs a live agent whose threshold-crossing
-/// decision actually fires.
+/// decision actually fires. Delegates to [`mock_live_agent_with_frame`] with
+/// the Claude statusline frame it has always fed (t-…-82348-36).
 #[cfg(test)]
 pub(crate) fn mock_live_agent_with_context(
     name: &str,
     pct: f32,
+) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+    mock_live_agent_with_frame(
+        name,
+        &crate::backend::Backend::ClaudeCode,
+        &format!(
+            "  Model: Fable 5 | Ctx Used: {pct:.1}% | ⎇ b | (+0,-0)\n  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        ),
+    )
+}
+
+/// Test-only generalization (t-…-82348-36): a LIVE handle whose tracker was
+/// fed an arbitrary rendered `frame` under an explicit `backend` — lets a
+/// test pin per-backend context semantics (e.g. the REAL captured Claude
+/// statusline, whose figure is context-WINDOW fill rather than remaining
+/// session budget, and whose alert/handoff wording must say so).
+#[cfg(test)]
+pub(crate) fn mock_live_agent_with_frame(
+    name: &str,
+    backend: &crate::backend::Backend,
+    frame: &str,
 ) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
     use std::sync::Arc;
     let pty_system = portable_pty::native_pty_system();
@@ -672,10 +693,8 @@ pub(crate) fn mock_live_agent_with_context(
     let reader = pair.master.try_clone_reader().expect("clone reader");
     let writer = pair.master.take_writer().expect("take writer");
     let pty_writer: crate::agent::PtyWriter = Arc::new(parking_lot::Mutex::new(writer));
-    let mut state = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
-    state.feed(&format!(
-        "  Model: Fable 5 | Ctx Used: {pct:.1}% | ⎇ b | (+0,-0)\n  ⏵⏵ bypass permissions on (shift+tab to cycle)"
-    ));
+    let mut state = crate::state::StateTracker::new(Some(backend));
+    state.feed(frame);
     let core = Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
         vterm: crate::vterm::VTerm::with_pty_writer(80, 10, Arc::clone(&pty_writer)),
         subscribers: Vec::new(),

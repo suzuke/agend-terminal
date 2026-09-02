@@ -684,4 +684,116 @@ mod tests {
             "#2781: handoff payload must render '85.3%', got: {msg}"
         );
     }
+
+    /// t-…-82348-36 RED: the same captured Claude window-fill frame must keep
+    /// driving the handoff machinery — under the fleet policy the reading IS
+    /// the fresh-restart trigger — but everything it EMITS must name the
+    /// figure for what it is (context-WINDOW fill of an auto-compacted window,
+    /// not remaining session budget) and ask for a fresh restart at the next
+    /// natural boundary rather than "then continue working".
+    ///
+    /// Emission pinned: `context_handoff_escalated`. The inject arm's own
+    /// event needs `fleet::resolve_uuid` to hand back this mock's handle, which
+    /// the test harness cannot arrange without new plumbing; the escalation is
+    /// reachable with the harness as-is (95.0% ≥ the 92% escalate default, no
+    /// SESSION-HANDOFF.md for a config-less agent) and carries the full policy
+    /// sentence. The captured frame reads Idle ("bypass permissions"), and idle
+    /// agents are deliberately never injected, so the agent is fed a working
+    /// frame after the parse pin — the statusline reading survives it (the
+    /// tracker keeps the last match), which is exactly the live shape: an agent
+    /// working at 95% window fill.
+    #[test]
+    #[serial(runtime_config)]
+    fn claude_statusline_reading_drives_handoff_with_window_fill_semantics() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-ctxhandoff-claude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home); // defaults: handoff 85, escalate 92
+        let old_handoff = std::env::var("AGEND_CONTEXT_HANDOFF_PCT").ok();
+        let old_escalate = std::env::var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT").ok();
+        std::env::remove_var("AGEND_CONTEXT_HANDOFF_PCT");
+        std::env::remove_var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT");
+
+        const CAPTURED_FRAME: &str = "\
+  Model: Fable 5.1 | Ctx Used: 95.0% | ⎇ main | (+0,-0)\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents";
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_with_frame(
+            "cl",
+            &crate::backend::Backend::ClaudeCode,
+            CAPTURED_FRAME,
+        );
+        assert_eq!(
+            handle.core.lock().state.resolved_context(),
+            Some((95.0, "pattern")),
+            "the captured frame must parse — the fix is the wording, not the number"
+        );
+        // The agent resumes work at 95% window fill (idle agents are marked,
+        // not injected); the statusline reading is retained across the frame.
+        handle
+            .core
+            .lock()
+            .state
+            .feed("  ✻ Thinking… (5s · esc to interrupt)");
+        assert_eq!(
+            handle.core.lock().state.resolved_context(),
+            Some((95.0, "pattern")),
+            "the reading must survive a frame without the statusline"
+        );
+
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = ContextHandoffHandler::new(1);
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx); // crossing → the one-per-episode injection stage
+        assert!(
+            h.phase_of("cl").is_some(),
+            "a Claude window-fill reading must ENTER the handoff episode state \
+             machine — it is the fleet policy's fresh-restart trigger"
+        );
+        h.run(&ctx); // 95% ≥ escalate, no SESSION-HANDOFF.md → escalation
+
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        let line = log
+            .lines()
+            .find(|l| l.contains("context_handoff_escalated"))
+            .unwrap_or_else(|| panic!("escalation must be logged; event log:\n{log}"))
+            .to_string();
+        assert!(
+            line.contains("context-WINDOW fill at 95.0%"),
+            "t-…-82348-36: the escalation must NAME the figure as context-window fill, \
+             not 'context' (read as session budget by two orchestrators): {line}"
+        );
+        assert!(
+            line.contains("fresh-restart"),
+            "t-…-82348-36: the escalation must state the fleet policy action \
+             (fresh-restart at the next natural boundary): {line}"
+        );
+
+        if let Some(val) = old_handoff {
+            std::env::set_var("AGEND_CONTEXT_HANDOFF_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_HANDOFF_PCT");
+        }
+        if let Some(val) = old_escalate {
+            std::env::set_var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT");
+        }
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home);
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
