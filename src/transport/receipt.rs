@@ -72,6 +72,14 @@ pub(crate) struct DeliveryReceipt {
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+    /// t-20260902165405106195-82348-105: set ONLY on a `TurnStarted` receipt
+    /// that superseded an `AckOverdue` — the seconds by which the consumer's
+    /// `ack_start` missed the acknowledgement window. Additive audit metadata
+    /// that the daemon's per-tick watchdog consumes to emit exactly one
+    /// late-ack reconciliation notice; it never participates in a state
+    /// transition, and the CAS that clears it is state-preserving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_ack_secs: Option<i64>,
     pub recorded_at: String,
 }
 
@@ -93,6 +101,7 @@ impl DeliveryReceipt {
             route: envelope.transport_mode.clone(),
             attempt: 1,
             outcome: Some(state.outcome_name().to_string()),
+            late_ack_secs: None,
             recorded_at: Utc::now().to_rfc3339(),
         }
     }

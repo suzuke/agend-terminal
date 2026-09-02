@@ -43,7 +43,9 @@ fn channel_bridge_queue_without_turn_start_is_truthfully_overdue() {
         .record_if_latest_state(accepted.delivery_id, DeliveryState::ProtocolAccepted, old)
         .expect("backdate"));
     assert_eq!(
-        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now()).expect("watchdog"),
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("watchdog")
+            .len(),
         1
     );
     assert_eq!(
@@ -143,7 +145,9 @@ fn self_kick_late_ack_after_four_minutes_is_admissible_and_completes() {
         .expect("backdate")
         .then_some(());
     assert_eq!(
-        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now()).expect("watchdog"),
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("watchdog")
+            .len(),
         1
     );
     let started = mcp_message(
@@ -310,8 +314,10 @@ fn self_kick_ack_is_exact_id_and_has_no_reply_or_sse_side_effect() {
             &home,
             "claude-agent",
             Utc::now() + chrono::Duration::hours(1),
+            &|_| None,
         )
-        .expect("successful turn watchdog"),
+        .expect("successful turn watchdog")
+        .len(),
         0,
         "a completed self-kick must not produce a missing-ack alert"
     );
@@ -337,11 +343,15 @@ fn self_kick_watchdog_replays_durable_acceptance_and_alerts_once() {
 
     let now = Utc::now();
     assert_eq!(
-        self_kick_watchdog_pass_at(&home, "claude-agent", now).expect("watchdog"),
+        self_kick_watchdog_pass_at(&home, "claude-agent", now, &|_| None)
+            .expect("watchdog")
+            .len(),
         1
     );
     assert_eq!(
-        self_kick_watchdog_pass_at(&home, "claude-agent", now).expect("latch"),
+        self_kick_watchdog_pass_at(&home, "claude-agent", now, &|_| None)
+            .expect("latch")
+            .len(),
         0
     );
     assert_eq!(
@@ -401,6 +411,94 @@ fn self_kick_receipt_cas_stress_has_one_terminal_winner() {
             .expect("receipt")
             .state,
         DeliveryState::AckOverdue
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// t-…-82348-105: an `ack_start` that arrives AFTER the watchdog declared
+/// `AckOverdue` must leave a durable, typed reconciliation marker so the
+/// daemon can tell the operator the earlier alarm is resolved — and must do
+/// so exactly once, for the ack and for the watchdog pass that consumes it.
+#[test]
+fn self_kick_late_ack_after_overdue_marks_and_reconciles_exactly_once() {
+    let (home, runtime, envelope, _chat_id) = self_kick_fixture("late-ack-marker");
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    let mut old = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("accepted");
+    old.recorded_at = (Utc::now()
+        - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64 + 14))
+    .to_rfc3339();
+    assert!(store
+        .record_if_latest_state(envelope.delivery_id, DeliveryState::ProtocolAccepted, old)
+        .expect("backdate"));
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("watchdog")
+            .len(),
+        1
+    );
+
+    let ack = json!({
+        "jsonrpc":"2.0", "id":1, "method":"tools/call",
+        "params":{"name":"ack_start","arguments":{"delivery_id":envelope.delivery_id}}
+    });
+    let started = mcp_message(ack.clone(), &runtime).expect("late start response");
+    assert_eq!(
+        started["result"]["structuredContent"]["state"],
+        "TurnStarted"
+    );
+
+    let latest = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert_eq!(
+        latest.backend_event.as_deref(),
+        Some("claude_channel_turn_started_late"),
+        "a post-AckOverdue ack must be marked as the late one"
+    );
+    let late_by = latest.late_ack_secs.expect("late_ack_secs must be stamped");
+    assert!(
+        (14..=16).contains(&late_by),
+        "late_ack_secs must measure the overshoot past the window, got {late_by}"
+    );
+
+    let log = fs::read_to_string(home.join("event-log.jsonl")).expect("event log");
+    assert_eq!(log.matches("claude_self_kick_ack_late").count(), 1);
+
+    // A second ack is an idempotent no-op: no second event, no re-stamp.
+    mcp_message(ack, &runtime).expect("repeat ack");
+    let log = fs::read_to_string(home.join("event-log.jsonl")).expect("event log");
+    assert_eq!(
+        log.matches("claude_self_kick_ack_late").count(),
+        1,
+        "a repeated ack must not log a second late-ack event"
+    );
+
+    // The watchdog reports the late ack once, then clears the marker.
+    let outcomes = self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+        .expect("reconcile pass");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "one reconciliation outcome: {outcomes:?}"
+    );
+    assert!(
+        matches!(
+            outcomes[0].kind,
+            SelfKickOutcomeKind::AckLate { late_by_secs } if late_by_secs == late_by
+        ),
+        "the outcome must be AckLate carrying the overshoot: {:?}",
+        outcomes[0].kind
+    );
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("second reconcile pass")
+            .len(),
+        0,
+        "the late ack is reconciled exactly once"
     );
     let _ = fs::remove_dir_all(home);
 }

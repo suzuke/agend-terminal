@@ -1338,17 +1338,63 @@ fn self_kick_ack_elapsed(recorded_at: &str, now: DateTime<Utc>) -> Option<Durati
     now.signed_duration_since(recorded).to_std().ok()
 }
 
+/// A hook-authority turn observed at or after a self-kick's acceptance —
+/// the evidence that distinguishes "the resume never became a session turn"
+/// from "the turn started but the ack protocol was not followed". Supplied by
+/// the daemon-side caller, which owns the agent registry; the transport never
+/// reads screen or hook state itself.
+// RED scaffolding: read by the GREEN commit's notice builder.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TurnObservation {
+    /// Seconds between the bridge's acceptance and the observed turn.
+    pub after_accept_secs: i64,
+}
+
+/// One reconciliation outcome from a watchdog pass. The transport owns the
+/// durable state transition and the escalation-channel/event-log record; the
+/// per-tick handler owns the operator-facing inbox notice, because that is
+/// the layer that holds the fleet, the recipient and the agent registry.
+// RED scaffolding: read by the GREEN commit's per-tick notice emitter.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SelfKickOutcome {
+    pub delivery_id: Uuid,
+    /// `AckOverdue`: when the bridge accepted the delivery (the accepted
+    /// receipt's timestamp is carried forward unchanged into `AckOverdue`).
+    /// `AckLate`: when the late `ack_start` was recorded.
+    pub at: DateTime<Utc>,
+    pub kind: SelfKickOutcomeKind,
+}
+
+// RED scaffolding: `AckLate` is constructed by the GREEN commit.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SelfKickOutcomeKind {
+    /// The acknowledgement window closed with no `ack_start`. Emitted at most
+    /// once per delivery — the `ProtocolAccepted -> AckOverdue` CAS is the
+    /// latch.
+    AckOverdue { turn: Option<TurnObservation> },
+    /// An `ack_start` arrived after an `AckOverdue`, this many seconds past
+    /// the window. Emitted at most once per delivery — the state-preserving
+    /// CAS that clears `late_ack_secs` is the latch.
+    AckLate { late_by_secs: i64 },
+}
+
 /// Reconcile accepted self-kicks from the durable receipt log. This scan is
 /// intentionally separate from Claude hook observations: elapsed time only
 /// creates a truthful nonterminal AckOverdue alert, never a TurnStarted proof
-/// or retry.
+/// or retry. `observe` answers "was a hook-authority turn seen at/after this
+/// acceptance time?" — evidence for the operator's notice, never a transition.
 fn self_kick_watchdog_pass_at(
     home: &Path,
     instance: &str,
     now: DateTime<Utc>,
-) -> anyhow::Result<usize> {
+    observe: &dyn Fn(DateTime<Utc>) -> Option<TurnObservation>,
+) -> anyhow::Result<Vec<SelfKickOutcome>> {
+    let _ = observe;
     let store = ReceiptStore::for_instance(home, instance)?;
-    let mut alerts = 0;
+    let mut outcomes = Vec::new();
     for (envelope, current) in store.pending_deliveries()? {
         if !envelope.self_kick
             || current.state != DeliveryState::ProtocolAccepted
@@ -1357,6 +1403,9 @@ fn self_kick_watchdog_pass_at(
         {
             continue;
         }
+        let accepted_at = DateTime::parse_from_rfc3339(&current.recorded_at)
+            .map(|at| at.with_timezone(&Utc))
+            .unwrap_or(now);
         let mut overdue = current.clone();
         overdue.state = DeliveryState::AckOverdue;
         overdue.backend_event = Some("claude_channel_self_kick_ack_timeout".to_string());
@@ -1388,13 +1437,21 @@ fn self_kick_watchdog_pass_at(
             instance,
             &format!("{alert} notified_channels={channels}"),
         );
-        alerts += 1;
+        outcomes.push(SelfKickOutcome {
+            delivery_id: envelope.delivery_id,
+            at: accepted_at,
+            kind: SelfKickOutcomeKind::AckOverdue { turn: None },
+        });
     }
-    Ok(alerts)
+    Ok(outcomes)
 }
 
-pub(crate) fn self_kick_watchdog_pass(home: &Path, instance: &str) -> anyhow::Result<usize> {
-    self_kick_watchdog_pass_at(home, instance, Utc::now())
+pub(crate) fn self_kick_watchdog_pass(
+    home: &Path,
+    instance: &str,
+    observe: &dyn Fn(DateTime<Utc>) -> Option<TurnObservation>,
+) -> anyhow::Result<Vec<SelfKickOutcome>> {
+    self_kick_watchdog_pass_at(home, instance, Utc::now(), observe)
 }
 
 pub(crate) fn run_channel_server(home: &Path, instance: &str) -> anyhow::Result<()> {

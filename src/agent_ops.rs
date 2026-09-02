@@ -1082,6 +1082,7 @@ pub(crate) fn list_snapshot(
                 api_in_flight,
                 last_api_activity_at,
                 observed_status,
+                self_kick,
             ) = {
                 let c = handle.core.lock();
                 (
@@ -1095,6 +1096,7 @@ pub(crate) fn list_snapshot(
                     c.api_activity.in_flight,
                     c.api_activity.last_active_epoch_ms,
                     c.observed_status.clone(),
+                    c.health.last_self_kick.clone(),
                 )
             };
             let entry = json!({
@@ -1118,6 +1120,17 @@ pub(crate) fn list_snapshot(
                 "api_in_flight": api_in_flight,
                 "last_api_activity_at": last_api_activity_at,
                 "observed_status": observed_status,
+                // t-…-82348-105: the last RECONCILED fresh-restart self-kick
+                // outcome, or null when nothing went wrong. Purely additive
+                // evidence so an orchestrator sees an unacknowledged resume in
+                // list_instances instead of only in the event log.
+                "self_kick": self_kick.map(|e| json!({
+                    "delivery_id": e.delivery_id,
+                    "accepted_at": e.accepted_at.to_rfc3339(),
+                    "state": e.state,
+                    "turn_observed_since_kick": e.turn_observed_since_kick,
+                    "at": e.at.to_rfc3339(),
+                })),
                 "kind": "managed",
             });
             (name, entry)

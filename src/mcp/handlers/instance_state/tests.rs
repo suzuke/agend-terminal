@@ -1230,7 +1230,9 @@ fn fresh_restart_clears_dead_session_self_kick_receipt_3414() {
         "#3414: a fresh restart must not leave a nonterminal receipt keyed to the session it destroyed"
     );
     assert_eq!(
-        crate::transport::claude_channel::self_kick_watchdog_pass(&home, "dev").expect("watchdog"),
+        crate::transport::claude_channel::self_kick_watchdog_pass(&home, "dev", &|_| None)
+            .expect("watchdog")
+            .len(),
         0,
         "#3414: the watchdog must not escalate an acknowledgement the operator's fresh restart made impossible"
     );

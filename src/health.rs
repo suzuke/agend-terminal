@@ -399,6 +399,29 @@ pub struct HealthTracker {
     /// `BlockedReason` / `HealthState` change — this is evidence the
     /// inbox-stuck watchdog quotes, never a dispatch-gating signal.
     pub last_mcp_refusal: Option<McpRefusalEvidence>,
+    /// t-20260902165405106195-82348-105: the last fresh-restart self-kick
+    /// outcome the daemon RECONCILED for this agent. Written only by
+    /// `crate::daemon::per_tick::claude_self_kick`, and only for the two
+    /// outcomes that need an operator: an overdue acknowledgement and the
+    /// late ack that resolves it. Like `last_mcp_refusal` it is evidence, not
+    /// a `BlockedReason` / `HealthState` change — nothing gates dispatch on it.
+    pub last_self_kick: Option<SelfKickEvidence>,
+}
+
+/// The reconciled outcome of one fresh-restart self-kick delivery.
+/// `state` is `"ack_overdue"` (the 30 s window closed with no `ack_start`) or
+/// `"turn_started_late"` (an `ack_start` arrived afterwards and resolved it);
+/// a self-kick that acknowledges inside the window is never recorded, so a
+/// `None` slot means "nothing went wrong". `turn_observed_since_kick` is the
+/// distinguishing evidence: whether a hook-authority turn was observed after
+/// the bridge accepted the delivery.
+#[derive(Debug, Clone)]
+pub struct SelfKickEvidence {
+    pub delivery_id: String,
+    pub accepted_at: chrono::DateTime<chrono::Utc>,
+    pub state: &'static str,
+    pub turn_observed_since_kick: bool,
+    pub at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Evidence that Codex refused an MCP tool call: when it was seen, and the
@@ -497,12 +520,22 @@ impl HealthTracker {
             last_stage1_fired_at: None,
             last_stage3_fired_at: None,
             last_mcp_refusal: None,
+            last_self_kick: None,
         }
     }
 
     /// Record the pane line proving Codex refused an MCP tool call.
     pub fn record_mcp_refusal(&mut self, at: chrono::DateTime<chrono::Utc>, line: String) {
         self.last_mcp_refusal = Some(McpRefusalEvidence { at, line });
+    }
+
+    // RED scaffolding: unwritten until the GREEN commit wires it up.
+    #[allow(dead_code)]
+    /// Stamp the reconciled self-kick outcome. Overwrites the previous one:
+    /// only the latest fresh-restart matters to an operator, and the durable
+    /// receipt log keeps the full history.
+    pub fn record_self_kick(&mut self, evidence: SelfKickEvidence) {
+        self.last_self_kick = Some(evidence);
     }
 
     /// `#685` sub-task 7c: atomic transition into `HealthState::Paused`
