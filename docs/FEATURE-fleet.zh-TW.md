@@ -144,6 +144,8 @@ teams:
 | `topic_id` | int | Telegram topic ID（daemon 自動管理，通常不需手動設定） |
 | `topic_binding_mode` | string | Topic 建立模式：`auto`（預設）/ `skip` / `deferred` |
 
+在 **codex** 上，instance 的 `model` / `args` 覆寫可能讓 MCP 完全失效：例如 Codex 0.150.x 搭配 `model: gpt-5.6-luna` 與 `-c model_reasoning_effort=xhigh`，Codex 會以 `MCP tool call requires approval, but approval policy is never` 拒絕每一個 MCP 呼叫 —— daemon 看到該行時會對團隊 orchestrator 發出 `codex_mcp_refusal` inbox 通知並記錄 `codex_mcp_refusal_detected` 事件；請移除這些覆寫並 fresh-restart。
+
 #### `channel` — 通訊頻道
 
 目前支援 Telegram 和 Discord 兩種頻道類型。

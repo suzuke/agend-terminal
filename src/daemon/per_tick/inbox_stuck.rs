@@ -65,6 +65,16 @@ impl InboxStuckHandler {
     }
 }
 
+/// One tick's lock-held snapshot: which agents are live, which are
+/// usage/quota blocked (with their parsed unlock time), and which carry codex
+/// MCP-refusal evidence. Built under registry+core locks and consumed only
+/// after both are dropped, because the scanner does file IO.
+struct Snapshot {
+    live: std::collections::HashSet<String>,
+    usage_blocked: HashMap<String, Option<String>>,
+    mcp_refusals: HashMap<String, crate::health::McpRefusalEvidence>,
+}
+
 impl PerTickHandler for InboxStuckHandler {
     fn name(&self) -> &'static str {
         "inbox_stuck_watchdog"
@@ -79,17 +89,26 @@ impl PerTickHandler for InboxStuckHandler {
         // names and the live usage/quota predicate (registry L0 → core L1,
         // then both locks dropped BEFORE scanner file IO). A same-name
         // redeploy must not inherit a stale re-alert timer or blocked episode.
-        let (live, usage_blocked): (
-            std::collections::HashSet<String>,
-            HashMap<String, Option<String>>,
-        ) = {
+        // t-20260902154222470714-82348-82: `mcp_refusals` rides the SAME
+        // `core.lock()` pass — the codex MCP-refusal evidence stamped by
+        // `codex_mcp_refusal`, so a stuck-alert for an agent whose tool calls
+        // Codex is refusing can say why.
+        let Snapshot {
+            live,
+            usage_blocked,
+            mcp_refusals,
+        } = {
             let reg = crate::agent::lock_registry(ctx.registry);
             let mut live = std::collections::HashSet::new();
             let mut usage_blocked = HashMap::new();
+            let mut mcp_refusals = HashMap::new();
             for handle in reg.values() {
                 let name = handle.name.as_str().to_string();
                 live.insert(name.clone());
                 let core = handle.core.lock();
+                if let Some(ev) = core.health.last_mcp_refusal.clone() {
+                    mcp_refusals.insert(name.clone(), ev);
+                }
                 let state = crate::daemon::shadow::operated_state(
                     core.state.current,
                     core.observed_status.as_ref(),
@@ -103,7 +122,11 @@ impl PerTickHandler for InboxStuckHandler {
                     usage_blocked.insert(name, crate::daemon::supervisor::parse_unlock_at(&tail));
                 }
             }
-            (live, usage_blocked)
+            Snapshot {
+                live,
+                usage_blocked,
+                mcp_refusals,
+            }
         };
         // The snapshot is the only current-state authority. Persist a recovery
         // boundary for every live agent absent from the blocked map, after the
@@ -120,8 +143,7 @@ impl PerTickHandler for InboxStuckHandler {
             &now,
             &mut last,
             &usage_blocked,
-            // RED scaffolding: the real per-agent evidence snapshot lands in GREEN.
-            &HashMap::new(),
+            &mcp_refusals,
         );
         last.retain(|name, _| live.contains(name));
     }

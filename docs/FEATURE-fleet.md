@@ -140,6 +140,8 @@ Each key is the agent's name (must match `[a-zA-Z0-9_-]`); the value is its conf
 | `topic_id` | int | Telegram topic ID (auto-managed by daemon; usually not set manually) |
 | `topic_binding_mode` | string | Topic creation mode: `auto` (default) / `skip` / `deferred` |
 
+On **codex**, instance `model` / `args` overrides can break MCP entirely: e.g. `-c model_reasoning_effort=xhigh` with `model: gpt-5.6-luna` on Codex 0.150.x makes Codex refuse every MCP call with `MCP tool call requires approval, but approval policy is never` — the daemon raises a `codex_mcp_refusal` inbox notice to the team orchestrator and a `codex_mcp_refusal_detected` event when it sees that line; remove the overrides and fresh-restart.
+
 #### `channel` — Communication Channel
 
 Two channel types are currently supported: Telegram and Discord.

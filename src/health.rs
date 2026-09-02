@@ -501,7 +501,6 @@ impl HealthTracker {
     }
 
     /// Record the pane line proving Codex refused an MCP tool call.
-    #[allow(dead_code)] // RED scaffolding: no production writer until GREEN
     pub fn record_mcp_refusal(&mut self, at: chrono::DateTime<chrono::Utc>, line: String) {
         self.last_mcp_refusal = Some(McpRefusalEvidence { at, line });
     }

@@ -60,8 +60,6 @@ pub(crate) fn scan_and_emit_with_blocked(
     usage_blocked: &HashMap<String, Option<String>>,
     mcp_refusals: &HashMap<String, crate::health::McpRefusalEvidence>,
 ) {
-    // RED scaffolding: parameter accepted, not yet read (see RED commit body).
-    let _ = mcp_refusals;
     let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
         return;
     };
@@ -131,6 +129,20 @@ pub(crate) fn scan_and_emit_with_blocked(
              (output-silence). NOT auto-restarting: this may be a transient stall (rate-limit / \
              auto-compact that self-heals) or a genuine wedge. Please check and nudge/restart if needed."
         );
+        // t-20260902154222470714-82348-82: when the daemon has seen Codex
+        // refuse an MCP tool call for this agent, say so here — an agent whose
+        // every tool call is refused looks exactly like a wedged one, and the
+        // operator otherwise has to go read the pane to tell them apart.
+        let text = match mcp_refusals.get(agent) {
+            None => text,
+            Some(ev) => format!(
+                "{text} Last MCP-refusal evidence: {} \"{}\" — MCP tool calls are being \
+                 refused by Codex; check model/effort overrides in fleet.yaml (see the \
+                 codex_mcp_refusal notice).",
+                ev.at.to_rfc3339(),
+                ev.line
+            ),
+        };
         if let Err(e) = crate::inbox::notify_system(
             home,
             &recipient,

@@ -40,15 +40,39 @@ use super::{PerTickHandler, TickContext};
 use crate::backend::Backend;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// The pane lines that mean "Codex refused an MCP tool call". The first is
 /// the literal seen in the incident pane; the second is the sibling wording
 /// found elsewhere in the Codex binary.
-#[allow(dead_code)] // RED scaffolding: no production reader until GREEN
 pub(crate) const CODEX_MCP_REFUSAL_LITERALS: &[&str] = &[
     "MCP tool call requires approval, but approval policy is never",
     "Codex delegates require approval policy",
 ];
+
+/// The refusal literals for `backend`, empty for every backend whose CLI
+/// cannot produce them. Codex-only today — see the module doc for why this
+/// table is handler-local instead of a `BackendProfile` field.
+fn refusal_literals(backend: &Backend) -> &'static [&'static str] {
+    match backend {
+        Backend::Codex => CODEX_MCP_REFUSAL_LITERALS,
+        _ => &[],
+    }
+}
+
+/// The first screen line that carries a refusal literal and is NOT the
+/// backend's composer line. Returns the trimmed line so the notice quotes it
+/// without the pane's leading indentation.
+fn first_refusal_line(screen: &str, literals: &[&str], markers: &[&str]) -> Option<String> {
+    screen
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            !markers.iter().any(|m| line.starts_with(m))
+                && literals.iter().any(|lit| line.contains(lit))
+        })
+        .map(str::to_string)
+}
 
 /// Per-agent edge latch. `armed` = the next appearance of a refusal line
 /// notifies immediately; firing disarms; the line vanishing re-arms.
@@ -81,9 +105,152 @@ impl PerTickHandler for CodexMcpRefusalHandler {
         "codex_mcp_refusal"
     }
 
-    fn run(&self, _ctx: &TickContext<'_>) {
-        // RED scaffolding: no behavior yet (see the RED commit body).
+    fn run(&self, ctx: &TickContext<'_>) {
+        if !self.gate.fire() {
+            return;
+        }
+
+        // Backend per agent, snapshot off the configs lock before touching the
+        // registry (never two of these locks held at once).
+        let backends: HashMap<String, Backend> = ctx
+            .configs
+            .lock()
+            .iter()
+            .filter_map(|(name, cfg)| cfg.backend.clone().map(|b| (name.clone(), b)))
+            .collect();
+
+        // Phase 1: per live agent, the first refusal line on its screen (or
+        // `None`). The `core` lock is held only long enough to copy the screen
+        // text out — no IO, no fleet load, no notify underneath it.
+        let mut observed: Vec<(String, Option<String>)> = Vec::new();
+        // #latch-prune (cleanup-on-delete, #1923 G5 class): capture ALL live
+        // agent names, not just the codex ones, so a same-name redeploy of a
+        // deleted agent never inherits a stale latch.
+        let live: HashSet<String> = {
+            let reg = crate::agent::lock_registry(ctx.registry);
+            let mut live = HashSet::new();
+            for handle in reg.values() {
+                let name = handle.name.as_str().to_string();
+                live.insert(name.clone());
+                let Some(backend) = backends.get(&name) else {
+                    continue;
+                };
+                let literals = refusal_literals(backend);
+                if literals.is_empty() {
+                    continue;
+                }
+                let markers = crate::backend_profile::profile(backend).input_line_markers;
+                let screen = {
+                    let core = handle.core.lock();
+                    let rows = core.vterm.rows() as usize;
+                    core.vterm.tail_lines(rows)
+                };
+                observed.push((name, first_refusal_line(&screen, literals, markers)));
+            }
+            live
+        };
+
+        // Phase 2: evaluate each latch, then fire outside every agent lock.
+        let fleet = crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home))
+            .unwrap_or_else(|_| Arc::new(crate::fleet::FleetConfig::default()));
+        let mut fired: Vec<(String, String)> = Vec::new();
+        {
+            let mut states = self.states.lock();
+            for (name, line) in observed {
+                let latch = states.entry(name.clone()).or_default();
+                let Some(line) = line else {
+                    // The line is gone — re-arm for the next episode.
+                    latch.armed = true;
+                    continue;
+                };
+                if !latch.armed {
+                    continue;
+                }
+                latch.armed = false;
+                fired.push((name, line));
+            }
+            // #latch-prune: drop latches for agents gone from the registry.
+            states.retain(|name, _| live.contains(name));
+        }
+
+        let now = chrono::Utc::now();
+        for (name, line) in fired {
+            crate::event_log::log(ctx.home, "codex_mcp_refusal_detected", &name, &line);
+            record_evidence(ctx.registry, &name, now, &line);
+
+            // Notify the agent's team orchestrator. Never the agent about
+            // itself — it is precisely the one that cannot act right now.
+            let recipient = crate::daemon::inbox_stuck_watchdog::orchestrator_for(&fleet, &name)
+                .unwrap_or_else(|| {
+                    crate::daemon::inbox_stuck_watchdog::FALLBACK_RECIPIENT.to_string()
+                });
+            if recipient == name {
+                continue;
+            }
+            let (model, args) = instance_overrides(&fleet, &name);
+            let text = format!(
+                "[codex_mcp_refusal] agent '{name}': MCP tool calls are being refused by \
+                 Codex — pane line: \"{line}\". Likely cause: model/effort overrides in \
+                 fleet.yaml (fleet.yaml for this instance: model={model}, args={args}); \
+                 `gpt-5.6-luna` + `-c model_reasoning_effort=xhigh` on Codex 0.150.1 is a \
+                 known trigger (d-20260902145934537160-41). Remove the overrides and \
+                 fresh-restart. This notice is edge-triggered: it re-fires only after the \
+                 line disappears and reappears."
+            );
+            if let Err(e) = crate::inbox::notify_system(
+                ctx.home,
+                &recipient,
+                "system:codex_mcp_refusal",
+                "codex_mcp_refusal",
+                text,
+                Some(&name),
+                None,
+            ) {
+                tracing::warn!(agent = %name, %recipient, error = %e, "codex_mcp_refusal: notify failed");
+                continue;
+            }
+            tracing::warn!(agent = %name, %recipient, %line, "codex_mcp_refusal: notified orchestrator");
+        }
     }
+}
+
+/// Stamp the evidence on the agent's own `HealthTracker`. A second, brief
+/// registry lock (phase 1's was already released) — deliberately NOT a
+/// `BlockedReason` / `HealthState` change: this is an evidence slot the
+/// inbox-stuck watchdog quotes, never a dispatch-gating signal.
+fn record_evidence(
+    registry: &crate::agent::AgentRegistry,
+    name: &str,
+    at: chrono::DateTime<chrono::Utc>,
+    line: &str,
+) {
+    let reg = crate::agent::lock_registry(registry);
+    if let Some(handle) = reg.values().find(|h| h.name.as_str() == name) {
+        handle
+            .core
+            .lock()
+            .health
+            .record_mcp_refusal(at, line.to_string());
+    }
+}
+
+/// The instance's fleet.yaml `model` / `args` overrides, rendered for the
+/// notice. They are the actionable part: the incident was cured by removing
+/// exactly these two keys.
+fn instance_overrides(fleet: &crate::fleet::FleetConfig, name: &str) -> (String, String) {
+    let Some(instance) = fleet.instances.get(name) else {
+        return ("default".to_string(), "[]".to_string());
+    };
+    let model = instance
+        .model
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let args = if instance.args.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("{:?}", instance.args)
+    };
+    (model, args)
 }
 
 #[cfg(test)]
@@ -91,7 +258,6 @@ impl PerTickHandler for CodexMcpRefusalHandler {
 mod tests {
     use super::*;
     use crate::daemon::AgentConfig;
-    use std::sync::Arc;
 
     const REFUSAL: &str = CODEX_MCP_REFUSAL_LITERALS[0];
     const SIBLING: &str = CODEX_MCP_REFUSAL_LITERALS[1];
