@@ -289,12 +289,6 @@ pub(crate) fn settle_by_scm_slug(
 pub(crate) fn sweep_settle_merged(home: &Path) {
     let dir = intents_dir(home);
     let now = chrono::Utc::now();
-    // Projecting the board clones every row, and a fleet board runs to
-    // thousands of them against hundreds of intents — so the obligations are
-    // read at most once per tick, and only if an intent actually reaches the
-    // seam where merge evidence is absent.
-    let obligations: std::cell::OnceCell<Vec<crate::task_events::TaskRecord>> =
-        std::cell::OnceCell::new();
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -328,7 +322,7 @@ pub(crate) fn sweep_settle_merged(home: &Path) {
                 home,
                 &intent,
                 now,
-                obligations.get_or_init(|| retention_obligations(home)),
+                &retention_obligations(home, &intent.task_id),
             );
             continue;
         };
@@ -1823,6 +1817,33 @@ mod tests {
         owner: Option<&str>,
     ) -> String {
         use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        if matches!(
+            crate::tasks::load_routed(home, "t-origin"),
+            Err(crate::tasks::TaskRouteError::NotFound)
+        ) {
+            crate::task_events::append(
+                home,
+                &InstanceName::from("test"),
+                TaskEvent::Created {
+                    task_id: TaskId("t-origin".into()),
+                    title: "origin".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: owner.map(|o| InstanceName(o.to_string())),
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: Some(branch.to_string()),
+                    bind: None,
+                    eta_secs: None,
+                    tags: Vec::new(),
+                    parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
+                },
+            )
+            .expect("seed origin");
+        }
         let id = obligation_id("seed");
         crate::task_events::append(
             home,
@@ -2253,7 +2274,12 @@ mod tests {
         let intent = intent_of(&repo, branch, &tip, "t-origin");
 
         let expired = chrono::Utc::now() + chrono::Duration::days(KEEP_TTL_DAYS + 1);
-        settle_by_owner_attestation(&home, &intent, expired, &retention_obligations(&home));
+        settle_by_owner_attestation(
+            &home,
+            &intent,
+            expired,
+            &retention_obligations(&home, &intent.task_id),
+        );
 
         let reopened = obligation(&home, &id);
         assert_eq!(reopened.status, crate::task_events::TaskStatus::Open);
@@ -2287,7 +2313,12 @@ mod tests {
         let intent = intent_of(&repo, branch, &tip, "t-origin");
 
         let inside = chrono::Utc::now() + chrono::Duration::days(KEEP_TTL_DAYS - 1);
-        settle_by_owner_attestation(&home, &intent, inside, &retention_obligations(&home));
+        settle_by_owner_attestation(
+            &home,
+            &intent,
+            inside,
+            &retention_obligations(&home, &intent.task_id),
+        );
 
         assert_eq!(
             obligation(&home, &id).status,
@@ -2314,7 +2345,12 @@ mod tests {
         let intent = intent_of(&repo, branch, &tip, "t-origin");
 
         let expired = chrono::Utc::now() + chrono::Duration::days(KEEP_TTL_DAYS + 1);
-        settle_by_owner_attestation(&home, &intent, expired, &retention_obligations(&home));
+        settle_by_owner_attestation(
+            &home,
+            &intent,
+            expired,
+            &retention_obligations(&home, &intent.task_id),
+        );
         assert_eq!(
             obligation(&home, &id).status,
             crate::task_events::TaskStatus::Open
@@ -2340,7 +2376,12 @@ mod tests {
         let old_deadline = answered_at[0] + chrono::Duration::days(KEEP_TTL_DAYS);
         assert!(old_deadline < answered_at[1] + chrono::Duration::days(KEEP_TTL_DAYS));
 
-        settle_by_owner_attestation(&home, &intent, old_deadline, &retention_obligations(&home));
+        settle_by_owner_attestation(
+            &home,
+            &intent,
+            old_deadline,
+            &retention_obligations(&home, &intent.task_id),
+        );
 
         assert_eq!(
             obligation(&home, &id).status,

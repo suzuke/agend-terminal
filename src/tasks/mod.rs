@@ -749,6 +749,12 @@ pub struct RoutedTask {
 }
 
 impl RoutedTask {
+    /// The authoritative project label for consumers that must select the same
+    /// board. This deliberately does not expose the router's resolved path.
+    pub(crate) fn project(&self) -> &str {
+        self.board.project()
+    }
+
     /// The opaque board this task was routed to — `tasks`-private, so only the
     /// high-level task operations (which own branch-link / usage-limit writes)
     /// can reach it.

@@ -6100,7 +6100,11 @@ fn plant_live_agents(home: &Path, agents: &[&str]) {
 }
 
 fn retention_tasks(home: &Path) -> Vec<crate::task_events::TaskRecord> {
-    crate::task_events::replay(home)
+    retention_tasks_at(home, crate::task_events::DEFAULT_PROJECT)
+}
+
+fn retention_tasks_at(home: &Path, project: &str) -> Vec<crate::task_events::TaskRecord> {
+    crate::task_events::projected_state_at(&crate::task_events::board_root(home, project))
         .map(|state| {
             state
                 .tasks
@@ -6109,6 +6113,108 @@ fn retention_tasks(home: &Path) -> Vec<crate::task_events::TaskRecord> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[test]
+fn retention_obligation_uses_originating_tasks_project_board() {
+    let home = tmp_home("retention-project-route");
+    let repo = tmp_repo("retention-project-route-repo");
+    let project = "org_project-route";
+    plant_live_agents(&home, &["agent-route"]);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+instances:
+  agent-route:
+    backend: codex
+teams:
+  route-team:
+    members:
+      - agent-route
+    source_repo: /repos/org/project-route
+"#,
+    )
+    .expect("fleet");
+    let created = crate::tasks::handle(
+        &home,
+        "agent-route",
+        &serde_json::json!({
+            "action": "create",
+            "title": "origin",
+            "assignee": "agent-route"
+        }),
+    );
+    let origin_id = created["id"].as_str().expect("origin id").to_string();
+
+    let lease = lease(&home, &repo, "agent-route", "feat/project-route").expect("lease");
+    crate::binding::bind_full(
+        &home,
+        "agent-route",
+        &origin_id,
+        "feat/project-route",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("bind");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+
+    release_full(&home, "agent-route", false);
+
+    assert!(
+        retention_tasks(&home).is_empty(),
+        "an origin-routed obligation must not leak onto the default board"
+    );
+    let obligations = retention_tasks_at(&home, project);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "the obligation must live beside its originating task"
+    );
+    let answered = crate::tasks::handle(
+        &home,
+        "agent-route",
+        &serde_json::json!({
+            "action": "done",
+            "id": obligations[0].id.0.clone(),
+            "result": "delete: no longer needed"
+        }),
+    );
+    assert_eq!(
+        answered["status"], "done",
+        "the accountable owner must pass the routed board ACL: {answered}"
+    );
+    crate::cleanup_intents::sweep_settle_merged(&home);
+    assert!(
+        crate::git_helpers::git_cmd(
+            &repo,
+            &["show-ref", "--verify", "refs/heads/feat/project-route"],
+        )
+        .is_err(),
+        "the settlement reader must find the answer on the routed project board"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
 }
 
 /// RED B1: a branch preserved at release with real work must leave exactly ONE
@@ -6462,10 +6568,27 @@ fn release_at_a_new_head_raises_a_fresh_retention_obligation() {
     commit(&l2.path, "b.txt");
     release_full(&home, "agent-nh", false);
 
+    let obligations = retention_tasks(&home);
     assert_eq!(
-        retention_tasks(&home).len(),
+        obligations.len(),
         2,
-        "a release at a NEW head is new unattested work and must raise its own obligation"
+        "both obligation records remain auditable"
+    );
+    assert_eq!(
+        obligations
+            .iter()
+            .filter(|task| !task.status.is_terminal())
+            .count(),
+        1,
+        "only the newest head may remain actionable"
+    );
+    assert_eq!(
+        obligations
+            .iter()
+            .filter(|task| task.status == crate::task_events::TaskStatus::Superseded)
+            .count(),
+        1,
+        "the older head must be superseded"
     );
 
     std::fs::remove_dir_all(&home).ok();

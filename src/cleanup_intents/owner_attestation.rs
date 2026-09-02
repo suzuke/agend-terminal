@@ -70,10 +70,25 @@ pub(super) fn settle_by_owner_attestation(
 ///
 /// Read from the SAME board `record_retention_obligation` writes to; a
 /// different board would make every answer invisible. The tag narrows WHAT is
-/// cloned, which is the whole point of reading once per tick — the exact
-/// retention key, not this tag, is what authorizes anything downstream.
-pub(super) fn retention_obligations(home: &Path) -> Vec<crate::task_events::TaskRecord> {
-    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+/// cloned; the exact retention key, not this tag, is what authorizes anything
+/// downstream.
+pub(super) fn retention_obligations(
+    home: &Path,
+    origin_task_id: &str,
+) -> Vec<crate::task_events::TaskRecord> {
+    let project = if origin_task_id.is_empty() {
+        crate::task_events::DEFAULT_PROJECT.to_string()
+    } else {
+        let Ok(routed) = crate::tasks::load_routed(home, origin_task_id) else {
+            tracing::warn!(
+                %origin_task_id,
+                "branch-retention origin could not be routed — answers preserved fail-closed"
+            );
+            return Vec::new();
+        };
+        routed.project().to_string()
+    };
+    let board = crate::task_events::board_root(home, &project);
     let Ok(state) = crate::task_events::projected_state_at(&board) else {
         return Vec::new();
     };
