@@ -20,6 +20,11 @@ const CFG_TEST: &str = "#[cfg(test)]";
 /// key from hiding a newly introduced, unprotected key in the same file.
 const SERIALIZED_PAIRS: &[(&str, &str, &str)] = &[
     (
+        "src/api/handlers/mcp_proxy_team_authority_tests.rs",
+        "AGEND_HOME",
+        "fleet_test_guard serializes the team authority fixtures",
+    ),
+    (
         "src/app/restart_resume_tests.rs",
         "AGEND_HOME",
         "fleet_test_guard serializes the restart ingress fixture",
