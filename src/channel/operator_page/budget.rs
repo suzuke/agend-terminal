@@ -9,9 +9,30 @@
 //! of garbage into it, refilled the hour. The daemon now holds the budget in a
 //! process-global map behind a lock and treats the file as a snapshot it writes.
 //!
-//! **Why that is enough.** Because memory is authoritative, deleting or editing
-//! the snapshot can never GRANT a slot. The only thing tampering can do is put the
-//! budget into a state the daemon will not vouch for — and that state DENIES.
+//! **Why that is enough within one process.** Because memory is authoritative,
+//! deleting or editing the snapshot can never GRANT a slot to a running daemon.
+//! The only thing tampering can do is put the budget into a state the daemon will
+//! not vouch for — and that state DENIES.
+//!
+//! **Initialisation is an OPERATOR act.** The first version of this module
+//! treated an ABSENT snapshot at initialisation as a genuinely fresh deployment
+//! and started empty. An adversarial verification pass proved that this was a
+//! bypass across the restart boundary: the daemon and every agent share one OS
+//! user, so an agent could delete the snapshot, cause a daemon restart, and have
+//! the new process re-initialise empty — a 3-per-hour cap degraded to
+//! 3-per-restart. The snapshot is now laid down by the same operator-gated act
+//! that turns paging on (`agend-terminal admin config-set operator_page.enabled
+//! true` → [`seed_snapshot`]), and an ABSENT snapshot at initialisation is
+//! POISON, exactly like a corrupt one.
+//!
+//! **What that buys, stated without inflation.** It does NOT make the snapshot
+//! tamper-proof: under one shared OS user nothing on disk is, and an agent can
+//! still delete the file at any moment. What it buys is that deleting it can only
+//! ever DENY — noticed at claim time (missing) or after a restart (absent), the
+//! answer is the same refusal, logged with the path — and that the only way back
+//! is the operator re-running the enable command. Deletion is therefore
+//! DETECTABLE and RECOVERABLE ONLY BY THE OPERATOR. An agent can silence its own
+//! pager; it can never refill the hour.
 //!
 //! The two denial modes are deliberately distinguishable at the API boundary:
 //! [`ClaimError::RateLimited`] means "you have used your pages this hour" and
@@ -31,10 +52,15 @@ use super::{RATE_LIMIT_PER_HOUR, RATE_WINDOW_SECS};
 enum Poison {
     /// A snapshot was present at initialisation but did not parse.
     CorruptSnapshot,
-    /// The snapshot vanished after initialisation wrote one. That is tampering,
-    /// not a fresh install — a fresh install is handled at initialisation.
+    /// No snapshot at initialisation. Either the operator has never enabled
+    /// paging for this home, or the snapshot was deleted and the daemon has since
+    /// restarted. Both DENY, and both are cleared the same way: the operator
+    /// re-runs the enable command, which re-seeds.
+    SnapshotAbsent,
+    /// The snapshot vanished after THIS process initialised from one — caught at
+    /// claim time, so memory still holds the true spent count.
     SnapshotMissing,
-    /// The snapshot could not be read, or could not be created on a fresh home.
+    /// The snapshot exists but could not be read.
     SnapshotUnusable,
 }
 
@@ -46,12 +72,25 @@ impl Poison {
             Poison::CorruptSnapshot => {
                 "the operator-page rate snapshot was corrupt when the daemon read it"
             }
+            Poison::SnapshotAbsent => {
+                "the operator-page rate snapshot is absent — paging has never been seeded for this home, or the snapshot was deleted before the daemon started"
+            }
             Poison::SnapshotMissing => {
-                "the operator-page rate snapshot is missing after initialisation wrote one"
+                "the operator-page rate snapshot is missing after this daemon initialised from one"
             }
-            Poison::SnapshotUnusable => {
-                "the operator-page rate snapshot could not be read or created"
-            }
+            Poison::SnapshotUnusable => "the operator-page rate snapshot could not be read",
+        }
+    }
+
+    /// Stable machine-readable cause, surfaced as `cause` alongside the
+    /// `budget_unavailable` code so a caller can tell ABSENT from CORRUPT without
+    /// matching on prose that is free to change.
+    fn code(self) -> &'static str {
+        match self {
+            Poison::CorruptSnapshot => "snapshot_corrupt",
+            Poison::SnapshotAbsent => "snapshot_absent",
+            Poison::SnapshotMissing => "snapshot_missing",
+            Poison::SnapshotUnusable => "snapshot_unusable",
         }
     }
 }
@@ -61,8 +100,12 @@ pub(crate) enum ClaimError {
     /// The rolling-hour budget is spent. Ordinary, expected, and retryable.
     RateLimited { retry_after_secs: i64 },
     /// The budget state itself is untrustworthy. NOT a rate cap — see the module
-    /// header for why the two must not share a code.
-    Unavailable { reason: &'static str },
+    /// header for why the two must not share a code. `cause` is the stable token,
+    /// `reason` the operator-facing sentence.
+    Unavailable {
+        cause: &'static str,
+        reason: &'static str,
+    },
 }
 
 #[derive(Default)]
@@ -92,9 +135,10 @@ fn persist(path: &Path, stamps: &BTreeMap<String, Vec<i64>>) -> anyhow::Result<(
 
 /// Build (or rebuild) the in-memory budget for `home`.
 ///
-/// ABSENT snapshot ⇒ a genuinely fresh deployment: start empty AND lay one down
-/// immediately, which is what makes a later absence provably a deletion.
-/// PRESENT and parses ⇒ seed from it. PRESENT and corrupt ⇒ poison.
+/// PRESENT and parses ⇒ load it. PRESENT and corrupt ⇒ poison. ABSENT ⇒ poison
+/// too: initialisation does NOT lay a snapshot down. Only the operator does, via
+/// [`seed_snapshot`] on the enable command. Starting empty here is what let an
+/// agent refill the hour by deleting the file and forcing a restart.
 fn ensure_init(state: &mut Budget, home: &Path) {
     if state.initialised && state.home == home {
         return;
@@ -117,13 +161,11 @@ fn ensure_init(state: &mut Budget, home: &Path) {
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Err(error) = persist(&path, &state.stamps) {
-                tracing::error!(
-                    snapshot = %path.display(), %error,
-                    "operator-page rate snapshot could not be created on a fresh home — budget poisoned"
-                );
-                state.poison = Some(Poison::SnapshotUnusable);
-            }
+            tracing::error!(
+                snapshot = %path.display(),
+                "operator-page rate snapshot is ABSENT — budget poisoned, paging denied until the operator re-runs `agend-terminal admin config-set operator_page.enabled true` to re-seed it"
+            );
+            state.poison = Some(Poison::SnapshotAbsent);
         }
         Err(error) => {
             tracing::error!(
@@ -133,6 +175,61 @@ fn ensure_init(state: &mut Budget, home: &Path) {
             state.poison = Some(Poison::SnapshotUnusable);
         }
     }
+}
+
+/// Lay down an EMPTY snapshot for `home` if there is not one already.
+///
+/// This is the OPERATOR-gated half of the design: it runs from
+/// `runtime_config::set("operator_page.enabled", true)`, whose only mutation
+/// surface is `agend-terminal admin config-set`. Because initialisation refuses
+/// to invent a snapshot, this is the ONLY way a home acquires one — which is what
+/// makes a later absence deny instead of refill.
+///
+/// Two properties matter and are both pinned by tests:
+///
+///   * It never clobbers. The file is created with `create_new`, so an existing
+///     snapshot — spent stamps and all — is left exactly as it is, and an
+///     operator re-running the enable command mid-hour does not refund it.
+///   * The remedy actually works without a restart. If this process was already
+///     poisoned for this home, creating the snapshot clears the poison and writes
+///     back what MEMORY holds, not an empty map. So re-seeding after a deletion
+///     restores service without handing back the pages already spent.
+///
+/// The honest limit is the same one the module header states: under one shared OS
+/// user this file is not tamper-proof, and re-seeding after a CORRUPT snapshot is
+/// removed does start the hour over — but only an operator can do it.
+pub(crate) fn seed_snapshot(home: &Path) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let mut state = budget().lock();
+    let path = snapshot_path(home);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(b"{}\n")?;
+            file.flush()?;
+        }
+        // Already seeded: leave it alone. This is the no-clobber guarantee.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    if state.initialised && state.home == home {
+        state.poison = None;
+        let stamps = std::mem::take(&mut state.stamps);
+        let outcome = persist(&path, &stamps);
+        state.stamps = stamps;
+        if let Err(error) = outcome {
+            tracing::error!(
+                snapshot = %path.display(), %error,
+                "operator-page rate snapshot re-seeded but the in-memory count could not be written back"
+            );
+        }
+    }
+    tracing::info!(snapshot = %path.display(), "operator-page rate snapshot seeded by the operator");
+    Ok(())
 }
 
 /// Claim one slot in `orchestrator`'s rolling hour.
@@ -146,13 +243,15 @@ pub(crate) fn claim(home: &Path, orchestrator: &str, now: i64) -> Result<usize, 
     ensure_init(&mut state, home);
     if let Some(poison) = state.poison {
         return Err(ClaimError::Unavailable {
+            cause: poison.code(),
             reason: poison.reason(),
         });
     }
 
-    // Initialisation guarantees a snapshot exists for this home, so an absent file
-    // HERE is a deletion. Memory is authoritative, so the deletion cannot refill
-    // the budget; it can only mark the state untrustworthy, which denies.
+    // Initialisation only gets past `poison` when a snapshot was present, so an
+    // absent file HERE is a deletion since this process started. Memory is
+    // authoritative, so the deletion cannot refill the budget; it can only mark
+    // the state untrustworthy, which denies.
     let path = snapshot_path(home);
     if !path.exists() {
         tracing::error!(
@@ -161,6 +260,7 @@ pub(crate) fn claim(home: &Path, orchestrator: &str, now: i64) -> Result<usize, 
         );
         state.poison = Some(Poison::SnapshotMissing);
         return Err(ClaimError::Unavailable {
+            cause: Poison::SnapshotMissing.code(),
             reason: Poison::SnapshotMissing.reason(),
         });
     }
@@ -195,14 +295,20 @@ pub(crate) fn claim(home: &Path, orchestrator: &str, now: i64) -> Result<usize, 
         drop_stamp(&mut state, orchestrator, now);
         tracing::warn!(%orchestrator, %error, "operator-page rate snapshot unwritable — refusing");
         return Err(ClaimError::Unavailable {
+            cause: "snapshot_unwritable",
             reason: "the operator-page rate snapshot could not be written",
         });
     }
     Ok(remaining)
 }
 
-/// Give a claimed slot back — used when the claim bought nothing, i.e. the
-/// fan-out reached zero channels, so no page was actually delivered.
+/// Give a claimed slot back — used when the fan-out reached ZERO channels, so the
+/// page left through no channel at all.
+///
+/// That is the only case the caller can prove. A nonzero fan-out count means the
+/// page reached at least one registered channel, not that it was delivered (see
+/// the rollback site in `operator_page.rs`), so a counted page may still have been
+/// dropped further down and this function is deliberately not called for it.
 pub(crate) fn release(home: &Path, orchestrator: &str, stamp: i64) {
     let mut state = budget().lock();
     ensure_init(&mut state, home);
@@ -254,15 +360,83 @@ mod tests {
         dir
     }
 
-    /// A fresh home lays down a snapshot at initialisation. Without that, a later
-    /// absence could not be told apart from a first run.
+    /// A home the operator has never seeded DENIES. Initialisation used to start
+    /// empty here, which meant deleting the snapshot and forcing a restart refilled
+    /// the hour. The refusal names ABSENT, distinctly from CORRUPT.
     #[test]
     #[serial]
-    fn fresh_home_writes_an_empty_snapshot() {
+    fn an_unseeded_home_denies_with_the_absent_cause() {
         reset_for_test();
-        let home = tmp_home("fresh");
-        assert!(claim(&home, "lead", 1_000).is_ok());
-        assert!(snapshot_path(&home).exists());
+        let home = tmp_home("unseeded");
+        assert!(!snapshot_path(&home).exists());
+        match claim(&home, "lead", 1_000) {
+            Err(ClaimError::Unavailable { cause, .. }) => assert_eq!(cause, "snapshot_absent"),
+            _ => panic!("an unseeded home must deny, not start a fresh budget"),
+        }
+        reset_for_test();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// …and the operator's remedy works in-process: seeding clears the poison and
+    /// the very next claim succeeds, with no daemon restart needed.
+    #[test]
+    #[serial]
+    fn seeding_clears_the_absent_poison_without_a_restart() {
+        reset_for_test();
+        let home = tmp_home("seed-clears");
+        assert!(claim(&home, "lead", 1_000).is_err());
+        seed_snapshot(&home).expect("operator seeds the snapshot");
+        assert!(
+            claim(&home, "lead", 1_000).is_ok(),
+            "re-seeding is the documented remedy — it has to actually restore service"
+        );
+        reset_for_test();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Seeding must never clobber: an existing snapshot's stamps survive it, so an
+    /// operator re-running the enable command mid-hour does not refund the budget.
+    #[test]
+    #[serial]
+    fn seeding_does_not_overwrite_an_existing_snapshot() {
+        reset_for_test();
+        let home = tmp_home("no-clobber");
+        let existing = serde_json::json!({ "lead": [1_000, 1_001] }).to_string();
+        std::fs::write(snapshot_path(&home), &existing).expect("write existing snapshot");
+        seed_snapshot(&home).expect("seed is a no-op here");
+        assert_eq!(
+            std::fs::read_to_string(snapshot_path(&home)).expect("snapshot readable"),
+            existing,
+            "an existing snapshot must be left byte-for-byte alone"
+        );
+        reset_for_test();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Delete the snapshot and re-seed it inside the SAME process: memory is still
+    /// authoritative, so the spent hour is not refunded.
+    #[test]
+    #[serial]
+    fn re_seeding_after_a_deletion_does_not_refund_the_hour() {
+        reset_for_test();
+        let home = tmp_home("reseed");
+        seed_snapshot(&home).expect("operator seeds the snapshot");
+        for _ in 0..RATE_LIMIT_PER_HOUR {
+            assert!(claim(&home, "lead", 1_000).is_ok());
+        }
+        std::fs::remove_file(snapshot_path(&home)).expect("delete the snapshot");
+        assert!(matches!(
+            claim(&home, "lead", 1_000),
+            Err(ClaimError::Unavailable { .. })
+        ));
+        seed_snapshot(&home).expect("operator re-seeds");
+        assert!(
+            matches!(
+                claim(&home, "lead", 1_000),
+                Err(ClaimError::RateLimited { .. })
+            ),
+            "re-seeding restores service but must not hand back spent pages"
+        );
         reset_for_test();
         std::fs::remove_dir_all(&home).ok();
     }
@@ -274,6 +448,7 @@ mod tests {
     fn editing_the_snapshot_cannot_grant_a_slot() {
         reset_for_test();
         let home = tmp_home("edit");
+        seed_snapshot(&home).expect("operator seeds the snapshot");
         for _ in 0..RATE_LIMIT_PER_HOUR {
             assert!(claim(&home, "lead", 1_000).is_ok());
         }
@@ -296,6 +471,7 @@ mod tests {
     fn a_restart_rebuilds_the_spent_budget_from_the_snapshot() {
         reset_for_test();
         let home = tmp_home("restart");
+        seed_snapshot(&home).expect("operator seeds the snapshot");
         for _ in 0..RATE_LIMIT_PER_HOUR {
             assert!(claim(&home, "lead", 1_000).is_ok());
         }

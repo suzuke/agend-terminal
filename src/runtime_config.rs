@@ -436,6 +436,9 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
         .ok()
         .and_then(|d| serde_json::from_str::<RuntimeConfig>(&d).ok())
         .unwrap_or_else(get);
+    // #3480: turning operator paging ON is the operator-gated act that SEEDS the
+    // rate snapshot. Recorded here, acted on only after the config write succeeds.
+    let mut seed_operator_page_budget = false;
     match key {
         "dev_idle_threshold_secs" => {
             config.dev_idle_threshold_secs = value
@@ -519,6 +522,13 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 "false" | "0" => false,
                 _ => return Err(format!("invalid boolean: {value} (use true/false)")),
             };
+            // #3480: `channel::operator_page::budget` refuses to invent a snapshot
+            // at initialisation — an absent one DENIES — because starting empty let
+            // an agent refill the hour by deleting the file and forcing a restart.
+            // This command is the only operator-gated write of the switch, so it is
+            // where the snapshot gets laid down. Seeding never clobbers an existing
+            // snapshot, so re-running this to recover does not refund spent pages.
+            seed_operator_page_budget = config.operator_page.enabled;
         }
         "operator_page.topic_name" => {
             if value.trim().is_empty() {
@@ -574,6 +584,18 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
     // which would silently flip watchdog / recovery gates.
     crate::store::atomic_write(&path, json.as_bytes()).map_err(|e| e.to_string())?;
     *global().write() = config.clone();
+    if seed_operator_page_budget {
+        // Deliberately NOT fatal to the switch write, and deliberately not silent:
+        // the switch is on but the budget stays poisoned, so paging denies with
+        // `budget_unavailable` until the snapshot can be written. Failing closed is
+        // the right direction; hiding it is not.
+        if let Err(error) = crate::channel::operator_page::budget::seed_snapshot(home) {
+            tracing::error!(
+                %error,
+                "#3480: operator_page.enabled was set but the rate snapshot could not be seeded — paging will refuse with budget_unavailable until it can be"
+            );
+        }
+    }
     Ok(serde_json::to_string(&config).unwrap_or_default())
 }
 

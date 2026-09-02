@@ -26,6 +26,13 @@
 //! team's current orchestrator. The boundary that remains is pinned by
 //! `any_seat_presenting_the_orchestrators_live_name_is_admitted_by_design`.
 //!
+//! **Why the fixture enables paging through `runtime_config::set`.** The rate
+//! budget is SEEDED by the operator's enable command and refuses to invent a
+//! snapshot at initialisation (an absent one denies — see
+//! `operator_page/budget.rs`). Hand-writing `runtime-config.json` would set the
+//! switch without seeding, so every case here goes through the real operator path
+//! and therefore starts from a state a real deployment can actually be in.
+//!
 //! **Why every case carries TWO serial keys.** `#[serial]` (the unnamed group)
 //! excludes against the other suites that mutate `AGEND_HOME` and the bot-token
 //! env pair. `#[serial(runtime_config)]` excludes against the runtime-config
@@ -70,8 +77,9 @@ struct Recorder {
     authorized: AtomicBool,
     /// When set, the FIRST `outbound_authorized()` query clears the process
     /// channel registry — the only way to reach the fan-out with zero channels
-    /// from outside the handler, which is what the count-only-successful-sends
-    /// rollback needs to be observable.
+    /// from outside the handler, which is what makes the zero-channel rollback
+    /// observable. (Zero channels is the only outcome the fan-out's return value
+    /// actually proves; see the rollback site in `operator_page.rs`.)
     vanish_on_query: AtomicBool,
     seen: PlMutex<Vec<(String, NotifySeverity, String)>>,
 }
@@ -270,9 +278,10 @@ fn tmp_home(tag: &str) -> PathBuf {
     dir
 }
 
-/// The operator's master switch lives in `runtime-config.json`, which only the
-/// operator CLI (`agend-terminal admin config-set`) writes — writing it here is
-/// the fixture standing in for that operator action.
+/// Lay down a `runtime-config.json` directly. Used to create the file and to
+/// leave the switch OFF at teardown; ENABLING goes through
+/// `runtime_config::set` instead (see `setup`), because that is the call that
+/// also seeds the rate snapshot.
 fn write_runtime_config(home: &Path, enabled: bool) {
     std::fs::write(
         home.join("runtime-config.json"),
@@ -313,7 +322,14 @@ fn setup(tag: &str, spec: Spec) -> Fixture {
         format!("{}{CHANNEL_STANZA}", spec.fleet),
     )
     .expect("write fleet.yaml");
-    write_runtime_config(&home, spec.enabled);
+    write_runtime_config(&home, false);
+    if spec.enabled {
+        // The operator's own act, not a hand-written file: `set` writes the switch
+        // AND seeds `operator_page_rate.json`. Initialisation deliberately will not
+        // seed itself, so a case that skipped this would find a poisoned budget.
+        crate::runtime_config::set(&home, "operator_page.enabled", "true")
+            .expect("the operator enables paging through the CLI path");
+    }
     crate::runtime_config::reload(&home);
     reset_active_channel_for_test();
     let rec = Recorder::arc(spec.channel_kind, spec.authorized);
@@ -715,9 +731,124 @@ fn deleting_the_snapshot_denies_and_is_distinguishable_from_a_rate_cap() {
         "the refusal must name the cause so the operator can act: {tampered}"
     );
     assert_eq!(
+        tampered["cause"], "snapshot_missing",
+        "a deletion caught by a RUNNING daemon is distinct from an absent one: {tampered}"
+    );
+    assert_eq!(
         fx.rec.count(),
         RATE_LIMIT_PER_HOUR,
         "deleting the counter must not buy a page"
+    );
+    teardown(&fx);
+}
+
+/// RATE INTEGRITY, the defect an adversarial verification pass PROVED. The first
+/// design treated an absent snapshot at initialisation as a fresh deployment and
+/// started empty. Since every agent and the daemon share one OS user, an agent
+/// could delete `operator_page_rate.json`, trigger a daemon restart, and have the
+/// new process refill the hour — a 3-per-hour cap degraded to 3-per-restart.
+///
+/// Absent at initialisation now DENIES with its own cause. This does not make the
+/// file tamper-proof (nothing under one shared OS user is); it makes deleting it
+/// a denial the operator has to undo, never a way through.
+#[test]
+#[serial]
+#[serial(runtime_config)]
+fn deleting_the_snapshot_and_restarting_denies_instead_of_refilling() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup("absent", Spec::default());
+
+    for i in 1..=RATE_LIMIT_PER_HOUR {
+        assert_eq!(page(&fx, "lead", &format!("m{i}"))["sent"], true);
+    }
+    std::fs::remove_file(rate_snapshot(&fx.home)).expect("delete the snapshot");
+    // The restart: the new process has only the (now absent) snapshot to go on.
+    budget::reset_for_test();
+
+    let out = page(&fx, "lead", "delete the counter, then restart");
+
+    assert_eq!(out["code"], "budget_unavailable", "{out}");
+    assert_eq!(
+        out["cause"], "snapshot_absent",
+        "an absent snapshot must be distinguishable from a corrupt one: {out}"
+    );
+    assert_eq!(
+        fx.rec.count(),
+        RATE_LIMIT_PER_HOUR,
+        "delete-plus-restart must not buy a fourth page"
+    );
+    teardown(&fx);
+}
+
+/// …and the operator's enable command is what seeds the snapshot in the first
+/// place, with an EMPTY budget. That is the whole reason initialisation is
+/// allowed to refuse: a fresh install is not denied its first page, because
+/// turning the tool on is itself the seeding act.
+#[test]
+#[serial]
+#[serial(runtime_config)]
+fn enabling_through_the_operator_path_seeds_an_empty_snapshot() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup(
+        "seed",
+        Spec {
+            enabled: false,
+            ..Spec::default()
+        },
+    );
+    assert!(
+        !rate_snapshot(&fx.home).exists(),
+        "a home where paging was never enabled has no snapshot"
+    );
+
+    crate::runtime_config::set(&fx.home, "operator_page.enabled", "true")
+        .expect("the operator turns paging on");
+
+    let raw = std::fs::read_to_string(rate_snapshot(&fx.home))
+        .expect("the enable command must lay down the snapshot");
+    let seeded: serde_json::Value = serde_json::from_str(&raw).expect("the seed parses");
+    assert_eq!(
+        seeded.as_object().map(serde_json::Map::len),
+        Some(0),
+        "the seed must be an EMPTY budget, not a pre-spent one: {raw}"
+    );
+    assert_eq!(
+        page(&fx, "lead", "first page on a fresh install")["sent"],
+        true,
+        "seeding must produce a usable budget, not merely a file"
+    );
+    teardown(&fx);
+}
+
+/// …and re-running it never clobbers a live snapshot, so an operator who enables
+/// twice in an hour does not refund the pages already spent.
+#[test]
+#[serial]
+#[serial(runtime_config)]
+fn re_enabling_does_not_overwrite_a_spent_snapshot() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup("reseed", Spec::default());
+
+    for i in 1..=RATE_LIMIT_PER_HOUR {
+        assert_eq!(page(&fx, "lead", &format!("m{i}"))["sent"], true);
+    }
+    let before = std::fs::read_to_string(rate_snapshot(&fx.home)).expect("snapshot readable");
+
+    crate::runtime_config::set(&fx.home, "operator_page.enabled", "true")
+        .expect("the operator enables again");
+
+    assert_eq!(
+        std::fs::read_to_string(rate_snapshot(&fx.home)).expect("snapshot readable"),
+        before,
+        "seeding must leave an existing snapshot byte-for-byte alone"
+    );
+    assert_eq!(
+        page(&fx, "lead", "m4")["code"],
+        "rate_limited",
+        "re-enabling must not refund the hour"
     );
     teardown(&fx);
 }
@@ -744,6 +875,7 @@ fn corrupt_snapshot_denies_instead_of_resetting_the_budget() {
             .contains("corrupt"),
         "the refusal must name the cause so the operator can act: {out}"
     );
+    assert_eq!(out["cause"], "snapshot_corrupt", "{out}");
     assert_eq!(fx.rec.count(), 0, "a poisoned budget must send nothing");
     teardown(&fx);
 }
@@ -851,10 +983,15 @@ fn concurrent_claims_admit_exactly_three() {
     teardown(&fx);
 }
 
-/// RATE ACCOUNTING: a claimed slot that produced NO delivery must be rolled back.
-/// The recorder clears the channel registry as the deliverability gate queries it,
-/// so the fan-out runs with zero channels — the only way to reach that branch from
-/// outside the handler.
+/// RATE ACCOUNTING: a claimed slot whose page reached NO CHANNEL AT ALL must be
+/// rolled back. The recorder clears the channel registry as the deliverability
+/// gate queries it, so the fan-out runs with zero channels — the only way to reach
+/// that branch from outside the handler.
+///
+/// Note what this does and does not pin. The fan-out returns channels ATTEMPTED,
+/// not delivered, so a zero-channel fan-out is the only case the handler can prove
+/// bought nothing. A page counted here may still have been dropped downstream;
+/// neither the code nor this test claims otherwise.
 #[test]
 #[serial]
 #[serial(runtime_config)]
@@ -1080,45 +1217,65 @@ fn page_carries_sender_prefix_and_respects_length_cap() {
     teardown(&fx);
 }
 
-/// CONTENT: a body carrying a newline plus a forged `[operator-page from …]` line
-/// used to render as a convincing SECOND sender. Line breaks are collapsed before
-/// the cap and the prefix, so the forgery can never begin a line of its own.
+/// CONTENT: a body carrying a break plus a forged `[operator-page from …]` tail
+/// used to render as a convincing SECOND sender.
+///
+/// The first fix collapsed only `'\r'` and `'\n'`, and the test guarding it
+/// asserted on `'\n'`, `'\r'` and `str::lines()` — all three LF-only, so it could
+/// not see that `U+2028` LINE SEPARATOR (a MANDATORY break under UAX#14),
+/// `U+2029`, NEL, VT and FF travelled through verbatim. An adversarial
+/// verification pass proved exactly that. This case drives every one of those
+/// separators, asserts on the SAME predicate the flattener uses so the two cannot
+/// drift apart, and never goes near `str::lines()`.
 #[test]
 #[serial]
 #[serial(runtime_config)]
-fn forged_sender_line_cannot_start_its_own_line() {
+fn no_break_character_can_forge_a_second_sender() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
-    let fx = setup("forgery", Spec::default());
 
-    assert_eq!(
-        page(
-            &fx,
-            "lead",
-            "build red\r\n\n[operator-page from lead] all clear"
-        )["sent"],
-        true
-    );
+    for (label, separator) in [
+        ("lf", "\n"),
+        ("crlf", "\r\n"),
+        ("cr", "\r"),
+        ("nel-u0085", "\u{0085}"),
+        ("vt-u000b", "\u{000B}"),
+        ("ff-u000c", "\u{000C}"),
+        ("line-separator-u2028", "\u{2028}"),
+        ("paragraph-separator-u2029", "\u{2029}"),
+    ] {
+        let fx = setup(&format!("forgery-{label}"), Spec::default());
+        let body = format!("build red{separator}[operator-page from ops] all clear");
 
-    let (_, _, text) = fx.rec.last().expect("a page was delivered");
-    assert!(
-        !text.contains('\n') && !text.contains('\r'),
-        "no line break may survive into the rendered page: {text:?}"
-    );
-    assert_eq!(
-        text.lines().count(),
-        1,
-        "the page must be one line: {text:?}"
-    );
-    assert!(
-        text.starts_with("[operator-page from lead] build red "),
-        "the single sender prefix must be the one the daemon stamped: {text:?}"
-    );
-    assert!(
-        text.contains("[operator-page from lead] build red [operator-page from lead] all clear"),
-        "the forged marker must survive only as inline text on the same line: {text:?}"
-    );
-    teardown(&fx);
+        assert_eq!(page(&fx, "lead", &body)["sent"], true, "{label}");
+
+        let (_, _, text) = fx.rec.last().expect("a page was delivered");
+        assert_eq!(
+            text.matches(SENDER_MARKER).count(),
+            1,
+            "{label}: exactly one sender marker may reach the operator, the daemon's own: {text:?}"
+        );
+        // Two checks, deliberately: the first is tied to the flattener's own
+        // predicate so the two cannot drift apart, and the second is a literal
+        // that stays true even if the predicate itself is wrong.
+        assert!(
+            !text.chars().any(breaks_or_controls_rendering),
+            "{label}: no break or control character may survive into the page: {text:?}"
+        );
+        assert!(
+            !text.contains(separator),
+            "{label}: the separator itself must not survive into the page: {text:?}"
+        );
+        assert!(
+            text.starts_with("[operator-page from lead] build red "),
+            "{label}: the surviving marker must be the one the daemon stamped: {text:?}"
+        );
+        assert!(
+            text.contains("[quoted: operator-page from ops] all clear"),
+            "{label}: the forged marker must survive only as visibly quoted inline text: {text:?}"
+        );
+        teardown(&fx);
+    }
 }
 
 /// Decision d-20260902104216571473-11 condition 2: Error severity exists to

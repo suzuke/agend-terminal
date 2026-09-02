@@ -24,9 +24,15 @@
 //!
 //! The controls that actually bound the damage are the ones that do not depend on
 //! identity at all: the switch is default-OFF and lives where an agent cannot
-//! write it, the budget is 3 per rolling hour and fails CLOSED, delivery is
-//! confined to the dedicated topic inside the allowlisted Telegram group, and the
-//! body is flattened so a page can never forge a second sender line.
+//! write it, the budget is 3 per rolling hour, is seeded only by the operator and
+//! fails CLOSED, delivery is confined to the dedicated topic inside the
+//! allowlisted Telegram group, and the body is flattened to ONE line with the
+//! daemon's own sender marker defanged inside it, so a forged
+//! `[operator-page from …]` can neither begin a line nor reproduce the marker
+//! verbatim. What that does NOT buy: a client that soft-wraps a long page can
+//! still start a visual row mid-body, and a forger can still write prose that
+//! merely resembles a sender. Flattening removes the mandatory breaks; it cannot
+//! make text unimpersonatable.
 //!
 //! # Gate order
 //!
@@ -74,28 +80,65 @@ pub(crate) const RATE_LIMIT_PER_HOUR: usize = 3;
 
 pub(crate) const RATE_WINDOW_SECS: i64 = 3600;
 
-/// Collapse every CR/LF — and every run of them — into a single space.
+/// The marker the daemon stamps in front of every page. Only the daemon may
+/// emit it; [`defang_sender_marker`] takes it away from anyone else.
+pub(crate) const SENDER_MARKER: &str = "[operator-page from ";
+
+/// Characters that may not survive into a page body.
 ///
-/// Applied BEFORE the cap and before the sender prefix. A body carrying
-/// `"\n[operator-page from lead] all clear"` rendered as a convincing SECOND
-/// sender, because the prefix the daemon stamps is only trustworthy while it is
-/// the only thing that can begin a line. With no line break left in the payload,
-/// a forged marker can only ever be inline text on the daemon's own single line.
-fn flatten_line_breaks(raw: &str) -> String {
+/// Everything `char::is_control()` covers — LF, CR, TAB, VT (`U+000B`), FF
+/// (`U+000C`), NEL (`U+0085`) and the rest of C0/C1 — plus `U+2028` LINE
+/// SEPARATOR and `U+2029` PARAGRAPH SEPARATOR, which are not control characters
+/// but ARE mandatory breaks under UAX#14 and do start a new line in Telegram
+/// clients. A page body is plain text with no formatting passthrough, so nothing
+/// in this set has a legitimate use here.
+///
+/// The first version of this predicate tested `'\r'` and `'\n'` and nothing
+/// else. An adversarial verification pass proved that `U+2028`, `U+2029`, NEL, VT
+/// and FF all travelled through verbatim, which put a forged marker on a line of
+/// its own — the exact forgery the flattening exists to stop.
+fn breaks_or_controls_rendering(ch: char) -> bool {
+    ch.is_control() || ch == '\u{2028}' || ch == '\u{2029}'
+}
+
+/// Flatten a body to a single line: every character matched by
+/// [`breaks_or_controls_rendering`] becomes a space, then runs of spaces collapse
+/// to one.
+///
+/// Applied BEFORE the cap and before the sender prefix. The prefix the daemon
+/// stamps is only trustworthy while it is the only thing that can begin a line,
+/// so with no break left in the payload a forged marker cannot open one.
+fn flatten_to_single_line(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    let mut in_break = false;
+    let mut in_space = false;
     for ch in raw.chars() {
-        if ch == '\r' || ch == '\n' {
-            if !in_break {
+        if breaks_or_controls_rendering(ch) || ch == ' ' {
+            if !in_space {
                 out.push(' ');
-                in_break = true;
+                in_space = true;
             }
         } else {
             out.push(ch);
-            in_break = false;
+            in_space = false;
         }
     }
     out
+}
+
+/// Take the daemon's exact sender marker away from the body.
+///
+/// Flattening alone leaves `"… [operator-page from ops] all clear"` sitting
+/// inline, one delimiter away from reading as a second sender — and flattening
+/// can even CREATE the marker, since `"[operator-page\u{2028}from ops]"` becomes
+/// `"[operator-page from ops]"` once the break turns into a space. Run this
+/// AFTER the flattening for that reason.
+///
+/// This is a narrow claim: after this, `SENDER_MARKER` appears exactly once in
+/// the delivered text and it is the daemon's own. It does NOT make the page
+/// unimpersonatable — a body is free to contain any other sender-looking prose,
+/// and no sanitiser here can decide what a human will read as authoritative.
+fn defang_sender_marker(body: &str) -> String {
+    body.replace(SENDER_MARKER, "[quoted: operator-page from ")
 }
 
 /// The dedicated operator-notification topic, or the sender's own as fallback.
@@ -208,8 +251,8 @@ pub(crate) fn handle_operator_page(
 ) -> Value {
     // (0) Content is sanitized FIRST so the emptiness test sees what will actually
     // be sent: a body of nothing but line breaks is an empty page.
-    let flattened = flatten_line_breaks(args["message"].as_str().unwrap_or(""));
-    let message = flattened.trim();
+    let flattened = flatten_to_single_line(args["message"].as_str().unwrap_or(""));
+    let message = defang_sender_marker(flattened.trim());
     if message.is_empty() {
         return json!({"error": "missing 'message'", "code": "missing_message"});
     }
@@ -268,14 +311,17 @@ pub(crate) fn handle_operator_page(
                 "hint": "the page was DROPPED, not queued — write the milestone to SESSION-HANDOFF.md",
             });
         }
-        Err(budget::ClaimError::Unavailable { reason }) => {
+        Err(budget::ClaimError::Unavailable { cause, reason }) => {
             // Deliberately NOT `rate_limited`: an untrustworthy budget and a spent
             // one call for different operator actions, so they must not look alike.
+            // `cause` is the machine-readable half so an operator tool can tell an
+            // absent snapshot from a corrupt one without matching on prose.
             return json!({
                 "sent": false,
                 "error": format!("operator paging is unavailable — {reason}"),
                 "code": "budget_unavailable",
-                "hint": "the page was DROPPED — ask the operator to inspect $AGEND_HOME/operator_page_rate.json; a daemon restart re-reads it",
+                "cause": cause,
+                "hint": "the page was DROPPED. Only the operator can restore paging: re-run `agend-terminal admin config-set operator_page.enabled true`, which re-seeds $AGEND_HOME/operator_page_rate.json (repair or delete a corrupt snapshot first). Under one shared OS user that file is not tamper-proof — what this buys is that tampering DENIES, is logged, and is recoverable only by the operator.",
             });
         }
     };
@@ -283,7 +329,7 @@ pub(crate) fn handle_operator_page(
     // (5) Content: capped body, and the sender's identity is not the caller's to
     // choose — the operator must always know who paged.
     let body: String = message.chars().take(MAX_PAGE_CHARS).collect();
-    let text = format!("[operator-page from {caller}] {body}");
+    let text = format!("{SENDER_MARKER}{caller}] {body}");
 
     // (6) Send through the existing chokepoint. Error severity is the gate pass
     // for Away/Sleep and nothing more (see the module header).
@@ -295,9 +341,15 @@ pub(crate) fn handle_operator_page(
         false,
     );
     if dispatched == 0 {
-        // Only successful sends are counted. The registry emptied between the
-        // deliverability gate and the fan-out, so the claim bought nothing — give
-        // the slot back rather than charging for a page that never left.
+        // NOT a delivery proof, and nothing here should be read as one.
+        // `notify_all_escalation_channels` returns how many channels it ATTEMPTED
+        // (`channel/mod.rs:200`), and `gated_notify` returns `Ok(())` even when it
+        // DROPS the notice (`channel/mod.rs:700`), so a nonzero count says only
+        // that the page reached at least one registered channel. Zero is the one
+        // thing it does prove: the registry emptied between the deliverability
+        // gate and the fan-out, so the page reached NO channel at all and the
+        // claim bought nothing. Roll back for that case only — a counted page may
+        // still have been dropped downstream and this site cannot tell.
         budget::release(home, caller, now);
         return json!({
             "sent": false,

@@ -19,11 +19,20 @@ use std::sync::OnceLock;
 
 // ── Mock channel + global guard ─────────────────────────────────────────
 
-/// `register_active_channel` uses a process-wide `OnceLock`. These tests
-/// share that slot; serialize through this guard.
+/// `register_active_channel` writes a process-wide registry. These tests share
+/// that slot — and so does every other suite that registers a channel, which is
+/// why this delegates to the CRATE-WIDE guard instead of owning a private mutex.
+///
+/// It used to own one (`static G: Mutex<()>`), and two mutexes guarding one
+/// global exclude nothing: these cases register real-kinded `telegram` /
+/// `discord` mocks and fan notices through them, which intermittently displaced
+/// the recorder that `channel::operator_page::tests` had registered under
+/// `channel::channel_registry_test_guard`. Observed directly: `cargo test --bin
+/// agend-terminal channel::` reddened a different operator-page case on most
+/// runs — on the parent commit too, so this is a pre-existing race, not one the
+/// #3480 work introduced.
 fn registry_guard() -> parking_lot::MutexGuard<'static, ()> {
-    static G: Mutex<()> = Mutex::new(());
-    G.lock()
+    crate::channel::channel_registry_test_guard()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -107,7 +107,7 @@ Drain 或管理 caller 的 durable inbox。
 
 在**不需要任何 inbound channel binding** 的情況下，把訊息推到 **operator 的 Telegram**——用於 operator 明確要求「離開或睡覺時有 milestone 要通知我」的場合。這補的是 harness 的缺口：`PushNotification` 的行動推播只有在 Remote Control 連線時才會送達，而 `reply` 需要一則 inbound 訊息才有回覆對象，operator 直接在 TUI 打字則不會產生 binding。
 
-- 必填：`message`。純文字，超過 1000 字元會截斷，並一律加上呼叫者的 instance 名稱前綴。換行字元會在截斷與加前綴之前先被壓成空白，因此訊息內容無法偽造第二行 `[operator-page from …]` 發件者。
+- 必填：`message`。純文字，超過 1000 字元會截斷，並一律加上呼叫者的 instance 名稱前綴。在截斷與加前綴之前，內容會先被壓成**一行**：所有 control character（LF、CR、TAB、VT、FF、NEL 以及其餘 C0/C1）連同 `U+2028` LINE SEPARATOR、`U+2029` PARAGRAPH SEPARATOR 一律換成空白，連續空白再收斂成一個；內容裡若出現字面的 `[operator-page from `，會被改寫成 `[quoted: operator-page from `。因此送到 operator 眼前的 `[operator-page from …]` 標記剛好只有一個，而且是 daemon 自己蓋的。誠實的界線：client 對長訊息 soft-wrap 時仍可能讓某個視覺行從內容中段開始，而內容本來就可以寫出其他「看起來像發件者」的文字。這道處理擋的是「複製標記」與「另起一行」，擋不掉「寫得像」。
 - **僅限 orchestrator，且綁定到「活的」instance。** 呼叫所帶的 `instance` 會先拿去 daemon 的 live registry 解析：沒有對應到任何執行中 instance（或對應到兩個）的名字以 `unknown_caller` 拒絕；同時屬於兩個 team 的呼叫者以 `ambiguous_team` 拒絕（而不是拿 map 順序亂猜）；不是所屬 team 現任 orchestrator 的以 `not_orchestrator` 拒絕並告知該找誰轉送。沒有 daemon runtime 的 standalone bridge 呼叫無從解析，以 `no_live_identity` 拒絕。
 
   誰都別騙自己：所有 agent 與 daemon 共用**同一個 OS 使用者**，所以拿 orchestrator 活著的名字來呼叫的座位**依設計會被放行**。這道 gate 擋的是「指向不存在之物的名字」，擋不住「說謎的座位」。真正限住損害的是下面這些：預設關閉、只有 operator 能開的開關、每小時 3 則、單一專用 topic（仍在 allowlist 群組內），以及 fail-closed 的額度狀態。
@@ -119,7 +119,13 @@ Drain 或管理 caller 的 durable inbox。
 
   目的地 topic 則以 `agend-terminal admin config-set operator_page.topic_name <NAME>` 設定（預設 `operator-notifications`）。`fleet.yaml` 裡的 `channel.operator_page` 區塊已完全不再讀取：fleet.yaml 是 agent 寫得了的檔案，把總開關放在那裡等於讓被管的人自己控開關。Telegram 本身仍需要 `fleet.yaml` 的 `channel.user_allowlist`——沒有它 outbound 一律 fail-closed。
 - **必須是 Telegram。** 這個工具存在的目的是送到 operator 的**手機**：已授權的 Discord channel 不算數；無法送達 telegram 的呼叫以 `not_delivered` 拒絕，且**不消耗**額度。
-- **每位 orchestrator 每滾動小時上限 3 則。** 超出的直接**丟棄**、不排隊；拒絕回應帶有 `retry_after_secs`，呼叫者應改把 milestone 寫進 `SESSION-HANDOFF.md`。計數器以 daemon 記憶體（加鎖）為權威，只把快照寫到 `$AGEND_HOME/operator_page_rate.json` 以保證重啟不會退款。因此刪除或損壞這個快照**拿不到**額度，只會讓額度狀態變得不可信；此時工具以 `budget_unavailable` 拒絕（與 `rate_limited` 區分開來、並說明原因），直到 operator 修復、daemon 重新讀取為止。
+- **每位 orchestrator 每滾動小時上限 3 則。** 超出的直接**丟棄**、不排隊；拒絕回應帶有 `retry_after_secs`，呼叫者應改把 milestone 寫進 `SESSION-HANDOFF.md`。計數器以 daemon 記憶體（加鎖）為權威，快照寫到 `$AGEND_HOME/operator_page_rate.json`，以保證重啟不會退款。
+
+  **快照由 operator 種下，daemon 不會自己造。** `agend-terminal admin config-set operator_page.enabled true` 會在快照不存在時放一個空的（已存在則完全不動，所以重跑這道指令不會退還已用掉的額度）。daemon 拒絕自己補檔：啟動時快照**不存在**的處理方式與「壞掉」完全相同——拒絕。這堵住的正是一個繞道：先刪掉檔案再逼 daemon 重啟，舊設計會以空額度重新初始化，等於把「每小時 3 則」變成「每次重啟 3 則」。
+
+  所有不可信狀態一律以 `budget_unavailable` 拒絕（與 `rate_limited` 明確區分），並附上 `cause` 指出是哪一種：`snapshot_absent`、`snapshot_corrupt`、`snapshot_missing`（daemon 執行中被刪）、`snapshot_unusable`、`snapshot_unwritable`。**每一種的解法都是請 operator 重跑那道 enable 指令**來重新種下快照；快照壞掉的情況要先修好或刪掉。
+
+  話說清楚：所有 agent 與 daemon 共用**同一個 OS 使用者**，所以這個檔案**不是防竄改的**，agent 隨時刪得掉。這個設計換到的是：竄改只會導致**拒絕**、會連同快照路徑寫進 log、而且只有 operator 的指令能救回來。Agent 可以讓自己的 pager 靜音，但拿不回額度。
 - **路由。** 訊息送到專用的 forum topic（預設 `operator-notifications`），首次使用時自動建立並註冊，讓所有 page 集中在一個 operator 可以靜音的地方。若該 topic 無法建立，則退回發送者自己的 topic——兩者都在同一個 allowlist 群組內。
 - **operator 的 Away/Sleep 模式不會抑制 page。** 這是刻意的：這個功能存在的原因，正是 operator 在睡覺而且要求 milestone 要叫醒他。控制 page 的是 `enabled` 開關（總開關）與每小時上限，而不是 mode；一般 daemon 通知仍照舊受 mode 管制。
 
