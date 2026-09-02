@@ -132,6 +132,9 @@ impl PerTickHandler for CodexMcpRefusalHandler {
             for handle in reg.values() {
                 let name = handle.name.as_str().to_string();
                 live.insert(name.clone());
+                // An agent with no AgentConfig entry has no known backend
+                // and is never scanned — by design, pinned by
+                // `agent_without_config_entry_is_skipped`.
                 let Some(backend) = backends.get(&name) else {
                     continue;
                 };
@@ -143,7 +146,12 @@ impl PerTickHandler for CodexMcpRefusalHandler {
                 let screen = {
                     let core = handle.core.lock();
                     let rows = core.vterm.rows() as usize;
-                    core.vterm.tail_lines(rows)
+                    // Dewrapped so a narrow attached pane (tui_bridge.rs
+                    // resizes the agent vterm to the attached client's
+                    // width) cannot split the literal across soft-wrapped
+                    // physical rows and hide it from the scan — the same
+                    // accessor the state hot path uses (agent/mod.rs).
+                    core.vterm.tail_lines_dewrapped(rows)
                 };
                 observed.push((name, first_refusal_line(&screen, literals, markers)));
             }
