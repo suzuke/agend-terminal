@@ -529,7 +529,9 @@ teams:
             .unwrap()
             .with_timezone(&chrono::Utc);
 
-        // Baseline: no evidence → the historical message.
+        // Baseline: no evidence → the historical message (byte-identical pin
+        // is a dedicated test, `stuck_alert_is_byte_identical_without_mcp_refusal_evidence`;
+        // here we only need the text as the prefix the with-evidence case builds on).
         let base_home = tmp_home("refusal-none");
         write_fleet(&base_home);
         seed_unread(&base_home, "worker", 4, 45);
@@ -546,10 +548,6 @@ teams:
             .map(|m| m.text)
             .find(|t| t.contains("[inbox_stuck_watchdog]"))
             .expect("baseline alert must fire");
-        assert!(
-            !base.contains("Last MCP-refusal evidence:"),
-            "no evidence → no evidence sentence: {base}"
-        );
 
         // With evidence for the stuck agent.
         let home = tmp_home("refusal-some");
@@ -596,5 +594,34 @@ teams:
 
         std::fs::remove_dir_all(base_home).ok();
         std::fs::remove_dir_all(home).ok();
+    }
+
+    /// Named pin (split out of `stuck_alert_appends_mcp_refusal_evidence_when_present`):
+    /// with no MCP-refusal evidence, the stuck-agent alert is byte-identical
+    /// to the historical message — no evidence sentence is ever appended.
+    #[test]
+    fn stuck_alert_is_byte_identical_without_mcp_refusal_evidence() {
+        let base_home = tmp_home("refusal-none-pin");
+        write_fleet(&base_home);
+        seed_unread(&base_home, "worker", 4, 45);
+        let mut last = HashMap::new();
+        scan_and_emit_with_blocked(
+            &base_home,
+            &chrono::Utc::now(),
+            &mut last,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let base = crate::inbox::drain(&base_home, "lead")
+            .into_iter()
+            .map(|m| m.text)
+            .find(|t| t.contains("[inbox_stuck_watchdog]"))
+            .expect("baseline alert must fire");
+        assert!(
+            !base.contains("Last MCP-refusal evidence:"),
+            "no evidence → no evidence sentence: {base}"
+        );
+
+        std::fs::remove_dir_all(base_home).ok();
     }
 }

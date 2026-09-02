@@ -501,6 +501,50 @@ mod tests {
         assert!(h.evidence().is_none(), "and records no evidence");
     }
 
+    /// (g) A narrow attached pane soft-wraps the refusal literal across
+    /// physical rows; the detector must scan the dewrapped screen so the
+    /// wrapped line is still caught (verifier finding: `tui_bridge.rs`
+    /// resizes the agent vterm to the attached client's width).
+    #[test]
+    fn wrapped_refusal_line_is_still_detected() {
+        let h = Harness::new("wrap", Backend::Codex);
+        h.core.lock().vterm.resize(60, 10);
+        h.feed(&tool_result_frame(REFUSAL));
+        let handler = CodexMcpRefusalHandler::new(1);
+        h.tick(&handler);
+
+        let notices = h.notices();
+        assert_eq!(
+            notices.len(),
+            1,
+            "a soft-wrapped refusal line must still raise exactly one notice: {notices:?}"
+        );
+        let ev = h
+            .evidence()
+            .expect("health must carry refusal evidence even when the pane is narrow");
+        assert!(
+            ev.line.contains(REFUSAL),
+            "evidence line must contain the full literal, not a wrapped fragment: {}",
+            ev.line
+        );
+    }
+
+    /// (h) An agent with no `AgentConfig` entry has no known backend and is
+    /// never scanned — by design (pinned, not a bug).
+    #[test]
+    fn agent_without_config_entry_is_skipped() {
+        let h = Harness::new("noconfig", Backend::Codex);
+        h.configs.lock().remove("worker");
+        h.feed(&tool_result_frame(REFUSAL));
+        let handler = CodexMcpRefusalHandler::new(1);
+        h.tick(&handler);
+        assert!(
+            h.notices().is_empty(),
+            "an agent with no AgentConfig entry must never be scanned"
+        );
+        assert!(h.evidence().is_none(), "and must record no evidence");
+    }
+
     /// (f) The sibling wording from the Codex binary is detected too.
     #[test]
     fn sibling_literal_is_detected() {
