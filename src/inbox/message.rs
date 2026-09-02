@@ -258,6 +258,15 @@ pub struct InboxMessage {
         deserialize_with = "deserialize_settlement_lenient"
     )]
     pub ci_handoff_settlement: Option<CiHandoffSettlement>,
+    /// PR #3495: exactly-once enqueue key. A producer that may legitimately
+    /// retry the same logical notice (a durable outbox intent replayed after a
+    /// crash or a failed enqueue) stamps a deterministic key here;
+    /// `crate::inbox::idempotent::enqueue_once_returning_unread_count` refuses
+    /// to append a second row carrying a key already present in the target
+    /// inbox. Absent on every other row — `#[serde(default,
+    /// skip_serializing_if)]` keeps legacy rows byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Delivery history projected into a live inbox response. This is derived
@@ -333,6 +342,13 @@ impl InboxMessage {
             timestamp: chrono::Utc::now().to_rfc3339(),
             ..Default::default()
         }
+    }
+
+    /// PR #3495: stamp the exactly-once enqueue key (see
+    /// [`InboxMessage::idempotency_key`]).
+    pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(key.into());
+        self
     }
 
     pub fn with_correlation_id(mut self, id: impl Into<String>) -> Self {

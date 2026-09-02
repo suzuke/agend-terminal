@@ -1433,6 +1433,7 @@ fn self_kick_watchdog_pass_at(
         let recorded_at = DateTime::parse_from_rfc3339(&current.recorded_at)
             .map(|at| at.with_timezone(&Utc))
             .unwrap_or(now);
+        // SCAFFOLD (RED commit): no replay of an unfinished notice intent yet.
         match current.state {
             DeliveryState::ProtocolAccepted => {
                 if self_kick_ack_elapsed(&current.recorded_at, now)
@@ -1447,8 +1448,13 @@ fn self_kick_watchdog_pass_at(
                     "ProtocolAccepted but no exact consumer ack within {:?}; no automatic retry; inspect the agent and reconcile delivery {}",
                     SELF_KICK_ACK_WINDOW, envelope.delivery_id
                 ));
-                // The CAS is the exactly-once latch: only the pass that moves
-                // ProtocolAccepted -> AckOverdue may alert.
+                // PR #3495: the SAME compare-and-append that consumes the
+                // overdue condition persists the durable INTENT to notify. The
+                // caller clears it only after the inbox notice is durably
+                // enqueued, so a crash — or a failed enqueue — in that gap
+                // cannot swallow the alert the way the pre-#3495 order could.
+                // SCAFFOLD (RED commit): no durable notice intent yet — the CAS
+                // still commits the transition BEFORE the caller notifies.
                 if !store.record_if_latest_state(
                     envelope.delivery_id,
                     DeliveryState::ProtocolAccepted,
@@ -1505,6 +1511,8 @@ fn self_kick_watchdog_pass_at(
                 reconciled.late_ack_secs = None;
                 reconciled.backend_event =
                     Some("claude_channel_turn_started_late_reconciled".to_string());
+                // SCAFFOLD (RED commit): the marker is CONSUMED here, before
+                // the caller's notice is enqueued — the defect under test.
                 if !store.record_if_latest_state(
                     envelope.delivery_id,
                     DeliveryState::TurnStarted,
@@ -1530,6 +1538,26 @@ pub(crate) fn self_kick_watchdog_pass(
     observe: &dyn Fn(DateTime<Utc>) -> Option<TurnObservation>,
 ) -> anyhow::Result<Vec<SelfKickOutcome>> {
     self_kick_watchdog_pass_at(home, instance, Utc::now(), observe)
+}
+
+/// PR #3495, step (c): clear the durable notice intent for `delivery_id` —
+/// called by the per-tick handler ONLY after the operator notice is durably in
+/// the recipient's inbox.
+///
+/// The CAS is marker-aware and state-preserving: it requires the exact
+/// `PendingNotice` this pass observed, so a concurrent scanner that already
+/// cleared (or replaced) the marker cannot have its work undone, and a caller
+/// holding a stale marker cannot clear a newer one. Returns `false` when the
+/// marker had already moved on; `true` when it is now clear (including the
+/// idempotent case where it was already clear).
+pub(crate) fn clear_self_kick_notice(
+    home: &Path,
+    instance: &str,
+    delivery_id: Uuid,
+) -> anyhow::Result<bool> {
+    // SCAFFOLD (RED commit): there is no durable intent to clear yet.
+    let _ = (home, instance, delivery_id);
+    Ok(true)
 }
 
 pub(crate) fn run_channel_server(home: &Path, instance: &str) -> anyhow::Result<()> {

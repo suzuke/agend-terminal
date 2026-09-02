@@ -14,6 +14,8 @@
 //!   JSONL lines are moved to `inbox.recovery/` for forensics.
 
 mod disk;
+pub(crate) mod idempotent;
+pub(crate) mod lock;
 pub mod message;
 pub mod notify;
 pub(crate) mod reclaim;
@@ -53,7 +55,8 @@ pub use notify::deliver;
 pub use notify::{
     compose_aware_inject, enqueue_with_idle_hint, format_event_header,
     inject_notification_with_submit, notify_agent, notify_agent_with_attachments, notify_system,
-    stamp_message_id, wake_persisted_pointer, AGENT_MSG_PREFIX, SYSTEM_MSG_PREFIX,
+    notify_system_once, stamp_message_id, wake_persisted_pointer, AGENT_MSG_PREFIX,
+    SYSTEM_MSG_PREFIX,
 };
 // Notification & PTY injection (pub(crate))
 pub(crate) use notify::build_excerpt;

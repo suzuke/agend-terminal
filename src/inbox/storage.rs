@@ -1,3 +1,4 @@
+use super::lock::with_inbox_lock;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -269,19 +270,6 @@ fn extract_msg_id(line: &str) -> Option<String> {
     serde_json::from_str::<IdOnly>(line).ok().and_then(|v| v.id)
 }
 
-/// Acquire a per-agent flock and run `f` with the inbox path.
-/// All read-modify-write operations on an agent's inbox (enqueue, drain,
-/// sweep_expired) must go through this helper to prevent concurrent races.
-fn with_inbox_lock<T>(home: &Path, name: &str, f: impl FnOnce(&Path) -> T) -> anyhow::Result<T> {
-    let path = inbox_path_resolved(home, name);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let lock_path = path.with_extension("jsonl.lock");
-    let _lock = crate::store::acquire_file_lock(&lock_path)?;
-    Ok(f(&path))
-}
-
 /// Parse an inbox JSONL body into successfully-deserialized [`InboxMessage`]s,
 /// skipping blank / unparseable / forward-schema rows. The READ-ONLY counterpart
 /// to the read-modify-write rewriters (`drain` / `sweep_expired` / `clear_compact`
@@ -465,7 +453,7 @@ impl UnreadProbe {
 /// Count actionable-unread rows in inbox file `content` via the cheap
 /// [`UnreadProbe`] deserialize. Shared spelling of the filter so the hot-path
 /// counter and `unread_count` cannot drift.
-fn count_unread_in_content(content: &str) -> usize {
+pub(crate) fn count_unread_in_content(content: &str) -> usize {
     content
         .lines()
         .filter(|l| !l.trim().is_empty())

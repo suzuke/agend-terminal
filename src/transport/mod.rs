@@ -14,7 +14,8 @@ mod registry;
 
 pub(crate) use envelope::{DeliveryEnvelope, DeliveryKind, SessionLocator};
 pub(crate) use receipt::{
-    delivery_path_for_instance, safe_component, DeliveryReceipt, DeliveryState, ReceiptStore,
+    delivery_path_for_instance, safe_component, DeliveryReceipt, DeliveryState, PendingNotice,
+    ReceiptStore,
 };
 #[cfg(test)]
 pub(crate) use registry::mode_for_backend;

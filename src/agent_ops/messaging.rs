@@ -522,6 +522,7 @@ fn build_message(
         ci_handoff_episode: None,
         ci_handoff_class: None,
         ci_handoff_settlement: None,
+        idempotency_key: None,
         delivery_nonce: req.delivery_nonce.clone(),
         review_assignment: None,
     }

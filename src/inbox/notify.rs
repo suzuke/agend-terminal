@@ -720,6 +720,107 @@ pub fn notify_system(
     enqueue_with_idle_hint(home, target, msg)
 }
 
+/// PR #3495: [`notify_system`] with EXACTLY-ONCE semantics for a producer that
+/// may legitimately replay the same logical notice.
+///
+/// `idempotency_key` is stamped on the row and checked against the target
+/// inbox under that inbox's per-agent flock (see
+/// [`crate::inbox::idempotent`]), so a replay after a crash — or after a
+/// failed enqueue — cannot deliver the notice twice. Returns `true` when this
+/// call appended the row and `false` when an existing row already carried the
+/// key; BOTH mean "the notice is durably in the recipient's inbox", and only
+/// `Err` means it is not.
+///
+/// No `task_id` parameter (unlike [`notify_system`]): no exactly-once producer
+/// needs one yet, and adding it would put this past the argument-count lint. A
+/// future caller that does can build the [`InboxMessage`] itself and call
+/// [`enqueue_once_with_idle_hint`].
+pub fn notify_system_once(
+    home: &Path,
+    target: &str,
+    source: &str,
+    kind: &str,
+    body: impl Into<String>,
+    correlation_id: Option<&str>,
+    idempotency_key: &str,
+) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    if NOTIFY_ONCE_FAILURE.with(std::cell::Cell::get) {
+        anyhow::bail!("notify_system_once: injected failure (test hook)");
+    }
+    let mut msg = InboxMessage::new_system(source, kind, body)
+        .with_delivery_mode("inbox_fallback")
+        .with_idempotency_key(idempotency_key);
+    if let Some(cid) = correlation_id {
+        msg = msg.with_correlation_id(cid);
+    }
+    enqueue_once_with_idle_hint(home, target, msg, idempotency_key)
+}
+
+// Test-only failure injection for the notice ENQUEUE path, so the durable
+// outbox's retry contract can be exercised without a real disk fault.
+// Thread-local: the per-tick handler under test runs synchronously on the
+// test's own thread, so this cannot leak into a parallel test.
+#[cfg(test)]
+thread_local! {
+    static NOTIFY_ONCE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make the next [`notify_system_once`] calls on THIS thread fail. Returns the
+/// previous setting.
+#[cfg(test)]
+pub(crate) fn set_notify_once_failure_for_test(fail: bool) -> bool {
+    NOTIFY_ONCE_FAILURE.with(|cell| cell.replace(fail))
+}
+
+/// [`enqueue_with_idle_hint`] with the PR #3495 exactly-once enqueue. The wake
+/// hint is emitted ONLY for a row this call actually appended — a suppressed
+/// duplicate must not re-nudge the recipient.
+pub(crate) fn enqueue_once_with_idle_hint(
+    home: &Path,
+    target: &str,
+    msg: InboxMessage,
+    idempotency_key: &str,
+) -> anyhow::Result<bool> {
+    // #1492: same self-IPC guard as `enqueue_with_idle_hint` — the emitter
+    // below reaches `api::call` over the loopback socket.
+    crate::sync_audit::assert_no_registry_lock_for_self_ipc("enqueue_with_idle_hint")?;
+    enqueue_once_with_idle_hint_with_emitter(home, target, msg, idempotency_key, |hint| {
+        compose_aware_inject(home, target, hint);
+    })
+}
+
+fn enqueue_once_with_idle_hint_with_emitter<F>(
+    home: &Path,
+    target: &str,
+    mut msg: InboxMessage,
+    idempotency_key: &str,
+    emit_hint: F,
+) -> anyhow::Result<bool>
+where
+    F: FnOnce(&str),
+{
+    storage::ensure_msg_id(&mut msg);
+    let id = msg.id.clone().unwrap_or_default();
+    let from = msg.from.clone();
+    let kind = msg.kind.clone();
+    let msg_text = msg.text.clone();
+
+    let Some(pending) =
+        super::idempotent::enqueue_once_returning_unread_count(home, target, msg, idempotency_key)?
+    else {
+        return Ok(false);
+    };
+    emit_hint(&idle_hint_line(
+        &id,
+        &from,
+        kind.as_deref(),
+        &msg_text,
+        pending,
+    ));
+    Ok(true)
+}
+
 /// #1493: single source of truth for the `[AGEND-MSG-PENDING]` pointer line.
 ///
 /// Both the producer ([`enqueue_with_idle_hint_with_emitter`]) and the
@@ -858,8 +959,28 @@ where
 
     // Single lock scope: enqueue + count in one read, avoiding double I/O.
     let pending = storage::enqueue_returning_unread_count(home, target, msg)?;
-    let from_short = from.strip_prefix("from:").unwrap_or(&from);
-    let kind_str = kind.as_deref().unwrap_or("");
+    emit_hint(&idle_hint_line(
+        &id,
+        &from,
+        kind.as_deref(),
+        &msg_text,
+        pending,
+    ));
+    Ok(())
+}
+
+/// The wake hint for one just-enqueued row. Extracted so the idempotent
+/// (PR #3495) enqueue emits the byte-identical pointer — a second spelling of
+/// this block is exactly the drift #1493 closed.
+fn idle_hint_line(
+    id: &str,
+    from: &str,
+    kind: Option<&str>,
+    msg_text: &str,
+    pending: usize,
+) -> String {
+    let from_short = from.strip_prefix("from:").unwrap_or(from);
+    let kind_str = kind.unwrap_or("");
     // #1134: ci-watch messages whose headline is a CI conclusion
     // (pass/fail/ended) get a friendly inline format instead of the
     // generic AGEND-MSG-PENDING pointer, reducing dual-delivery feel.
@@ -870,16 +991,14 @@ where
     // #1487: `now=<operator-TZ timestamp>` so the agent sees fresh, correctly-
     // zoned time on the wake hint too (space-free value — see operator_now_field).
     let now_field = operator_now_field();
-    let hint = if is_ci_conclusion {
-        let first_line = msg_text.lines().next().unwrap_or(&msg_text);
+    if is_ci_conclusion {
+        let first_line = msg_text.lines().next().unwrap_or(msg_text);
         format!("{} (inbox={}) {}", first_line, pending, now_field)
     } else {
         // #1493: build via the shared `build_pending_pointer` so the consumer
         // tests exercise this exact shape (no hand-crafted drift).
-        build_pending_pointer(&id, kind_str, from_short, pending, &now_field)
-    };
-    emit_hint(&hint);
-    Ok(())
+        build_pending_pointer(id, kind_str, from_short, pending, &now_field)
+    }
 }
 
 /// AUDIT2-006: the selected transport delivery is offloaded to the bounded

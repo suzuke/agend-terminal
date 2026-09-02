@@ -50,6 +50,45 @@ impl DeliveryState {
     }
 }
 
+/// PR #3495: the durable INTENT to emit exactly one operator-facing notice for
+/// this delivery.
+///
+/// It exists because the notice is enqueued by a DIFFERENT layer (the per-tick
+/// handler owns the fleet, the recipient and the registry) than the one that
+/// owns the durable state (this store). Persisting the intent BEFORE the
+/// enqueue — and clearing it only AFTER the enqueue reports success — is what
+/// makes the reconciliation crash-safe: a daemon that dies in the gap, or an
+/// enqueue that returns `Err`, leaves the marker set and the next watchdog pass
+/// replays it. The replay is safe because the enqueue is idempotent by key
+/// (`self-kick:<delivery_id>:<kind>`, see `crate::inbox::idempotent`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingNotice {
+    /// `"ack_overdue"` or `"late_ack"` — also the `<kind>` half of the
+    /// idempotency key, so the key is recomputable from the durable row alone.
+    pub kind: String,
+    /// The `AckLate` overshoot the notice must quote. Carried here because the
+    /// same CAS that persists the intent CLEARS `late_ack_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_by_secs: Option<i64>,
+    pub created_at: String,
+}
+
+impl PendingNotice {
+    pub(crate) const ACK_OVERDUE: &'static str = "ack_overdue";
+    pub(crate) const LATE_ACK: &'static str = "late_ack";
+
+    // SCAFFOLD (RED commit): nothing in the production path writes an intent
+    // yet, so the constructor is test-only until the GREEN commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(kind: &str, late_by_secs: Option<i64>) -> Self {
+        Self {
+            kind: kind.to_string(),
+            late_by_secs,
+            created_at: Utc::now().to_rfc3339(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DeliveryReceipt {
     pub delivery_id: Uuid,
@@ -80,6 +119,12 @@ pub(crate) struct DeliveryReceipt {
     /// transition, and the CAS that clears it is state-preserving.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub late_ack_secs: Option<i64>,
+    /// PR #3495: an unfinished operator notice for this delivery — see
+    /// [`PendingNotice`]. Set by the watchdog pass in the SAME compare-and-append
+    /// that consumes the condition it reports, and cleared by a second CAS only
+    /// after the notice is durably in the recipient's inbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_pending: Option<PendingNotice>,
     pub recorded_at: String,
 }
 
@@ -102,6 +147,7 @@ impl DeliveryReceipt {
             attempt: 1,
             outcome: Some(state.outcome_name().to_string()),
             late_ack_secs: None,
+            notice_pending: None,
             recorded_at: Utc::now().to_rfc3339(),
         }
     }
@@ -214,10 +260,47 @@ impl ReceiptStore {
         expected: DeliveryState,
         next: DeliveryReceipt,
     ) -> anyhow::Result<bool> {
+        self.record_if(delivery_id, next, |latest| latest.state == expected)
+    }
+
+    /// PR #3495: MARKER-AWARE compare-and-append.
+    ///
+    /// `record_if_latest_state` compares only `state`, which is not a
+    /// linearization point for a transition that PRESERVES the state and moves
+    /// only a marker (the late-ack reconciliation is exactly that). Two
+    /// scanners holding the same stale snapshot both pass a state-only
+    /// predicate — sequentially, under this same lock — and both emit the
+    /// outcome. Including the markers in the predicate makes the stale
+    /// scanner's CAS fail, so the outcome is produced exactly once.
+    // SCAFFOLD (RED commit): no production caller until the GREEN commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn record_if_marker(
+        &self,
+        delivery_id: Uuid,
+        expected: DeliveryState,
+        expected_late_ack_secs: Option<i64>,
+        expected_notice: Option<&PendingNotice>,
+        next: DeliveryReceipt,
+    ) -> anyhow::Result<bool> {
+        // SCAFFOLD (RED commit): the marker arguments are accepted but not yet
+        // compared — this still behaves exactly like `record_if_latest_state`,
+        // which is the defect. The GREEN commit adds the marker predicate.
+        let _ = (expected_late_ack_secs, expected_notice);
+        self.record_if(delivery_id, next, |latest| latest.state == expected)
+    }
+
+    /// The shared compare-and-append body: read the latest durable receipt
+    /// under the per-instance lock, test `matches`, and append only on a hit.
+    fn record_if(
+        &self,
+        delivery_id: Uuid,
+        next: DeliveryReceipt,
+        matches: impl Fn(&DeliveryReceipt) -> bool,
+    ) -> anyhow::Result<bool> {
         let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
         restrict_permissions(&self.lock_path(), 0o600)?;
         let latest = self.latest_locked(delivery_id)?;
-        if latest.as_ref().map(|receipt| receipt.state) != Some(expected) {
+        if !latest.as_ref().is_some_and(&matches) {
             return Ok(false);
         }
         let mut next = next;

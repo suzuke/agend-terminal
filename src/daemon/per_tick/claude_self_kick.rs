@@ -37,8 +37,10 @@ use crate::daemon::shadow::evidence::Authority;
 use crate::daemon::shadow::reducer::{ObservedState, ObservedStatus};
 use crate::health::SelfKickEvidence;
 use crate::transport::claude_channel::{
-    SelfKickOutcome, SelfKickOutcomeKind, TurnObservation, SELF_KICK_ACK_WINDOW,
+    clear_self_kick_notice, SelfKickOutcome, SelfKickOutcomeKind, TurnObservation,
+    SELF_KICK_ACK_WINDOW,
 };
+use crate::transport::PendingNotice;
 use chrono::{DateTime, Utc};
 
 const NOTICE_SOURCE: &str = "system:claude_self_kick";
@@ -211,8 +213,23 @@ fn late_notice_text(agent: &str, delivery_id: &str, late_by_secs: i64) -> String
     )
 }
 
+/// PR #3495: the exactly-once enqueue key for one delivery's notice. Derived
+/// only from the durable receipt (`delivery_id` + the marker's kind), so the
+/// replay after a crash recomputes the SAME key and the idempotent enqueue
+/// recognises the notice it already appended.
+pub(crate) fn notice_idempotency_key(delivery_id: &str, marker_kind: &str) -> String {
+    format!("self-kick:{delivery_id}:{marker_kind}")
+}
+
 /// File one outcome: inbox notice to `recipient`, then the health evidence
 /// slot `list_instances` mirrors.
+///
+/// PR #3495 ORDERING: the watchdog pass has already persisted the durable
+/// INTENT to send this notice (`DeliveryReceipt::notice_pending`). This
+/// function enqueues the notice IDEMPOTENTLY and clears that intent only after
+/// the enqueue reports the row is durable. An `Err` therefore means "retry on
+/// the next pass" — it returns WITHOUT clearing, and the pass replays the
+/// marker. Nothing here may clear a marker before its notice is enqueued.
 fn announce(
     ctx: &TickContext<'_>,
     agent: &str,
@@ -221,7 +238,7 @@ fn announce(
     outcome: &SelfKickOutcome,
 ) {
     let delivery_id = outcome.delivery_id.to_string();
-    let (text, kind, state, turn_observed) = match outcome.kind {
+    let (text, kind, state, turn_observed, marker_kind) = match outcome.kind {
         SelfKickOutcomeKind::AckOverdue { turn } => (
             overdue_notice_text(
                 agent,
@@ -233,6 +250,7 @@ fn announce(
             "claude_self_kick_ack_overdue",
             "ack_overdue",
             turn.is_some(),
+            PendingNotice::ACK_OVERDUE,
         ),
         SelfKickOutcomeKind::AckLate { late_by_secs } => (
             late_notice_text(agent, &delivery_id, late_by_secs),
@@ -241,20 +259,36 @@ fn announce(
             // The ack itself is the turn proof — a session that called
             // `ack_start` demonstrably started a turn.
             true,
+            PendingNotice::LATE_ACK,
         ),
     };
     // NOTE: no `recipient == agent` skip. See the module doc, item 5.
-    if let Err(error) = crate::inbox::notify_system(
+    let key = notice_idempotency_key(&delivery_id, marker_kind);
+    match crate::inbox::notify_system_once(
         ctx.home,
         recipient,
         NOTICE_SOURCE,
         kind,
         text,
         Some(agent),
-        None,
+        &key,
     ) {
-        tracing::warn!(agent = %agent, %recipient, error = %error, "claude_self_kick: notify failed");
-        return;
+        // The intent stays pending: the next pass replays this notice. One
+        // warn per failed pass, no event-log spam, no retry counter.
+        Err(error) => {
+            tracing::warn!(agent = %agent, %recipient, error = %error, "claude_self_kick: notify failed; notice intent left pending for the next pass");
+            return;
+        }
+        // A replay whose notice was already appended before the crash. The
+        // recipient has it exactly once; all that is left is clearing.
+        Ok(false) => {
+            tracing::warn!(agent = %agent, %recipient, delivery_id = %delivery_id, "claude_self_kick: notice already durable (replay); clearing the pending intent");
+        }
+        Ok(true) => {}
+    }
+    // Durably enqueued — only now may the intent be cleared.
+    if let Err(error) = clear_self_kick_notice(ctx.home, agent, outcome.delivery_id) {
+        tracing::warn!(agent = %agent, delivery_id = %delivery_id, error = %error, "claude_self_kick: clearing the notice intent failed; the next pass replays it idempotently");
     }
     tracing::warn!(agent = %agent, %recipient, delivery_id = %delivery_id, state, "claude_self_kick: notified orchestrator");
     record_evidence(
@@ -382,6 +416,35 @@ mod tests {
         assert!(store
             .record_if_latest_state(delivery_id, current.state, started)
             .expect("late ack CAS"));
+    }
+
+    /// The durable notice INTENT on the delivery's latest receipt (PR #3495).
+    fn pending_marker(home: &Path, delivery_id: Uuid) -> Option<crate::transport::PendingNotice> {
+        ReceiptStore::for_instance(home, AGENT)
+            .expect("store")
+            .latest(delivery_id)
+            .expect("latest")
+            .expect("receipt")
+            .notice_pending
+    }
+
+    /// The durable state of the delivery's latest receipt.
+    fn latest_state(home: &Path, delivery_id: Uuid) -> DeliveryState {
+        ReceiptStore::for_instance(home, AGENT)
+            .expect("store")
+            .latest(delivery_id)
+            .expect("latest")
+            .expect("receipt")
+            .state
+    }
+
+    /// Run ONE watchdog pass at the transport layer and throw the outcomes
+    /// away: exactly the durable state a daemon leaves behind when it dies
+    /// after the intent CAS and before the notice is enqueued.
+    fn crash_after_intent_cas(home: &Path) -> usize {
+        crate::transport::claude_channel::self_kick_watchdog_pass(home, AGENT, &|_| None)
+            .expect("watchdog pass")
+            .len()
     }
 
     struct Harness {
@@ -662,5 +725,224 @@ mod tests {
         assert!(
             !overdue_notice_text("worker", "d-1", accepted_at, None, None).contains("after spawn")
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // PR #3495 round 2: the notice must survive a failed enqueue and both
+    // crash gaps, and a stale scanner must not reconcile twice.
+    // ---------------------------------------------------------------------
+
+    /// (a) A notification error must NOT consume the reconciliation marker.
+    /// Pre-#3495 the marker was cleared by the CAS BEFORE `notify_system` ran,
+    /// so a failed enqueue meant the promised resolving notice was emitted
+    /// ZERO times, for ever.
+    #[test]
+    fn late_ack_notice_survives_notify_failure() {
+        let h = Harness::new("late-notify-fail", LEAD);
+        let handler = ClaudeSelfKickHandler::new(1);
+        let accepted_at = Utc::now() - ChronoDuration::seconds(31);
+        let delivery_id = seed_accepted_kick(&h.home, accepted_at);
+        h.tick(&handler);
+        assert_eq!(h.notices(LEAD).len(), 1, "the overdue notice");
+        seed_late_ack(&h.home, delivery_id, 14);
+
+        let previous = crate::inbox::notify::set_notify_once_failure_for_test(true);
+        h.tick(&handler);
+        crate::inbox::notify::set_notify_once_failure_for_test(previous);
+        assert!(
+            h.notices(LEAD).is_empty(),
+            "a failed enqueue must deliver no notice"
+        );
+        assert!(
+            pending_marker(&h.home, delivery_id).is_some(),
+            "and must leave the notice intent durably pending for the next pass"
+        );
+
+        h.tick(&handler);
+        let notices = h.notices(LEAD);
+        assert_eq!(
+            notices.len(),
+            1,
+            "the pass after the failure must deliver exactly one notice: {notices:?}"
+        );
+        assert!(
+            notices[0].contains("arrived late (+14s after the window)"),
+            "and it is the resolving notice: {}",
+            notices[0]
+        );
+        assert!(
+            pending_marker(&h.home, delivery_id).is_none(),
+            "which clears the intent"
+        );
+        h.tick(&handler);
+        assert!(
+            h.notices(LEAD).is_empty(),
+            "and a later pass must not re-announce it"
+        );
+    }
+
+    /// (b) Crash gap BEFORE the enqueue: the intent is durable, the notice is
+    /// not. A fresh pass must deliver it exactly once.
+    #[test]
+    fn late_ack_crash_gap_before_enqueue_is_retried_once() {
+        let h = Harness::new("late-crash-before", LEAD);
+        let handler = ClaudeSelfKickHandler::new(1);
+        let accepted_at = Utc::now() - ChronoDuration::seconds(31);
+        let delivery_id = seed_accepted_kick(&h.home, accepted_at);
+        h.tick(&handler);
+        assert_eq!(h.notices(LEAD).len(), 1, "the overdue notice");
+        seed_late_ack(&h.home, delivery_id, 9);
+
+        assert_eq!(
+            crash_after_intent_cas(&h.home),
+            1,
+            "the pass produced the outcome the daemon died before announcing"
+        );
+        let marker = pending_marker(&h.home, delivery_id)
+            .expect("the intent must be durable before the enqueue");
+        assert_eq!(marker.kind, crate::transport::PendingNotice::LATE_ACK);
+        assert_eq!(marker.late_by_secs, Some(9));
+        assert!(
+            h.notices(LEAD).is_empty(),
+            "and nothing was delivered before the crash"
+        );
+
+        h.tick(&handler);
+        let notices = h.notices(LEAD);
+        assert_eq!(
+            notices.len(),
+            1,
+            "the fresh pass delivers the notice exactly once: {notices:?}"
+        );
+        assert!(notices[0].contains("arrived late (+9s after the window)"));
+        assert!(pending_marker(&h.home, delivery_id).is_none());
+        h.tick(&handler);
+        assert!(h.notices(LEAD).is_empty(), "and never again");
+    }
+
+    /// (c) Crash gap AFTER the enqueue, before the intent is cleared. The
+    /// replay must be a no-op because the enqueue is keyed and idempotent.
+    #[test]
+    fn late_ack_crash_gap_after_enqueue_does_not_duplicate() {
+        let h = Harness::new("late-crash-after", LEAD);
+        let handler = ClaudeSelfKickHandler::new(1);
+        let accepted_at = Utc::now() - ChronoDuration::seconds(31);
+        let delivery_id = seed_accepted_kick(&h.home, accepted_at);
+        h.tick(&handler);
+        assert_eq!(h.notices(LEAD).len(), 1, "the overdue notice");
+        seed_late_ack(&h.home, delivery_id, 11);
+
+        // Drive the production steps by hand and stop between (b) and (c):
+        // intent persisted, notice enqueued, marker NOT yet cleared.
+        assert_eq!(crash_after_intent_cas(&h.home), 1);
+        let id = delivery_id.to_string();
+        assert!(
+            crate::inbox::notify_system_once(
+                &h.home,
+                LEAD,
+                NOTICE_SOURCE,
+                "claude_self_kick_ack_late",
+                late_notice_text(AGENT, &id, 11),
+                Some(AGENT),
+                &notice_idempotency_key(&id, crate::transport::PendingNotice::LATE_ACK),
+            )
+            .expect("enqueue"),
+            "the notice is durably enqueued"
+        );
+        assert!(
+            pending_marker(&h.home, delivery_id).is_some(),
+            "the daemon dies before clearing the intent"
+        );
+
+        h.tick(&handler);
+        let notices = h.notices(LEAD);
+        assert_eq!(
+            notices.len(),
+            1,
+            "the replay must not enqueue a second copy: {notices:?}"
+        );
+        assert!(notices[0].contains("arrived late (+11s after the window)"));
+        assert!(
+            pending_marker(&h.home, delivery_id).is_none(),
+            "and the replay clears the intent"
+        );
+        h.tick(&handler);
+        assert!(h.notices(LEAD).is_empty(), "no further notices");
+    }
+
+    /// (e) The AckOverdue notice shares the gap: pre-#3495 the
+    /// `ProtocolAccepted -> AckOverdue` CAS was committed before
+    /// `notify_system` ran, so a notification error lost the ALERT — the very
+    /// notice this feature exists to deliver.
+    #[test]
+    fn ack_overdue_notice_survives_notify_failure() {
+        let h = Harness::new("overdue-notify-fail", LEAD);
+        let handler = ClaudeSelfKickHandler::new(1);
+        let delivery_id = seed_accepted_kick(&h.home, Utc::now() - ChronoDuration::seconds(31));
+
+        let previous = crate::inbox::notify::set_notify_once_failure_for_test(true);
+        h.tick(&handler);
+        crate::inbox::notify::set_notify_once_failure_for_test(previous);
+        assert!(
+            h.notices(LEAD).is_empty(),
+            "a failed enqueue must deliver no overdue notice"
+        );
+        assert_eq!(
+            latest_state(&h.home, delivery_id),
+            DeliveryState::AckOverdue,
+            "the truthful state transition still stands"
+        );
+        let marker = pending_marker(&h.home, delivery_id)
+            .expect("but the notice intent must still be pending");
+        assert_eq!(marker.kind, crate::transport::PendingNotice::ACK_OVERDUE);
+        assert!(
+            h.evidence().is_none(),
+            "and no evidence is stamped for a notice nobody received"
+        );
+
+        h.tick(&handler);
+        let notices = h.notices(LEAD);
+        assert_eq!(
+            notices.len(),
+            1,
+            "the next pass delivers the overdue alert exactly once: {notices:?}"
+        );
+        assert!(
+            notices[0].contains("No turn was observed since the kick"),
+            "with the same classification: {}",
+            notices[0]
+        );
+        assert!(pending_marker(&h.home, delivery_id).is_none());
+        assert_eq!(h.evidence().expect("evidence").state, "ack_overdue");
+        h.tick(&handler);
+        assert!(h.notices(LEAD).is_empty(), "and exactly once overall");
+    }
+
+    /// (e2) The AckOverdue crash gap: the daemon dies between the state CAS
+    /// and the enqueue. The alert must still reach the orchestrator.
+    #[test]
+    fn ack_overdue_crash_gap_before_enqueue_is_retried_once() {
+        let h = Harness::new("overdue-crash-before", LEAD);
+        let handler = ClaudeSelfKickHandler::new(1);
+        let delivery_id = seed_accepted_kick(&h.home, Utc::now() - ChronoDuration::seconds(31));
+
+        assert_eq!(crash_after_intent_cas(&h.home), 1);
+        assert!(
+            pending_marker(&h.home, delivery_id).is_some(),
+            "the intent is durable before any enqueue"
+        );
+        assert!(h.notices(LEAD).is_empty());
+
+        h.tick(&handler);
+        let notices = h.notices(LEAD);
+        assert_eq!(
+            notices.len(),
+            1,
+            "the fresh pass delivers the overdue alert once: {notices:?}"
+        );
+        assert!(notices[0].contains("fresh-restart resume NOT confirmed"));
+        assert!(pending_marker(&h.home, delivery_id).is_none());
+        h.tick(&handler);
+        assert!(h.notices(LEAD).is_empty());
     }
 }

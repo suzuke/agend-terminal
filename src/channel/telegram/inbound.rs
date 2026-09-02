@@ -380,6 +380,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                     ci_handoff_episode: None,
                     ci_handoff_class: None,
                     ci_handoff_settlement: None,
+                    idempotency_key: None,
                 },
             ),
             "status_summary",
@@ -730,6 +731,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             ci_handoff_episode: None,
             ci_handoff_class: None,
             ci_handoff_settlement: None,
+            idempotency_key: None,
         };
         // Stamp the durable row identity before enqueueing so a generic reply
         // can settle this exact row even when the inline notification is

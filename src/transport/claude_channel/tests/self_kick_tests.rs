@@ -348,6 +348,17 @@ fn self_kick_watchdog_replays_durable_acceptance_and_alerts_once() {
             .len(),
         1
     );
+    // PR #3495: the alert is latched by the state CAS, but its durable notice
+    // intent is replayed until the caller confirms the notice is enqueued —
+    // that replay is the crash-gap guarantee, not a second alert.
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", now, &|_| None)
+            .expect("replay")
+            .len(),
+        1,
+        "an unconfirmed notice intent is replayed"
+    );
+    assert!(clear_self_kick_notice(&home, "claude-agent", envelope.delivery_id).expect("clear"));
     assert_eq!(
         self_kick_watchdog_pass_at(&home, "claude-agent", now, &|_| None)
             .expect("latch")
@@ -493,12 +504,153 @@ fn self_kick_late_ack_after_overdue_marks_and_reconciles_exactly_once() {
         "the outcome must be AckLate carrying the overshoot: {:?}",
         outcomes[0].kind
     );
+    // PR #3495: the pass MOVES the marker into a durable notice intent rather
+    // than consuming it, so the outcome is replayed until the caller confirms
+    // the notice is enqueued. Until then a repeat pass re-offers the SAME
+    // outcome (that is the crash-gap retry), and only the clear ends it.
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("replay pass")
+            .len(),
+        1,
+        "an unconfirmed notice intent is replayed, not dropped"
+    );
+    assert!(
+        clear_self_kick_notice(&home, "claude-agent", envelope.delivery_id).expect("clear"),
+        "the caller clears the intent once the notice is durably enqueued"
+    );
     assert_eq!(
         self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
             .expect("second reconcile pass")
             .len(),
         0,
         "the late ack is reconciled exactly once"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// PR #3495 (d): two scanners that read the SAME durable snapshot must not
+/// both reconcile it. The late-ack transition PRESERVES `TurnStarted`, so a
+/// state-only compare-and-append is not a linearization point for it: both
+/// scanners pass it — sequentially, under the store's own file lock — and the
+/// operator gets the resolving notice twice. The marker-aware CAS makes the
+/// scanner holding the stale marker lose.
+#[test]
+fn concurrent_stale_snapshot_reconciles_once() {
+    let (home, runtime, envelope, _chat_id) = self_kick_fixture("stale-snapshot");
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    let mut old = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("accepted");
+    old.recorded_at = (Utc::now()
+        - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64 + 12))
+    .to_rfc3339();
+    assert!(store
+        .record_if_latest_state(envelope.delivery_id, DeliveryState::ProtocolAccepted, old)
+        .expect("backdate"));
+
+    // The overdue half: the state CHANGES, so a stale scanner already loses
+    // there — pinned below — but the intent must be durable before the notice.
+    let overdue_snapshot = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("watchdog")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .latest(envelope.delivery_id)
+            .expect("latest")
+            .expect("receipt")
+            .notice_pending
+            .map(|notice| notice.kind),
+        Some(crate::transport::PendingNotice::ACK_OVERDUE.to_string()),
+        "the overdue notice intent must be persisted by the SAME CAS that moves the state"
+    );
+    let mut stale_overdue = overdue_snapshot.clone();
+    stale_overdue.state = DeliveryState::AckOverdue;
+    stale_overdue.notice_pending = Some(crate::transport::PendingNotice::new(
+        crate::transport::PendingNotice::ACK_OVERDUE,
+        None,
+    ));
+    assert!(
+        !store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::ProtocolAccepted,
+                overdue_snapshot.late_ack_secs,
+                overdue_snapshot.notice_pending.as_ref(),
+                stale_overdue,
+            )
+            .expect("stale overdue CAS"),
+        "a second scanner holding the pre-transition snapshot must lose"
+    );
+    assert!(
+        clear_self_kick_notice(&home, "claude-agent", envelope.delivery_id).expect("clear overdue")
+    );
+
+    // The late-ack half: the state is PRESERVED, which is where a state-only
+    // predicate admits the duplicate.
+    let ack = json!({
+        "jsonrpc":"2.0", "id":1, "method":"tools/call",
+        "params":{"name":"ack_start","arguments":{"delivery_id":envelope.delivery_id}}
+    });
+    assert_eq!(
+        mcp_message(ack, &runtime).expect("late start response")["result"]["structuredContent"]
+            ["state"],
+        "TurnStarted"
+    );
+    let snapshot_a = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    let late_by = snapshot_a.late_ack_secs.expect("late_ack_secs");
+    // Scanner B reads the identical snapshot before A commits anything.
+    let snapshot_b = snapshot_a.clone();
+
+    // A reconciles in full: intent CAS, (the caller's enqueue), clear.
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("scanner A")
+            .len(),
+        1,
+        "scanner A reconciles the late ack"
+    );
+    assert!(
+        clear_self_kick_notice(&home, "claude-agent", envelope.delivery_id).expect("clear late"),
+        "and clears the intent after its notice is durable"
+    );
+
+    // B now attempts the same transition from its stale snapshot.
+    let mut reconciled = snapshot_b.clone();
+    reconciled.late_ack_secs = None;
+    reconciled.notice_pending = Some(crate::transport::PendingNotice::new(
+        crate::transport::PendingNotice::LATE_ACK,
+        Some(late_by),
+    ));
+    assert!(
+        !store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::TurnStarted,
+                snapshot_b.late_ack_secs,
+                snapshot_b.notice_pending.as_ref(),
+                reconciled,
+            )
+            .expect("stale late-ack CAS"),
+        "the scanner holding the stale reconciliation marker must lose its CAS"
+    );
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("final pass")
+            .len(),
+        0,
+        "and exactly one reconciliation happened overall"
     );
     let _ = fs::remove_dir_all(home);
 }

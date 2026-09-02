@@ -1054,6 +1054,7 @@ fn agent_picked_up_emitted_on_inbox_drain() {
             ci_handoff_episode: None,
             ci_handoff_class: None,
             ci_handoff_settlement: None,
+            idempotency_key: None,
             delivery_nonce: None,
             review_assignment: None,
         },
@@ -1135,6 +1136,7 @@ fn agent_picked_up_fires_for_all_pending_messages() {
             ci_handoff_episode: None,
             ci_handoff_class: None,
             ci_handoff_settlement: None,
+            idempotency_key: None,
             delivery_nonce: None,
             review_assignment: None,
         },
@@ -1301,6 +1303,7 @@ fn test_describe_message_shows_delivery_mode() {
         ci_handoff_episode: None,
         ci_handoff_class: None,
         ci_handoff_settlement: None,
+        idempotency_key: None,
         delivery_nonce: None,
         review_assignment: None,
     };

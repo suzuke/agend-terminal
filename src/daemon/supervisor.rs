@@ -1605,6 +1605,7 @@ fn enqueue_reply_ledger_lead_escalation(
         ci_handoff_episode: None,
         ci_handoff_class: None,
         ci_handoff_settlement: None,
+        idempotency_key: None,
         delivery_nonce: None,
         review_assignment: None,
     };
