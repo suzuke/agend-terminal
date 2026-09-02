@@ -72,23 +72,21 @@ pub(super) fn settle_by_owner_attestation(
 /// different board would make every answer invisible. The tag narrows WHAT is
 /// cloned; the exact retention key, not this tag, is what authorizes anything
 /// downstream.
-pub(super) fn retention_obligations(
-    home: &Path,
-    origin_task_id: &str,
-) -> Vec<crate::task_events::TaskRecord> {
-    let project = if origin_task_id.is_empty() {
+pub(super) fn retention_project(home: &Path, origin_task_id: &str) -> String {
+    if origin_task_id.is_empty() {
         crate::task_events::DEFAULT_PROJECT.to_string()
     } else {
-        let Ok(routed) = crate::tasks::load_routed(home, origin_task_id) else {
-            tracing::warn!(
-                %origin_task_id,
-                "branch-retention origin could not be routed — answers preserved fail-closed"
-            );
-            return Vec::new();
-        };
-        routed.project().to_string()
-    };
-    let board = crate::task_events::board_root(home, &project);
+        crate::tasks::load_routed(home, origin_task_id)
+            .map(|routed| routed.project().to_string())
+            .unwrap_or_else(|_| crate::task_events::DEFAULT_PROJECT.to_string())
+    }
+}
+
+pub(super) fn retention_obligations(
+    home: &Path,
+    project: &str,
+) -> Vec<crate::task_events::TaskRecord> {
+    let board = crate::task_events::board_root(home, project);
     let Ok(state) = crate::task_events::projected_state_at(&board) else {
         return Vec::new();
     };

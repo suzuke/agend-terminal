@@ -6217,6 +6217,78 @@ teams:
     std::fs::remove_dir_all(&repo).ok();
 }
 
+#[test]
+fn missing_origin_records_visible_default_board_obligation() {
+    let home = tmp_home("retention-missing-origin");
+    let repo = tmp_repo("retention-missing-origin-repo");
+    plant_live_agents(&home, &["agent-missing"]);
+    let lease = lease(&home, &repo, "agent-missing", "feat/missing-origin").expect("lease");
+    crate::binding::bind_full(
+        &home,
+        "agent-missing",
+        "t-origin-gone",
+        "feat/missing-origin",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("bind");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+
+    release_full(&home, "agent-missing", false);
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(obligations.len(), 1, "the obligation must not disappear");
+    assert!(
+        obligations[0]
+            .tags
+            .iter()
+            .any(|tag| tag == "branch-retention-unrouted"),
+        "the default-board fallback must be visibly degraded"
+    );
+    let answered = crate::tasks::handle(
+        &home,
+        "agent-missing",
+        &serde_json::json!({
+            "action": "done",
+            "id": obligations[0].id.0.clone(),
+            "result": "delete: no longer needed"
+        }),
+    );
+    assert_eq!(answered["status"], "done");
+    crate::cleanup_intents::sweep_settle_merged(&home);
+    assert!(
+        crate::git_helpers::git_cmd(
+            &repo,
+            &["show-ref", "--verify", "refs/heads/feat/missing-origin"],
+        )
+        .is_err(),
+        "the fallback reader must consume the default-board answer"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// RED B1: a branch preserved at release with real work must leave exactly ONE
 /// owner-assigned retention obligation on the board, carrying the repo, branch,
 /// originating task id and exact head so the owner can answer without guessing.

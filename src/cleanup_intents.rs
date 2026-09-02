@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 mod owner_attestation;
 #[cfg(test)]
 use owner_attestation::KEEP_TTL_DAYS;
-use owner_attestation::{retention_obligations, settle_by_owner_attestation};
+use owner_attestation::{retention_obligations, retention_project, settle_by_owner_attestation};
 
 fn intents_dir(home: &Path) -> PathBuf {
     home.join("cleanup-intents")
@@ -289,6 +289,8 @@ pub(crate) fn settle_by_scm_slug(
 pub(crate) fn sweep_settle_merged(home: &Path) {
     let dir = intents_dir(home);
     let now = chrono::Utc::now();
+    let mut obligations_by_project =
+        std::collections::HashMap::<String, Vec<crate::task_events::TaskRecord>>::new();
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -318,12 +320,11 @@ pub(crate) fn sweep_settle_merged(home: &Path) {
         let Some(pr_num) = observed_pr else {
             // No merge evidence exists for this branch — the seam where the
             // merge ledger gives up. Ask the owner's recorded answer instead.
-            settle_by_owner_attestation(
-                home,
-                &intent,
-                now,
-                &retention_obligations(home, &intent.task_id),
-            );
+            let project = retention_project(home, &intent.task_id);
+            let obligations = obligations_by_project
+                .entry(project.clone())
+                .or_insert_with(|| retention_obligations(home, &project));
+            settle_by_owner_attestation(home, &intent, now, obligations);
             continue;
         };
         match settle_intent(home, &intent.repo, &intent.branch, true, Some(pr_num)) {
@@ -2278,7 +2279,7 @@ mod tests {
             &home,
             &intent,
             expired,
-            &retention_obligations(&home, &intent.task_id),
+            &retention_obligations(&home, &retention_project(&home, &intent.task_id)),
         );
 
         let reopened = obligation(&home, &id);
@@ -2317,7 +2318,7 @@ mod tests {
             &home,
             &intent,
             inside,
-            &retention_obligations(&home, &intent.task_id),
+            &retention_obligations(&home, &retention_project(&home, &intent.task_id)),
         );
 
         assert_eq!(
@@ -2349,7 +2350,7 @@ mod tests {
             &home,
             &intent,
             expired,
-            &retention_obligations(&home, &intent.task_id),
+            &retention_obligations(&home, &retention_project(&home, &intent.task_id)),
         );
         assert_eq!(
             obligation(&home, &id).status,
@@ -2380,7 +2381,7 @@ mod tests {
             &home,
             &intent,
             old_deadline,
-            &retention_obligations(&home, &intent.task_id),
+            &retention_obligations(&home, &retention_project(&home, &intent.task_id)),
         );
 
         assert_eq!(

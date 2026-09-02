@@ -55,6 +55,7 @@ fn disposable_review_task_terminal(home: &Path, task_id: &str) -> Option<bool> {
 /// branch-retention obligation.
 pub(crate) const RETENTION_TAG: &str = "branch-retention";
 const RETENTION_ORPHAN_TAG: &str = "branch-retention-orphan";
+const RETENTION_UNROUTED_TAG: &str = "branch-retention-unrouted";
 const RETENTION_DUE_DAYS: i64 = 14;
 
 /// Stable idempotency key over the EXACT (repo, branch, head) triple.
@@ -109,19 +110,17 @@ fn record_retention_obligation(
     let key_tag = retention_key(repo, branch, head);
     let lane_tag = retention_lane_key(repo, branch);
 
-    // An originating task makes its own project board authoritative. A route
-    // failure is not permission to leak the obligation onto the default board.
-    let routed_origin = if origin_task_id.is_empty() {
-        None
+    let (routed_origin, unrouted) = if origin_task_id.is_empty() {
+        (None, false)
     } else {
         match crate::tasks::load_routed(home, origin_task_id) {
-            Ok(routed) => Some(routed),
+            Ok(routed) => (Some(routed), false),
             Err(error) => {
                 tracing::warn!(
                     %repo, %branch, %origin_task_id, %error,
-                    "branch-retention origin could not be routed — obligation preserved fail-closed"
+                    "branch-retention origin could not be routed — recording visibly on default board"
                 );
-                return;
+                (None, true)
             }
         }
     };
@@ -141,6 +140,9 @@ fn record_retention_obligation(
     };
 
     let mut tags = vec![RETENTION_TAG.to_string(), lane_tag.clone(), key_tag.clone()];
+    if unrouted {
+        tags.push(RETENTION_UNROUTED_TAG.to_string());
+    }
     if assignee.is_none() {
         tags.push(RETENTION_ORPHAN_TAG.to_string());
     }
