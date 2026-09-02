@@ -902,10 +902,8 @@ mod tests {
     #[test]
     #[serial(runtime_config)]
     fn operator_page_switch_is_default_off_and_operator_settable() {
-        let dir = std::env::temp_dir().join(format!(
-            "agend-test-runtime-config-operator-page-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agend-test-oppage-switch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         std::fs::remove_file(dir.join("runtime-config.json")).ok();
         assert!(
