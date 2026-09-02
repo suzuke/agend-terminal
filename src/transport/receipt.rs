@@ -48,6 +48,33 @@ impl DeliveryState {
     pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Ambiguous)
     }
+
+    /// PR #3495 r4: the durable PROGRESSION order of a self-kick delivery,
+    /// used by the store's non-regression guard.
+    ///
+    /// The enum's DECLARATION order is deliberately not this order:
+    /// `AckOverdue` is declared last because it was added after the others and
+    /// the variant order is part of the on-disk serde shape. The real
+    /// progression a self-kick walks is
+    ///
+    ///   Queued < ProtocolAccepted < ObservedInSession < AckOverdue
+    ///          < TurnStarted < {Completed, Failed, Ambiguous}
+    ///
+    /// `AckOverdue` sits BELOW `TurnStarted` because it is deliberately
+    /// nonterminal: a truthful late `ack_start` still advances an overdue
+    /// delivery to `TurnStarted`. The three terminal outcomes share the top
+    /// rank — they never legitimately supersede one another, and the guard
+    /// only fences moves DOWN this ladder.
+    fn progression_rank(self) -> u8 {
+        match self {
+            Self::Queued => 0,
+            Self::ProtocolAccepted => 1,
+            Self::ObservedInSession => 2,
+            Self::AckOverdue => 3,
+            Self::TurnStarted => 4,
+            Self::Completed | Self::Failed | Self::Ambiguous => 5,
+        }
+    }
 }
 
 /// PR #3495: the durable INTENT to emit exactly one operator-facing notice for
@@ -194,6 +221,22 @@ fn is_native_opencode_protocol_request_id(value: &str) -> bool {
         && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
+/// Whether an append names the value it expects to supersede.
+///
+/// The distinction is the whole content of the r4 store guard: only a
+/// marker-aware compare-and-append (which was handed the OBSERVED state and
+/// markers) may move a self-kick row's markers; everything else is fenced by
+/// [`ReceiptStore::reject_self_kick_regression_locked`].
+#[derive(Debug, Clone, Copy)]
+enum AppendMode {
+    /// Reached only through [`ReceiptStore::record_if`], whose predicate has
+    /// already established that the latest row is exactly what the caller
+    /// observed.
+    MarkerAwareCas,
+    /// Every other writer. Guarded.
+    Unconditional,
+}
+
 impl ReceiptStore {
     pub(crate) fn for_instance(home: &Path, instance: &str) -> anyhow::Result<Self> {
         let dir = delivery_dir(home);
@@ -222,10 +265,13 @@ impl ReceiptStore {
         }
         let mut receipt = DeliveryReceipt::queued(envelope);
         receipt.attempt = self.next_attempt_locked(envelope)?;
-        self.append_locked(DurableRecord {
-            envelope: Some(envelope.clone()),
-            receipt: receipt.clone(),
-        })?;
+        self.append_locked(
+            DurableRecord {
+                envelope: Some(envelope.clone()),
+                receipt: receipt.clone(),
+            },
+            AppendMode::Unconditional,
+        )?;
         Ok(receipt)
     }
 
@@ -238,10 +284,13 @@ impl ReceiptStore {
                 receipt.route = previous.route;
             }
         }
-        self.append_locked(DurableRecord {
-            envelope: None,
-            receipt,
-        })
+        self.append_locked(
+            DurableRecord {
+                envelope: None,
+                receipt,
+            },
+            AppendMode::Unconditional,
+        )
     }
 
     /// Append `next` only when the latest durable state is `expected`.
@@ -312,10 +361,13 @@ impl ReceiptStore {
                 next.route = previous.route;
             }
         }
-        self.append_locked(DurableRecord {
-            envelope: None,
-            receipt: next,
-        })?;
+        self.append_locked(
+            DurableRecord {
+                envelope: None,
+                receipt: next,
+            },
+            AppendMode::MarkerAwareCas,
+        )?;
         Ok(true)
     }
 
@@ -368,6 +420,15 @@ impl ReceiptStore {
     ) -> anyhow::Result<Option<(DeliveryEnvelope, DeliveryReceipt)>> {
         let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
         restrict_permissions(&self.lock_path(), 0o600)?;
+        self.delivery_locked(delivery_id)
+    }
+
+    /// [`Self::delivery`] for a caller that already holds the per-instance
+    /// lock — the store guard runs inside `append_locked`, under it.
+    fn delivery_locked(
+        &self,
+        delivery_id: Uuid,
+    ) -> anyhow::Result<Option<(DeliveryEnvelope, DeliveryReceipt)>> {
         if !self.path.exists() {
             return Ok(None);
         }
@@ -504,7 +565,72 @@ impl ReceiptStore {
         Ok(latest)
     }
 
-    fn append_locked(&self, record: DurableRecord) -> anyhow::Result<()> {
+    /// PR #3495 r4: the store-level NON-REGRESSION invariant, and the single
+    /// place it is enforced.
+    ///
+    /// RULE — a CAS whose expected value comes from a fresh re-read is not a
+    /// CAS. Every marker-aware write must compare against the value its caller
+    /// OBSERVED and acted on. This guard is the store-side half of that rule:
+    /// it makes the property hold even for a writer that never heard of the
+    /// markers, so no reviewer has to accept an "unreachable" claim about some
+    /// unconditional append.
+    ///
+    /// For a delivery whose durable envelope says `self_kick`, an
+    /// UNCONDITIONAL append is refused when it would either
+    ///
+    ///  * move the row DOWN [`DeliveryState::progression_rank`], or
+    ///  * change or drop a `notice_pending` / `late_ack_secs` the latest row
+    ///    is carrying — those markers are owed operator notices, and losing
+    ///    one loses the notice.
+    ///
+    /// Only [`Self::record_if_marker`] (and its `#[cfg(test)]` sibling) may
+    /// move the markers, because only they name the observed value. Non
+    /// self-kick deliveries keep their unconditional semantics untouched: the
+    /// codex and opencode adapters legitimately overwrite their rows in place.
+    fn reject_self_kick_regression_locked(&self, next: &DeliveryReceipt) -> anyhow::Result<()> {
+        let Some((envelope, latest)) = self.delivery_locked(next.delivery_id)? else {
+            return Ok(());
+        };
+        if !envelope.self_kick {
+            return Ok(());
+        }
+        if next.state.progression_rank() < latest.state.progression_rank() {
+            anyhow::bail!(
+                "unconditional receipt append for self-kick delivery {} would regress {:?} -> {:?}; \
+                 use the marker-aware compare-and-append",
+                next.delivery_id,
+                latest.state,
+                next.state
+            );
+        }
+        if latest.notice_pending.is_some() && next.notice_pending != latest.notice_pending {
+            anyhow::bail!(
+                "unconditional receipt append for self-kick delivery {} would change or drop a pending \
+                 notice_pending intent; only the marker-aware compare-and-append may move it",
+                next.delivery_id
+            );
+        }
+        if latest.late_ack_secs.is_some() && next.late_ack_secs != latest.late_ack_secs {
+            anyhow::bail!(
+                "unconditional receipt append for self-kick delivery {} would change or drop an \
+                 unreconciled late_ack_secs stamp; only the marker-aware compare-and-append may move it",
+                next.delivery_id
+            );
+        }
+        Ok(())
+    }
+
+    fn append_locked(&self, record: DurableRecord, mode: AppendMode) -> anyhow::Result<()> {
+        if matches!(mode, AppendMode::Unconditional) {
+            if let Err(error) = self.reject_self_kick_regression_locked(&record.receipt) {
+                tracing::error!(
+                    delivery_id = %record.receipt.delivery_id,
+                    state = ?record.receipt.state,
+                    "receipt store refused a regressing unconditional append: {error}"
+                );
+                return Err(error);
+            }
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
