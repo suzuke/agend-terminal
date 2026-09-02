@@ -64,8 +64,13 @@
 //! `valid_snapshot_rewrite_plus_restart_refills_the_hour_by_design` driving the
 //! real MCP entry in `operator_page/tests.rs`.
 //!
-//! **Why there is no integrity mechanism — and why DETECTION fails too.** Signing
-//! the snapshot needs a key the daemon can read at boot with no operator present.
+//! **Why there is no integrity mechanism — and why DETECTION fails too.** Start
+//! with what makes the question moot: a seat that can rewrite this file has,
+//! per `docs/architecture.md` §1.2, already read `api.operator` and can message
+//! the operator directly. Hardening this cap against that seat protects nothing,
+//! because a strictly better bypass is already in its hands. Even setting that
+//! aside, the mechanism cannot be built: signing the snapshot needs a key the
+//! daemon can read at boot with no operator present.
 //! Per `docs/architecture.md` §1.2 a hostile same-UID seat can already read
 //! same-owner credentials and rewrite same-owner runtime state, so it can read
 //! that key and MAC `{}` itself. Detection fails for exactly the reason
@@ -91,11 +96,16 @@
 //! operator-gated switch, the dedicated topic, and the fact that every page is
 //! attributed and lands in front of the operator.
 //!
-//! **What is NOT withdrawn.** The original operator requirement — the counter
-//! must survive a daemon restart, or the restart itself becomes the bypass — is
-//! still met: an honest restart preserves the spent hour. What is withdrawn is
-//! the STRONGER claim this module added on top, that a hostile agent cannot
-//! refill the hour by itself. That one was false, and it is gone.
+//! **What is NOT withdrawn.** The durability requirement — the counter must
+//! survive a daemon restart, or the restart itself becomes the bypass — is still
+//! met: an honest restart preserves the spent hour. Provenance, because it was
+//! got wrong once already and the mistake drove four rounds of work: that
+//! sentence is the ORCHESTRATOR's expansion in the implementation task, not the
+//! operator's words. The operator decision (d-20260902104216571473-11) settles
+//! the 3/hour cap, the DROP semantics and the refusal, and says nothing about
+//! restarts. What is withdrawn is the STRONGER claim this module added on top,
+//! that a hostile agent cannot refill the hour by itself. That one was false,
+//! and it is gone.
 //!
 //! **What the operator's remedy costs, said out loud.** Re-seeding after a
 //! snapshot that was ABSENT or CORRUPT at initialisation writes `{}` and hands
