@@ -525,8 +525,13 @@ fn stale_orchestrator_grants_nobody_the_page() {
 ///
 /// What the gate does buy is the rest of the matrix above (dead names, ambiguous
 /// names, ambiguous teams, non-orchestrators). What actually bounds the damage is
-/// elsewhere: default-OFF, 3 pages per rolling hour, one dedicated topic inside
-/// the allowlisted group, and fail-closed budget state.
+/// elsewhere, and only the controls that do NOT live in an agent-writable file
+/// count: default-OFF, the operator-gated switch, one dedicated topic inside the
+/// allowlisted group, and the fact that every page is attributed and lands in
+/// front of the operator. The 3-per-hour cap is deliberately NOT on that list —
+/// it bounds accident and runaway, not a hostile seat (see the tamper matrix in
+/// `operator_page/budget.rs` and
+/// `valid_snapshot_rewrite_plus_restart_refills_the_hour_by_design` below).
 #[test]
 #[serial]
 #[serial(runtime_config)]
@@ -756,9 +761,11 @@ fn deleting_the_snapshot_denies_and_is_distinguishable_from_a_rate_cap() {
 /// could delete `operator_page_rate.json`, trigger a daemon restart, and have the
 /// new process refill the hour — a 3-per-hour cap degraded to 3-per-restart.
 ///
-/// Absent at initialisation now DENIES with its own cause. This does not make the
-/// file tamper-proof (nothing under one shared OS user is); it makes deleting it
-/// a denial the operator has to undo, never a way through.
+/// Absent at initialisation now DENIES with its own cause. This closes the DELETE
+/// shape and nothing wider: it does not make the file tamper-proof (nothing under
+/// one shared OS user is), and a snapshot that still PARSES is trusted after a
+/// restart — see `valid_snapshot_rewrite_plus_restart_refills_the_hour_by_design`
+/// below and the tamper matrix in `operator_page/budget.rs`.
 #[test]
 #[serial]
 #[serial(runtime_config)]
@@ -792,7 +799,8 @@ fn deleting_the_snapshot_and_restarting_denies_instead_of_refilling() {
     // That reset is acceptable — it is operator-gated and denies by default — but
     // asking the operator to perform it blind is not, which is what a second
     // adversarial pass caught. Nothing here claims the snapshot is tamper-PROOF;
-    // under one shared OS user it is tamper-EVIDENT and operator-recoverable.
+    // deletion is one of the four shapes that are tamper-EVIDENT at all, and the
+    // remedy for those is operator-recoverable. A parseable rewrite is neither.
     let hint = out["hint"].as_str().unwrap_or_default();
     assert!(
         hint.contains("STARTS A NEW ROLLING HOUR"),
@@ -801,6 +809,62 @@ fn deleting_the_snapshot_and_restarting_denies_instead_of_refilling() {
     assert!(
         hint.contains("config-set operator_page.enabled true"),
         "the remedy hint must still name the operator command: {out}"
+    );
+    teardown(&fx);
+}
+
+/// THE ACCEPTED LIMITATION of the persisted cap, at the REAL MCP entry, pinned so
+/// nobody can mistake it for a control that passes. A PRIMARY reviewer proved it
+/// with a repro; the two cases above fix the DELETE and CORRUPT shapes, and this
+/// one states the shape they do not cover.
+///
+/// A syntactically VALID rewrite is indistinguishable from an honest snapshot:
+/// initialisation trusts any well-formed map, `{}` included. So an agent that has
+/// spent the orchestrator's 3/3 can blank the file and, after the next daemon
+/// restart, page again — and this test asserts that it SUCCEEDS.
+///
+/// It can be neither prevented nor detected while the file is agent-writable
+/// under one shared UID: any key the daemon can read at boot to verify a MAC is
+/// readable by the agent, which can then MAC `{}` (`docs/architecture.md` §1.2).
+/// Failing closed at every restart instead was rejected on evidence — see the
+/// tamper matrix in `operator_page/budget.rs`, which also holds the general rule
+/// and the whole shape × lifetime table.
+///
+/// IF AN INTEGRITY MECHANISM IS EVER ADDED, INVERT THIS TEST — do not delete it.
+#[test]
+#[serial]
+#[serial(runtime_config)]
+fn valid_snapshot_rewrite_plus_restart_refills_the_hour_by_design() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+    let fx = setup("valid-rewrite", Spec::default());
+
+    for i in 1..=RATE_LIMIT_PER_HOUR {
+        assert_eq!(page(&fx, "lead", &format!("m{i}"))["sent"], true);
+    }
+    assert_eq!(
+        page(&fx, "lead", "m4")["code"],
+        "rate_limited",
+        "the hour has to be genuinely spent before the rewrite means anything"
+    );
+
+    // The adversarial write: valid JSON, an empty budget, nothing to fail.
+    std::fs::write(rate_snapshot(&fx.home), "{}").expect("blank the snapshot");
+    // …and the restart, which is what makes it work: memory no longer holds the
+    // spent count, so the daemon rebuilds it from the file it has just trusted.
+    budget::reset_for_test();
+
+    let out = page(&fx, "lead", "after a valid rewrite and a restart");
+
+    assert_eq!(
+        out["sent"], true,
+        "documented, ACCEPTED limitation — a valid rewrite plus a restart really \
+         does reset the window: {out}"
+    );
+    assert_eq!(
+        fx.rec.count(),
+        RATE_LIMIT_PER_HOUR + 1,
+        "the fourth page really left the daemon"
     );
     teardown(&fx);
 }

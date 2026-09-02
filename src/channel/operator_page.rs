@@ -23,12 +23,20 @@
 //! orchestrator's live name is admitted, by design.
 //!
 //! The controls that actually bound the damage are the ones that do not depend on
-//! identity at all: the switch is default-OFF and lives where an agent cannot
-//! write it, the budget is 3 per rolling hour, is seeded only by the operator and
-//! fails CLOSED, delivery is confined to the dedicated topic inside the
-//! allowlisted Telegram group, and the body is flattened to ONE line and then
-//! REFUSED outright if what is left still carries the daemon's own sender
-//! marker.
+//! identity at all AND do not live in an agent-writable file: the switch is
+//! default-OFF and lives where an agent cannot write it, delivery is confined to
+//! the dedicated topic inside the allowlisted Telegram group, every page is
+//! attributed and lands in front of the operator, and the body is flattened to
+//! ONE line and then REFUSED outright if what is left still carries the daemon's
+//! own sender marker.
+//!
+//! The 3-per-rolling-hour budget is deliberately NOT on that list. It is seeded
+//! only by the operator and fails CLOSED on a snapshot it cannot parse, which is
+//! real defence in depth against an accident, a clumsy reset and a crash — but
+//! its state lives in an agent-writable file, and a syntactically VALID rewrite
+//! plus a daemon restart resets the window with nothing able to prevent or detect
+//! it. The full shape × lifetime matrix, and why an integrity mechanism cannot
+//! help under one shared UID, are in [`budget`].
 //!
 //! Exactly what that flattening covers, and what it does not, because an earlier
 //! version of this paragraph claimed more than the code delivers:
@@ -487,7 +495,7 @@ pub(crate) fn handle_operator_page(
                 "error": format!("operator paging is unavailable — {reason}"),
                 "code": "budget_unavailable",
                 "cause": cause,
-                "hint": format!("the page was DROPPED. Only the operator can restore paging: re-run `agend-terminal admin config-set operator_page.enabled true`, which re-seeds $AGEND_HOME/operator_page_rate.json (repair or delete a corrupt snapshot first).{resets_the_hour} Under one shared OS user that file is not tamper-proof — what this buys is that tampering DENIES, is logged, and is recoverable only by the operator."),
+                "hint": format!("the page was DROPPED. Only the operator can restore paging: re-run `agend-terminal admin config-set operator_page.enabled true`, which re-seeds $AGEND_HOME/operator_page_rate.json (repair or delete a corrupt snapshot first).{resets_the_hour} Under one shared OS user that file is not tamper-proof: an ABSENT, CORRUPT, TRUNCATED or UNREADABLE snapshot denies and is logged, which is what you are seeing, but a syntactically VALID rewrite plus a restart resets the window and can be neither prevented nor detected. This cap bounds accident, not a hostile seat — see docs/architecture.md §1.2."),
             });
         }
     };

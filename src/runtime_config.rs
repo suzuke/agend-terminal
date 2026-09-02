@@ -534,6 +534,8 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
             // This command is the only operator-gated write of the switch, so it is
             // where the snapshot gets laid down. Seeding never clobbers an existing
             // snapshot, so re-running this to recover does not refund spent pages.
+            // What this does and does NOT cover — a valid rewrite plus a restart
+            // still resets the window — is the tamper matrix in that module.
             seed_operator_page_budget = config.operator_page.enabled;
         }
         "operator_page.topic_name" => {

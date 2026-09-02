@@ -120,7 +120,7 @@ Drain 或管理 caller 的 durable inbox。
   原本那條誠實的界線仍然成立：client 對長訊息 soft-wrap 時仍可能讓某個視覺行從內容中段開始，而內容本來就可以寫出其他「看起來像發件者」的文字。以上任何一項都沒有讓 page 變成無法被冒充。
 - **僅限 orchestrator，且綁定到「活的」instance。** 呼叫所帶的 `instance` 會先拿去 daemon 的 live registry 解析：沒有對應到任何執行中 instance（或對應到兩個）的名字以 `unknown_caller` 拒絕；同時屬於兩個 team 的呼叫者以 `ambiguous_team` 拒絕（而不是拿 map 順序亂猜）；不是所屬 team 現任 orchestrator 的以 `not_orchestrator` 拒絕並告知該找誰轉送。沒有 daemon runtime 的 standalone bridge 呼叫無從解析，以 `no_live_identity` 拒絕。
 
-  誰都別騙自己：所有 agent 與 daemon 共用**同一個 OS 使用者**，所以拿 orchestrator 活著的名字來呼叫的座位**依設計會被放行**。這道 gate 擋的是「指向不存在之物的名字」，擋不住「說謎的座位」。真正限住損害的是下面這些：預設關閉、只有 operator 能開的開關、每小時 3 則、單一專用 topic（仍在 allowlist 群組內），以及 fail-closed 的額度狀態。
+  誰都別騙自己：所有 agent 與 daemon 共用**同一個 OS 使用者**，所以拿 orchestrator 活著的名字來呼叫的座位**依設計會被放行**。這道 gate 擋的是「指向不存在之物的名字」，擋不住「說謎的座位」。真正限住損害的是下面這些——而且只有「不放在 agent 寫得了的檔案裡」的控制才算數：預設關閉、只有 operator 能開的開關、單一專用 topic（仍在 allowlist 群組內），以及每一則 page 都掛著呼叫者名字、直接送到 operator 眼前。每小時 3 則的上限刻意**不**列在這裡：它限住的是意外與失控，不是有敵意的座位（見下面的額度那一條）。
 - **預設關閉，且開關只有 operator 能動。** 開關位於 daemon 的 runtime config；`config` MCP tool 只能讀、不能寫（`set` 於 #2548 移到 CLI）。operator 以下列指令開啟：
 
   ```
@@ -129,15 +129,22 @@ Drain 或管理 caller 的 durable inbox。
 
   目的地 topic 則以 `agend-terminal admin config-set operator_page.topic_name <NAME>` 設定（預設 `operator-notifications`）。`fleet.yaml` 裡的 `channel.operator_page` 區塊已完全不再讀取：fleet.yaml 是 agent 寫得了的檔案，把總開關放在那裡等於讓被管的人自己控開關。Telegram 本身仍需要 `fleet.yaml` 的 `channel.user_allowlist`——沒有它 outbound 一律 fail-closed。
 - **必須是 Telegram。** 這個工具存在的目的是送到 operator 的**手機**：已授權的 Discord channel 不算數；無法送達 telegram 的呼叫以 `not_delivered` 拒絕，且**不消耗**額度。
-- **每位 orchestrator 每滾動小時上限 3 則。** 超出的直接**丟棄**、不排隊；拒絕回應帶有 `retry_after_secs`，呼叫者應改把 milestone 寫進 `SESSION-HANDOFF.md`。計數器以 daemon 記憶體（加鎖）為權威，快照寫到 `$AGEND_HOME/operator_page_rate.json`，以保證重啟不會退款。
+- **每位 orchestrator 每滾動小時上限 3 則。** 超出的直接**丟棄**、不排隊；拒絕回應帶有 `retry_after_secs`，呼叫者應改把 milestone 寫進 `SESSION-HANDOFF.md`。計數器以 daemon 記憶體（加鎖）為權威，快照寫到 `$AGEND_HOME/operator_page_rate.json`，以保證**誠實的**重啟不會退款。至於有敵意的改寫在重啟之後還能做什麼，下面會完整講明。
 
   **快照由 operator 種下，daemon 不會自己造。** `agend-terminal admin config-set operator_page.enabled true` 會在快照不存在時放一個空的（已存在則完全不動，所以重跑這道指令不會退還已用掉的額度）。daemon 拒絕自己補檔：啟動時快照**不存在**的處理方式與「壞掉」完全相同——拒絕。這堵住的正是一個繞道：先刪掉檔案再逼 daemon 重啟，舊設計會以空額度重新初始化，等於把「每小時 3 則」變成「每次重啟 3 則」。
 
   所有不可信狀態一律以 `budget_unavailable` 拒絕（與 `rate_limited` 明確區分），並附上 `cause` 指出是哪一種：`snapshot_absent`、`snapshot_corrupt`、`snapshot_missing`（daemon 執行中被刪）、`snapshot_unusable`、`snapshot_unwritable`。**每一種的解法都是請 operator 重跑那道 enable 指令**來重新種下快照；快照壞掉的情況要先修好或刪掉。
 
-  **執行這道解法之前，先知道它的代價。** 對 `snapshot_absent` 與 `snapshot_corrupt` 來說，daemon 已經不再持有這個 home 的已用次數——它跟著快照一起被毀掉了——所以重新種下的是一份空的計數器，等於**重新開始一個滾動小時**：當前這個小時裡已經用掉的 page 會被遺忘，呼叫者拿回完整額度。拒絕訊息的 hint 會在 operator 動手之前把這件事講明，種快照本身也會以 `warn!` 記下快照路徑。至於 `snapshot_missing` 與 `snapshot_unwritable`，記憶體裡仍有真實的已用次數，重新種下時會把它寫回去，小時不會被重置；這兩種的 hint 不會帶這段警告。這段話**不是**在宣稱快照防得了竄改——見下一段。它只是 tamper-EVIDENT，而且重置一定要經過一個明確的人為動作。
+  **執行這道解法之前，先知道它的代價。** 對 `snapshot_absent` 與 `snapshot_corrupt` 來說，daemon 已經不再持有這個 home 的已用次數——它跟著快照一起被毀掉了——所以重新種下的是一份空的計數器，等於**重新開始一個滾動小時**：當前這個小時裡已經用掉的 page 會被遺忘，呼叫者拿回完整額度。拒絕訊息的 hint 會在 operator 動手之前把這件事講明，種快照本身也會以 `warn!` 記下快照路徑。至於 `snapshot_missing` 與 `snapshot_unwritable`，記憶體裡仍有真實的已用次數，重新種下時會把它寫回去，小時不會被重置；這兩種的 hint 不會帶這段警告。這段話**不是**在宣稱快照防得了竄改——見下一段。真正看得出被動過的只有「不存在、壞掉、被截斷、讀不到」這四種形狀，而這道 operator 解法是給這四種與意外用的。
 
-  話說清楚：所有 agent 與 daemon 共用**同一個 OS 使用者**，所以這個檔案**不是防竄改的**，agent 隨時刪得掉。這個設計換到的是：竄改只會導致**拒絕**、會連同快照路徑寫進 log、而且只有 operator 的指令能救回來。Agent 可以讓自己的 pager 靜音，但**自己**拿不回額度——唯一回到滿額度的路徑要經過上面那道 operator 指令，而該指令現在會在執行前就講明它會重開一個滾動小時。
+  **這個持久化計數器擋得住什麼、擋不住什麼。** 這一段的前一個版本宣稱得太多，PRIMARY reviewer 用一個能跑的重現把它推翻了，所以現在改成「竄改形狀 × 行程生命週期」的矩陣來講，而不是喊口號。
+
+  - **擋得住。** daemon **執行中**時每一種形狀都是關著的：計數器在記憶體裡、加了鎖，而且 claim 路徑根本不會去讀檔案取數字，所以檔案裡寫什麼都不影響。**誠實的**重啟會保留已用掉的滾動小時。重啟之後，快照若**不存在、壞掉、被截斷或讀不到**，一律 **fail closed**——以 `budget_unavailable` 加上 `cause` 拒絕（與一般的 `rate_limited` 明確可分），並連同快照路徑寫進 log。快照**寫不進去**時同樣拒絕，並把該次 claim 回滾，而不是放一則沒被計數的 page 出去。這是針對**意外、笨拙的重置與 crash** 的縱深防禦。
+  - **擋不住，直說。** 重啟之後，只要快照**解析得過**，daemon 就會信它，不管內容是什麼。已經用掉 orchestrator 三則額度的 agent，可以把檔案覆寫成合法的 `{}`——或只刪掉某一位 orchestrator 的戳記、或把一份較舊的誠實快照放回去——然後在下一次 daemon 重啟後繼續發 page。這**確實**會把視窗重置。而且在共用同一個 UID、檔案又是 agent 寫得了的前提下，這既**擋不住也偵測不到**：daemon 開機時讀得到、用來驗 MAC 的任何金鑰，agent 一樣讀得到，也就能自己對 `{}` 算出合法的 MAC——偵測失效的理由和防護失效的理由完全一樣。見 [architecture.md §1.2](architecture.zh-TW.md#12-共用-uid-信任模型)。
+  - **「每次重啟都 fail closed」這個選項評估過，被否決了。** 每次 daemon 啟動都不還原剩餘額度，確實能讓「竄改只會導致拒絕」變成字面上為真。但這個部署的 event log 顯示 2026-08-24 到 2026-09-02 之間有 40 次 `daemon_start`——大約每 5.5 小時一次——那等於**有大約 18% 的時間 operator 根本收不到 page**，而這個功能存在的理由就是在他睡覺時把他叫醒。它同時把「攻擊者多拿三則 page」換成「攻擊者**或任何一次 crash** 就能讓 operator 的手機安靜一小時」；對一個**告警**功能來說，被壓下去比送太多更糟。
+  - **所以**，這個持久化的「每小時 3 則」上限**不是**獨立的 same-UID 損害邊界，也不准被說成是。它限住的是意外與非敵意的重置。真正對抗敵意座位的控制，列在上面「僅限 orchestrator」那一條裡。
+
+  當初 operator 提的需求——計數器必須撐過 daemon 重啟，否則重啟本身就是繞道——仍然成立。被撤回的是更強的那句：「有敵意的 agent 沒辦法自己把額度補滿」。
 - **路由。** 訊息送到專用的 forum topic（預設 `operator-notifications`），首次使用時自動建立並註冊，讓所有 page 集中在一個 operator 可以靜音的地方。若該 topic 無法建立，則退回發送者自己的 topic——兩者都在同一個 allowlist 群組內。
 - **operator 的 Away/Sleep 模式不會抑制 page。** 這是刻意的：這個功能存在的原因，正是 operator 在睡覺而且要求 milestone 要叫醒他。控制 page 的是 `enabled` 開關（總開關）與每小時上限，而不是 mode；一般 daemon 通知仍照舊受 mode 管制。
 

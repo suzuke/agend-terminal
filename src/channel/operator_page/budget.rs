@@ -11,8 +11,9 @@
 //!
 //! **Why that is enough within one process.** Because memory is authoritative,
 //! deleting or editing the snapshot can never GRANT a slot to a running daemon.
-//! The only thing tampering can do is put the budget into a state the daemon will
-//! not vouch for — and that state DENIES.
+//! While this process lives, the only thing tampering can do is put the budget
+//! into a state the daemon will not vouch for — and that state DENIES. Across a
+//! RESTART the picture is different, and the matrix below states it exactly.
 //!
 //! **Initialisation is an OPERATOR act.** The first version of this module
 //! treated an ABSENT snapshot at initialisation as a genuinely fresh deployment
@@ -25,14 +26,76 @@
 //! true` → [`seed_snapshot`]), and an ABSENT snapshot at initialisation is
 //! POISON, exactly like a corrupt one.
 //!
-//! **What that buys, stated without inflation.** It does NOT make the snapshot
-//! tamper-proof: under one shared OS user nothing on disk is, and an agent can
-//! still delete the file at any moment. What it buys is that deleting it can only
-//! ever DENY — noticed at claim time (missing) or after a restart (absent), the
-//! answer is the same refusal, logged with the path — and that the only way back
-//! is the operator re-running the enable command. Deletion is therefore
-//! DETECTABLE and RECOVERABLE ONLY BY THE OPERATOR. An agent can silence its own
-//! pager; it can never refill the hour by itself.
+//! # The tamper matrix: shape × process lifetime
+//!
+//! Two tampering shapes have now been proved against this module by review —
+//! delete-plus-restart, then a syntactically VALID rewrite plus restart. Fixing
+//! a third cell would just invite a fourth, so what follows is the general RULE
+//! and the whole class.
+//!
+//! **The rule.** In a LIVE process every shape is CLOSED, because memory is
+//! authoritative and the claim path never consults the file for a count. After a
+//! RESTART memory is gone and the file is the only witness, so one question
+//! decides everything: do the bytes PARSE as `BTreeMap<String, Vec<i64>>`?
+//!
+//!   * ABSENT, UNPARSEABLE or UNREADABLE ⇒ the daemon refuses to invent a count
+//!     and fails CLOSED ([`ClaimError::Unavailable`], with a `cause`).
+//!   * PARSEABLE ⇒ the daemon TRUSTS it, whatever it says. There is no integrity
+//!     check and there cannot be a meaningful one here (below), so EVERY
+//!     parseable rewrite is an ACCEPTED limitation, not a defect to fix.
+//!
+//! | shape on disk | while the daemon runs | after a restart |
+//! |---|---|---|
+//! | deleted | CLOSED — `snapshot_missing` denies | CLOSED — `snapshot_absent` denies |
+//! | corrupt / unparseable | CLOSED — never read for a count | CLOSED — `snapshot_corrupt` denies |
+//! | truncated | CLOSED — never read for a count | CLOSED — unparseable ⇒ `snapshot_corrupt` |
+//! | unreadable (e.g. path replaced by a directory) | CLOSED — never read for a count | CLOSED — `snapshot_unusable` denies |
+//! | unwritable (the persist fails) | CLOSED — claim rolled back, `snapshot_unwritable` denies | CLOSED — identical |
+//! | rewritten to a valid `{}` | CLOSED — memory is authoritative | **ACCEPTED** — the hour IS refilled |
+//! | PARTIAL valid rewrite (one orchestrator's stamps dropped) | CLOSED — memory is authoritative | **ACCEPTED** — that orchestrator's hour IS refilled |
+//! | STALE honest snapshot restored | CLOSED — memory is authoritative | **ACCEPTED** — the older count is believed |
+//! | future-dated stamps | CLOSED — memory is authoritative | CLOSED — future stamps are KEPT, not pruned, so they still occupy the hour |
+//!
+//! Every CLOSED cell has a test and every ACCEPTED cell has an honestly named
+//! pin, which must be INVERTED rather than deleted if this ever changes. The
+//! live column is `every_tampering_shape_is_closed_while_the_process_lives`; the
+//! restart column is `restart_with_absent_or_unparseable_state_fails_closed` and
+//! `restart_with_any_parseable_rewrite_is_trusted_by_design`, plus
+//! `valid_snapshot_rewrite_plus_restart_refills_the_hour_by_design` driving the
+//! real MCP entry in `operator_page/tests.rs`.
+//!
+//! **Why there is no integrity mechanism — and why DETECTION fails too.** Signing
+//! the snapshot needs a key the daemon can read at boot with no operator present.
+//! Per `docs/architecture.md` §1.2 a hostile same-UID seat can already read
+//! same-owner credentials and rewrite same-owner runtime state, so it can read
+//! that key and MAC `{}` itself. Detection fails for exactly the reason
+//! prevention does: a forged record is indistinguishable from an honest one.
+//!
+//! **Why not fail CLOSED at every restart instead** — restore no remaining budget
+//! and treat the hour as spent after each daemon start? That would make
+//! "tampering can only deny" literally true. It is rejected on evidence. This
+//! deployment's event log carries 40 `daemon_start` events between 2026-08-24 and
+//! 2026-09-02, one every ~5.5 hours; blanking paging for up to an hour after each
+//! leaves the operator unpageable roughly 18% of the time, in a feature whose
+//! whole purpose is reaching them overnight. It also converts "an attacker gains
+//! three extra pages" into "an attacker OR ANY CRASH silences the operator's
+//! phone for an hour", and for an ALERTING feature suppression is the worse
+//! failure mode. Under §1.2 an agent seat is trusted code running as the
+//! operator's own OS user: this cap's job is to bound ACCIDENT and runaway, not
+//! malice.
+//!
+//! **So, plainly.** The persisted 3/hour cap is NOT an independent same-UID
+//! damage bound and must not be described as one. It is defence in depth against
+//! an accident, a clumsy reset and a crash. What bounds a hostile seat is the set
+//! of controls that do not live in an agent-writable file: default-OFF, the
+//! operator-gated switch, the dedicated topic, and the fact that every page is
+//! attributed and lands in front of the operator.
+//!
+//! **What is NOT withdrawn.** The original operator requirement — the counter
+//! must survive a daemon restart, or the restart itself becomes the bypass — is
+//! still met: an honest restart preserves the spent hour. What is withdrawn is
+//! the STRONGER claim this module added on top, that a hostile agent cannot
+//! refill the hour by itself. That one was false, and it is gone.
 //!
 //! **What the operator's remedy costs, said out loud.** Re-seeding after a
 //! snapshot that was ABSENT or CORRUPT at initialisation writes `{}` and hands
@@ -152,6 +215,13 @@ fn persist(path: &Path, stamps: &BTreeMap<String, Vec<i64>>) -> anyhow::Result<(
 /// too: initialisation does NOT lay a snapshot down. Only the operator does, via
 /// [`seed_snapshot`] on the enable command. Starting empty here is what let an
 /// agent refill the hour by deleting the file and forcing a restart.
+///
+/// This function is the whole PARSEABLE ⇒ TRUSTED half of the module header's
+/// matrix, and it carries NO integrity check by design: any well-formed map is
+/// believed, `{}` included. A MAC would be verified with a key a same-UID agent
+/// can read and forge with, so it would stop nobody while adding the appearance
+/// of a control. Deletion, corruption, truncation and unreadability are the only
+/// tamper shapes anything here can catch — and all four deny.
 fn ensure_init(state: &mut Budget, home: &Path) {
     if state.initialised && state.home == home {
         return;
@@ -217,10 +287,13 @@ fn ensure_init(state: &mut Budget, home: &Path) {
 /// distinguishes that from a fresh install, and it costs an operator act at both
 /// ends.
 ///
-/// The honest limit is the same one the module header states: under one shared OS
-/// user this file is not tamper-proof. Where the in-memory count is gone too —
-/// absent or corrupt at initialisation, or a restart before the first claim —
-/// re-seeding genuinely DOES start the rolling hour over. That is accepted (only
+/// The honest limit is the same one the module header's matrix states: under one
+/// shared OS user this file is not tamper-proof, and only the ABSENT, CORRUPT,
+/// TRUNCATED and UNREADABLE shapes are even tamper-EVIDENT — a parseable rewrite
+/// is not, so this operator remedy is the answer to the evident shapes and to
+/// accidents, not a control against a hostile seat. Where the in-memory count is
+/// gone too — absent or corrupt at initialisation, or a restart before the first
+/// claim — re-seeding genuinely DOES start the rolling hour over. That is accepted (only
 /// an operator can do it, and the default is to deny), but it is never silent: it
 /// is logged at `warn!` here, and the refusal that sent the operator to this
 /// command says so before they run it.
@@ -502,8 +575,10 @@ mod tests {
     /// hour. This pins both ends of that: a genuine FIRST seed says nothing about a
     /// reset, and a RE-seed after the count was lost warns.
     ///
-    /// Nothing here makes the snapshot tamper-proof. Under one shared OS user it is
-    /// tamper-EVIDENT, and the reset costs a deliberate human act.
+    /// Nothing here makes the snapshot tamper-proof, and only the ABSENT, CORRUPT,
+    /// TRUNCATED and UNREADABLE shapes are tamper-EVIDENT at all (module header
+    /// matrix). This operator-gated reset is the remedy for those and for
+    /// accidents; it is not a control against a hostile seat.
     #[test]
     #[serial]
     #[tracing_test::traced_test]
@@ -546,8 +621,15 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// The in-memory budget is the authority: rewriting the snapshot with an empty
-    /// map does NOT hand back a spent slot.
+    /// LIVE PROCESS ONLY. While this daemon runs, memory is the authority, so
+    /// rewriting the snapshot with an empty map does NOT hand back a spent slot.
+    ///
+    /// That is the whole of what this pins, and it must not be read as more. The
+    /// SAME rewrite followed by a RESTART does refill the hour — the accepted
+    /// limitation in the module header's matrix, pinned by
+    /// [`restart_with_any_parseable_rewrite_is_trusted_by_design`] below and by
+    /// `valid_snapshot_rewrite_plus_restart_refills_the_hour_by_design` at the
+    /// real MCP entry.
     #[test]
     #[serial]
     fn editing_the_snapshot_cannot_grant_a_slot() {
@@ -604,6 +686,208 @@ mod tests {
             claim(&home, "lead", 1_000),
             Err(ClaimError::Unavailable { .. })
         ));
+        reset_for_test();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── the tamper matrix (module header) ────────────────────────────────
+    //
+    // Two review rounds each proved ONE tampering shape (delete+restart, then a
+    // valid rewrite+restart). These three cases replace cell-by-cell whack-a-mole
+    // with the class: every shape below is exercised in BOTH lifetime columns,
+    // and each cell is either CLOSED with an assertion or ACCEPTED with a pin.
+
+    /// One on-disk tampering shape. `Unwritable` is not a content shape and is
+    /// pinned separately by [`an_unwritable_snapshot_denies_and_rolls_the_claim_back`].
+    #[derive(Clone, Copy, Debug)]
+    enum Shape {
+        Deleted,
+        Corrupt,
+        Truncated,
+        /// The snapshot path replaced by a DIRECTORY. Portable and uid-proof
+        /// (a `chmod 000` test is a no-op for root, which CI containers often
+        /// are), and it makes both the read and the rename fail.
+        Unreadable,
+        EmptyRewrite,
+        /// One orchestrator's stamps removed, another's kept — still valid JSON.
+        PartialRewrite,
+        /// An older HONEST snapshot put back, taken before the hour was spent.
+        StaleRestore,
+        FutureDated,
+    }
+
+    const SHAPES: [Shape; 8] = [
+        Shape::Deleted,
+        Shape::Corrupt,
+        Shape::Truncated,
+        Shape::Unreadable,
+        Shape::EmptyRewrite,
+        Shape::PartialRewrite,
+        Shape::StaleRestore,
+        Shape::FutureDated,
+    ];
+
+    fn apply(shape: Shape, path: &Path, now: i64) {
+        match shape {
+            Shape::Deleted => std::fs::remove_file(path).expect("delete the snapshot"),
+            Shape::Corrupt => std::fs::write(path, "not json at all").expect("corrupt it"),
+            // A prefix of a real snapshot: still bytes, no longer JSON.
+            Shape::Truncated => std::fs::write(path, "{\n  \"lead\": [1").expect("truncate it"),
+            Shape::Unreadable => {
+                std::fs::remove_file(path).expect("clear the snapshot");
+                std::fs::create_dir(path).expect("replace the snapshot with a directory");
+            }
+            Shape::EmptyRewrite => std::fs::write(path, "{}").expect("blank it"),
+            Shape::PartialRewrite => {
+                std::fs::write(path, serde_json::json!({ "other": [now] }).to_string())
+                    .expect("drop lead's stamps, keep another orchestrator's")
+            }
+            Shape::StaleRestore => {
+                std::fs::write(path, serde_json::json!({ "lead": [now] }).to_string())
+                    .expect("restore an older honest snapshot")
+            }
+            Shape::FutureDated => std::fs::write(
+                path,
+                serde_json::json!({ "lead": [now + 9_000, now + 9_001, now + 9_002] }).to_string(),
+            )
+            .expect("write future-dated stamps"),
+        }
+    }
+
+    /// Seed `home`, spend `lead`'s whole hour, then apply `shape`.
+    fn spent_home_with(shape: Shape, tag: &str) -> PathBuf {
+        let home = tmp_home(tag);
+        seed_snapshot(&home, false).expect("operator seeds the snapshot");
+        for _ in 0..RATE_LIMIT_PER_HOUR {
+            assert!(claim(&home, "lead", 1_000).is_ok(), "{shape:?}");
+        }
+        apply(shape, &snapshot_path(&home), 1_000);
+        home
+    }
+
+    /// MATRIX, LIVE COLUMN — every shape is CLOSED, and this is a general
+    /// argument rather than eight coincidences: the claim path never consults the
+    /// file for a count while the process is initialised for the home, so what the
+    /// bytes say cannot matter. The only thing a shape can change is WHICH refusal
+    /// comes back (a deletion is noticed by the existence probe and escalates to
+    /// `snapshot_missing`); none of them can turn a refusal into a grant.
+    #[test]
+    #[serial]
+    fn every_tampering_shape_is_closed_while_the_process_lives() {
+        for shape in SHAPES {
+            reset_for_test();
+            let home = spent_home_with(shape, "live-matrix");
+            match claim(&home, "lead", 1_000) {
+                Err(ClaimError::RateLimited { .. }) => {}
+                Err(ClaimError::Unavailable { cause, .. }) => assert_eq!(
+                    cause, "snapshot_missing",
+                    "only a DELETED snapshot is noticed on the live claim path: {shape:?}"
+                ),
+                Ok(_) => panic!("{shape:?} must not grant a slot while the process lives"),
+            }
+            reset_for_test();
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+
+    /// MATRIX, RESTART COLUMN — the CLOSED half. After a restart the file is the
+    /// only witness left, and a daemon that cannot PARSE one refuses to invent a
+    /// count. Absent, corrupt, truncated and unreadable therefore all deny, each
+    /// with its own cause so the operator can tell them apart.
+    #[test]
+    #[serial]
+    fn restart_with_absent_or_unparseable_state_fails_closed() {
+        for (shape, expected) in [
+            (Shape::Deleted, "snapshot_absent"),
+            (Shape::Corrupt, "snapshot_corrupt"),
+            (Shape::Truncated, "snapshot_corrupt"),
+            (Shape::Unreadable, "snapshot_unusable"),
+        ] {
+            reset_for_test();
+            let home = spent_home_with(shape, "restart-closed");
+            // The restart: memory is gone, so the file decides.
+            reset_for_test();
+            match claim(&home, "lead", 1_000) {
+                Err(ClaimError::Unavailable { cause, .. }) => assert_eq!(
+                    cause, expected,
+                    "{shape:?} must deny after a restart with its own cause"
+                ),
+                _ => panic!("{shape:?} must fail CLOSED after a restart"),
+            }
+            reset_for_test();
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+
+    /// MATRIX, RESTART COLUMN — the ACCEPTED half, named so it can never be
+    /// mistaken for a security control that passes.
+    ///
+    /// Anything that PARSES is TRUSTED after a restart, whatever it says. The only
+    /// defence against a rewrite was "memory is authoritative", and memory dies
+    /// with the process; the file carries no integrity material because any key
+    /// this daemon can read at boot is readable — and forgeable — by a same-UID
+    /// agent (`docs/architecture.md` §1.2). So a spent hour really is refilled by
+    /// a blank rewrite, by a partial one, and by restoring an older honest file.
+    /// This is the DOCUMENTED, ACCEPTED limitation of the persisted cap: it bounds
+    /// accident and runaway, not a hostile seat.
+    ///
+    /// IF AN INTEGRITY MECHANISM IS EVER ADDED, INVERT THIS TEST — do not delete
+    /// it. The assertion that a rewrite is trusted is exactly the thing that would
+    /// have to start failing.
+    #[test]
+    #[serial]
+    fn restart_with_any_parseable_rewrite_is_trusted_by_design() {
+        for shape in [
+            Shape::EmptyRewrite,
+            Shape::PartialRewrite,
+            Shape::StaleRestore,
+        ] {
+            reset_for_test();
+            let home = spent_home_with(shape, "restart-accepted");
+            reset_for_test();
+            assert!(
+                claim(&home, "lead", 1_000).is_ok(),
+                "{shape:?} plus a restart DOES refill the hour — accepted, not fixed"
+            );
+            reset_for_test();
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        // The one parseable shape that buys nothing: stamps dated in the FUTURE
+        // are kept rather than pruned, so "write the hour forward" stays closed.
+        reset_for_test();
+        let home = spent_home_with(Shape::FutureDated, "restart-future");
+        reset_for_test();
+        assert!(
+            matches!(
+                claim(&home, "lead", 1_000),
+                Err(ClaimError::RateLimited { .. })
+            ),
+            "future-dated stamps must still occupy the hour after a restart"
+        );
+        reset_for_test();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// MATRIX: the UNWRITABLE cell, which behaves identically in both columns. A
+    /// counter this process cannot snapshot is a counter the next process would
+    /// not see, which is precisely the bypass the snapshot exists to prevent — so
+    /// the claim is rolled back and refused rather than let through uncounted.
+    #[test]
+    #[serial]
+    fn an_unwritable_snapshot_denies_and_rolls_the_claim_back() {
+        reset_for_test();
+        let home = tmp_home("unwritable");
+        seed_snapshot(&home, false).expect("operator seeds the snapshot");
+        crate::store::fail_next_atomic_write_for_test(&snapshot_path(&home));
+        match claim(&home, "lead", 1_000) {
+            Err(ClaimError::Unavailable { cause, .. }) => assert_eq!(cause, "snapshot_unwritable"),
+            _ => panic!("a snapshot that cannot be written must deny"),
+        }
+        assert!(
+            claim(&home, "lead", 1_000).is_ok(),
+            "the refused claim must have been rolled back, not silently spent"
+        );
         reset_for_test();
         std::fs::remove_dir_all(&home).ok();
     }
