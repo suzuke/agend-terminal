@@ -39,7 +39,7 @@ const SSE_READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// A fresh-restart self-kick must prove consumer admission promptly. This is
 /// deliberately a bounded ambiguity window, not a retry timer: accepted
 /// without an exact consumer ack is never resent automatically.
-const SELF_KICK_ACK_WINDOW: Duration = Duration::from_secs(30);
+pub(crate) const SELF_KICK_ACK_WINDOW: Duration = Duration::from_secs(30);
 const HTTP_PATH: &str = "/webhook";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,6 +433,7 @@ impl ChannelRuntime {
     /// compare-and-append receipt transition is intentionally separate from
     /// `remember_reply`: it emits no reply event and no SSE notification.
     fn acknowledge_self_kick(&self, delivery_id: Uuid) -> anyhow::Result<DeliveryReceipt> {
+        let now = Utc::now();
         let (store, envelope, mut current) = self.self_kick_receipt(delivery_id)?;
         if current.state == DeliveryState::TurnStarted {
             return Ok(current);
@@ -480,16 +481,53 @@ impl ChannelRuntime {
         ) {
             anyhow::bail!("self-kick delivery is not protocol-accepted")
         }
+        // t-…-82348-105: a truthful ack that arrives AFTER the watchdog gave
+        // up. The `AckOverdue` receipt still carries the ACCEPTED timestamp
+        // (the watchdog transitions state in place and never restamps
+        // `recorded_at`), so the overshoot past the window is computable here
+        // and nowhere else downstream. Recorded as additive audit metadata —
+        // the admissible `AckOverdue -> TurnStarted` transition is unchanged.
+        let late_by_secs = (current.state == DeliveryState::AckOverdue)
+            .then(|| self_kick_ack_elapsed(&current.recorded_at, now))
+            .flatten()
+            .map(|elapsed| {
+                (elapsed.as_secs() as i64 - SELF_KICK_ACK_WINDOW.as_secs() as i64).max(0)
+            });
         let mut started = DeliveryReceipt::for_state(&envelope, DeliveryState::TurnStarted);
         started.protocol_request_id = current
             .protocol_request_id
             .or_else(|| Some(delivery_id.to_string()));
         started.backend_session_id = Some(self.session_id.clone());
-        started.backend_event = Some("claude_channel_turn_started".to_string());
-        started.detail = Some("consumer acknowledged exact self-kick delivery_id".to_string());
+        started.backend_event = Some(
+            if late_by_secs.is_some() {
+                "claude_channel_turn_started_late"
+            } else {
+                "claude_channel_turn_started"
+            }
+            .to_string(),
+        );
+        started.late_ack_secs = late_by_secs;
+        started.detail = Some(match late_by_secs {
+            Some(late) => format!(
+                "consumer acknowledged exact self-kick delivery_id {late}s after the {:?} ack window closed",
+                SELF_KICK_ACK_WINDOW
+            ),
+            None => "consumer acknowledged exact self-kick delivery_id".to_string(),
+        });
         let mut expected = current.state;
         loop {
             if store.record_if_latest_state(delivery_id, expected, started.clone())? {
+                if let Some(late) = late_by_secs {
+                    crate::event_log::log(
+                        &self.home,
+                        "claude_self_kick_ack_late",
+                        &self.instance,
+                        &format!(
+                            "agent {} delivery {delivery_id} late by {late}s past the {:?} ack window; the earlier AckOverdue is resolved",
+                            self.instance, SELF_KICK_ACK_WINDOW
+                        ),
+                    );
+                }
                 return Ok(started);
             }
             let latest = store
@@ -1343,8 +1381,6 @@ fn self_kick_ack_elapsed(recorded_at: &str, now: DateTime<Utc>) -> Option<Durati
 /// from "the turn started but the ack protocol was not followed". Supplied by
 /// the daemon-side caller, which owns the agent registry; the transport never
 /// reads screen or hook state itself.
-// RED scaffolding: read by the GREEN commit's notice builder.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TurnObservation {
     /// Seconds between the bridge's acceptance and the observed turn.
@@ -1355,8 +1391,6 @@ pub(crate) struct TurnObservation {
 /// durable state transition and the escalation-channel/event-log record; the
 /// per-tick handler owns the operator-facing inbox notice, because that is
 /// the layer that holds the fleet, the recipient and the agent registry.
-// RED scaffolding: read by the GREEN commit's per-tick notice emitter.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SelfKickOutcome {
     pub delivery_id: Uuid,
@@ -1367,8 +1401,6 @@ pub(crate) struct SelfKickOutcome {
     pub kind: SelfKickOutcomeKind,
 }
 
-// RED scaffolding: `AckLate` is constructed by the GREEN commit.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SelfKickOutcomeKind {
     /// The acknowledgement window closed with no `ack_start`. Emitted at most
@@ -1392,56 +1424,102 @@ fn self_kick_watchdog_pass_at(
     now: DateTime<Utc>,
     observe: &dyn Fn(DateTime<Utc>) -> Option<TurnObservation>,
 ) -> anyhow::Result<Vec<SelfKickOutcome>> {
-    let _ = observe;
     let store = ReceiptStore::for_instance(home, instance)?;
     let mut outcomes = Vec::new();
     for (envelope, current) in store.pending_deliveries()? {
-        if !envelope.self_kick
-            || current.state != DeliveryState::ProtocolAccepted
-            || self_kick_ack_elapsed(&current.recorded_at, now)
-                .is_none_or(|elapsed| elapsed < SELF_KICK_ACK_WINDOW)
-        {
+        if !envelope.self_kick {
             continue;
         }
-        let accepted_at = DateTime::parse_from_rfc3339(&current.recorded_at)
+        let recorded_at = DateTime::parse_from_rfc3339(&current.recorded_at)
             .map(|at| at.with_timezone(&Utc))
             .unwrap_or(now);
-        let mut overdue = current.clone();
-        overdue.state = DeliveryState::AckOverdue;
-        overdue.backend_event = Some("claude_channel_self_kick_ack_timeout".to_string());
-        overdue.detail = Some(format!(
-            "ProtocolAccepted but no exact consumer ack within {:?}; no automatic retry; inspect the agent and reconcile delivery {}",
-            SELF_KICK_ACK_WINDOW, envelope.delivery_id
-        ));
-        if !store.record_if_latest_state(
-            envelope.delivery_id,
-            DeliveryState::ProtocolAccepted,
-            overdue,
-        )? {
-            continue;
+        match current.state {
+            DeliveryState::ProtocolAccepted => {
+                if self_kick_ack_elapsed(&current.recorded_at, now)
+                    .is_none_or(|elapsed| elapsed < SELF_KICK_ACK_WINDOW)
+                {
+                    continue;
+                }
+                let mut overdue = current.clone();
+                overdue.state = DeliveryState::AckOverdue;
+                overdue.backend_event = Some("claude_channel_self_kick_ack_timeout".to_string());
+                overdue.detail = Some(format!(
+                    "ProtocolAccepted but no exact consumer ack within {:?}; no automatic retry; inspect the agent and reconcile delivery {}",
+                    SELF_KICK_ACK_WINDOW, envelope.delivery_id
+                ));
+                // The CAS is the exactly-once latch: only the pass that moves
+                // ProtocolAccepted -> AckOverdue may alert.
+                if !store.record_if_latest_state(
+                    envelope.delivery_id,
+                    DeliveryState::ProtocolAccepted,
+                    overdue,
+                )? {
+                    continue;
+                }
+                // Evidence, not a transition: whether the caller saw a
+                // hook-authority turn after the bridge accepted the delivery.
+                // It never influences the state machine — it only tells the
+                // operator which of the two failures this is.
+                let turn = observe(recorded_at);
+                let alert = format!(
+                    "[claude-self-kick] {} accepted delivery {} but received no exact consumer ack within {:?}; state=AckOverdue; no automatic retry — inspect the agent and reconcile manually",
+                    instance, envelope.delivery_id, SELF_KICK_ACK_WINDOW
+                );
+                let channels = crate::channel::notify_all_escalation_channels(
+                    instance,
+                    crate::channel::NotifySeverity::Error,
+                    &alert,
+                    false,
+                );
+                tracing::warn!(agent = %instance, delivery_id = %envelope.delivery_id, "{alert}");
+                crate::event_log::log(
+                    home,
+                    "claude_self_kick_ack_overdue",
+                    instance,
+                    &format!(
+                        "{alert} notified_channels={channels} accepted_at={} turn_observed_since_kick={}{}",
+                        current.recorded_at,
+                        turn.is_some(),
+                        turn.map(|t| format!(
+                            " turn_observed_after_accept_s={}",
+                            t.after_accept_secs
+                        ))
+                        .unwrap_or_default()
+                    ),
+                );
+                outcomes.push(SelfKickOutcome {
+                    delivery_id: envelope.delivery_id,
+                    at: recorded_at,
+                    kind: SelfKickOutcomeKind::AckOverdue { turn },
+                });
+            }
+            DeliveryState::TurnStarted => {
+                // A late ack left a typed marker (`late_ack_secs`). Clear it
+                // with a STATE-PRESERVING compare-and-append so the
+                // reconciliation is reported exactly once per delivery, and
+                // durably so across a daemon restart.
+                let Some(late_by_secs) = current.late_ack_secs else {
+                    continue;
+                };
+                let mut reconciled = current.clone();
+                reconciled.late_ack_secs = None;
+                reconciled.backend_event =
+                    Some("claude_channel_turn_started_late_reconciled".to_string());
+                if !store.record_if_latest_state(
+                    envelope.delivery_id,
+                    DeliveryState::TurnStarted,
+                    reconciled,
+                )? {
+                    continue;
+                }
+                outcomes.push(SelfKickOutcome {
+                    delivery_id: envelope.delivery_id,
+                    at: recorded_at,
+                    kind: SelfKickOutcomeKind::AckLate { late_by_secs },
+                });
+            }
+            _ => {}
         }
-        let alert = format!(
-            "[claude-self-kick] {} accepted delivery {} but received no exact consumer ack within {:?}; state=AckOverdue; no automatic retry — inspect the agent and reconcile manually",
-            instance, envelope.delivery_id, SELF_KICK_ACK_WINDOW
-        );
-        let channels = crate::channel::notify_all_escalation_channels(
-            instance,
-            crate::channel::NotifySeverity::Error,
-            &alert,
-            false,
-        );
-        tracing::warn!(agent = %instance, delivery_id = %envelope.delivery_id, "{alert}");
-        crate::event_log::log(
-            home,
-            "claude_self_kick_ack_overdue",
-            instance,
-            &format!("{alert} notified_channels={channels}"),
-        );
-        outcomes.push(SelfKickOutcome {
-            delivery_id: envelope.delivery_id,
-            at: accepted_at,
-            kind: SelfKickOutcomeKind::AckOverdue { turn: None },
-        });
     }
     Ok(outcomes)
 }

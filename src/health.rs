@@ -529,8 +529,6 @@ impl HealthTracker {
         self.last_mcp_refusal = Some(McpRefusalEvidence { at, line });
     }
 
-    // RED scaffolding: unwritten until the GREEN commit wires it up.
-    #[allow(dead_code)]
     /// Stamp the reconciled self-kick outcome. Overwrites the previous one:
     /// only the latest fresh-restart matters to an operator, and the durable
     /// receipt log keeps the full history.
