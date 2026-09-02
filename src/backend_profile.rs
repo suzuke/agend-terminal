@@ -75,6 +75,22 @@ pub struct BackendProfile {
     /// only over the bottom status rows — NOT the error tail window — because
     /// agents routinely DISCUSS context% in conversation text (prose-FP).
     pub context_pattern: Option<&'static str>,
+    /// t-…-82348-36: what the scraped `context_pattern` figure MEANS, so a
+    /// consumer cannot mistake it for remaining session budget. `None` exactly
+    /// when `context_pattern` is `None` (nothing is scraped, nothing to
+    /// explain). Surfaced verbatim on LIST as `context_meaning` and used by the
+    /// daemon's alert/handoff wording. Values today:
+    /// - `"window_fill"` (ClaudeCode) — ccstatusline's `context-percentage` is
+    ///   the fill of an auto-compacted CONTEXT WINDOW: auto-compaction fires
+    ///   near 95% and the figure then drops, so it CYCLES during normal work
+    ///   and is NOT a session-budget countdown (2026-09-02 evidence: a live
+    ///   pane read 95.0%, auto-compaction fired, it then read 7.0%). Under the
+    ///   fleet policy — fresh-restart at a natural boundary INSTEAD of letting
+    ///   compaction happen — it is the fresh-restart trigger.
+    /// - `"context_gauge"` (KiroCli) — kiro's own ◔ context gauge. Its relation
+    ///   to auto-compaction is NOT established by fleet evidence; also not
+    ///   session budget.
+    pub context_meaning: Option<&'static str>,
     /// #1947: prompt markers identifying the backend's INPUT line (and echoed /
     /// submitted user-message lines). An error pattern matched on a line whose
     /// trimmed start is one of these is operator-typed / quoted text, not CLI
@@ -177,6 +193,7 @@ fn grok_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Generic),
         },
         context_pattern: None,
+        context_meaning: None,
         input_line_markers: &["❯"],
         initial_state: AgentState::Starting,
     }
@@ -265,6 +282,7 @@ fn agy_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Agy),
         },
         context_pattern: None,
+        context_meaning: None,
         input_line_markers: &[],
         initial_state: AgentState::Starting,
     }
@@ -329,6 +347,7 @@ fn kirocli_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Kiro),
         },
         context_pattern: Some(KIRO_CONTEXT_PATTERN),
+        context_meaning: Some("context_gauge"),
         input_line_markers: &[">"],
         initial_state: AgentState::Starting,
     }
@@ -412,6 +431,7 @@ fn opencode_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::OpenCode),
         },
         context_pattern: None,
+        context_meaning: None,
         input_line_markers: &[],
         initial_state: AgentState::Starting,
     }
@@ -471,6 +491,7 @@ fn codex_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Codex),
         },
         context_pattern: None,
+        context_meaning: None,
         input_line_markers: &["›"],
         initial_state: AgentState::Starting,
     }
@@ -558,6 +579,8 @@ fn claudecode_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Claude),
         },
         context_pattern: Some(CLAUDE_CONTEXT_PATTERN),
+        // Window-fill semantics — see the field doc; the wording was the bug.
+        context_meaning: Some("window_fill"),
         input_line_markers: &["❯", ">"],
         initial_state: AgentState::Starting,
     }
@@ -576,6 +599,7 @@ fn empty_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Generic),
         },
         context_pattern: None,
+        context_meaning: None,
         input_line_markers: &[],
         initial_state: AgentState::Idle,
     }
@@ -620,6 +644,43 @@ mod context_pattern_tests {
             .captures("Kiro · auto · ◔ 10%        ~/.agend-terminal/workspace/kiro")
             .expect("kiro live render matches");
         assert_eq!(&caps[1], "10");
+    }
+
+    /// t-…-82348-36: `context_meaning` exists exactly when a figure is
+    /// scraped — a reading with no stated meaning is what let two
+    /// orchestrators read Claude's window fill as remaining session budget —
+    /// and the two live values are pinned.
+    #[test]
+    fn context_meaning_present_exactly_when_pattern_is() {
+        for b in [
+            Backend::ClaudeCode,
+            Backend::KiroCli,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Agy,
+            Backend::Grok,
+            Backend::Shell,
+            Backend::Raw("x".into()),
+        ] {
+            let p = profile(&b);
+            assert_eq!(
+                p.context_meaning.is_some(),
+                p.context_pattern.is_some(),
+                "{b:?}: a scraped figure must state its meaning, and a backend that \
+                 scrapes nothing must state none"
+            );
+        }
+        assert_eq!(
+            profile(&Backend::ClaudeCode).context_meaning,
+            Some("window_fill"),
+            "Claude's statusline figure is context-WINDOW fill of an auto-compacted \
+             window, not session budget"
+        );
+        assert_eq!(
+            profile(&Backend::KiroCli).context_meaning,
+            Some("context_gauge"),
+            "kiro reports its own ◔ context gauge"
+        );
     }
 }
 

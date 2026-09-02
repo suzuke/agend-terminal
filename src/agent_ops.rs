@@ -1078,6 +1078,7 @@ pub(crate) fn list_snapshot(
                 blocked_note,
                 context,
                 context_provider,
+                context_meaning,
                 api_in_flight,
                 last_api_activity_at,
                 observed_status,
@@ -1090,6 +1091,7 @@ pub(crate) fn list_snapshot(
                     c.health.current_note.clone(),
                     c.state.resolved_context(),
                     c.state.context_provider(),
+                    c.state.context_meaning(),
                     c.api_activity.in_flight,
                     c.api_activity.last_active_epoch_ms,
                     c.observed_status.clone(),
@@ -1107,6 +1109,12 @@ pub(crate) fn list_snapshot(
                 "context_pct": context.map(|(pct, _)| pct),
                 "context_source": context.map(|(_, source)| source),
                 "context_provider": context_provider.source_name(),
+                // t-…-82348-36: what context_pct MEANS — "window_fill" (Claude:
+                // fill of an auto-compacted context window, NOT remaining
+                // session budget), "context_gauge" (kiro), null when the
+                // backend scrapes no figure. Additive; context_pct /
+                // context_source / context_provider are unchanged.
+                "context_meaning": context_meaning,
                 "api_in_flight": api_in_flight,
                 "last_api_activity_at": last_api_activity_at,
                 "observed_status": observed_status,
@@ -1351,6 +1359,58 @@ pub fn spawn_one(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// t-…-82348-36: LIST carries the reading's MEANING alongside the number.
+    /// Without it a consumer sees only `context_pct` and assumes "remaining
+    /// session budget" — the misread that nearly restarted healthy agents on
+    /// 2026-09-02. Claude scrapes context-WINDOW fill of an auto-compacted
+    /// window; kiro reports its own gauge; a backend that scrapes nothing says
+    /// null. The pre-existing context fields are untouched.
+    #[test]
+    fn list_snapshot_reports_context_meaning() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home = tmp_home("list-context-meaning");
+        let registry: AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let (claude, _r1) = crate::daemon::per_tick::mock_live_agent_with_frame(
+            "cl",
+            &crate::backend::Backend::ClaudeCode,
+            "  Model: Fable 5.1 | Ctx Used: 95.0% | ⎇ main | (+0,-0)",
+        );
+        let (kiro, _r2) = crate::daemon::per_tick::mock_live_agent_with_frame(
+            "k",
+            &crate::backend::Backend::KiroCli,
+            "  Kiro · auto · ◔ 82%",
+        );
+        let (plain, _r3) = crate::daemon::per_tick::mock_live_agent_no_context("sh");
+        for h in [claude, kiro, plain] {
+            registry.lock().insert(h.id, h);
+        }
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let out = list_snapshot(&home, &registry, &externals);
+        let by_name = |n: &str| -> serde_json::Value {
+            out["result"]["agents"]
+                .as_array()
+                .expect("agents array")
+                .iter()
+                .find(|a| a["name"] == n)
+                .unwrap_or_else(|| panic!("agent {n} in LIST"))
+                .clone()
+        };
+        let cl = by_name("cl");
+        assert_eq!(
+            cl["context_meaning"], "window_fill",
+            "Claude's scraped figure is context-WINDOW fill, not session budget: {cl}"
+        );
+        // Additive: the existing context fields are unchanged.
+        assert_eq!(cl["context_pct"], 95.0);
+        assert_eq!(cl["context_source"], "pattern");
+        assert_eq!(cl["context_provider"], "statusline");
+        assert_eq!(by_name("k")["context_meaning"], "context_gauge");
+        assert_eq!(by_name("sh")["context_meaning"], serde_json::Value::Null);
+        std::fs::remove_dir_all(&home).ok();
+    }
 
     fn tmp_home(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};

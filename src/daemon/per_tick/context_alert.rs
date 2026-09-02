@@ -174,7 +174,11 @@ impl PerTickHandler for ContextAlertHandler {
         // Phase 1 (cheap, locks only): snapshot each agent's resolved context
         // — statusline pattern only (#1945-disable: no transcript estimate;
         // an unreadable pane is unknown and never alerts).
-        let mut resolved: Vec<(String, f32, &'static str)> = Vec::new();
+        // t-…-82348-36: the tuple carries the reading's MEANING
+        // (`context_meaning`) so the message can name the figure instead of
+        // letting the reader assume "remaining session budget". No gating —
+        // every backend that produces a reading still alerts.
+        let mut resolved: Vec<(String, f32, &'static str, Option<&'static str>)> = Vec::new();
         // #latch-prune (cleanup-on-delete, #1923 G5 class): capture ALL live
         // agent names — not just those with a context reading — so the per-agent
         // `states` latch can drop deleted agents below. Without it a same-name
@@ -184,8 +188,14 @@ impl PerTickHandler for ContextAlertHandler {
             let mut live = std::collections::HashSet::new();
             for handle in reg.values() {
                 live.insert(handle.name.as_str().to_string());
-                if let Some((pct, source)) = handle.core.lock().state.resolved_context() {
-                    resolved.push((handle.name.as_str().to_string(), pct, source));
+                let core = handle.core.lock();
+                if let Some((pct, source)) = core.state.resolved_context() {
+                    resolved.push((
+                        handle.name.as_str().to_string(),
+                        pct,
+                        source,
+                        core.state.context_meaning(),
+                    ));
                 }
             }
             live
@@ -203,7 +213,7 @@ impl PerTickHandler for ContextAlertHandler {
         let fleet = crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home))
             .unwrap_or_else(|_| Arc::new(crate::fleet::FleetConfig::default()));
         let mut states = self.states.lock();
-        for (name, pct, source) in resolved {
+        for (name, pct, source, meaning) in resolved {
             let threshold =
                 resolve_instance_thresholds(&name, global, &fleet, &self.invalid_override_warnings)
                     .alert;
@@ -221,13 +231,33 @@ impl PerTickHandler for ContextAlertHandler {
             if recipient == name {
                 continue;
             }
-            let text = format!(
-                "[context_alert] agent '{name}' context usage at {pct:.1}% \
-                 (source: {source}, threshold {threshold:.1}%). Handling is NOT \
-                 automated — at a natural boundary consider a handoff + \
-                 restart_instance to free the context. Re-alerts every 30min \
-                 while it stays high."
-            );
+            // t-…-82348-36: Claude's figure is context-WINDOW fill of an
+            // auto-compacted window (2026-09-02: a pane read 95.0%,
+            // auto-compaction fired, it then read 7.0%) — say so, and say what
+            // the fleet policy wants done, because two orchestrators read the
+            // old "context usage" wording as remaining session budget and
+            // nearly restarted healthy agents. Every other backend's text is
+            // unchanged.
+            let reading = crate::daemon::per_tick::context_reading_phrase(meaning, pct);
+            let text = if meaning == Some("window_fill") {
+                format!(
+                    "[context_alert] agent '{name}' {reading} \
+                     (source: {source}, threshold {threshold:.1}%; statusline; \
+                     auto-compact fires near 95%; this is NOT session budget). \
+                     Fleet policy: at the next natural boundary write \
+                     SESSION-HANDOFF.md and fresh-restart (restart_instance \
+                     mode=fresh) rather than let compaction happen. Re-alerts \
+                     every 30min while it stays high."
+                )
+            } else {
+                format!(
+                    "[context_alert] agent '{name}' {reading} \
+                     (source: {source}, threshold {threshold:.1}%). Handling is NOT \
+                     automated — at a natural boundary consider a handoff + \
+                     restart_instance to free the context. Re-alerts every 30min \
+                     while it stays high."
+                )
+            };
             if let Err(e) = crate::inbox::notify_system(
                 ctx.home,
                 &recipient,

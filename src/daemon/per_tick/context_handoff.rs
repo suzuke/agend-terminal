@@ -159,15 +159,51 @@ fn decide(
 /// for was silently skipped). Injected verbatim (`auto_kind = None`) since the
 /// marker is already in the payload. Single line: a multi-line PTY injection risks
 /// splitting into multiple submits.
-fn handoff_payload(pct: f32) -> String {
-    format!(
-        "{marker} context usage at {pct:.1}% — before it runs out: (1) write {HANDOFF_FILENAME} \
-         in your working directory (current task + state, key decisions, next steps, \
-         open branches/PRs); (2) add a brief handoff note to your active task on the \
-         board (task action=update); then continue working. One-shot reminder — the \
-         daemon will not repeat it this episode.",
-        marker = crate::agent::DAEMON_HANDOFF_INJECT_MARKER
-    )
+///
+/// t-…-82348-36: for Claude the figure is context-WINDOW fill of an
+/// auto-compacted window, not remaining session budget, and the fleet policy is
+/// to fresh-restart at a natural boundary INSTEAD of letting compaction happen
+/// — so the Claude payload names the figure and asks for the restart. Every
+/// other backend's payload is byte-identical to before.
+fn handoff_payload(meaning: Option<&str>, pct: f32) -> String {
+    let reading = super::context_reading_phrase(meaning, pct);
+    let marker = crate::agent::DAEMON_HANDOFF_INJECT_MARKER;
+    if meaning == Some(WINDOW_FILL) {
+        format!(
+            "{marker} {reading} (auto-compact fires near 95%; NOT session budget). \
+             Fleet policy: rather than let compaction happen, at the next natural \
+             boundary (1) write {HANDOFF_FILENAME} in your working directory (current \
+             task + state, key decisions, next steps, open branches/PRs); (2) add a \
+             brief handoff note to your active task on the board (task action=update); \
+             (3) fresh-restart (restart_instance mode=fresh). One-shot reminder — the \
+             daemon will not repeat it this episode."
+        )
+    } else {
+        format!(
+            "{marker} {reading} — before it runs out: (1) write {HANDOFF_FILENAME} \
+             in your working directory (current task + state, key decisions, next steps, \
+             open branches/PRs); (2) add a brief handoff note to your active task on the \
+             board (task action=update); then continue working. One-shot reminder — the \
+             daemon will not repeat it this episode."
+        )
+    }
+}
+
+/// `BackendProfile::context_meaning` value for a reading that is context-WINDOW
+/// fill of an auto-compacted window (Claude) rather than remaining session
+/// budget — see [`super::context_reading_phrase`].
+const WINDOW_FILL: &str = "window_fill";
+
+/// The window-fill naming of [`super::context_reading_phrase`], with THIS
+/// module's own base fallback: the event log and the escalation say
+/// "context at N%" where the alert says "context usage at N%", and the rename
+/// is Claude-only, so both base phrasings must survive byte-identical.
+fn event_reading_phrase(meaning: Option<&str>, pct: f32) -> String {
+    if meaning == Some(WINDOW_FILL) {
+        super::context_reading_phrase(meaning, pct)
+    } else {
+        format!("context at {pct:.1}%")
+    }
 }
 
 /// True if the agent's `SESSION-HANDOFF.md` was modified at/after
@@ -241,7 +277,11 @@ impl PerTickHandler for ContextHandoffHandler {
         // Phase 1 (cheap, locks only): snapshot resolved context + idleness.
         // Agents without a pattern reading (every non-claude backend today)
         // produce nothing here and are never injected.
-        let mut snapshot: Vec<(String, f32, bool)> = Vec::new();
+        // t-…-82348-36: the tuple carries the reading's MEANING so the
+        // emissions can name the figure (Claude: context-WINDOW fill of an
+        // auto-compacted window, not session budget). No gating — the reading
+        // IS the fleet policy's fresh-restart trigger.
+        let mut snapshot: Vec<(String, f32, bool, Option<&'static str>)> = Vec::new();
         // #latch-prune (cleanup-on-delete, #1923 G5 class): capture ALL live
         // agent names so the per-agent `states` episode-latch can drop deleted
         // agents below — else a same-name redeploy inherits a stale episode
@@ -254,7 +294,12 @@ impl PerTickHandler for ContextHandoffHandler {
                 let core = handle.core.lock();
                 if let Some((pct, _source)) = core.state.resolved_context() {
                     let is_idle = core.state.get_state() == crate::state::AgentState::Idle;
-                    snapshot.push((handle.name.as_str().to_string(), pct, is_idle));
+                    snapshot.push((
+                        handle.name.as_str().to_string(),
+                        pct,
+                        is_idle,
+                        core.state.context_meaning(),
+                    ));
                 }
             }
             live
@@ -270,7 +315,7 @@ impl PerTickHandler for ContextHandoffHandler {
             .unwrap_or_else(|_| Arc::new(crate::fleet::FleetConfig::default()));
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut states = self.states.lock();
-        for (name, pct, is_idle) in snapshot {
+        for (name, pct, is_idle, meaning) in snapshot {
             let thresholds =
                 resolve_instance_thresholds(&name, global, &fleet, &self.invalid_override_warnings);
             let state = states.entry(name.clone()).or_default();
@@ -300,7 +345,7 @@ impl PerTickHandler for ContextHandoffHandler {
                         crate::agent::inject_with_target_gated(
                             &t,
                             &name,
-                            handoff_payload(pct).as_bytes(),
+                            handoff_payload(meaning, pct).as_bytes(),
                             false,
                             // #2282: None → inject verbatim; the payload carries the
                             // actionable `[AGEND-HANDOFF]` marker, NOT the never-act
@@ -316,7 +361,8 @@ impl PerTickHandler for ContextHandoffHandler {
                             "context_handoff_injected",
                             &name,
                             &format!(
-                                "context at {pct:.1}% — handoff nudge injected (one per episode)"
+                                "{reading} — handoff nudge injected (one per episode)",
+                                reading = event_reading_phrase(meaning, pct)
                             ),
                         );
                     } else {
@@ -332,18 +378,30 @@ impl PerTickHandler for ContextHandoffHandler {
                         "context_full_idle",
                         &name,
                         &format!(
-                            "context at {pct:.1}% while Idle — not injecting (idle context-full \
-                             is not urgent); injection fires if it wakes while still high"
+                            "{reading} while Idle — not injecting (idle context-full \
+                             is not urgent); injection fires if it wakes while still high",
+                            reading = event_reading_phrase(meaning, pct)
                         ),
                     );
                 }
                 Some(Action::Escalate) => {
-                    let msg = format!(
-                        "[context-handoff] agent '{name}' context at {pct:.1}% and no \
-                         {HANDOFF_FILENAME} update since the {thresholds_handoff:.1}% nudge — \
-                         consider a manual handoff + restart_instance. (One-time notice.)",
-                        thresholds_handoff = thresholds.handoff
-                    );
+                    let reading = event_reading_phrase(meaning, pct);
+                    let thresholds_handoff = thresholds.handoff;
+                    let msg = if meaning == Some(WINDOW_FILL) {
+                        format!(
+                            "[context-handoff] agent '{name}' {reading} (auto-compact fires \
+                             near 95%; NOT session budget) and no {HANDOFF_FILENAME} update \
+                             since the {thresholds_handoff:.1}% nudge — fleet policy: handoff \
+                             + fresh-restart (restart_instance mode=fresh) at the next natural \
+                             boundary rather than let compaction happen. (One-time notice.)"
+                        )
+                    } else {
+                        format!(
+                            "[context-handoff] agent '{name}' {reading} and no \
+                             {HANDOFF_FILENAME} update since the {thresholds_handoff:.1}% nudge — \
+                             consider a manual handoff + restart_instance. (One-time notice.)"
+                        )
+                    };
                     crate::channel::notify_all_escalation_channels(
                         &name,
                         crate::channel::NotifySeverity::Warn,
@@ -663,9 +721,42 @@ mod tests {
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 
+    /// t-…-82348-36: the Claude payload names the figure (context-WINDOW fill
+    /// of an auto-compacted window, not session budget) and asks for the fleet
+    /// policy's fresh-restart instead of the old "then continue working".
+    #[test]
+    fn handoff_payload_window_fill_asks_for_fresh_restart() {
+        let msg = super::handoff_payload(Some("window_fill"), 95.0);
+        assert!(msg.contains("context-WINDOW fill at 95.0%"), "{msg}");
+        assert!(msg.contains("NOT session budget"), "{msg}");
+        assert!(
+            msg.contains("fresh-restart (restart_instance mode=fresh)"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("then continue working"),
+            "the policy is to fresh-restart at the boundary, not continue: {msg}"
+        );
+    }
+
+    /// t-…-82348-36: every non-Claude payload is byte-identical to base — the
+    /// rename applies only to the window-fill reading.
+    #[test]
+    fn handoff_payload_non_claude_wording_unchanged() {
+        let base = super::handoff_payload(None, 85.0);
+        assert_eq!(
+            base,
+            super::handoff_payload(Some("context_gauge"), 85.0),
+            "kiro's gauge keeps the base payload"
+        );
+        assert!(base.contains("context usage at 85.0%"), "{base}");
+        assert!(base.contains("then continue working"), "{base}");
+        assert!(!base.contains("WINDOW"), "{base}");
+    }
+
     #[test]
     fn handoff_payload_renders_one_decimal_2781() {
-        let msg = super::handoff_payload(61.0);
+        let msg = super::handoff_payload(None, 61.0);
         assert!(
             msg.contains("61.0%"),
             "#2781: handoff payload must render one-decimal '61.0%', got: {msg}"
@@ -678,7 +769,7 @@ mod tests {
 
     #[test]
     fn handoff_payload_renders_fractional_decimal_2781() {
-        let msg = super::handoff_payload(85.3);
+        let msg = super::handoff_payload(None, 85.3);
         assert!(
             msg.contains("85.3%"),
             "#2781: handoff payload must render '85.3%', got: {msg}"
