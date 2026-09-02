@@ -320,32 +320,65 @@ mod tests {
 
     #[test]
     fn maintenance_tick_driver_coalesces_full_queue_without_blocking() {
-        let (driver, tick_rx) = MaintenanceTickDriver::spawn(
-            "test_maintenance_tick_coalesce",
-            Duration::from_millis(2),
-        );
+        const INTERVAL: Duration = Duration::from_millis(2);
+        let (driver, tick_rx) =
+            MaintenanceTickDriver::spawn("test_maintenance_tick_coalesce", INTERVAL);
         tick_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("first maintenance tick");
 
-        // Liveness. Model a slow handler by leaving the bounded receiver
-        // untouched while several producer intervals elapse, so the producer
-        // repeatedly hits `Full`. Draining and then receiving again proves it
-        // coalesced rather than died: a counting assertion alone cannot tell
-        // "coalesced" from "producer exited on the first Full".
-        std::thread::sleep(Duration::from_millis(50));
-        while tick_rx.try_recv().is_ok() {}
+        // Wait until the bounded slot is *proven* occupied and then hold it
+        // that way for many producer intervals, so every one of those intervals
+        // is a send attempt that finds the slot `Full`. `is_full()` is a true
+        // snapshot of the slot; sleeping a fixed span and assuming saturation
+        // is the timing dependency this test exists to avoid, and `try_iter()`
+        // is not a snapshot at all — it keeps yielding while the producer
+        // refills during iteration, which is the macOS CI failure on run
+        // 33621682494.
+        let prove_slot_saturated = || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !tick_rx.is_full() {
+                assert!(
+                    Instant::now() < deadline,
+                    "producer never filled the bounded tick slot"
+                );
+                std::thread::yield_now();
+            }
+            let dwell_until = Instant::now() + INTERVAL * 50;
+            while Instant::now() < dwell_until {
+                assert!(
+                    tick_rx.is_full(),
+                    "nothing may drain the slot while proving repeated Full attempts"
+                );
+                std::thread::yield_now();
+            }
+        };
+
+        // Liveness: the producer must survive meeting a full slot. A counting
+        // assertion cannot tell "coalesced" from "exited on the first Full",
+        // because both leave at most one tick behind.
+        prove_slot_saturated();
+        assert_eq!(
+            tick_rx.try_recv(),
+            Ok(()),
+            "the saturated slot must yield its single coalesced tick"
+        );
+        // A producer that exited on `Full` has already dropped its sender, so
+        // this observes death immediately rather than inferring it from a
+        // timeout.
+        assert_ne!(
+            tick_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected),
+            "producer must stay alive after coalescing a full queue"
+        );
         tick_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("producer must continue after coalescing a full queue");
+            .expect("producer must keep ticking after coalescing a full queue");
 
-        // Coalescing, observed as a true snapshot. Saturate the slot again and
-        // then stop the producer: `drop` joins the worker, so the queue can no
-        // longer be refilled and what remains is exactly what it held. Counting
-        // a live `try_iter()` instead is racy — the 2ms producer refills the
-        // slot *during* iteration, so a slow enough consumer counts 2+ (the
-        // macOS CI failure at run 33621682494).
-        std::thread::sleep(Duration::from_millis(50));
+        // Coalescing, observed as a true snapshot: saturate again, then stop the
+        // producer. `drop` joins the worker, so the slot can no longer be
+        // refilled and what remains is exactly what the bounded channel held.
+        prove_slot_saturated();
 
         // If the producer were blocked in send, dropping it could not join
         // promptly while the receiver remains full.
