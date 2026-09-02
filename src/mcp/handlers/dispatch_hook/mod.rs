@@ -13,6 +13,7 @@ mod lifecycle_permit;
 mod live_binding;
 mod provider_neutral_slug;
 mod rebase_dispatch;
+mod types;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 pub(crate) use provider_neutral_slug::derive_repo_slug_any_forge_pub;
 pub(crate) use rebase_dispatch::dispatch_auto_bind_lease_with_source_and_chain_preheld;
@@ -22,131 +23,9 @@ pub(crate) use lifecycle_permit::{
     is_active as lifecycle_is_active, BindGuard, LifecycleOperation, LifecyclePermit,
 };
 pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
-
-/// Structured auto-bind outcome shared by repo checkout and task dispatch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DispatchOutcome {
-    /// Which source-repo resolution tier fired.
-    pub source_repo_tier: SourceRepoTier,
-    /// Whether this dispatch authored the branch.
-    pub auto_created_branch: bool,
-    /// Whether lazy fetch fallback ran.
-    pub fetch_attempted: bool,
-    /// Whether post-bind CI-watch arming failed.
-    pub ci_watch_arm_failed: bool,
-    /// Result of a dispatch-time CI-watch arm, or `None` when not attempted.
-    pub ci_watch: Option<CiWatchOutcome>,
-}
-
-/// Result of an attempted dispatch-time ci-watch arm.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CiWatchOutcome {
-    /// Whether the watch sidecar was armed successfully.
-    pub armed: bool,
-    /// The normalized chain targets passed to the watch arm.
-    pub next_after_ci: Vec<String>,
-}
-
-/// Structured dispatch failure with stable code and pipeline stage.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DispatchError {
-    /// Human-readable summary. Safe to log verbatim.
-    pub message: String,
-    /// Canonical reason class.
-    pub code: ErrorCode,
-    /// Pipeline stage that raised the error.
-    pub stage: Stage,
-    /// Whether fetch fallback ran before the failure.
-    pub fetch_attempted: bool,
-    /// Raw git stderr if any — for debug / post-mortem. `None` when
-    /// the failure didn't involve a git subprocess.
-    pub raw: Option<String>,
-}
-
-impl std::fmt::Display for DispatchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for DispatchError {}
-
-/// Source-repo resolution tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceRepoTier {
-    /// Explicit caller override.
-    Override,
-    /// Tier 2 — per-instance `source_repo:` in fleet.yaml.
-    FleetSourceRepo,
-    /// Tier 2.5 — team `source_repo:` in fleet.yaml.
-    TeamSourceRepo,
-    /// Per-instance working-directory fallback.
-    WorkingDirectory,
-    /// `$AGEND_HOME/workspace/<agent>` fallback.
-    Stub,
-}
-
-/// Pipeline stage that produced a [`DispatchError`]. Coarse enough to
-/// remain stable across refactors, fine enough to debug.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Stage {
-    ValidateExpectedHead,
-    /// `from_ref` rejected by `validate_branch` charset / option-injection guard.
-    ValidateFromRef,
-    /// `branch` rejected by `validate_branch` (charset / option-injection) or by
-    /// `is_protected_ref` (E4.5) — at the validation boundary, before any git
-    /// subprocess runs (CR-2026-06-14 F1).
-    ValidateBranch,
-    /// First `git branch <name> <from_ref>` attempt failed for a reason
-    /// other than "already exists" / "not a valid ref".
-    CreateBranch,
-    /// `git fetch origin` after the missing-ref fallback failed.
-    Fetch,
-    /// Retry `git branch <name> <from_ref>` after fetch still failed.
-    RetryCreate,
-    /// `worktree_pool::lease` returned error (worktree creation failed,
-    /// cross-agent lease conflict, same-agent different-branch conflict).
-    WorktreeLeaseConflict,
-    /// Source repo resolution fell through to stub (tier 4) while
-    /// `AGEND_BIND_STRICT_MODE=1`.
-    ResolveSourceRepo,
-    /// `bind_full` write failed after worktree was leased.
-    Bind,
-    VerifyExpectedHead,
-}
-
-/// Canonical `code` enum — stable across releases. Callers MUST match
-/// on this rather than parsing `message` substrings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    InvalidExpectedHead,
-    ExpectedHeadMismatch,
-    /// `from_ref` arg rejected by `validate_branch` charset rules.
-    InvalidFromRef,
-    /// `branch` arg rejected by `validate_branch` charset / option-injection
-    /// rules (CR-2026-06-14 F1).
-    InvalidBranch,
-    /// `git branch` failed at a stage we can't recover from (not
-    /// already-exists, not invalid-ref).
-    BranchCreateFailed,
-    /// `git fetch origin` exit non-zero / spawn error.
-    FetchFailed,
-    /// `worktree_pool::lease` rejected — cross-agent branch lease,
-    /// same-agent different-branch, worktree::create None, etc.
-    LeaseConflict,
-    /// E4.5 protected ref guard (`main` / `master`).
-    ProtectedBranch,
-    /// `bind_in_flight_set` already contains `(home, agent)` — concurrent
-    /// dispatch blocked.
-    BindInFlight,
-    /// `AGEND_BIND_STRICT_MODE=1` and source_repo resolved to stub (tier 4).
-    StubRejected,
-    /// `bind_full` failed — worktree was rolled back.
-    BindFailed,
-}
+pub(crate) use types::{
+    CiWatchOutcome, DispatchError, DispatchOutcome, ErrorCode, SourceRepoTier, Stage,
+};
 
 #[allow(dead_code)]
 pub(crate) fn acquire_bind_guard(home: &Path, target: &str) -> Result<BindGuard, String> {
@@ -271,11 +150,26 @@ pub(crate) fn dispatch_auto_bind_lease_with_chain(
     )
 }
 
-/// Extended entry point accepting an explicit `source_repo_override`.
+/// Sprint 55 P0-B: extended entry point that accepts an explicit
+/// `source_repo_override`. Used by `handle_bind_self(source_repo=...)`;
+/// existing callers go through [`dispatch_auto_bind_lease`] which passes
+/// `None` to preserve pre-Sprint-55 behavior.
+///
+/// **Callers**: `handle_bind_self` (post-`release_worktree` re-claim,
+/// rebase recovery) + `handle_checkout_repo` with `bind:true` (#779
+/// Option 1 atomic fresh provision). Both share this dispatch path —
+/// caller chooses entry based on whether the caller already knows the
+/// source repo (bind:true) or relies on fleet.yaml resolution (bind_self).
+///
 /// #2158 GR1: passes `arm_ci_watch=false` — a `bind_self` self-provision NEVER
 /// silently arms a ci-watch (the agent arms `ci action=watch` explicitly if it
 /// wants CI notifications). The dispatch wrappers (`_with_chain` / the bare entry)
 /// pass `true`.
+///
+/// #781 Piece 7: returns structured [`DispatchOutcome`] / [`DispatchError`].
+/// C2 commit performs the signature migration mechanically — `source_repo_tier`,
+/// `auto_created_branch`, `fetch_attempted` populated with placeholders here
+/// and wired to real observability sources in C4.
 ///
 pub(crate) fn dispatch_auto_bind_lease_with_source(
     home: &Path,

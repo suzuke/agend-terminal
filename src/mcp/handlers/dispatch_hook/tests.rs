@@ -523,6 +523,7 @@ fn untyped_send_mismatched_remote_branch_rolls_back_binding_3479() {
     let remote_branch = "refs/remotes/origin/review/3479-mismatch";
     crate::git_helpers::git_cmd(&repo, &["update-ref", remote_branch, &remote_tip])
         .expect("seed remote branch");
+    let worktree = crate::worktree::worktree_path(&home, "target-agent", "review/3479-mismatch");
     let tid = create_review_class_task(&home, "single");
     let sender = Some(Sender::new("lead").expect("sender"));
 
@@ -541,6 +542,11 @@ fn untyped_send_mismatched_remote_branch_rolls_back_binding_3479() {
     );
     assert_eq!(result["code"], "expected_head_mismatch", "{result}");
     assert!(crate::binding::read(&home, "target-agent").is_none());
+    assert!(
+        !worktree.exists(),
+        "rollback must remove the auto-created worktree: {}",
+        worktree.display()
+    );
     assert!(
         crate::git_helpers::git_cmd(
             &repo,
