@@ -327,16 +327,25 @@ mod tests {
         tick_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("first maintenance tick");
-        // Model a slow handler by leaving the bounded receiver untouched while
-        // several producer intervals elapse.
-        std::thread::sleep(Duration::from_millis(25));
-        assert!(
-            tick_rx.try_iter().count() <= 1,
-            "a full bounded queue must coalesce ticks instead of growing"
-        );
+
+        // Liveness. Model a slow handler by leaving the bounded receiver
+        // untouched while several producer intervals elapse, so the producer
+        // repeatedly hits `Full`. Draining and then receiving again proves it
+        // coalesced rather than died: a counting assertion alone cannot tell
+        // "coalesced" from "producer exited on the first Full".
+        std::thread::sleep(Duration::from_millis(50));
+        while tick_rx.try_recv().is_ok() {}
         tick_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("producer must continue after coalescing a full queue");
+
+        // Coalescing, observed as a true snapshot. Saturate the slot again and
+        // then stop the producer: `drop` joins the worker, so the queue can no
+        // longer be refilled and what remains is exactly what it held. Counting
+        // a live `try_iter()` instead is racy — the 2ms producer refills the
+        // slot *during* iteration, so a slow enough consumer counts 2+ (the
+        // macOS CI failure at run 33621682494).
+        std::thread::sleep(Duration::from_millis(50));
 
         // If the producer were blocked in send, dropping it could not join
         // promptly while the receiver remains full.
@@ -345,6 +354,16 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "a full tick queue must not prevent prompt stop/join"
+        );
+        assert_eq!(
+            tick_rx.try_recv(),
+            Ok(()),
+            "a full bounded queue must hold exactly one coalesced tick"
+        );
+        assert_eq!(
+            tick_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected),
+            "a full bounded queue must coalesce ticks instead of growing"
         );
     }
 
