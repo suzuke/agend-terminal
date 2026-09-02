@@ -706,8 +706,16 @@ pub(crate) fn classify(
                             ),
                         };
                     }
+                    // #3479: the shim cannot tell a tracked-file pathspec from a
+                    // branch name without repo queries, so the deny stays — but
+                    // the message steers a same-branch file restore to the two
+                    // shapes that already pass (`restore` arm; is_pathspec_restore
+                    // above). Message-only; the permission surface is unchanged.
                     return Action::Deny(format!(
-                        "cross-branch — assigned to '{assigned}', cannot switch to '{target_branch}'"
+                        "cross-branch — assigned to '{assigned}', cannot switch to '{target_branch}'. \
+                         If '{target_branch}' is a file you meant to restore on the current branch, \
+                         use `git restore {target_branch}` or `git checkout -- {target_branch}` — \
+                         both pass; a bare `git checkout <path>` reads as a branch switch."
                     ));
                 }
             }
