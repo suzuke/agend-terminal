@@ -150,12 +150,21 @@ pub const KIRO_CONTEXT_PATTERN: &str = r"◔\s*(\d+(?:\.\d+)?)\s*%";
 ///
 /// So the exposure is the live-menu window plus ~2s, once per spawn. Mitigation
 /// is follow-up task t-20260902123656981395-82348-52; do not implement it here.
+///
+/// The cursor glyph (`›`) is OPTIONAL on each option line: it may sit on any
+/// of the three (a stray Down keypress mid-repaint, or a build that restores
+/// the previous selection, can leave it off option 1). The dismiss sequence
+/// selects Skip BY NUMBER (`2\r`), so cursor position is irrelevant to the
+/// keystroke that gets typed — the classifier must be equally indifferent to
+/// it. It is the tail anchor (`\z`), not the cursor, that separates this live
+/// menu from a quoted one: a repaint under it (composer, status line) breaks
+/// the match regardless of where `›` sits.
 pub const CODEX_UPDATE_MENU_LIVE: &str = concat!(
     r"Update available![^\n]*\n",
     r"(?:[^\n]*\n){0,4}?",
-    r"[ \t]*› 1\. Update now[^\n]*\n",
-    r"[ \t]*2\. Skip[ \t]*\n",
-    r"[ \t]*3\. Skip until next version[ \t]*",
+    r"[ \t]*(?:›[ \t]*)?1\. Update now[^\n]*\n",
+    r"[ \t]*(?:›[ \t]*)?2\. Skip[ \t]*\n",
+    r"[ \t]*(?:›[ \t]*)?3\. Skip until next version[ \t]*",
     r"(?:\n[ \t]*(?:Press enter to continue)?[ \t]*)*\z",
 );
 
