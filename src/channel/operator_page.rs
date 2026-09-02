@@ -28,10 +28,30 @@
 //! fails CLOSED, delivery is confined to the dedicated topic inside the
 //! allowlisted Telegram group, and the body is flattened to ONE line and then
 //! REFUSED outright if what is left still carries the daemon's own sender
-//! marker. What that does NOT buy: a client that soft-wraps a long page can
-//! still start a visual row mid-body, and a forger can still write prose that
-//! merely resembles a sender. Flattening removes the mandatory breaks and the
-//! invisible look-alikes; it cannot make text unimpersonatable.
+//! marker.
+//!
+//! Exactly what that flattening covers, and what it does not, because an earlier
+//! version of this paragraph claimed more than the code delivers:
+//!
+//!   * COVERED — every mandatory line break and every character that cannot
+//!     survive verbatim: control characters (Cc), Unicode `White_Space`
+//!     including NBSP, format characters (Cf) such as ZWSP and the bidi
+//!     overrides, and the `Default_Ignorable_Code_Point` set (CGJ `U+034F`, the
+//!     variation selectors). So the marker cannot begin a line, and it cannot be
+//!     spelled with an invisible-format character or a look-alike space.
+//!   * NOT COVERED — a marker spelled with HOMOGLYPHS. `[\u{043E}perator-page
+//!     from ops]`, with Cyrillic `о` for Latin `o`, is NOT detected and IS
+//!     delivered. Every character in it renders, so invisibility is the wrong
+//!     test for it, and confusable folding is not attempted here.
+//!   * WHY THE RESIDUAL IS BOUNDED, as a mitigation and not more: the body is
+//!     flattened to ONE line and the daemon's own prefix is always first, so a
+//!     homoglyph forgery can only ever appear MID-LINE after a genuine
+//!     `[operator-page from <caller>]` prefix. It cannot open a line and it
+//!     cannot displace the real sender.
+//!
+//! A client that soft-wraps a long page can still start a visual row mid-body,
+//! and a forger can still write prose that merely resembles a sender. None of
+//! this makes text unimpersonatable.
 //!
 //! ## Why a forged marker is REFUSED and not rewritten
 //!
@@ -46,9 +66,9 @@
 //!     refusing costs nothing, while refusing turns an attack attempt into a
 //!     DETECTABLE event — a `warn!` naming the caller — instead of one the daemon
 //!     quietly absorbs.
-//!   * The rewrite was defeated by look-alikes it never saw anyway: case
-//!     variants (`[Operator-Page From ops]`) passed it untouched, and NBSP, ZWSP
-//!     and RLO reproduced the marker's appearance without its bytes.
+//!   * The rewrite was defeated by spellings it never saw anyway: case variants
+//!     (`[Operator-Page From ops]`) passed it untouched, and NBSP, ZWSP and RLO
+//!     reproduced the marker's appearance without its bytes.
 //!
 //! The refusal is reached only while paging is ON — see the gate order below.
 //!
@@ -116,26 +136,45 @@ pub(crate) const RATE_WINDOW_SECS: i64 = 3600;
 /// body.
 pub(crate) const SENDER_MARKER: &str = "[operator-page from ";
 
-/// Unicode general category **Cf** (format characters): ZWSP `U+200B`, ZWNJ/ZWJ,
-/// the bidi set LRM/RLM/LRE/RLE/PDF/LRO/RLO, the `U+2066`–`U+2069` isolates,
-/// `U+FEFF` and the rest.
+/// Characters that have no visible rendering of their own: Unicode general
+/// category **Cf** (format characters) UNION the binary property
+/// **`Default_Ignorable_Code_Point`**.
+///
+/// Cf is ZWSP `U+200B`, ZWNJ/ZWJ, the bidi set LRM/RLM/LRE/RLE/PDF/LRO/RLO, the
+/// `U+2066`–`U+2069` isolates, `U+FEFF` and the rest.
+/// `Default_Ignorable_Code_Point` is Unicode's own name for "should have no
+/// visible rendering", and it reaches what Cf does not: CGJ `U+034F`, the
+/// variation selectors `U+FE00`–`U+FE0F` and `U+180B`–`U+180F` (all category
+/// **Mn**), the Hangul fillers `U+115F`/`U+1160`/`U+3164`/`U+FFA0` (category
+/// **Lo**) and the Khmer invisible vowels `U+17B4`/`U+17B5`. Neither set
+/// contains the other, so both are asked.
+///
+/// Only the default-IGNORABLE part of Mn is taken. Category Mn as a whole is
+/// deliberately NOT stripped: combining marks are how Vietnamese, Hebrew,
+/// Devanagari and many other scripts are written, and stripping them wholesale
+/// would corrupt legitimate page bodies — a worse trade than the residual it
+/// would close. The one accepted cost of taking the ignorable part is that
+/// `U+FE0F` is stripped from an emoji, so an emoji in a page may render in its
+/// text presentation rather than its emoji presentation.
 ///
 /// `char` has no `is_format()`, and `char::is_control()` is Cc ONLY. The category
-/// data comes from `regex`, which is already a direct dependency of this crate
-/// (`Cargo.toml`, `regex = "1"`, default features, so `unicode-gencat` is on) —
-/// no dependency is added for this, and the table tracks the `regex` crate's
-/// Unicode version rather than a hand-copied list that would silently go stale.
+/// and property data come from `regex`, which is already a direct dependency of
+/// this crate (`Cargo.toml`, `regex = "1"`, default features, so both
+/// `unicode-gencat` and `unicode-bool` are on) — NO dependency and no feature is
+/// added for this, and the tables track the `regex` crate's Unicode version
+/// rather than a hand-copied list that would silently go stale.
 /// The pattern is a constant and the `expect` follows the convention already used
 /// for static patterns elsewhere in the crate (`task_events.rs:103`,
-/// `backend.rs:2401`): a build that could not classify Cf must fail loudly, never
-/// silently classify nothing and let the look-alikes through.
-fn is_format_char(ch: char) -> bool {
-    static CF: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let cf = CF.get_or_init(|| {
-        regex::Regex::new(r"^\p{Cf}$").expect("the static \\p{Cf} pattern must compile")
+/// `backend.rs:2401`): a build that could not classify these must fail loudly,
+/// never silently classify nothing and let the invisibles through.
+fn has_no_visible_rendering(ch: char) -> bool {
+    static INVISIBLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let invisible = INVISIBLE.get_or_init(|| {
+        regex::Regex::new(r"^[\p{Cf}\p{Default_Ignorable_Code_Point}]$")
+            .expect("the static \\p{Cf} + \\p{Default_Ignorable_Code_Point} pattern must compile")
     });
     let mut buf = [0u8; 4];
-    cf.is_match(ch.encode_utf8(&mut buf))
+    invisible.is_match(ch.encode_utf8(&mut buf))
 }
 
 /// Characters that may not survive verbatim into a page body. Each one becomes a
@@ -151,21 +190,38 @@ fn is_format_char(ch: char) -> bool {
 ///     the two mandatory UAX#14 breaks `U+2028`/`U+2029`. A space look-alike is
 ///     not a cosmetic problem: `[operator-page\u{00A0}from ops]` renders
 ///     pixel-identically to the real marker.
-///   * [`is_format_char`] — category Cf. ZWSP inside the marker
+///   * [`has_no_visible_rendering`] — category Cf and the
+///     `Default_Ignorable_Code_Point` property. ZWSP inside the marker
 ///     (`[operator-page fr\u{200B}om ops]`) is invisible; RLO makes
-///     `\u{202E}]spo morf egap-rotarepo[` display as the marker, read backwards.
+///     `\u{202E}]spo morf egap-rotarepo[` display as the marker, read backwards;
+///     CGJ (`[operator-page f\u{034F}rom ops]`) and the variation selectors are
+///     defined never to render at all.
+///
+/// What this set does NOT reach, stated plainly because the prose used to claim
+/// otherwise: a marker spelled with HOMOGLYPHS — Cyrillic `о` `U+043E` for Latin
+/// `o`, say — is not detected here and is delivered verbatim. Every character in
+/// such a body renders, so no predicate over invisibility can see it, and
+/// normalising confusables is a different (and much larger) mechanism than this
+/// one. What bounds it is structural rather than lexical: the body is flattened
+/// to ONE line and the daemon's own prefix is always first, so a homoglyph
+/// forgery can only ever appear MID-LINE after a genuine
+/// `[operator-page from <caller>]` prefix. It cannot open a line and it cannot
+/// displace the real sender. That is a mitigation, not a fix.
 ///
 /// The ordinary space is deliberately NOT in this set: it is what everything
 /// here becomes, and `flatten_to_single_line` collapses runs of it separately.
 ///
-/// Two adversarial passes shaped this. The first predicate tested `'\r'` and
+/// Three adversarial passes shaped this. The first predicate tested `'\r'` and
 /// `'\n'` only, and `U+2028`, `U+2029`, NEL, VT and FF travelled through
 /// verbatim. The second predicate was `is_control()` + `U+2028`/`U+2029`, which
-/// is Cc-only, and NBSP, ZWSP and RLO travelled through verbatim. A page body is
+/// is Cc-only, and NBSP, ZWSP and RLO travelled through verbatim. The third
+/// predicate was Cc + `White_Space` + Cf, and CGJ `U+034F` and the variation
+/// selectors `U+FE00`/`U+FE0F` — invisible, but category Mn — travelled through
+/// verbatim; `Default_Ignorable_Code_Point` closes exactly those. A page body is
 /// plain text with no formatting passthrough, so nothing in this set has a
 /// legitimate use here.
 fn must_not_survive_verbatim(ch: char) -> bool {
-    ch != ' ' && (ch.is_control() || ch.is_whitespace() || is_format_char(ch))
+    ch != ' ' && (ch.is_control() || ch.is_whitespace() || has_no_visible_rendering(ch))
 }
 
 /// Flatten a body to a single line: every character matched by
@@ -357,7 +413,7 @@ pub(crate) fn handle_operator_page(
             "error": "the page body may not contain the daemon's sender marker",
             "code": "marker_in_body",
             "hint": format!(
-                "`{SENDER_MARKER}…]` is stamped by the daemon and identifies who paged; a body containing it (in any case, or spelled with look-alike spaces or invisible characters) is refused so it cannot read as a second sender. Reword the message and page again — no rate slot was spent."
+                "`{SENDER_MARKER}…]` is stamped by the daemon and identifies who paged; a body containing it after normalisation — in any case, or spelled with a look-alike space or an invisible character (Cf or default-ignorable, e.g. NBSP, ZWSP, RLO, CGJ, a variation selector) — is refused so it cannot read as a second sender. A marker spelled with homoglyphs is NOT detected and is not what this refusal covers. Reword the message and page again — no rate slot was spent."
             ),
         });
     }

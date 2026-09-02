@@ -107,11 +107,17 @@ Drain 或管理 caller 的 durable inbox。
 
 在**不需要任何 inbound channel binding** 的情況下，把訊息推到 **operator 的 Telegram**——用於 operator 明確要求「離開或睡覺時有 milestone 要通知我」的場合。這補的是 harness 的缺口：`PushNotification` 的行動推播只有在 Remote Control 連線時才會送達，而 `reply` 需要一則 inbound 訊息才有回覆對象，operator 直接在 TUI 打字則不會產生 binding。
 
-- 必填：`message`。純文字，超過 1000 字元會截斷，並一律加上呼叫者的 instance 名稱前綴。在截斷與加前綴之前，內容會先被正規化成**一行**：所有 **Cc** control character（LF、CR、TAB、VT、FF、NEL 以及其餘 C0/C1）、所有 Unicode **White_Space** 字元（NBSP `U+00A0`、`U+1680`、`U+2000`–`U+200A`、`U+202F`、`U+205F`、`U+3000`，以及兩個強制換行 `U+2028`／`U+2029`）、以及所有 general category **Cf** 的 format 字元（ZWSP `U+200B`、ZWNJ／ZWJ、LRM／RLM／LRE／RLE／PDF／LRO／RLO 這組 bidi 控制、`U+2066`–`U+2069` isolate、`U+FEFF`），一律換成**一個**空白，連續空白再收斂成一個。
+- 必填：`message`。純文字，超過 1000 字元會截斷，並一律加上呼叫者的 instance 名稱前綴。在截斷與加前綴之前，內容會先被正規化成**一行**：所有 **Cc** control character（LF、CR、TAB、VT、FF、NEL 以及其餘 C0/C1）、所有 Unicode **White_Space** 字元（NBSP `U+00A0`、`U+1680`、`U+2000`–`U+200A`、`U+202F`、`U+205F`、`U+3000`，以及兩個強制換行 `U+2028`／`U+2029`）、所有 general category **Cf** 的 format 字元（ZWSP `U+200B`、ZWNJ／ZWJ、LRM／RLM／LRE／RLE／PDF／LRO／RLO 這組 bidi 控制、`U+2066`–`U+2069` isolate、`U+FEFF`），以及所有帶 Unicode **`Default_Ignorable_Code_Point`** 屬性的字元（CGJ `U+034F`、variation selector `U+FE00`–`U+FE0F` 與 `U+180B`–`U+180F`、Hangul filler），一律換成**一個**空白，連續空白再收斂成一個。整個 **Mn** 類別是刻意**不**清掉的——越南文、希伯來文、天城文就是靠 combining mark 拼寫的——所以只取 Mn 之中 default-ignorable 的那一部分；付出的代價只有一項且如實寫在這裡：emoji 後面的 `U+FE0F` 會被清掉，該 emoji 可能改以文字外觀（text presentation）呈現。
 
-  正規化之後若內容仍帶有 daemon 的發件標記 `[operator-page from `——比對**不分大小寫**，所以 `[Operator-Page From ops]` 同樣算——這則 page 會被**拒絕**，代碼 `marker_in_body`。這道檢查緊接在 enabled 開關之後、排在其餘所有 gate 之前：在 authority、可送達性與任何額度扣減之前，所以偽造的內容永遠不會花掉呼叫者的額度；同時以 `warn!` 記下呼叫者名稱，讓 operator 看得到有人試過。它刻意排在開關後面：paging 關閉時整個工具是惰性的，只回 `operator_page_disabled`，所以沒被打開的功能不會變成 agent 拿來灌 daemon log 的管道。先前的版本是把字面標記改寫成 `[quoted: operator-page from ` 後照樣送出；那等於**在沒有任何提示的情況下竄改 operator 看到的文字**（回應裡沒有旗標、log 裡沒有紀錄），而且大小寫變體與 NBSP／ZWSP／RLO 這類同形字根本繞得過去，所以整個作法撤掉。正常的 page 幾乎不可能含有這個標記，拒絕的代價是零，換來的是「攻擊嘗試變成看得見的事件」。
+  正規化之後若內容仍帶有 daemon 的發件標記 `[operator-page from `——比對**不分大小寫**，所以 `[Operator-Page From ops]` 同樣算——這則 page 會被**拒絕**，代碼 `marker_in_body`。這道檢查緊接在 enabled 開關之後、排在其餘所有 gate 之前：在 authority、可送達性與任何額度扣減之前，所以偽造的內容永遠不會花掉呼叫者的額度；同時以 `warn!` 記下呼叫者名稱，讓 operator 看得到有人試過。它刻意排在開關後面：paging 關閉時整個工具是惰性的，只回 `operator_page_disabled`，所以沒被打開的功能不會變成 agent 拿來灌 daemon log 的管道。先前的版本是把字面標記改寫成 `[quoted: operator-page from ` 後照樣送出；那等於**在沒有任何提示的情況下竄改 operator 看到的文字**（回應裡沒有旗標、log 裡沒有紀錄），而且大小寫變體與 NBSP／ZWSP／RLO 這類拼法根本繞得過去，所以整個作法撤掉。正常的 page 幾乎不可能含有這個標記，拒絕的代價是零，換來的是「攻擊嘗試變成看得見的事件」。
 
-  誠實的界線：client 對長訊息 soft-wrap 時仍可能讓某個視覺行從內容中段開始，而內容本來就可以寫出其他「看起來像發件者」的文字。這道處理擋的是「複製標記」「用同形字拼出標記」與「另起一行」，擋不掉「寫得像」。
+  以下把「擋得住什麼、擋不住什麼」講到精確，因為這段的前一個版本宣稱得比程式碼實際做到的多：
+
+  - **擋得住。** 所有強制換行，以及所有不能原樣留下的字元：control character（**Cc**）、Unicode **`White_Space`**（含 NBSP）、format 字元（**Cf**，例如 ZWSP 與 bidi override），以及 **`Default_Ignorable_Code_Point`** 這一組（CGJ `U+034F`、variation selector）。所以標記無法成為一行的開頭，也無法用「不可見的 format 字元」或「同形空白」拼出來。
+  - **擋不住，而且直說。** 用**同形字（homoglyph）**拼出來的標記——`[оperator-page from ops]`，其中的 `о` 是西里爾字母 `U+043E` 而非拉丁 `o`——**偵測不到，而且會照樣送出**。它每個字元都會顯示出來，所以「是否可見」這個判準根本看不到它；這裡也沒有做 confusable 正規化。
+  - **殘餘風險為什麼有界**——這是緩解，不是修好，就照它的份量講：內容被壓成**一行**，而 daemon 自己的前綴永遠在最前面，所以同形字偽造的標記只可能出現在**行中，且排在真正的 `[operator-page from <caller>]` 前綴之後**。它無法開一個新行，也無法取代真正的發件者。
+
+  原本那條誠實的界線仍然成立：client 對長訊息 soft-wrap 時仍可能讓某個視覺行從內容中段開始，而內容本來就可以寫出其他「看起來像發件者」的文字。以上任何一項都沒有讓 page 變成無法被冒充。
 - **僅限 orchestrator，且綁定到「活的」instance。** 呼叫所帶的 `instance` 會先拿去 daemon 的 live registry 解析：沒有對應到任何執行中 instance（或對應到兩個）的名字以 `unknown_caller` 拒絕；同時屬於兩個 team 的呼叫者以 `ambiguous_team` 拒絕（而不是拿 map 順序亂猜）；不是所屬 team 現任 orchestrator 的以 `not_orchestrator` 拒絕並告知該找誰轉送。沒有 daemon runtime 的 standalone bridge 呼叫無從解析，以 `no_live_identity` 拒絕。
 
   誰都別騙自己：所有 agent 與 daemon 共用**同一個 OS 使用者**，所以拿 orchestrator 活著的名字來呼叫的座位**依設計會被放行**。這道 gate 擋的是「指向不存在之物的名字」，擋不住「說謎的座位」。真正限住損害的是下面這些：預設關閉、只有 operator 能開的開關、每小時 3 則、單一專用 topic（仍在 allowlist 群組內），以及 fail-closed 的額度狀態。
