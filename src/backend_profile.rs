@@ -96,6 +96,77 @@ pub const CLAUDE_CONTEXT_PATTERN: &str = r"(?i)\bctx\s+used:\s*(\d+(?:\.\d+)?)\s
 /// appears in prose.
 pub const KIRO_CONTEXT_PATTERN: &str = r"◔\s*(\d+(?:\.\d+)?)\s*%";
 
+/// t-…-82348-29 r2: the codex 0.150.x startup update menu, recognized
+/// STRUCTURALLY and anchored to the TAIL of the rendered screen.
+///
+/// It matches the whole menu block and nothing else: the `Update available!`
+/// title line, then (within at most 4 intervening lines — the release-notes
+/// line and its blank spacers) the cursor option `› 1. Update now`, then the
+/// two consecutive options `2. Skip` and `3. Skip until next version`, and
+/// after option 3 NOTHING but blank lines and the optional
+/// `Press enter to continue` hint before end-of-text (`\z`).
+///
+/// WHY TAIL-ANCHORED — this is the whole FP argument, do not weaken it to a
+/// phrase. The live modal REPLACES codex's UI: while it owns the terminal
+/// nothing is painted below it — no `›` composer, no `esc to interrupt`
+/// status line, no transcript. A menu that appears in ordinary output
+/// (a transcript, an issue body, this repo's own tests, a resume repaint) is
+/// by construction NOT the last thing on the screen: codex's composer and
+/// status chrome render underneath it. So "the complete menu block sits at
+/// the very end of the rendered screen" is the property that separates live
+/// from quoted; the bare phrase `Skip until next version` — an unanchored
+/// whole-visible-text match, with no position guard and no heartbeat override
+/// (`StatePatterns::detect_with_match` is `re.find(whole screen)`, and
+/// PermissionPrompt is not a HIGH_FP state so neither `apply_anchor_gate` nor
+/// `apply_position_gate` applies) — separates nothing at all.
+///
+/// The screen text this is matched against is
+/// [`crate::vterm::VTerm::tail_lines_dewrapped`] / `tail_lines`, which trims
+/// trailing blank rows, so a live frame ends immediately after the hint; the
+/// trailing `(?:\n[ \t]*…)*` run keeps the anchor tolerant of a capture or
+/// fixture that does carry trailing newlines.
+///
+/// Used in BOTH places that act on this modal, deliberately from ONE
+/// definition: the codex `PermissionPrompt` classification (see
+/// [`codex_profile`]) and the codex update `DismissPattern.label` (see
+/// `Backend::Codex`'s preset in `crate::backend`). Because the dismiss scan
+/// matches the same anchored regex, quoted text cannot fire the `2\r`
+/// keystroke under ANY [`crate::agent::dismiss::DismissScanScope`] — Startup
+/// included — not merely under the post-latch re-arm.
+///
+/// F3 (disclosed, NOT fixed here): while this menu is up the pane classifies
+/// `PermissionPrompt`, so `supervisor/reactions.rs`'s edge-triggered notice
+/// would be suppressed for a genuine approval prompt arriving in the same
+/// window. Bounds, measured rather than assumed:
+///
+/// * codex's modal is EXCLUSIVE — no other prompt can render while it owns the
+///   screen — so there is no genuine approval prompt to miss while it is up.
+/// * `detect` releases the instant anything is painted below the menu (that is
+///   what the tail anchor buys). The tracked STATE lags by the hysteresis
+///   min-hold for a priority-DOWN transition, 2s from `PermissionPrompt`
+///   (`StateTracker::transition`), with `INTERACTIVE_EXPIRY` (120s) as the
+///   backstop for the case where the screen then goes hash-stable and
+///   detection stops re-evaluating.
+///
+/// So the exposure is the live-menu window plus ~2s, once per spawn. Mitigation
+/// is follow-up task t-20260902123656981395-82348-52; do not implement it here.
+pub const CODEX_UPDATE_MENU_LIVE: &str = concat!(
+    r"Update available![^\n]*\n",
+    r"(?:[^\n]*\n){0,4}?",
+    r"[ \t]*› 1\. Update now[^\n]*\n",
+    r"[ \t]*2\. Skip[ \t]*\n",
+    r"[ \t]*3\. Skip until next version[ \t]*",
+    r"(?:\n[ \t]*(?:Press enter to continue)?[ \t]*)*\z",
+);
+
+/// The plain literal every [`CODEX_UPDATE_MENU_LIVE`] match necessarily
+/// contains. Two consumers need it: the dismiss scan's cheap `screen.contains`
+/// prefilter (a structural label has no `DISMISS_REGEX_*_PREFIX` to strip, so
+/// the generic literal-hint recovery would hand `contains` an entire regex),
+/// and `REARM_PRE_IDLE_BACKEND_STARTUP_HINTS`, whose membership stays keyed on
+/// this literal. See `crate::agent::dismiss`.
+pub const CODEX_UPDATE_MENU_LITERAL: &str = "Update available!";
+
 /// The single dispatch: `Backend → &'static BackendProfile`, lazy-cached
 /// (compile-once, mirroring `StatePatterns::for_backend`'s `OnceLock`). This
 /// `match` is the ONE unavoidable flat-enum lookup; the per-backend DATA lives
@@ -448,18 +519,27 @@ fn codex_profile() -> BackendProfile {
                 AgentState::ModelUnsupported,
                 r"invalid_request_error|model is not supported|Model metadata for .*? not found",
             ),
-            // t-…-82348-29: `Skip until next version` is the codex startup
-            // update menu (0.150.x shows it even with
-            // `-c check_for_update_on_startup=false` on the argv). Without a
-            // prompt token this frame fell through to Active ("esc to
+            (
+                AgentState::PermissionPrompt,
+                r"Would you like to run the following command\?|Press enter to confirm or esc to cancel|No, and tell Codex what to do differently",
+            ),
+            // t-…-82348-29: the codex startup update menu (0.150.x shows it
+            // even with `-c check_for_update_on_startup=false` on the argv).
+            // Without a prompt token this frame fell through to Active ("esc to
             // interrupt" in the repainted transcript) or Idle (the menu's own
             // `›` cursor), so the post-latch dismiss scan never armed and the
             // agent stranded until a human keypress. Priority order puts this
             // above both, matching how the other prompt tokens already win.
-            (
-                AgentState::PermissionPrompt,
-                r"Would you like to run the following command\?|Press enter to confirm or esc to cancel|No, and tell Codex what to do differently|Skip until next version",
-            ),
+            //
+            // r2 (review F2): a SEPARATE entry carrying the structural,
+            // tail-anchored [`CODEX_UPDATE_MENU_LIVE`] rather than a bare
+            // `Skip until next version` token folded into the alternation
+            // above. Same classification (first-match priority is by state, and
+            // both entries are PermissionPrompt), but the recognizer now
+            // distinguishes the LIVE modal from a transcript quoting it —
+            // a bare phrase could not, and any prose carrying it kept the pane
+            // prompt_blocked and re-armed the dismiss scan.
+            (AgentState::PermissionPrompt, CODEX_UPDATE_MENU_LIVE),
             (
                 AgentState::GitConflict,
                 r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",

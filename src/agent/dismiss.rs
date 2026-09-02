@@ -45,6 +45,7 @@ pub(crate) fn set_pre_write_rendezvous_for_test(hook: Option<Box<dyn Fn()>>) {
 /// screen-hash change, so a pre-Idle repaint that still shows the modal
 /// re-arms the scan the instant this window lapses, and `DISMISS_IN_FLIGHT`
 /// only bounds CONCURRENT dismisses. The real bound is the per-spawn one-shot
+/// threaded through [`try_prepared_dismiss_dialog_once_per_spawn`]
 /// (t-…-82348-29 r2, review F1).
 const DISMISS_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -220,7 +221,28 @@ fn dismiss_regex_cache_contains(pattern: &str) -> bool {
 const DISMISS_REGEX_PREFIX: &str = r"(?m)^[^A-Za-z\n]{0,8}";
 const DISMISS_REGEX_WIDE_PREFIX: &str = r"(?m)^[^A-Za-z\n]*";
 
+/// t-…-82348-29 r2 (review F2): dismiss labels that are STRUCTURAL rather than
+/// `DISMISS_REGEX_*_PREFIX` + literal, mapped to the plain literal that every
+/// match necessarily contains.
+///
+/// Two consumers need that literal and neither can recover it by stripping a
+/// prefix: the cheap `screen.contains` prefilter in
+/// [`try_prepared_dismiss_dialog_once_per_spawn`] (handing it a whole regex
+/// would make the pattern permanently unfireable — the trap
+/// [`dismiss_literal_hint`]'s doc warns about), and the hint lists below, whose
+/// membership stays keyed on the human-readable literal so the audit point
+/// still reads as one.
+const STRUCTURAL_DISMISS_HINTS: &[(&str, &str)] = &[(
+    crate::backend_profile::CODEX_UPDATE_MENU_LIVE,
+    crate::backend_profile::CODEX_UPDATE_MENU_LITERAL,
+)];
+
 fn dismiss_literal_hint(pattern: &str) -> &str {
+    for (label, hint) in STRUCTURAL_DISMISS_HINTS {
+        if *label == pattern {
+            return hint;
+        }
+    }
     pattern
         .strip_prefix(DISMISS_REGEX_PREFIX)
         .or_else(|| pattern.strip_prefix(DISMISS_REGEX_WIDE_PREFIX))
@@ -291,10 +313,36 @@ fn is_rearm_pre_idle_hint(literal_hint: &str) -> bool {
 /// #1069 fallback was structurally dead: the agent stranded for ~11h until a
 /// human pressed a key. The pre-Idle bound keeps the #2474 exposure to the
 /// startup window: post-Idle the phrase is transcript and the settled re-arm
-/// refuses it. Residual (accepted): a resume-repainted transcript QUOTING the
-/// full modal at line start pre-Idle can fire a stray "2\r" into the composer —
-/// a visible, self-healing message, traded against a silent day-long strand.
-const REARM_PRE_IDLE_BACKEND_STARTUP_HINTS: &[&str] = &["Update available!"];
+/// refuses it.
+///
+/// r2 (review F1 + F2) — the round-1 residual note that stood here ("one
+/// possible stray 2\r, 10s-cooldown-limited") was wrong on BOTH halves. It is
+/// replaced by two real bounds, and no comment in this repo may restate the old
+/// claim:
+///
+/// * RECOGNITION (F2): the label is no longer a phrase. It is
+///   [`crate::backend_profile::CODEX_UPDATE_MENU_LIVE`] — the complete menu
+///   block anchored to the TAIL of the rendered screen — so a transcript that
+///   quotes the modal cannot match it in ANY scope, Startup included, not
+///   merely on the post-latch re-arm. The same const is the classifier's
+///   PermissionPrompt pattern, so quoted text never even reaches
+///   `prompt_blocked`.
+/// * COUNT (F1): membership in THIS list makes a pattern a PER-SPAWN ONE-SHOT.
+///   The flag is owned by the PTY read loop and threaded through
+///   [`try_prepared_dismiss_dialog_once_per_spawn`], which spends it at the
+///   first DISPATCH. The loop's 10s cooldown is rate limiting, NOT the bound:
+///   `StateTracker::feed_with_lazy_fg` reports `state_changed` on any
+///   screen-hash change, so without the flag every pre-Idle repaint still
+///   showing the menu enqueued another "2\r" once the window lapsed, and
+///   `DISMISS_IN_FLIGHT` bounds only CONCURRENT dismisses.
+///
+/// Consequence, stated plainly: exactly one "2\r" per spawn. If that single
+/// write fails, the auto-skip is FORFEIT for the spawn — the pane stays
+/// prompt-blocked and visible to the stuck watchdog, which is the honest
+/// degradation; `restart_instance` gets a fresh one-shot because the read loop,
+/// and with it the flag, restarts.
+const REARM_PRE_IDLE_BACKEND_STARTUP_HINTS: &[&str] =
+    &[crate::backend_profile::CODEX_UPDATE_MENU_LITERAL];
 
 fn is_rearm_pre_idle_backend_startup_hint(literal_hint: &str) -> bool {
     REARM_PRE_IDLE_BACKEND_STARTUP_HINTS.contains(&literal_hint)
@@ -334,6 +382,17 @@ impl PreparedDismissPattern {
             DismissScanScope::RearmPreIdle => self.rearm_past_latch || self.rearm_pre_idle,
             DismissScanScope::RearmSettled => self.rearm_past_latch,
         }
+    }
+
+    /// t-…-82348-29 r2: is this a BACKEND-caused startup-modal hint
+    /// ([`REARM_PRE_IDLE_BACKEND_STARTUP_HINTS`]) — the class the per-spawn
+    /// one-shot governs? DERIVED from the two flags that define the class, not
+    /// stored, so it cannot drift from them: pre-Idle re-arm eligible AND not
+    /// routed through the dev-modal generation gate (the daemon-caused class
+    /// carries its own per-generation one-shot inside that gate, so applying
+    /// this flag to it would double-count and is deliberately excluded).
+    fn is_backend_startup_hint(&self) -> bool {
+        self.rearm_pre_idle && !self.dev_gated
     }
 }
 
@@ -405,6 +464,49 @@ pub fn try_prepared_dismiss_dialog(
     dev_gate: &mut DevModalGate,
     now: LogicalMs,
 ) -> bool {
+    // A caller with no spawn-scoped flag gets a FRESH one-shot for this single
+    // frame — the historical meaning of this seam, and the right default for a
+    // one-frame verdict. The PTY read loop must NOT use it: its flag has to
+    // live for the whole spawn (see `pty_read_loop`).
+    let mut backend_startup_hint_spent = false;
+    try_prepared_dismiss_dialog_once_per_spawn(
+        name,
+        screen,
+        pty_writer,
+        dismiss_patterns,
+        scope,
+        dev_gate,
+        now,
+        &mut backend_startup_hint_spent,
+    )
+}
+
+/// As [`try_prepared_dismiss_dialog`], plus the t-…-82348-29 r2 (review F1)
+/// per-spawn ONE-SHOT for backend-caused startup-modal hints.
+///
+/// `backend_startup_hint_spent` is owned by the PTY read loop, created once per
+/// `pty_read_loop` invocation (i.e. per spawn) and NEVER reset within it. A
+/// pattern in [`REARM_PRE_IDLE_BACKEND_STARTUP_HINTS`] is eligible in EVERY
+/// scope — Startup as well as RearmPreIdle — only while the flag is false, and
+/// the flag is set at DISPATCH: after the in-flight slot is claimed and before
+/// the inline write or the detached worker runs. So exactly one keystroke per
+/// spawn reaches the PTY, and a failed write forfeits the auto-skip for that
+/// spawn rather than opening a retry loop (see the hint list's doc comment).
+///
+/// Everything else is untouched: `DISMISS_IN_FLIGHT` concurrency, the #3314
+/// dev-modal gate (`enqueue_receipt` / Spent / write barrier / `still_valid`),
+/// and the #3314 RearmSettled / #2474 settled-scope behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn try_prepared_dismiss_dialog_once_per_spawn(
+    name: &str,
+    screen: &str,
+    pty_writer: &PtyWriter,
+    dismiss_patterns: &[PreparedDismissPattern],
+    scope: DismissScanScope,
+    dev_gate: &mut DevModalGate,
+    now: LogicalMs,
+    backend_startup_hint_spent: &mut bool,
+) -> bool {
     #[cfg(test)]
     DISMISS_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -417,6 +519,15 @@ pub fn try_prepared_dismiss_dialog(
         // not admit — never fire runtime-approval (`Yes, proceed`) off the latch,
         // and admit a daemon-caused startup modal only before the agent settles.
         if !pattern.eligible(scope) {
+            continue;
+        }
+        // t-…-82348-29 r2 (review F1): a backend-caused startup modal is
+        // answered AT MOST ONCE per spawn, in EVERY scope. Scope-independent
+        // deliberately: the codex update menu holds the pane in
+        // PermissionPrompt, so the startup latch never closes and the scope
+        // stays `Startup` for as long as the modal is up — a RearmPreIdle-only
+        // guard would bound nothing in exactly the situation it exists for.
+        if pattern.is_backend_startup_hint() && *backend_startup_hint_spent {
             continue;
         }
         if !pattern.literal_hint.is_empty() && !screen.contains(&pattern.literal_hint) {
@@ -467,6 +578,21 @@ pub fn try_prepared_dismiss_dialog(
                     return true; // dismiss already pending
                 }
                 inflight.insert(flight_key.clone());
+            }
+            // t-…-82348-29 r2 (review F1): spend the per-spawn one-shot HERE —
+            // at dispatch, after the in-flight slot is claimed (a collision
+            // returned above without dispatching, so it must not spend) and
+            // before either write path runs. Never reset within this spawn.
+            //
+            // Deliberately NOT the dev-modal gate's spend-only-on-success rule:
+            // that gate may safely retry because its recognition is bound to
+            // facts the daemon OWNS (this generation's argv, the frame epoch).
+            // This one is bound only to what is on the screen, so a retry after
+            // a failed write is a retry on evidence that may already be stale —
+            // forfeiting the auto-skip leaves the pane blocked and VISIBLE to
+            // the watchdog, which is the safer failure.
+            if pattern.is_backend_startup_hint() {
+                *backend_startup_hint_spent = true;
             }
             let writer = Arc::clone(pty_writer);
             let keys = pattern.key_seq.clone();

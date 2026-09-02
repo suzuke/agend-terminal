@@ -1,0 +1,18 @@
+[2J[H  I read through the codex startup menu handling. Option 3 on that menu is
+  labelled `Skip until next version`; the daemon auto-presses option 2.
+  The frame it renders looks exactly like this:
+
+  ✨ Update available! 0.150.1 -> 0.152.0
+
+  Release notes: https://github.com/openai/codex/releases
+
+  › 1. Update now (runs `sh -c 'curl -fsSL https://codex.openai.com/install.sh | sh'`)
+2. Skip
+3. Skip until next version
+
+  Press enter to continue
+
+  That block is quoted transcript, not a live modal: codex always paints its
+  composer underneath, which is exactly what separates the two.
+
+▌ › 

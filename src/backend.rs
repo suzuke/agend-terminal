@@ -560,17 +560,17 @@ impl Backend {
                         label: r"(?m)^[^A-Za-z\n]*Please restart",
                         sequence: b"\r",
                     },
-                    // #1069: version-update modal blocks agent until operator
-                    // selects an option. "2\r" = "Skip" (least invasive).
-                    // #1626 FALLBACK: the `-c check_for_update_on_startup=false`
-                    // flag above normally suppresses this modal entirely, so this
-                    // dismiss never fires in the happy path. Kept as belt-and-
-                    // suspenders: codex silently no-ops unknown `-c` keys, so if
-                    // upstream ever renames the key the flag dormant-fails and this
-                    // dismiss degrades the failure from "blocking hang" to a racy
-                    // (but non-blocking) auto-skip.
+                    // #1069: version-update modal blocks the agent until an
+                    // option is selected; "2\r" = Skip (least invasive). #1626
+                    // was believed to make this dead code — codex 0.150.x shows
+                    // the menu with that flag on the argv (verified on the live
+                    // stranded pid), so this IS the defense. t-…-82348-29 r2: the
+                    // label is the tail-anchored structural const the classifier
+                    // also uses (quoted transcript cannot fire it in ANY scope),
+                    // answered as a deterministic PER-SPAWN one-shot — not "racy
+                    // but non-blocking"; the loop's 10s cooldown is not the bound.
                     DismissPattern {
-                        label: r"(?m)^[^A-Za-z\n]*Update available!",
+                        label: crate::backend_profile::CODEX_UPDATE_MENU_LIVE,
                         sequence: b"2\r",
                     },
                 ],
@@ -2389,31 +2389,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn codex_update_dismiss_anchored_rejects_mid_line() {
-        let codex = Backend::Codex.preset();
-        let pattern = codex
-            .dismiss_patterns
-            .iter()
-            .find(|dp| dp.label.contains("Update available!"))
-            .expect("#1069: codex update dismiss pattern must exist")
-            .label;
-        let re = regex::Regex::new(pattern).expect("pattern must compile");
-        assert!(
-            re.is_match("✨ Update available! 0.132.0 -> 0.133.0"),
-            "line-start match must succeed"
-        );
-        assert!(
-            !re.is_match("User asked: is there an Update available! for the tool?"),
-            "mid-line mention must NOT match (Issue #468 anchoring)"
-        );
-        // #1087: centered TUI modal with 40+ char prefix must match
-        let centered = format!("{}Update available! 1.0 -> 2.0", " ".repeat(45));
-        assert!(
-            re.is_match(&centered),
-            "#1087: centered modal with 45-space prefix must match"
-        );
-    }
+    // t-…-82348-29 r2: `codex_update_dismiss_anchored_rejects_mid_line` was
+    // RE-HOMED (not dropped) to
+    // `agent::dismiss::tests::codex_update_dismiss_matches_only_the_live_centered_menu`.
+    // Its subject changed: the label is no longer a line-anchored TITLE
+    // (`^[^A-Za-z\n]*Update available!`) but the structural, tail-anchored
+    // `backend_profile::CODEX_UPDATE_MENU_LIVE`, whose semantics belong beside
+    // the other codex-update dismiss pins. Both original intents are carried
+    // over and strengthened there — #468 (a mid-line mention must not match)
+    // and #1087 (a 45-space-centered TUI modal must match) — plus two new
+    // negatives the old label could not express: the title line ALONE, and the
+    // same block with codex's composer painted under it (review F2).
 
     /// #1626: the `-c check_for_update_on_startup=false` override must be present
     /// in BOTH spawn modes and, in Resume mode, must come BEFORE the `resume`

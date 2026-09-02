@@ -23,7 +23,7 @@ pub use dismiss::try_dismiss_dialog;
 pub(crate) mod crash_disposition;
 use dismiss::{
     dismiss_scan_armed, dismiss_scan_scope, is_dismissible_prompt_state, prepare_dismiss_patterns,
-    try_prepared_dismiss_dialog, PreparedDismissPattern,
+    try_prepared_dismiss_dialog_once_per_spawn, PreparedDismissPattern,
 };
 
 pub mod deleting;
@@ -1956,6 +1956,20 @@ fn pty_read_loop(
     // the post-latch re-arm narrows to workspace-trust only. See
     // `dismiss_scan_scope`.
     let mut dismiss_agent_ever_idle = false;
+    // t-…-82348-29 r2 (review F1): the PER-SPAWN one-shot for BACKEND-caused
+    // startup modals (`REARM_PRE_IDLE_BACKEND_STARTUP_HINTS` — today the codex
+    // update menu). Set when such a dismiss is DISPATCHED, never reset here, so
+    // exactly one answering keystroke reaches this child. Scoped by
+    // construction: a `restart_instance` runs this loop afresh and therefore
+    // gets a fresh one-shot.
+    //
+    // This — not the cooldown below — is the bound. The cooldown is rate
+    // limiting: `feed_with_lazy_fg` reports `state_changed` on ANY screen-hash
+    // change, so a repaint that still shows the modal re-arms the scan the
+    // moment the window lapses. If the single write fails the auto-skip is
+    // forfeited for this spawn: the pane stays prompt-blocked and visible to
+    // the stuck watchdog rather than looping keystrokes into the child.
+    let mut backend_startup_hint_spent = false;
     // #t-23: debug-only seam — verbose per-read PTY logging (read counts / byte
     // totals). Off by default; enable with `AGEND_DEBUG_PTY_READ=1`. Tightened
     // from presence-based (`is_ok()`: any value, even `=0`, enabled it) to the
@@ -2071,7 +2085,7 @@ fn pty_read_loop(
                     state_changed,
                     pre_idle_dev_modal_visible,
                 ) && (!in_cooldown || pre_idle_dev_modal_visible)
-                    && try_prepared_dismiss_dialog(
+                    && try_prepared_dismiss_dialog_once_per_spawn(
                         name,
                         &screen,
                         pty_writer,
@@ -2085,6 +2099,7 @@ fn pty_read_loop(
                         },
                         &mut dev_modal_gate,
                         dev_modal::LogicalMs(dev_modal_clock.elapsed().as_millis() as u64),
+                        &mut backend_startup_hint_spent,
                     )
                 {
                     dismiss_cooldown_until =

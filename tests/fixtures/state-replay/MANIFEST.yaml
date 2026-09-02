@@ -44,12 +44,17 @@ fixtures:
     # then Thinking from the working spinner, then UsageLimit from the
     # quota-exceeded banner.
     # t-…-82348-29: the startup update menu now classifies PermissionPrompt
-    # (`Skip until next version` token) instead of falling through to Idle —
-    # this frame is a BLOCKING modal, and the misclassification is what kept
-    # the #1069 dismiss fallback from ever arming (an agent stranded ~11h on
-    # 0.150.1). While the menu text stays on the visible grid it outranks the
-    # spinner's Thinking, so the thinking hop disappears from this capture;
-    # UsageLimit still outranks it at the quota banner.
+    # instead of falling through to Idle — this frame is a BLOCKING modal, and
+    # the misclassification is what kept the #1069 dismiss fallback from ever
+    # arming (an agent stranded ~11h on 0.150.1).
+    # r2 (review F2): the classifier is the tail-anchored CODEX_UPDATE_MENU_LIVE,
+    # not a bare `Skip until next version` token. MEASURED on this capture: the
+    # menu is LIVE (block at the tail, nothing painted below) on 3 of 32 replayed
+    # frames — it is NOT "on the grid throughout", which is what the round-1 note
+    # here claimed. The transition list is unchanged because the tracker's
+    # hysteresis holds PermissionPrompt on a priority-DOWN move (2s min-hold) and
+    # replay advances no wall clock, so the thinking hop still never lands;
+    # UsageLimit outranks it at the quota banner.
     expected_transitions: [starting, permission, usage_limit]
     expected_final_state: usage_limit
     expected_final_detect: usage_limit
@@ -63,12 +68,15 @@ fixtures:
     # idle `›` prompt). Without the pattern, the `›` prompt fires Idle,
     # then the working spinner fires Thinking. Final detect() returns
     # Idle because the `› ` prompt glyph is visible on the final grid.
-    # t-…-82348-29: the update menu now classifies PermissionPrompt (`Skip
-    # until next version` token) — the entire short capture keeps the menu
-    # text on the visible grid, so it outranks Idle/Thinking throughout and
-    # the replayed transition list collapses to the modal state. In live
-    # operation the #1069 dismiss answers the menu and codex's full redraw
-    # clears the token from the grid, recovering Idle/Active.
+    # t-…-82348-29: the update menu now classifies PermissionPrompt, so the
+    # replayed transition list collapses to the modal state.
+    # r2 (review F2): the classifier is the tail-anchored CODEX_UPDATE_MENU_LIVE.
+    # MEASURED here: the menu is LIVE on 4 of 67 replayed frames — the collapse
+    # is NOT "the token stays on the grid throughout" (the round-1 note here),
+    # it is the tracker's 2s priority-DOWN min-hold never elapsing in a replay
+    # that advances no wall clock. In live operation the #1069 dismiss answers
+    # the menu, codex redraws below it, `detect` releases immediately and the
+    # STATE follows ~2s later.
     expected_transitions: [starting, permission]
     expected_final_state: permission
     # detect() on the FINAL grid alone is idle — the dismissed menu is gone
@@ -263,12 +271,13 @@ fixtures:
     # PermissionPrompt via hysteresis — no behavioral change for
     # consumers.
     # t-…-82348-29: this capture's startup ALSO renders the 0.120 update menu
-    # (`Update available!` present twice in the raw), so the new
-    # `Skip until next version` PermissionPrompt token now classifies the
-    # opening frames as the modal and the menu text lingering on the visible
-    # grid outranks Idle/Thinking for the rest of this short capture — the
-    # transition list collapses to the modal state, and the approval dialog
-    # later in the capture lands on the same (deduped) PermissionPrompt.
+    # (`Update available!` present twice in the raw), so the opening frames now
+    # classify as the modal and the transition list collapses; the approval
+    # dialog later in the capture lands on the same (deduped) PermissionPrompt.
+    # r2 (review F2): the classifier is the tail-anchored CODEX_UPDATE_MENU_LIVE.
+    # MEASURED here: LIVE on 3 of 193 replayed frames — the collapse is the
+    # tracker's 2s priority-DOWN min-hold in a zero-wall-clock replay, not the
+    # menu "lingering on the visible grid" as the round-1 note claimed.
     expected_transitions: [starting, permission]
     expected_final_state: permission
     expected_final_detect: idle
@@ -376,11 +385,12 @@ fixtures:
     # final frame (only the `Token usage:` / `resume ...` summary lines
     # remain).
     # t-…-82348-29: this 0.120 capture also opens on the update menu (`Update
-    # available!` ×2 in the raw); the new `Skip until next version`
-    # PermissionPrompt token classifies those frames as the modal, and the
-    # menu text lingering on the short capture's visible grid outranks
-    # Idle/Thinking — the transition list collapses to the modal state, the
-    # same shape as the codex-thinking/update/perm entries above.
+    # available!` ×2 in the raw); those frames classify as the modal and the
+    # transition list collapses — same shape as codex-thinking/update/perm above.
+    # r2 (review F2): the classifier is the tail-anchored CODEX_UPDATE_MENU_LIVE.
+    # MEASURED here: LIVE on 3 of 139 replayed frames — the collapse is the
+    # tracker's 2s priority-DOWN min-hold in a zero-wall-clock replay, not the
+    # menu "lingering on the visible grid" as the round-1 note claimed.
     expected_transitions: [starting, permission]
     expected_final_state: permission
     expected_final_detect: null
@@ -831,6 +841,34 @@ fixtures:
     expected_final_detect: server_rate_limit
     capture_kind: synthetic
     provenance: "#1470-1 regression-proof — codex prose mentioning net-error phrasing; raw detect matches but feed gates keep STATE out of SRL"
+
+  - file: codex-quoted-update-menu.raw
+    backend: codex
+    cli_version: "0.150.1"
+    recorded_on: "2026-09-02"
+    scenario: |
+      t-…-82348-29 r2 (review F2) FP-control, HAND-AUTHORED (see capture_kind /
+      provenance): an ordinary codex pane whose transcript quotes BOTH the bare
+      phrase `Skip until next version` and the complete 0.150.1 update menu
+      verbatim, with codex's own composer painted underneath it.
+
+      The sibling prose control (codex-discussion-text.raw) cannot cover this:
+      it contains neither the phrase nor the menu. Round 1 classified this shape
+      as PermissionPrompt, which re-armed the dismiss scan and typed `2\r` into
+      the composer. The tail-anchored CODEX_UPDATE_MENU_LIVE matches only a menu
+      block that ends the visible screen, so a quoted one — always followed by
+      the composer — does not match.
+
+      Contract: `permission` must NEVER appear in the transitions for this
+      capture. The unit-level frames in src/agent/dismiss/tests.rs
+      (`quoted_codex_update_menu_*`) carry the same contract at the byte level,
+      including the `esc to interrupt` variant and the zero-bytes-written
+      assertion under BOTH Startup and RearmPreIdle scopes.
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+    capture_kind: synthetic
+    provenance: "t-…-82348-29 r2 review F2 — hand-authored (plain text + a leading ANSI clear/home), NOT a PTY capture; the menu text is copied verbatim from the live 0.150.1 frame the operator was stranded on, the surrounding prose and composer are authored"
 
   - file: agy-discussion-text.raw
     backend: agy

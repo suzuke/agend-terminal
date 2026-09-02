@@ -868,11 +868,11 @@ impl Drop for InlineWrite {
 
 /// The per-spawn one-shot seam for the backend-startup-hint tests.
 ///
-/// At the RED commit `try_prepared_dismiss_dialog` has no one-shot parameter,
-/// so this wrapper drops the flag and the scan is bounded by nothing; the GREEN
-/// commit points it at `try_prepared_dismiss_dialog_once_per_spawn` and threads
-/// the flag through. The wrapper exists so the RED test BODIES below are
-/// byte-identical across both commits — the only thing that changes is the
+/// At the RED commit `try_prepared_dismiss_dialog` had no one-shot parameter,
+/// so this wrapper dropped the flag and the scan was bounded by nothing; GREEN
+/// points it at the production `try_prepared_dismiss_dialog_once_per_spawn` and
+/// threads the flag through. The wrapper exists so the test BODIES below are
+/// byte-identical across both commits — the only thing that changed is the
 /// production machinery they reach.
 #[allow(clippy::too_many_arguments)]
 fn scan_with_one_shot(
@@ -885,8 +885,7 @@ fn scan_with_one_shot(
     now: LogicalMs,
     backend_startup_hint_spent: &mut bool,
 ) -> bool {
-    let _ = &mut *backend_startup_hint_spent;
-    try_prepared_dismiss_dialog(
+    try_prepared_dismiss_dialog_once_per_spawn(
         name,
         screen,
         pty_writer,
@@ -894,6 +893,7 @@ fn scan_with_one_shot(
         scope,
         dev_gate,
         now,
+        backend_startup_hint_spent,
     )
 }
 
@@ -1009,6 +1009,57 @@ fn quoted_codex_update_menu_writes_no_bytes_in_any_scope() {
                  a phrase that circulates as transcript"
             );
         }
+    }
+}
+
+/// #468/#1087 anchoring, RE-HOMED from `backend::tests::
+/// codex_update_dismiss_anchored_rejects_mid_line` (t-…-82348-29 r2) because
+/// the label's subject changed: it is no longer a line-anchored TITLE
+/// (`^[^A-Za-z\n]*Update available!`) but the structural, tail-anchored
+/// [`crate::backend_profile::CODEX_UPDATE_MENU_LIVE`].
+///
+/// Both original intents are carried over — #468 (a mid-line mention must never
+/// fire a keystroke) and #1087 (a centered TUI modal with a 40+ char prefix must
+/// still match) — and two negatives the old label could not express are added:
+/// the title line ALONE is not a menu, and the same block with codex's composer
+/// painted under it is quoted transcript, not a live modal.
+#[test]
+fn codex_update_dismiss_matches_only_the_live_centered_menu() {
+    let pattern = crate::backend::Backend::Codex
+        .preset()
+        .dismiss_patterns
+        .iter()
+        .find(|dp| dp.label.contains("Update available!"))
+        .expect("#1069: the codex update dismiss pattern must exist")
+        .label;
+    let re = regex::Regex::new(pattern).expect("pattern must compile");
+    // #1087: TUI modals are centered, so every line carries a wide indent.
+    let pad = " ".repeat(45);
+    let title = format!("{pad}✨ Update available! 1.0 -> 2.0");
+    let menu = format!(
+        "{title}\n\n{pad}Release notes: https://example.invalid\n\n\
+         {pad}› 1. Update now (runs `sh -c 'curl -fsSL https://x | sh'`)\n\
+         {pad}2. Skip\n{pad}3. Skip until next version\n\n{pad}Press enter to continue"
+    );
+    assert!(
+        re.is_match(&menu),
+        "#1087: a centered, complete, LIVE menu must match"
+    );
+    for (text, why) in [
+        (
+            "User asked: is there an Update available! for the tool?".to_string(),
+            "#468: a mid-line mention must NOT match",
+        ),
+        (
+            title,
+            "r2/F2: the title line alone is not the menu — the old label matched it",
+        ),
+        (
+            format!("{menu}\n\n▐ › "),
+            "r2/F2: the same block with codex's composer under it is quoted, not live",
+        ),
+    ] {
+        assert!(!re.is_match(&text), "{why}");
     }
 }
 
