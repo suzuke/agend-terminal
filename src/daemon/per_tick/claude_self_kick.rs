@@ -330,7 +330,7 @@ mod tests {
         static C: AtomicU32 = AtomicU32::new(0);
         let id = C.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "agend-selfkick-{}-{}-{}",
+            "agend-selfkick-notice-{}-{}-{}",
             std::process::id(),
             tag,
             id
