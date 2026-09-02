@@ -30,6 +30,11 @@ const SERIALIZED_PAIRS: &[(&str, &str, &str)] = &[
         "fleet_test_guard serializes the restart ingress fixture",
     ),
     (
+        "src/channel/operator_page/tests.rs",
+        "AGEND_HOME",
+        "fleet_test_guard + channel_registry_test_guard serialize the operator-page fixture",
+    ),
+    (
         "src/daemon/ci_watch/poller_tests.rs",
         "GITLAB_TOKEN",
         "GitlabTokenGuard holds ENV_MUTEX and restores the token",

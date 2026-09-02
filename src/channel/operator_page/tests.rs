@@ -162,7 +162,18 @@ fn teardown(home: &std::path::Path) {
     std::fs::remove_dir_all(home).ok();
 }
 
-fn page(caller: &str, text: &str) -> serde_json::Value {
+/// Drives the REAL tool entry, re-asserting `AGEND_HOME` immediately before the
+/// call.
+///
+/// 116 tests in this crate mutate `AGEND_HOME`, and one file does so under a
+/// NAMED `#[serial(...)]` key, which does not mutually exclude with our global
+/// `#[serial]`. Setting it once in `setup` leaves a window as wide as the whole
+/// test in which a foreign mutation can redirect the handler at another
+/// fixture's home; re-asserting per call shrinks that window to microseconds.
+/// Observed as a real flake: this suite failed once in a full-suite run and
+/// passed clean in the next.
+fn page(home: &std::path::Path, caller: &str, text: &str) -> serde_json::Value {
+    std::env::set_var("AGEND_HOME", home);
     handle_tool(
         "operator_page",
         &serde_json::json!({ "message": text }),
@@ -181,7 +192,7 @@ fn non_orchestrator_caller_is_refused() {
     let _r = channel_registry_test_guard();
     let (home, rec) = setup("authz", true, true);
 
-    let out = page("worker", "milestone");
+    let out = page(&home, "worker", "milestone");
 
     assert_eq!(out["code"], "not_orchestrator", "{out}");
     assert_eq!(
@@ -201,7 +212,7 @@ fn disabled_switch_refuses_and_sends_nothing() {
     let _r = channel_registry_test_guard();
     let (home, rec) = setup("disabled", false, true);
 
-    let out = page("lead", "milestone");
+    let out = page(&home, "lead", "milestone");
 
     assert_eq!(out["code"], "operator_page_disabled", "{out}");
     assert_eq!(rec.count(), 0, "a disabled tool must send nothing");
@@ -218,12 +229,12 @@ fn fourth_page_in_the_hour_is_dropped_with_retry_after() {
     let (home, rec) = setup("rate", true, true);
 
     for i in 1..=RATE_LIMIT_PER_HOUR {
-        let out = page("lead", &format!("milestone {i}"));
+        let out = page(&home, "lead", &format!("milestone {i}"));
         assert_eq!(out["sent"], true, "page {i} must succeed: {out}");
     }
     assert_eq!(rec.count(), RATE_LIMIT_PER_HOUR, "three pages delivered");
 
-    let out = page("lead", "milestone 4");
+    let out = page(&home, "lead", "milestone 4");
 
     assert_eq!(out["code"], "rate_limited", "{out}");
     let retry = out["retry_after_secs"].as_i64().unwrap_or(-1);
@@ -249,7 +260,7 @@ fn rate_counter_survives_a_simulated_restart() {
     let (home, rec) = setup("durable", true, true);
 
     for i in 1..=RATE_LIMIT_PER_HOUR {
-        assert_eq!(page("lead", &format!("m{i}"))["sent"], true);
+        assert_eq!(page(&home, "lead", &format!("m{i}"))["sent"], true);
     }
     let sidecar = home.join("operator_page_rate.json");
     assert!(
@@ -263,7 +274,7 @@ fn rate_counter_survives_a_simulated_restart() {
     let rec2 = Recorder::arc("telegram-op-page-durable-2", true);
     register_active_channel(rec2.clone());
 
-    let out = page("lead", "after restart");
+    let out = page(&home, "lead", "after restart");
 
     assert_eq!(
         out["code"], "rate_limited",
@@ -288,7 +299,7 @@ fn dedicated_topic_is_used_when_registered() {
     crate::channel::telegram::topic_registry::register_topic(&home, 77, "operator-notifications")
         .expect("register dedicated topic");
 
-    assert_eq!(page("lead", "milestone")["sent"], true);
+    assert_eq!(page(&home, "lead", "milestone")["sent"], true);
 
     let (routed_to, _, _) = rec.last().expect("a page was delivered");
     assert_eq!(
@@ -309,7 +320,7 @@ fn topic_creation_failure_falls_back_to_sender_topic() {
     // No topics.json entry and no reachable Telegram API, so creation fails.
     let (home, rec) = setup("fallback", true, true);
 
-    assert_eq!(page("lead", "milestone")["sent"], true);
+    assert_eq!(page(&home, "lead", "milestone")["sent"], true);
 
     let (routed_to, _, _) = rec.last().expect("a page was delivered");
     assert_eq!(
@@ -329,7 +340,7 @@ fn page_carries_sender_prefix_and_respects_length_cap() {
     let (home, rec) = setup("content", true, true);
 
     let long = "x".repeat(MAX_PAGE_CHARS * 3);
-    assert_eq!(page("lead", &long)["sent"], true);
+    assert_eq!(page(&home, "lead", &long)["sent"], true);
 
     let (_, _, text) = rec.last().expect("a page was delivered");
     assert!(
@@ -353,7 +364,7 @@ fn unauthorized_channel_still_drops_the_page() {
     let _r = channel_registry_test_guard();
     let (home, rec) = setup("allowlist", true, false);
 
-    let out = page("lead", "milestone");
+    let out = page(&home, "lead", "milestone");
 
     assert_eq!(rec.count(), 0, "the fail-closed gate must not be bypassed");
     assert_eq!(
@@ -384,7 +395,7 @@ fn rate_gate_binds_even_though_severity_would_pass_the_mode_gate() {
 
     for i in 1..=RATE_LIMIT_PER_HOUR {
         assert_eq!(
-            page("lead", &format!("m{i}"))["sent"],
+            page(&home, "lead", &format!("m{i}"))["sent"],
             true,
             "an operator page must survive Sleep — that is the whole point of #3480"
         );
@@ -396,7 +407,7 @@ fn rate_gate_binds_even_though_severity_would_pass_the_mode_gate() {
         "pages ride Error severity so the Sleep gate passes them"
     );
 
-    let out = page("lead", "m4");
+    let out = page(&home, "lead", "m4");
 
     assert_eq!(
         out["code"], "rate_limited",
