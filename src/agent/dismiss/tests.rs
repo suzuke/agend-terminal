@@ -842,6 +842,323 @@ fn codex_update_marker_is_not_dismissed_when_settled() {
     }
     assert_eq!(written.lock().as_slice(), b"2\r");
 }
+// ── r2 review remedies: F2 (quoted vs live) and F1 (per-spawn one-shot) ──
+//
+// Round 1 was REJECTED by both reviewers. Two P1 findings, one test block
+// each. Everything here drives the PRODUCTION entry points — the real codex
+// preset, the real `StateTracker`, the real scan, and (for the loop
+// assertion) the real `pty_read_loop`.
+
+/// #3314-style inline-write arming as an RAII guard, so a failing assertion
+/// cannot leave the seam armed for the next case on this thread.
+struct InlineWrite;
+
+impl InlineWrite {
+    fn arm() -> Self {
+        set_inline_dismiss_write_for_test(true);
+        Self
+    }
+}
+
+impl Drop for InlineWrite {
+    fn drop(&mut self) {
+        set_inline_dismiss_write_for_test(false);
+    }
+}
+
+/// The per-spawn one-shot seam for the backend-startup-hint tests.
+///
+/// At the RED commit `try_prepared_dismiss_dialog` has no one-shot parameter,
+/// so this wrapper drops the flag and the scan is bounded by nothing; the GREEN
+/// commit points it at `try_prepared_dismiss_dialog_once_per_spawn` and threads
+/// the flag through. The wrapper exists so the RED test BODIES below are
+/// byte-identical across both commits — the only thing that changes is the
+/// production machinery they reach.
+#[allow(clippy::too_many_arguments)]
+fn scan_with_one_shot(
+    name: &str,
+    screen: &str,
+    pty_writer: &PtyWriter,
+    dismiss_patterns: &[PreparedDismissPattern],
+    scope: DismissScanScope,
+    dev_gate: &mut DevModalGate,
+    now: LogicalMs,
+    backend_startup_hint_spent: &mut bool,
+) -> bool {
+    let _ = &mut *backend_startup_hint_spent;
+    try_prepared_dismiss_dialog(
+        name,
+        screen,
+        pty_writer,
+        dismiss_patterns,
+        scope,
+        dev_gate,
+        now,
+    )
+}
+
+// ── F2: a transcript QUOTING the update menu is not the live modal ──
+//
+// Reviewer finding F2 (P1): `Skip until next version` as a bare
+// PermissionPrompt token is an UNANCHORED whole-visible-text prose match.
+// `StatePatterns::detect_with_match` is `re.find(text)` over the entire
+// rendered screen (src/state/patterns.rs), and PermissionPrompt is not a
+// HIGH_FP state, so neither the #1450 colour anchor nor the #1518 position
+// gate runs on it; `gate_on_heartbeat` can only downgrade a PermissionPrompt
+// when the heartbeat is FRESH, so a stale or absent heartbeat cannot override
+// it either. A codex pane whose transcript merely QUOTES the phrase therefore
+// reads prompt_blocked, which re-arms the dismiss scan, which types `2\r`
+// into the composer.
+//
+// The existing prose control (tests/fixtures/state-replay/
+// codex-discussion-text.raw) proves nothing about this token: it contains
+// NEITHER the phrase nor the menu. These frames are the real control. Each
+// carries BOTH the bare phrase in prose AND the complete menu quoted verbatim,
+// followed by codex's normal bottom chrome — which is the whole point: the
+// live modal REPLACES codex's UI, so nothing is ever painted below it, while a
+// quoted one always has the composer (and usually the status line) underneath.
+
+/// Ordinary codex transcript prose that quotes the phrase AND the whole menu.
+/// No bottom chrome yet — the two variants below append it.
+const CODEX_QUOTED_UPDATE_MENU: &str = "\
+  I read through the codex startup menu handling. Option 3 on that menu is
+  labelled `Skip until next version`; the daemon auto-presses option 2.
+  The frame it renders looks exactly like this:
+
+  ✨ Update available! 0.150.1 -> 0.152.0
+
+  Release notes: https://github.com/openai/codex/releases
+
+  › 1. Update now (runs `sh -c 'curl -fsSL https://codex.openai.com/install.sh | sh'`)
+2. Skip
+3. Skip until next version
+
+  Press enter to continue
+";
+
+/// The quoted menu with codex's idle composer painted under it — the shape a
+/// resume repaint leaves on screen.
+fn codex_quoted_menu_idle() -> String {
+    format!("{CODEX_QUOTED_UPDATE_MENU}\n▌ › \n")
+}
+
+/// The quoted menu with the composer AND the working status line under it —
+/// the shape while the agent that WROTE that prose is still streaming.
+fn codex_quoted_menu_working() -> String {
+    format!("{CODEX_QUOTED_UPDATE_MENU}\n▌ › \n  esc to interrupt\n")
+}
+
+/// F2 (1): through the REAL `StateTracker`, a codex pane quoting the menu must
+/// not classify as a dismissible prompt — it is Idle (composer) or Active
+/// (status line), exactly as it reads to a human.
+#[test]
+fn quoted_codex_update_menu_does_not_classify_as_a_prompt() {
+    let patterns = crate::state::StatePatterns::for_backend(&crate::backend::Backend::Codex);
+    for (screen, expected) in [
+        (codex_quoted_menu_idle(), crate::state::AgentState::Idle),
+        (
+            codex_quoted_menu_working(),
+            crate::state::AgentState::Active,
+        ),
+    ] {
+        assert_eq!(
+            patterns.detect(&screen),
+            Some(expected),
+            "F2: a transcript quoting the update menu under codex's own bottom \
+             chrome must read {expected:?}, not a prompt"
+        );
+        let mut st = crate::state::StateTracker::new(Some(&crate::backend::Backend::Codex));
+        st.feed(&screen);
+        assert!(
+            !is_dismissible_prompt_state(st.get_state()),
+            "F2: quoting the menu must not put the pane in a dismissible-prompt \
+             state (that is what re-arms the dismiss scan) — got {:?}",
+            st.get_state()
+        );
+    }
+}
+
+/// F2 (2): and the dismiss scan itself must not fire on it — under the
+/// post-latch pre-Idle re-arm OR inside the startup window, where every
+/// pattern is eligible. Byte assertion, not a boolean: the scan's return value
+/// is not what reaches the agent's PTY.
+#[test]
+fn quoted_codex_update_menu_writes_no_bytes_in_any_scope() {
+    let _inline = InlineWrite::arm();
+    let prepared = codex_prepared_patterns();
+    for scope in [DismissScanScope::Startup, DismissScanScope::RearmPreIdle] {
+        for screen in [codex_quoted_menu_idle(), codex_quoted_menu_working()] {
+            let (writer, written) = recording_writer_3314();
+            let mut spent = false;
+            let tag = format!("codex-quoted-{scope:?}");
+            scan_with_one_shot(
+                &tag,
+                &screen,
+                &writer,
+                &prepared,
+                scope,
+                &mut ungated_stable_3314(&screen).0,
+                LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+                &mut spent,
+            );
+            DISMISS_IN_FLIGHT.lock().retain(|key| key.0 != tag);
+            assert!(
+                written.lock().is_empty(),
+                "F2: a quoted update menu must write ZERO bytes under {scope:?} — \
+                 the dismiss label must recognize the LIVE modal structurally, not \
+                 a phrase that circulates as transcript"
+            );
+        }
+    }
+}
+
+// ── F1: the backend-startup hint is a per-spawn one-shot ──
+//
+// Reviewer finding F1 (P1, both reviewers): the ungated hint had NO real
+// one-shot. The read loop's 10s `Instant` cooldown is rate limiting, not a
+// bound — `feed_with_lazy_fg` reports `state_changed` on ANY screen-hash
+// change, so every pre-Idle repaint that still shows the menu re-arms the scan
+// once the window lapses, and `DISMISS_IN_FLIGHT` only bounds CONCURRENT
+// dismisses. Round 1's "one possible stray 2\r, 10s-cooldown-limited" residual
+// claim was false: the count is unbounded in the number of repaints.
+
+/// The live 0.150.1 menu as codex repaints it while the modal owns the screen.
+/// The menu block itself is byte-stable; the row ABOVE it changes, so every
+/// repaint is a NEW screen hash — which is all `feed_with_lazy_fg` needs to
+/// report `state_changed` and re-arm the scan the moment the cooldown lapses.
+/// The menu still sits at the tail, so it is genuinely LIVE on every frame.
+fn codex_live_menu_repaint(step: usize) -> String {
+    format!("  ✱ contacting api.openai.com … {step}\n\n{CODEX_UPDATE_MODAL_0150}")
+}
+
+/// F1 at the dismiss level: three CHANGED pre-Idle repaints, each scanned
+/// through the production scan entry point exactly as the read loop would once
+/// the cooldown had lapsed. Total bytes on the PTY must be ONE `2\r`.
+#[test]
+fn codex_update_menu_startup_hint_is_one_shot_per_spawn() {
+    let _inline = InlineWrite::arm();
+    let prepared = codex_prepared_patterns();
+    let (writer, written) = recording_writer_3314();
+    // ONE flag for the whole spawn — the read loop owns exactly one of these
+    // per `pty_read_loop` invocation and never resets it.
+    let mut spent = false;
+    for step in 0..3 {
+        let screen = codex_live_menu_repaint(step);
+        scan_with_one_shot(
+            "codex-one-shot",
+            &screen,
+            &writer,
+            &prepared,
+            DismissScanScope::RearmPreIdle,
+            &mut DevModalGate::new(false),
+            LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+            &mut spent,
+        );
+        DISMISS_IN_FLIGHT
+            .lock()
+            .retain(|key| key.0 != "codex-one-shot");
+    }
+    assert_eq!(
+        written.lock().as_slice(),
+        b"2\r",
+        "F1: the backend-startup hint must be spent for the whole spawn at its \
+         FIRST dispatch — three post-cooldown scans of a still-live menu must \
+         send one Skip, not one per repaint"
+    );
+}
+
+/// F1 through the REAL read loop — the reviewer's exact wording: "changed
+/// repaints before Idle across >10s through the real read loop".
+///
+/// This drives production `pty_read_loop` (src/agent/mod.rs) with a reader that
+/// hands it three full repaints of the live menu and then EOF: real VTerm, real
+/// `feed_with_lazy_fg` dedup, real `dismiss_scan_armed`, real cooldown
+/// bookkeeping, real scope selection, real `try_prepared_dismiss_dialog*`.
+///
+/// The cooldown is compressed to 1ms through `dismiss_cooldown()` and the
+/// reader pauses 5ms between repaints, so every repaint arrives AFTER the
+/// window lapsed. That makes the assertion STRICTLY STRONGER than a 10s test
+/// would be: the cooldown is provably not what bounds the writes, so the
+/// per-spawn flag is the only thing that can.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn read_loop_answers_the_codex_update_menu_once_per_spawn() {
+    let _inline = InlineWrite::arm();
+    set_dismiss_cooldown_for_test(Some(std::time::Duration::from_millis(1)));
+    struct Repaints {
+        step: usize,
+    }
+    impl std::io::Read for Repaints {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.step >= 3 {
+                return Ok(0);
+            }
+            if self.step > 0 {
+                // Cross the (compressed) cooldown, so the next repaint is
+                // scanned rather than rate-limited away.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // Full repaint: clear + home, CRLF line ends like a real PTY.
+            let frame = format!(
+                "\x1b[2J\x1b[H{}",
+                codex_live_menu_repaint(self.step).replace('\n', "\r\n")
+            );
+            self.step += 1;
+            let bytes = frame.as_bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+    }
+
+    let (writer, written) = recording_writer_3314();
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: crate::vterm::VTerm::new(120, 40),
+        subscribers: Vec::new(),
+        state: crate::state::StateTracker::new(Some(&crate::backend::Backend::Codex)),
+        health: crate::health::HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+    let dismiss_patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::Codex
+        .preset()
+        .dismiss_patterns
+        .iter()
+        .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+        .collect();
+    let ctx = PtyReadContext {
+        name: "codex-loop-one-shot".to_string(),
+        instance_id: crate::types::InstanceId::default(),
+        core,
+        pty_writer: Arc::clone(&writer),
+        registry: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        home: None,
+        crash_tx: None,
+        dismiss_patterns: prepare_dismiss_patterns(&dismiss_patterns),
+        dev_modal_armed: false,
+        // shutdown=true keeps `handle_pty_close` on its cleanup-only path at
+        // EOF (no process wait, no crash classification) — the loop body is
+        // what this test is about.
+        shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+    };
+    let mut reader = Repaints { step: 0 };
+    let capture = crate::capture::make_capture_writer(None, "codex-loop-one-shot", "test");
+    crate::agent::pty_read_loop(&mut reader, &ctx, capture);
+    set_dismiss_cooldown_for_test(None);
+    DISMISS_IN_FLIGHT
+        .lock()
+        .retain(|key| key.0 != "codex-loop-one-shot");
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"2\r",
+        "F1: three CHANGED pre-Idle repaints of the live menu, each arriving \
+         after the cooldown lapsed, must produce exactly ONE Skip through the \
+         real read loop — the per-spawn one-shot is the bound, not the cooldown"
+    );
+}
 
 // ── #3314 r1: real-capture frames, generation gate, byte-count contract ──
 //

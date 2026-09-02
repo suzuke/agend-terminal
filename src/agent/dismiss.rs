@@ -36,6 +36,47 @@ pub(crate) fn set_pre_write_rendezvous_for_test(hook: Option<Box<dyn Fn()>>) {
     PRE_WRITE_RENDEZVOUS.with(|h| *h.borrow_mut() = hook);
 }
 
+/// The PTY read loop's post-dismiss cooldown: once a dismiss has fired, the
+/// loop refuses to scan the next frames until this has elapsed.
+///
+/// RATE LIMITING ONLY — it is NOT a bound on how many times a startup modal
+/// can be answered, and no comment here or in `crate::backend` may claim it
+/// is. `StateTracker::feed_with_lazy_fg` reports `state_changed` on ANY
+/// screen-hash change, so a pre-Idle repaint that still shows the modal
+/// re-arms the scan the instant this window lapses, and `DISMISS_IN_FLIGHT`
+/// only bounds CONCURRENT dismisses. The real bound is the per-spawn one-shot
+/// (t-…-82348-29 r2, review F1).
+const DISMISS_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: compress the read loop's cooldown so a loop-level test can
+    /// deliver repaints AFTER it has lapsed without sleeping 10s per repaint —
+    /// a wall-clock wait is exactly the dependence that lets a one-shot
+    /// regression pass against unfixed code (the #3314 lesson). THREAD-local
+    /// for the same reason as `INLINE_DISMISS_WRITE`: cases run in parallel and
+    /// a process-global lets one case retune another. The loop-level test
+    /// drives `pty_read_loop` on its own thread, so the loop reads this value.
+    static DISMISS_COOLDOWN_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_dismiss_cooldown_for_test(cooldown: Option<std::time::Duration>) {
+    DISMISS_COOLDOWN_OVERRIDE.with(|c| c.set(cooldown));
+}
+
+/// The cooldown the PTY read loop applies after a dismiss fires. Production
+/// always returns [`DISMISS_COOLDOWN`]; the single accessor exists so the test
+/// seam above has one place to intercept.
+pub(crate) fn dismiss_cooldown() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(cooldown) = DISMISS_COOLDOWN_OVERRIDE.with(std::cell::Cell::get) {
+        return cooldown;
+    }
+    DISMISS_COOLDOWN
+}
+
 #[cfg(test)]
 fn run_pre_write_rendezvous() {
     let hook = PRE_WRITE_RENDEZVOUS.with(|h| h.borrow_mut().take());

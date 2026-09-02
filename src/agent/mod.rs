@@ -2088,7 +2088,7 @@ fn pty_read_loop(
                     )
                 {
                     dismiss_cooldown_until =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+                        Some(std::time::Instant::now() + dismiss::dismiss_cooldown());
                 }
                 if dismiss_latch_off {
                     dismiss_scan_enabled = false;
