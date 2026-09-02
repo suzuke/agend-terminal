@@ -64,6 +64,14 @@ pub(crate) fn backend_mismatch_declared(
     Backend::from_command(live_backend_command).as_ref() != Some(expected)
 }
 
+fn backend_mismatch_for_handle(
+    declared_backend: Option<&Backend>,
+    _fleet_default: &Backend,
+    live_backend_command: &str,
+) -> bool {
+    backend_mismatch_declared(declared_backend, live_backend_command)
+}
+
 /// Pure: should this tick fire a backend-exit detection for an agent whose live
 /// backend mismatches its configured one, `elapsed_since_spawn` since its last
 /// (re)spawn?
@@ -142,7 +150,7 @@ impl PerTickHandler for BackendExitDetectionHandler {
             // command, so it has no managed backend identity to enforce.  Do
             // not replace it with fleet.yaml's default backend.
             let expected_backend = declared_backend.as_ref();
-            if backend_mismatch_declared(expected_backend, live_backend) {
+            if backend_mismatch_for_handle(expected_backend, &resolved.backend, live_backend) {
                 mismatched.insert(name.clone());
             }
             if should_fire_backend_exit_declared(
@@ -263,7 +271,7 @@ mod tests {
     #[test]
     fn missing_declared_backend_stays_exempt_from_fleet_defaults() {
         assert!(
-            !backend_mismatch_declared(None, "/bin/bash"),
+            !backend_mismatch_for_handle(None, &Backend::ClaudeCode, "/bin/bash"),
             "None identifies a shell/raw handle and must not inherit fleet.yaml's default backend"
         );
     }
