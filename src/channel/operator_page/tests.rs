@@ -25,6 +25,16 @@
 //! more than one team is refused, and the resolved live instance must be its
 //! team's current orchestrator. The boundary that remains is pinned by
 //! `any_seat_presenting_the_orchestrators_live_name_is_admitted_by_design`.
+//!
+//! **Why every case carries TWO serial keys.** `#[serial]` (the unnamed group)
+//! excludes against the other suites that mutate `AGEND_HOME` and the bot-token
+//! env pair. `#[serial(runtime_config)]` excludes against the runtime-config
+//! suite: the master switch now lives in the process-global `RuntimeConfig`, and
+//! ANY `runtime_config::reload` from another home resets `operator_page.enabled`
+//! to its default of false. The gap between this suite's own reload and the
+//! handler's `get()` spans two disk writes (usage stats + heartbeat), which is
+//! milliseconds — wide enough that this was not theoretical: it reddened one test
+//! per run, a different one each time, until both keys were held.
 
 use super::*;
 use crate::channel::channel_registry_test_guard;
@@ -186,7 +196,8 @@ fn restore_bot_tokens(guard: &TokenEnvGuard) {
 }
 
 /// One team, one orchestrator — the shape most cases want.
-const STD_FLEET: &str = "instances:\n  lead:\n    backend: claude\n  worker:\n    backend: claude\n\
+const STD_FLEET: &str =
+    "instances:\n  lead:\n    backend: claude\n  worker:\n    backend: claude\n\
      teams:\n  archfix:\n    orchestrator: lead\n    members: [lead, worker]\n";
 
 /// Two teams that BOTH list `lead` — the ambiguity a `.values().find(...)` lookup
@@ -319,6 +330,10 @@ fn setup(tag: &str, spec: Spec) -> Fixture {
 fn teardown(fx: &Fixture) {
     reset_active_channel_for_test();
     reset_topic_seam_for_test();
+    // The rate budget is a process-global. Per-test homes already force a
+    // re-initialisation, but clearing it explicitly means no case can inherit a
+    // poisoned latch from the one before it.
+    budget::reset_for_test();
     restore_bot_tokens(&fx.tokens);
     // Leave the process-global runtime config switched OFF: it is default-off in
     // production and a test must not hand the next suite an enabled pager.
@@ -377,6 +392,7 @@ fn page_without_runtime(fx: &Fixture, caller: &str, text: &str) -> serde_json::V
 /// refused and told who to route through — and nothing reaches the channel.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn non_orchestrator_caller_is_refused() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -398,6 +414,7 @@ fn non_orchestrator_caller_is_refused() {
 /// any team lookup, so a stale fleet.yaml row cannot stand in for a running seat.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn unknown_or_dead_claimed_name_is_refused() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -415,6 +432,7 @@ fn unknown_or_dead_claimed_name_is_refused() {
 /// paper over it with a first-match.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn ambiguous_live_name_is_refused() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -437,6 +455,7 @@ fn ambiguous_live_name_is_refused() {
 /// answer must not come from HashMap iteration order. Refuse instead of guessing.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn caller_owned_by_two_teams_is_refused_as_ambiguous() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -459,6 +478,7 @@ fn caller_owned_by_two_teams_is_refused_as_ambiguous() {
 /// nobody the page. The live member is not promoted into the vacancy.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn stale_orchestrator_grants_nobody_the_page() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -493,6 +513,7 @@ fn stale_orchestrator_grants_nobody_the_page() {
 /// the allowlisted group, and fail-closed budget state.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn any_seat_presenting_the_orchestrators_live_name_is_admitted_by_design() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -514,6 +535,7 @@ fn any_seat_presenting_the_orchestrators_live_name_is_admitted_by_design() {
 /// rather than fall back to trusting the name it was handed.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn standalone_call_without_runtime_is_refused() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -533,6 +555,7 @@ fn standalone_call_without_runtime_is_refused() {
 /// where an agent cannot write it.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn disabled_switch_refuses_and_sends_nothing() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -556,6 +579,7 @@ fn disabled_switch_refuses_and_sends_nothing() {
 /// `operator_page` stanza left in fleet.yaml grants nothing.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn fleet_yaml_stanza_cannot_enable_the_tool() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -568,8 +592,11 @@ fn fleet_yaml_stanza_cannot_enable_the_tool() {
     );
     let yaml = crate::fleet::fleet_yaml_path(&fx.home);
     let body = std::fs::read_to_string(&yaml).expect("read fleet.yaml");
-    std::fs::write(&yaml, format!("{body}  operator_page:\n    enabled: true\n"))
-        .expect("write fleet.yaml");
+    std::fs::write(
+        &yaml,
+        format!("{body}  operator_page:\n    enabled: true\n"),
+    )
+    .expect("write fleet.yaml");
 
     let out = page(&fx, "lead", "milestone");
 
@@ -587,6 +614,7 @@ fn fleet_yaml_stanza_cannot_enable_the_tool() {
 /// so the caller can fall back to SESSION-HANDOFF.md.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn fourth_page_in_the_hour_is_dropped_with_retry_after() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -618,6 +646,7 @@ fn fourth_page_in_the_hour_is_dropped_with_retry_after() {
 /// not a bypass. The snapshot must hold the full spent budget.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn rate_counter_survives_a_simulated_restart() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -636,6 +665,9 @@ fn rate_counter_survives_a_simulated_restart() {
         "the snapshot must carry the whole spent budget for restart continuity: {stamps}"
     );
 
+    // The restart itself: drop everything the process was holding, so the next
+    // call has to rebuild the spent budget from the snapshot alone.
+    budget::reset_for_test();
     let out = page(&fx, "lead", "after restart");
 
     assert_eq!(
@@ -652,6 +684,7 @@ fn rate_counter_survives_a_simulated_restart() {
 /// operator can tell "the state is untrustworthy" from "you used your 3 pages".
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn deleting_the_snapshot_denies_and_is_distinguishable_from_a_rate_cap() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -694,6 +727,7 @@ fn deleting_the_snapshot_denies_and_is_distinguishable_from_a_rate_cap() {
 /// refilled the hour — fail OPEN on the one file an agent can write.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn corrupt_snapshot_denies_instead_of_resetting_the_budget() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -720,6 +754,7 @@ fn corrupt_snapshot_denies_instead_of_resetting_the_budget() {
 /// the caller a refilled budget.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn future_dated_stamps_do_not_grant_extra_slots() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -745,6 +780,7 @@ fn future_dated_stamps_do_not_grant_extra_slots() {
 /// one counter (nor be able to exhaust each other's).
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn distinct_orchestrators_do_not_share_a_counter() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -758,7 +794,8 @@ fn distinct_orchestrators_do_not_share_a_counter() {
     );
 
     for i in 1..=RATE_LIMIT_PER_HOUR {
-        assert_eq!(page(&fx, "lead", &format!("a{i}"))["sent"], true);
+        let out = page(&fx, "lead", &format!("a{i}"));
+        assert_eq!(out["sent"], true, "page {i} from lead must succeed: {out}");
     }
     for i in 1..=RATE_LIMIT_PER_HOUR {
         let out = page(&fx, "lead2", &format!("b{i}"));
@@ -778,6 +815,7 @@ fn distinct_orchestrators_do_not_share_a_counter() {
 /// pages may win.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn concurrent_claims_admit_exactly_three() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -819,6 +857,7 @@ fn concurrent_claims_admit_exactly_three() {
 /// outside the handler.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn a_zero_dispatch_send_does_not_consume_a_slot() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -850,6 +889,7 @@ fn a_zero_dispatch_send_does_not_consume_a_slot() {
 /// channel drops the page even though every one of the tool's own gates passed.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn unauthorized_channel_still_drops_the_page() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -863,7 +903,11 @@ fn unauthorized_channel_still_drops_the_page() {
 
     let out = page(&fx, "lead", "milestone");
 
-    assert_eq!(fx.rec.count(), 0, "the fail-closed gate must not be bypassed");
+    assert_eq!(
+        fx.rec.count(),
+        0,
+        "the fail-closed gate must not be bypassed"
+    );
     assert_eq!(
         out["sent"], false,
         "the caller must learn the page was not delivered: {out}"
@@ -878,6 +922,7 @@ fn unauthorized_channel_still_drops_the_page() {
 /// require a telegram channel specifically — and must not charge for the refusal.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn discord_only_allowlist_refuses_without_spending_a_slot() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -912,6 +957,7 @@ fn discord_only_allowlist_refuses_without_spending_a_slot() {
 /// topic is reused, so the creation seam is never even consulted.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn dedicated_topic_is_used_when_registered() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -943,6 +989,7 @@ fn dedicated_topic_is_used_when_registered() {
 /// because both topics sit inside the allowlisted group; the gates do not.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn topic_creation_failure_falls_back_to_sender_topic() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -973,6 +1020,7 @@ fn topic_creation_failure_falls_back_to_sender_topic() {
 /// code path under this home ever entered credential resolution or `Bot::new`.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn real_looking_bot_token_never_reaches_the_bot_api() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -1010,6 +1058,7 @@ fn real_looking_bot_token_never_reaches_the_bot_api() {
 /// of text.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn page_carries_sender_prefix_and_respects_length_cap() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -1036,6 +1085,7 @@ fn page_carries_sender_prefix_and_respects_length_cap() {
 /// the cap and the prefix, so the forgery can never begin a line of its own.
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn forged_sender_line_cannot_start_its_own_line() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();
@@ -1055,7 +1105,11 @@ fn forged_sender_line_cannot_start_its_own_line() {
         !text.contains('\n') && !text.contains('\r'),
         "no line break may survive into the rendered page: {text:?}"
     );
-    assert_eq!(text.lines().count(), 1, "the page must be one line: {text:?}");
+    assert_eq!(
+        text.lines().count(),
+        1,
+        "the page must be one line: {text:?}"
+    );
     assert!(
         text.starts_with("[operator-page from lead] build red "),
         "the single sender prefix must be the one the daemon stamped: {text:?}"
@@ -1073,6 +1127,7 @@ fn forged_sender_line_cannot_start_its_own_line() {
 /// is still refused by the rate gate (proving the gate runs first).
 #[test]
 #[serial]
+#[serial(runtime_config)]
 fn rate_gate_binds_even_though_severity_would_pass_the_mode_gate() {
     let _g = fleet_test_guard();
     let _r = channel_registry_test_guard();

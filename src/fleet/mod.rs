@@ -110,6 +110,52 @@ pub fn team_orchestrator_for(home: &Path, member: &str) -> Option<String> {
         })
 }
 
+/// #3480: which team owns `member`, three ways.
+///
+/// [`team_orchestrator_for`] answers with whichever team a `.values().find(...)`
+/// scan reaches first, i.e. with HashMap iteration order when an instance is
+/// listed by more than one team. That is acceptable for the watchdog escalation
+/// it was written for and unacceptable for an authority decision, which must
+/// refuse rather than pick. Kept separate so the existing callers are untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwningTeam {
+    /// Exactly one team lists the member, with that team's declared
+    /// orchestrator (`None` when the team declares none).
+    Sole {
+        team: String,
+        orchestrator: Option<String>,
+    },
+    /// More than one team lists the member, so no single orchestrator exists.
+    /// Team names are sorted so the refusal is reproducible.
+    Ambiguous { teams: Vec<String> },
+    /// No team lists the member — including when fleet.yaml cannot be read.
+    None,
+}
+
+/// Resolve the team(s) that list `member`. Fails closed: an unreadable
+/// fleet.yaml is [`OwningTeam::None`], which grants nothing.
+pub fn owning_team_for(home: &Path, member: &str) -> OwningTeam {
+    let Ok(config) = FleetConfig::load(&fleet_yaml_path(home)) else {
+        return OwningTeam::None;
+    };
+    let mut owning: Vec<(&String, &TeamConfig)> = config
+        .teams
+        .iter()
+        .filter(|(_, team)| team.members.iter().any(|m| m == member))
+        .collect();
+    owning.sort_by(|left, right| left.0.cmp(right.0));
+    match owning.as_slice() {
+        [] => OwningTeam::None,
+        [(name, team)] => OwningTeam::Sole {
+            team: (*name).clone(),
+            orchestrator: team.orchestrator.clone(),
+        },
+        _ => OwningTeam::Ambiguous {
+            teams: owning.iter().map(|(name, _)| (*name).clone()).collect(),
+        },
+    }
+}
+
 /// #1989: the fleet.yaml schema version this daemon reads and writes. Bump
 /// ONLY on a breaking (non-additive) change — additive optional fields with
 /// serde defaults do NOT bump it (`docs/COMPATIBILITY.md`).
@@ -295,12 +341,6 @@ pub enum ChannelConfig {
         /// are described in `docs/FEATURE-channels.md`.
         #[serde(default)]
         fleet_binding: Option<FleetBindingConfig>,
-        /// #3480: opt-in switch + routing for the orchestrator-only operator
-        /// page tool. Omitted = the tool is OFF (the operator decided default
-        /// off, decision d-20260902104216571473-11). Additive optional field
-        /// with a serde default, so it does NOT bump `FLEET_SCHEMA_VERSION`.
-        #[serde(default)]
-        operator_page: Option<OperatorPageConfig>,
     },
     /// Discord adapter. Bootstrap wiring landed #2562 P1; the adapter
     /// implementation is behind the `discord` feature gate.
@@ -373,37 +413,6 @@ pub enum FleetBindingStruct {
     /// display name used to find or create the topic; resolution (map
     /// name → topic_id) happens at bootstrap, not at parse time.
     Topic { name: String },
-}
-
-/// #3480: fleet-level configuration for the operator page tool.
-///
-/// Default-off is the operator's decision, not a conservative guess: with the
-/// field omitted the tool refuses every call. `topic_name` names the dedicated
-/// forum topic pages are routed to, so pages collect in one mutable place
-/// instead of scattering across per-orchestrator topics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OperatorPageConfig {
-    /// Master switch. `false` (the default) makes the tool refuse with a
-    /// structured `operator_page_disabled` and send nothing.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Forum topic that pages are routed to; auto-created and registered on
-    /// first use.
-    #[serde(default = "default_operator_page_topic")]
-    pub topic_name: String,
-}
-
-impl Default for OperatorPageConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            topic_name: default_operator_page_topic(),
-        }
-    }
-}
-
-fn default_operator_page_topic() -> String {
-    "operator-notifications".to_string()
 }
 
 fn default_mode() -> String {
@@ -828,16 +837,6 @@ impl FleetConfig {
             .into_iter()
             .map(|(_, c)| c)
             .find(|c| matches!(c, ChannelConfig::Telegram { .. }))
-    }
-
-    /// #3480: the operator-page configuration of the first configured Telegram
-    /// channel. `None` when there is no Telegram channel or the stanza is
-    /// omitted — both mean the tool is off, so callers treat `None` as disabled.
-    pub fn operator_page_config(&self) -> Option<&OperatorPageConfig> {
-        match self.telegram_channel() {
-            Some(ChannelConfig::Telegram { operator_page, .. }) => operator_page.as_ref(),
-            _ => None,
-        }
     }
 
     /// #2642: the first configured Discord channel — Discord counterpart of

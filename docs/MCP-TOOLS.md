@@ -107,21 +107,19 @@ Reply to the user/operator through an external channel; do not use it for inter-
 
 Page the **operator** on their Telegram, independent of any inbound channel binding — for milestones they explicitly asked to be told about while away or asleep. This is the agend-side answer to a gap in the harness: `PushNotification`'s mobile leg only reaches a phone when Remote Control is connected, and `reply` needs an inbound message to answer, which operator input typed in the TUI never creates.
 
-- Required: `message`. Plain text, truncated at 1000 characters, always prefixed with the calling instance's name.
-- **Orchestrator-only.** Only the current orchestrator of the caller's team may page; anyone else is refused with `not_orchestrator` and told which orchestrator to route through.
-- **Off by default.** Enable per fleet in `fleet.yaml`:
+- Required: `message`. Plain text, truncated at 1000 characters, always prefixed with the calling instance's name. Line breaks are collapsed to spaces before the cap and the prefix, so a body cannot forge a second `[operator-page from …]` sender line.
+- **Orchestrator-only, bound to a LIVE instance.** The `instance` a call carries is resolved against the daemon's live registry before anything else: a name matching no running instance — or matching two — is refused with `unknown_caller`; a caller listed by more than one team is refused with `ambiguous_team` rather than answered from map order; a caller that is not its team's current orchestrator is refused with `not_orchestrator` and told who to route through. A standalone bridge call has no registry to resolve against and is refused with `no_live_identity`.
 
-  ```yaml
-  channel:
-    type: telegram
-    group_id: -100…
-    user_allowlist: [12345]      # still required — outbound is fail-closed without it
-    operator_page:
-      enabled: true
-      topic_name: operator-notifications   # optional, this is the default
+  The honest limit: every agent and the daemon share ONE OS user, so a seat that presents the orchestrator's live name **is** admitted. The gate rejects names that mean nothing; it cannot reject a seat that lies. What bounds the damage is the rest of this list — default-off, the operator-only switch, three pages an hour, one dedicated topic inside the allowlisted group, and fail-closed budget state.
+- **Off by default, and the switch is operator-only.** It lives in the daemon's runtime config, which the `config` MCP tool can READ but not write (`set` moved to the CLI in #2548). The operator turns paging on with:
+
+  ```
+  agend-terminal admin config-set operator_page.enabled true
   ```
 
-- **Rate-capped at 3 per orchestrator per rolling hour.** The excess is DROPPED, never queued; the refusal carries `retry_after_secs` so the caller can fall back to recording the milestone in `SESSION-HANDOFF.md`. The counter is durable, so restarting the daemon does not refill the budget.
+  and picks the destination topic with `agend-terminal admin config-set operator_page.topic_name <NAME>` (default `operator-notifications`). A `channel.operator_page` stanza in `fleet.yaml` is no longer read at all: fleet.yaml is agent-writable, so a master switch there is one its own subjects could flip. Telegram itself still needs `channel.user_allowlist` in `fleet.yaml` — outbound is fail-closed without it.
+- **Telegram specifically.** The page has to be able to reach the operator's phone: an authorized Discord channel does not count, and a call that cannot reach telegram is refused with `not_delivered` without spending a rate slot.
+- **Rate-capped at 3 per orchestrator per rolling hour.** The excess is DROPPED, never queued; the refusal carries `retry_after_secs` so the caller can fall back to recording the milestone in `SESSION-HANDOFF.md`. The counter is authoritative in the daemon's memory behind a lock and is snapshotted to `$AGEND_HOME/operator_page_rate.json` only so a restart does not refill the budget. Deleting or corrupting that snapshot therefore cannot grant a page: it makes the budget untrustworthy, and the tool refuses with `budget_unavailable` — a distinct code from `rate_limited`, naming the cause — until the operator repairs it and the daemon re-reads it.
 - **Routing.** Pages land in a dedicated forum topic (default `operator-notifications`), auto-created and registered on first use, so they collect in one place the operator can mute. If that topic cannot be created the page falls back to the sender's own topic — both live inside the allowlisted group.
 - **Operator Away/Sleep mode does NOT suppress pages.** That is deliberate: the feature exists because the operator was asleep and asked to be woken for milestones. The controls for pages are the `enabled` switch (the master off) and the hourly cap — not the mode. Ordinary daemon notices remain mode-gated as before.
 
@@ -250,7 +248,7 @@ Operator-only PREPARE step for a persisted usage-limit takeover episode. It writ
 Read runtime configuration. Actions: `get`, `list`; MCP mutation is not supported.
 
 - `get` requires `key`.
-- Current keys: `dev_idle_threshold_secs`, `fleet_idle_threshold_secs`, `fleet_idle_ack_ttl_secs`, `hang_auto_recovery_enabled`, `usage_limit_propagation_enabled`, `idle_watchdog_enabled`, `show_pane_state`, `copy_on_select`, `dim_unfocused_panes`, `observed_badge`, `context_alert_pct`, `context_handoff_pct`, `context_handoff_escalate_pct`, `experimental.tool_cli_enabled`.
+- Current keys: `dev_idle_threshold_secs`, `fleet_idle_threshold_secs`, `fleet_idle_ack_ttl_secs`, `hang_auto_recovery_enabled`, `usage_limit_propagation_enabled`, `idle_watchdog_enabled`, `show_pane_state`, `copy_on_select`, `dim_unfocused_panes`, `observed_badge`, `context_alert_pct`, `context_handoff_pct`, `context_handoff_escalate_pct`, `experimental.tool_cli_enabled`, `operator_page.enabled`, `operator_page.topic_name`.
 - Change a value with `agend-terminal admin config-set <KEY> <VALUE>`.
 
 ### `restart_daemon`

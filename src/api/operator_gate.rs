@@ -259,6 +259,10 @@ pub(crate) fn check_operation_allowed(
             "hang_auto_recovery_enabled",
             "usage_limit_propagation_enabled",
             "experimental.tool_cli_enabled",
+            // #3480: the operator-page master switch. The `config` tool has no
+            // `set` action any more (#2548), so this is defence in depth — but a
+            // switch an agent could flip is not a switch.
+            "operator_page.enabled",
         ];
         let key = params
             .get("arguments")
@@ -658,6 +662,7 @@ mod tests {
             "hang_auto_recovery_enabled",
             "usage_limit_propagation_enabled",
             "experimental.tool_cli_enabled",
+            "operator_page.enabled",
         ] {
             assert!(
                 check_operation_allowed("mcp_tool", &set_key(key), &active).is_err(),

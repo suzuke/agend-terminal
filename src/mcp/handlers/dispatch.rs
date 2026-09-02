@@ -282,8 +282,16 @@ macro_rules! action_adapter {
 
 /// #3480: orchestrator-only operator page. The handler owns every gate; this
 /// is a plain adapter so the registry entry stays uniform with its neighbours.
+/// `ctx.runtime` is forwarded because authority binds to the daemon-resolved LIVE
+/// requester, not to the `instance` string the call carried: without a runtime
+/// there is no registry to resolve against and the handler fails closed.
 pub(crate) fn dispatch_operator_page(ctx: &HandlerCtx<'_>) -> Value {
-    crate::channel::operator_page::handle_operator_page(ctx.home, ctx.args, ctx.instance_name)
+    crate::channel::operator_page::handle_operator_page(
+        ctx.home,
+        ctx.args,
+        ctx.instance_name,
+        ctx.runtime,
+    )
 }
 
 pub(crate) fn dispatch_list_instances(ctx: &HandlerCtx<'_>) -> Value {
