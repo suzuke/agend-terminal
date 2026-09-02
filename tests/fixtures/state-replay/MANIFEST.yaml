@@ -43,7 +43,14 @@ fixtures:
     # idle `›` prompt). Without the pattern, the `›` prompt fires Idle,
     # then Thinking from the working spinner, then UsageLimit from the
     # quota-exceeded banner.
-    expected_transitions: [starting, idle, thinking, usage_limit]
+    # t-…-82348-29: the startup update menu now classifies PermissionPrompt
+    # (`Skip until next version` token) instead of falling through to Idle —
+    # this frame is a BLOCKING modal, and the misclassification is what kept
+    # the #1069 dismiss fallback from ever arming (an agent stranded ~11h on
+    # 0.150.1). While the menu text stays on the visible grid it outranks the
+    # spinner's Thinking, so the thinking hop disappears from this capture;
+    # UsageLimit still outranks it at the quota banner.
+    expected_transitions: [starting, permission, usage_limit]
     expected_final_state: usage_limit
     expected_final_detect: usage_limit
 
@@ -56,8 +63,17 @@ fixtures:
     # idle `›` prompt). Without the pattern, the `›` prompt fires Idle,
     # then the working spinner fires Thinking. Final detect() returns
     # Idle because the `› ` prompt glyph is visible on the final grid.
-    expected_transitions: [starting, idle, thinking]
-    expected_final_state: thinking
+    # t-…-82348-29: the update menu now classifies PermissionPrompt (`Skip
+    # until next version` token) — the entire short capture keeps the menu
+    # text on the visible grid, so it outranks Idle/Thinking throughout and
+    # the replayed transition list collapses to the modal state. In live
+    # operation the #1069 dismiss answers the menu and codex's full redraw
+    # clears the token from the grid, recovering Idle/Active.
+    expected_transitions: [starting, permission]
+    expected_final_state: permission
+    # detect() on the FINAL grid alone is idle — the dismissed menu is gone
+    # and the `› ` prompt glyph is visible; only the latched STATE remembers
+    # the modal (no wall-clock passes in replay to expire it).
     expected_final_detect: idle
 
   - file: agy-thinking.raw
@@ -246,7 +262,14 @@ fixtures:
     # Final detect() shifted from tool_use → idle. Tracker retains
     # PermissionPrompt via hysteresis — no behavioral change for
     # consumers.
-    expected_transitions: [starting, idle, thinking, permission]
+    # t-…-82348-29: this capture's startup ALSO renders the 0.120 update menu
+    # (`Update available!` present twice in the raw), so the new
+    # `Skip until next version` PermissionPrompt token now classifies the
+    # opening frames as the modal and the menu text lingering on the visible
+    # grid outranks Idle/Thinking for the rest of this short capture — the
+    # transition list collapses to the modal state, and the approval dialog
+    # later in the capture lands on the same (deduped) PermissionPrompt.
+    expected_transitions: [starting, permission]
     expected_final_state: permission
     expected_final_detect: idle
 
@@ -352,8 +375,14 @@ fixtures:
     # because the tool-block lines scroll off the visible tail by the
     # final frame (only the `Token usage:` / `resume ...` summary lines
     # remain).
-    expected_transitions: [starting, idle, thinking]
-    expected_final_state: thinking
+    # t-…-82348-29: this 0.120 capture also opens on the update menu (`Update
+    # available!` ×2 in the raw); the new `Skip until next version`
+    # PermissionPrompt token classifies those frames as the modal, and the
+    # menu text lingering on the short capture's visible grid outranks
+    # Idle/Thinking — the transition list collapses to the modal state, the
+    # same shape as the codex-thinking/update/perm entries above.
+    expected_transitions: [starting, permission]
+    expected_final_state: permission
     expected_final_detect: null
     # #685 PR-3 (corpus expansion): final=thinking. `• Explored` appears
     # in the raw byte stream but VTerm-rendered final screen no longer

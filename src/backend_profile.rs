@@ -448,9 +448,17 @@ fn codex_profile() -> BackendProfile {
                 AgentState::ModelUnsupported,
                 r"invalid_request_error|model is not supported|Model metadata for .*? not found",
             ),
+            // t-…-82348-29: `Skip until next version` is the codex startup
+            // update menu (0.150.x shows it even with
+            // `-c check_for_update_on_startup=false` on the argv). Without a
+            // prompt token this frame fell through to Active ("esc to
+            // interrupt" in the repainted transcript) or Idle (the menu's own
+            // `›` cursor), so the post-latch dismiss scan never armed and the
+            // agent stranded until a human keypress. Priority order puts this
+            // above both, matching how the other prompt tokens already win.
             (
                 AgentState::PermissionPrompt,
-                r"Would you like to run the following command\?|Press enter to confirm or esc to cancel|No, and tell Codex what to do differently",
+                r"Would you like to run the following command\?|Press enter to confirm or esc to cancel|No, and tell Codex what to do differently|Skip until next version",
             ),
             (
                 AgentState::GitConflict,

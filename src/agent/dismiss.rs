@@ -101,9 +101,20 @@ pub struct PreparedDismissPattern {
     rearm_past_latch: bool,
     /// #3314: may this pattern fire on a post-latch re-arm while the agent has
     /// NEVER reached Idle — i.e. the startup sequence is demonstrably still
-    /// running? True for daemon-CAUSED startup modals only. Derived from
-    /// [`REARM_PRE_IDLE_STARTUP_HINTS`]; see [`DismissScanScope`].
+    /// running? True for daemon-CAUSED startup modals
+    /// ([`REARM_PRE_IDLE_STARTUP_HINTS`]) and for backend-caused startup modals
+    /// with a fixed safe answer ([`REARM_PRE_IDLE_BACKEND_STARTUP_HINTS`],
+    /// t-…-82348-29); see [`DismissScanScope`].
     rearm_pre_idle: bool,
+    /// #3314: does this pattern route through the dev-modal generation gate
+    /// ([`DevModalGate`])? That gate binds recognition to facts the daemon OWNS
+    /// (the dev-channel argv it passed, frame-epoch, a per-generation one-shot)
+    /// and its fingerprint is the dev-channel modal's static lines — so it is
+    /// TRUE only for [`REARM_PRE_IDLE_STARTUP_HINTS`]. A backend-caused startup
+    /// modal (codex update prompt) carries no daemon-owned fact to bind and its
+    /// frame never satisfies the dev fingerprint, so routing it through the gate
+    /// would refuse it unconditionally (t-…-82348-29 preflight).
+    dev_gated: bool,
 }
 
 /// #1886 follow-up: RAII guard that removes an agent from `DISMISS_IN_FLIGHT` on
@@ -224,6 +235,30 @@ fn is_rearm_pre_idle_hint(literal_hint: &str) -> bool {
     REARM_PRE_IDLE_STARTUP_HINTS.contains(&literal_hint)
 }
 
+/// t-…-82348-29: literal hints of BACKEND-caused startup modals — prompts the
+/// backend itself raises during its startup sequence, whose answer is fixed and
+/// is never the operator's to make. Like [`REARM_PRE_IDLE_STARTUP_HINTS`] they
+/// may fire on a post-latch re-arm ONLY while the agent has never reached Idle,
+/// but they do NOT route through the dev-modal generation gate: there is no
+/// daemon-owned fact (argv flag) to bind, and the gate's fingerprint is the
+/// dev-channel modal's static lines, so the gate would refuse them outright.
+///
+/// The codex "Update available!" entry is here because codex 0.150.x shows the
+/// update menu even when the child argv carries
+/// `-c check_for_update_on_startup=false` (#1626 — verified on the live
+/// stranded pid), and the modal frame previously classified Idle/Active, so the
+/// #1069 fallback was structurally dead: the agent stranded for ~11h until a
+/// human pressed a key. The pre-Idle bound keeps the #2474 exposure to the
+/// startup window: post-Idle the phrase is transcript and the settled re-arm
+/// refuses it. Residual (accepted): a resume-repainted transcript QUOTING the
+/// full modal at line start pre-Idle can fire a stray "2\r" into the composer —
+/// a visible, self-healing message, traded against a silent day-long strand.
+const REARM_PRE_IDLE_BACKEND_STARTUP_HINTS: &[&str] = &["Update available!"];
+
+fn is_rearm_pre_idle_backend_startup_hint(literal_hint: &str) -> bool {
+    REARM_PRE_IDLE_BACKEND_STARTUP_HINTS.contains(&literal_hint)
+}
+
 /// #3314: which dismiss patterns may a single rendered frame's scan consider?
 /// Selected by [`dismiss_scan_scope`] from the startup latch plus whether the
 /// agent has ever been Idle.
@@ -272,7 +307,9 @@ pub fn prepare_dismiss_patterns(
             Some(PreparedDismissPattern {
                 pattern: pattern.clone(),
                 rearm_past_latch: is_rearm_past_latch_hint(&literal_hint),
-                rearm_pre_idle: is_rearm_pre_idle_hint(&literal_hint),
+                rearm_pre_idle: is_rearm_pre_idle_hint(&literal_hint)
+                    || is_rearm_pre_idle_backend_startup_hint(&literal_hint),
+                dev_gated: is_rearm_pre_idle_hint(&literal_hint),
                 literal_hint,
                 regex,
                 key_seq: key_seq.clone(),
@@ -362,7 +399,7 @@ pub fn try_prepared_dismiss_dialog(
             // Every other pattern keeps its existing path and pacing untouched.
             #[cfg(test)]
             let mut scheduled_from_first_sighting = false;
-            if pattern.rearm_pre_idle {
+            if pattern.dev_gated {
                 match dev_gate.observe(screen, now) {
                     GateOutcome::Enqueue => {}
                     GateOutcome::Schedule => {
@@ -404,8 +441,8 @@ pub fn try_prepared_dismiss_dialog(
             // rejected enqueue must leave the generation able to try again;
             // spending early strands it as Refused(Spent) with the modal
             // unanswered, which is the exact failure the rule exists to prevent.
-            let barrier = pattern.rearm_pre_idle.then(|| dev_gate.write_barrier());
-            let enqueue_receipt = pattern.rearm_pre_idle.then(|| dev_gate.enqueue_receipt());
+            let barrier = pattern.dev_gated.then(|| dev_gate.write_barrier());
+            let enqueue_receipt = pattern.dev_gated.then(|| dev_gate.enqueue_receipt());
             #[cfg(test)]
             if INLINE_DISMISS_WRITE.with(std::cell::Cell::get) {
                 if scheduled_from_first_sighting {
