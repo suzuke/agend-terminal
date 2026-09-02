@@ -433,119 +433,16 @@ impl ChannelRuntime {
     /// compare-and-append receipt transition is intentionally separate from
     /// `remember_reply`: it emits no reply event and no SSE notification.
     fn acknowledge_self_kick(&self, delivery_id: Uuid) -> anyhow::Result<DeliveryReceipt> {
-        let now = Utc::now();
-        let (store, envelope, mut current) = self.self_kick_receipt(delivery_id)?;
-        if current.state == DeliveryState::TurnStarted {
-            return Ok(current);
-        }
-        if current.state.is_terminal() && current.state != DeliveryState::Ambiguous {
-            anyhow::bail!("self-kick delivery is no longer awaiting start acknowledgement")
-        }
-        if !matches!(
-            current.state,
-            DeliveryState::Queued
-                | DeliveryState::ProtocolAccepted
-                | DeliveryState::Ambiguous
-                | DeliveryState::AckOverdue
-        ) {
-            anyhow::bail!("self-kick delivery is not awaiting start acknowledgement")
-        }
-
-        // The bridge can write the notification and receive the consumer's
-        // ack before the daemon-side post-202 receipt append. Preserve the
-        // truthful ProtocolAccepted state first when the durable row is still
-        // Queued, then advance it to TurnStarted.
-        if current.state == DeliveryState::Queued {
-            let mut accepted = current.clone();
-            accepted.state = DeliveryState::ProtocolAccepted;
-            accepted.protocol_request_id = Some(delivery_id.to_string());
-            accepted.backend_session_id = Some(self.session_id.clone());
-            accepted.backend_event = Some("webhook_accepted".to_string());
-            if store.record_if_latest_state(delivery_id, DeliveryState::Queued, accepted)? {
-                current = store
-                    .latest(delivery_id)?
-                    .ok_or_else(|| anyhow::anyhow!("self-kick receipt disappeared after accept"))?;
-            } else {
-                current = store.latest(delivery_id)?.ok_or_else(|| {
-                    anyhow::anyhow!("self-kick receipt disappeared during accept")
-                })?;
-            }
-        }
-
-        if current.state == DeliveryState::TurnStarted {
-            return Ok(current);
-        }
-        if !matches!(
-            current.state,
-            DeliveryState::ProtocolAccepted | DeliveryState::Ambiguous | DeliveryState::AckOverdue
-        ) {
-            anyhow::bail!("self-kick delivery is not protocol-accepted")
-        }
-        // t-…-82348-105: a truthful ack that arrives AFTER the watchdog gave
-        // up. The `AckOverdue` receipt still carries the ACCEPTED timestamp
-        // (the watchdog transitions state in place and never restamps
-        // `recorded_at`), so the overshoot past the window is computable here
-        // and nowhere else downstream. Recorded as additive audit metadata —
-        // the admissible `AckOverdue -> TurnStarted` transition is unchanged.
-        let late_by_secs = (current.state == DeliveryState::AckOverdue)
-            .then(|| self_kick_ack_elapsed(&current.recorded_at, now))
-            .flatten()
-            .map(|elapsed| {
-                (elapsed.as_secs() as i64 - SELF_KICK_ACK_WINDOW.as_secs() as i64).max(0)
-            });
-        let mut started = DeliveryReceipt::for_state(&envelope, DeliveryState::TurnStarted);
-        started.protocol_request_id = current
-            .protocol_request_id
-            .or_else(|| Some(delivery_id.to_string()));
-        started.backend_session_id = Some(self.session_id.clone());
-        started.backend_event = Some(
-            if late_by_secs.is_some() {
-                "claude_channel_turn_started_late"
-            } else {
-                "claude_channel_turn_started"
-            }
-            .to_string(),
-        );
-        started.late_ack_secs = late_by_secs;
-        started.detail = Some(match late_by_secs {
-            Some(late) => format!(
-                "consumer acknowledged exact self-kick delivery_id {late}s after the {:?} ack window closed",
-                SELF_KICK_ACK_WINDOW
-            ),
-            None => "consumer acknowledged exact self-kick delivery_id".to_string(),
-        });
-        let mut expected = current.state;
-        loop {
-            if store.record_if_latest_state(delivery_id, expected, started.clone())? {
-                if let Some(late) = late_by_secs {
-                    crate::event_log::log(
-                        &self.home,
-                        "claude_self_kick_ack_late",
-                        &self.instance,
-                        &format!(
-                            "agent {} delivery {delivery_id} late by {late}s past the {:?} ack window; the earlier AckOverdue is resolved",
-                            self.instance, SELF_KICK_ACK_WINDOW
-                        ),
-                    );
-                }
-                return Ok(started);
-            }
-            let latest = store
-                .latest(delivery_id)?
-                .ok_or_else(|| anyhow::anyhow!("self-kick receipt disappeared during start ack"))?;
-            if latest.state == DeliveryState::TurnStarted {
-                return Ok(latest);
-            }
-            if !matches!(
-                latest.state,
-                DeliveryState::ProtocolAccepted
-                    | DeliveryState::Ambiguous
-                    | DeliveryState::AckOverdue
-            ) {
-                anyhow::bail!("self-kick start acknowledgement lost a receipt race")
-            }
-            expected = latest.state;
-        }
+        let (store, envelope, current) = self.self_kick_receipt(delivery_id)?;
+        record_self_kick_turn_started(
+            &self.home,
+            &self.instance,
+            &self.session_id,
+            &store,
+            &envelope,
+            current,
+            Utc::now(),
+        )
     }
 
     /// Complete a self-kick only after the successor has finished its bounded
@@ -1385,6 +1282,157 @@ fn self_kick_ack_elapsed(recorded_at: &str, now: DateTime<Utc>) -> Option<Durati
 pub(crate) struct TurnObservation {
     /// Seconds between the bridge's acceptance and the observed turn.
     pub after_accept_secs: i64,
+}
+
+/// The durable `-> TurnStarted` half of the consumer's exact-id `ack_start`,
+/// factored out of [`ChannelRuntime::acknowledge_self_kick`] (which owns only
+/// the identity checks) so the daemon's per-tick tests — which hold no bridge
+/// runtime — can drive the REAL transition rather than a hand-written receipt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_self_kick_turn_started(
+    home: &Path,
+    instance: &str,
+    session_id: &str,
+    store: &ReceiptStore,
+    envelope: &DeliveryEnvelope,
+    mut current: DeliveryReceipt,
+    now: DateTime<Utc>,
+) -> anyhow::Result<DeliveryReceipt> {
+    let delivery_id = envelope.delivery_id;
+    if current.state == DeliveryState::TurnStarted {
+        return Ok(current);
+    }
+    if current.state.is_terminal() && current.state != DeliveryState::Ambiguous {
+        anyhow::bail!("self-kick delivery is no longer awaiting start acknowledgement")
+    }
+    if !matches!(
+        current.state,
+        DeliveryState::Queued
+            | DeliveryState::ProtocolAccepted
+            | DeliveryState::Ambiguous
+            | DeliveryState::AckOverdue
+    ) {
+        anyhow::bail!("self-kick delivery is not awaiting start acknowledgement")
+    }
+
+    // The bridge can write the notification and receive the consumer's
+    // ack before the daemon-side post-202 receipt append. Preserve the
+    // truthful ProtocolAccepted state first when the durable row is still
+    // Queued, then advance it to TurnStarted.
+    if current.state == DeliveryState::Queued {
+        let mut accepted = current.clone();
+        accepted.state = DeliveryState::ProtocolAccepted;
+        accepted.protocol_request_id = Some(delivery_id.to_string());
+        accepted.backend_session_id = Some(session_id.to_string());
+        accepted.backend_event = Some("webhook_accepted".to_string());
+        store.record_if_latest_state(delivery_id, DeliveryState::Queued, accepted)?;
+        current = store
+            .latest(delivery_id)?
+            .ok_or_else(|| anyhow::anyhow!("self-kick receipt disappeared during accept"))?;
+    }
+
+    if current.state == DeliveryState::TurnStarted {
+        return Ok(current);
+    }
+    if !matches!(
+        current.state,
+        DeliveryState::ProtocolAccepted | DeliveryState::Ambiguous | DeliveryState::AckOverdue
+    ) {
+        anyhow::bail!("self-kick delivery is not protocol-accepted")
+    }
+    loop {
+        // t-…-82348-105: a truthful ack that arrives AFTER the watchdog gave
+        // up. The `AckOverdue` receipt still carries the ACCEPTED timestamp
+        // (the watchdog transitions state in place and never restamps
+        // `recorded_at`), so the overshoot past the window is computable here
+        // and nowhere else downstream. Recorded as additive audit metadata —
+        // the admissible `AckOverdue -> TurnStarted` transition is unchanged.
+        let late_by_secs = (current.state == DeliveryState::AckOverdue)
+            .then(|| self_kick_ack_elapsed(&current.recorded_at, now))
+            .flatten()
+            .map(|elapsed| {
+                (elapsed.as_secs() as i64 - SELF_KICK_ACK_WINDOW.as_secs() as i64).max(0)
+            });
+        let mut started = DeliveryReceipt::for_state(envelope, DeliveryState::TurnStarted);
+        started.protocol_request_id = current
+            .protocol_request_id
+            .clone()
+            .or_else(|| Some(delivery_id.to_string()));
+        started.backend_session_id = Some(session_id.to_string());
+        started.backend_event = Some(
+            if late_by_secs.is_some() {
+                "claude_channel_turn_started_late"
+            } else {
+                "claude_channel_turn_started"
+            }
+            .to_string(),
+        );
+        started.late_ack_secs = late_by_secs;
+        started.detail = Some(match late_by_secs {
+            Some(late) => format!(
+                "consumer acknowledged exact self-kick delivery_id {late}s after the {:?} ack window closed",
+                SELF_KICK_ACK_WINDOW
+            ),
+            None => "consumer acknowledged exact self-kick delivery_id".to_string(),
+        });
+        if store.record_if_latest_state(delivery_id, current.state, started.clone())? {
+            if let Some(late) = late_by_secs {
+                crate::event_log::log(
+                    home,
+                    "claude_self_kick_ack_late",
+                    instance,
+                    &format!(
+                        "agent {instance} delivery {delivery_id} late by {late}s past the {:?} ack window; the earlier AckOverdue is resolved",
+                        SELF_KICK_ACK_WINDOW
+                    ),
+                );
+            }
+            return Ok(started);
+        }
+        let latest = store
+            .latest(delivery_id)?
+            .ok_or_else(|| anyhow::anyhow!("self-kick receipt disappeared during start ack"))?;
+        if latest.state == DeliveryState::TurnStarted {
+            return Ok(latest);
+        }
+        if !matches!(
+            latest.state,
+            DeliveryState::ProtocolAccepted | DeliveryState::Ambiguous | DeliveryState::AckOverdue
+        ) {
+            anyhow::bail!("self-kick start acknowledgement lost a receipt race")
+        }
+        current = latest;
+    }
+}
+
+/// Drive the real `ack_start` receipt transition for `delivery_id` without a
+/// bridge runtime: the daemon-side tests own no `ChannelRuntime`, and a
+/// hand-written `TurnStarted` receipt would pin the fixture instead of the
+/// production transition.
+#[cfg(test)]
+pub(crate) fn ack_start_for_test(
+    home: &Path,
+    instance: &str,
+    delivery_id: Uuid,
+) -> anyhow::Result<DeliveryReceipt> {
+    let store = ReceiptStore::for_instance(home, instance)?;
+    let (envelope, current) = store
+        .delivery(delivery_id)?
+        .ok_or_else(|| anyhow::anyhow!("no durable receipt for {delivery_id}"))?;
+    let session_id = envelope
+        .session
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "test-session".to_string());
+    record_self_kick_turn_started(
+        home,
+        instance,
+        &session_id,
+        &store,
+        &envelope,
+        current,
+        Utc::now(),
+    )
 }
 
 /// One reconciliation outcome from a watchdog pass. The transport owns the

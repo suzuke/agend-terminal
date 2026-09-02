@@ -945,4 +945,84 @@ mod tests {
         h.tick(&handler);
         assert!(h.notices(LEAD).is_empty());
     }
+
+    /// PR #3495 r3 (b): a late `ack_start` that lands BEFORE the per-tick pass
+    /// enqueues the overdue notice must not swallow it. Two distinct notices
+    /// are owed — the alert, then the resolution — and in that order.
+    #[test]
+    fn late_ack_before_enqueue_delivers_overdue_then_late_notice() {
+        let h = Harness::new("late-before-enqueue", LEAD);
+        let handler = ClaudeSelfKickHandler::new(1);
+        let delivery_id = seed_accepted_kick(&h.home, Utc::now() - ChronoDuration::seconds(38));
+
+        // The watchdog persists state=AckOverdue + the notice INTENT; the
+        // daemon has not announced anything yet.
+        assert_eq!(crash_after_intent_cas(&h.home), 1);
+        assert!(h.notices(LEAD).is_empty(), "nothing delivered yet");
+
+        // The real transition the consumer's ack_start drives.
+        crate::transport::claude_channel::ack_start_for_test(&h.home, AGENT, delivery_id)
+            .expect("late ack");
+        assert_eq!(
+            latest_state(&h.home, delivery_id),
+            DeliveryState::TurnStarted
+        );
+
+        h.tick(&handler);
+        let first = h.notices(LEAD);
+        assert_eq!(first.len(), 1, "the overdue alert comes first: {first:?}");
+        assert!(
+            first[0].contains("fresh-restart resume NOT confirmed"),
+            "and it is the overdue one: {}",
+            first[0]
+        );
+
+        h.tick(&handler);
+        let second = h.notices(LEAD);
+        assert_eq!(second.len(), 1, "then the resolving notice: {second:?}");
+        assert!(
+            second[0].contains("arrived late (+8s after the window)"),
+            "and it is the late-ack one: {}",
+            second[0]
+        );
+        assert!(
+            pending_marker(&h.home, delivery_id).is_none(),
+            "both intents are cleared"
+        );
+        h.tick(&handler);
+        assert!(h.notices(LEAD).is_empty(), "and neither repeats");
+    }
+
+    /// PR #3495 r3 (c): the same shape with a crash right after the ack — the
+    /// daemon dies with the overdue intent durable and unsent. A fresh pass
+    /// sequence must still deliver exactly one of each notice.
+    #[test]
+    fn crash_after_late_ack_before_enqueue_loses_nothing() {
+        let h = Harness::new("late-crash-no-loss", LEAD);
+        let handler = ClaudeSelfKickHandler::new(1);
+        let delivery_id = seed_accepted_kick(&h.home, Utc::now() - ChronoDuration::seconds(35));
+        assert_eq!(crash_after_intent_cas(&h.home), 1);
+        crate::transport::claude_channel::ack_start_for_test(&h.home, AGENT, delivery_id)
+            .expect("late ack");
+        // The daemon dies here: a pass computed the outcome and announced
+        // nothing.
+        assert_eq!(
+            crash_after_intent_cas(&h.home),
+            1,
+            "the unsent intent is still replayable after the ack"
+        );
+        assert!(h.notices(LEAD).is_empty());
+
+        h.tick(&handler);
+        let first = h.notices(LEAD);
+        assert_eq!(first.len(), 1, "one overdue notice: {first:?}");
+        assert!(first[0].contains("fresh-restart resume NOT confirmed"));
+        h.tick(&handler);
+        let second = h.notices(LEAD);
+        assert_eq!(second.len(), 1, "one late-ack notice: {second:?}");
+        assert!(second[0].contains("arrived late (+5s after the window)"));
+        assert!(pending_marker(&h.home, delivery_id).is_none());
+        h.tick(&handler);
+        assert!(h.notices(LEAD).is_empty(), "exactly one of each overall");
+    }
 }

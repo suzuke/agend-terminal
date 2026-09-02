@@ -171,4 +171,40 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// PR #3495 r3 (P1): an inbox the scan CANNOT read must fail CLOSED.
+    /// `read_to_string(..).unwrap_or_default()` treated a permission/IO error
+    /// and invalid UTF-8 as "no rows", so the append below could add a SECOND
+    /// row for a key that is already there — the duplicate this module exists
+    /// to prevent. NotFound (a genuinely absent inbox) is still empty.
+    #[test]
+    fn idempotent_enqueue_fails_closed_on_unreadable_inbox() {
+        let home = tmp_home_outbox("unreadable");
+        let key = "self-kick:d-3:ack_overdue";
+        // NotFound stays "empty": the very first enqueue creates the file.
+        assert!(
+            enqueue_once_returning_unread_count(&home, "lead", notice("first"), key)
+                .expect("absent inbox is an empty inbox")
+                .is_some()
+        );
+        let path = with_inbox_lock(&home, "lead", |path| path.to_path_buf()).expect("path");
+        let before = std::fs::read(&path).expect("bytes");
+        // The row is intact, but the file no longer decodes as UTF-8.
+        let mut corrupted = before.clone();
+        corrupted.extend_from_slice(b"\xff\xfe not utf-8\n");
+        std::fs::write(&path, &corrupted).expect("corrupt");
+
+        let error = enqueue_once_returning_unread_count(&home, "lead", notice("dup"), key)
+            .expect_err("an unreadable inbox must not be treated as empty");
+        assert!(
+            format!("{error:#}").contains("inbox"),
+            "the error must name the inbox it refused to append to: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("bytes after"),
+            corrupted,
+            "and nothing may be appended before the read succeeds"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
