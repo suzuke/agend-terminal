@@ -161,6 +161,48 @@ pub(super) fn create_branch_with_commit(repo: &Path, branch: &str, commit_msg: &
     sha
 }
 
+/// #3470: forge exact-head evidence is authoritative even when the local
+/// remote-tracking default branch has not fetched the merge yet.
+#[test]
+fn pr_merge_status_accepts_exact_forge_merge_with_stale_local_default() {
+    let repo = setup_repo("forge-merged-stale-default");
+    let base = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    git_run(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/repo.git",
+        ],
+    );
+    git_run(&repo, &["update-ref", "refs/remotes/origin/main", &base]);
+
+    let branch = "forge-merged";
+    let head = create_branch_with_commit(&repo, branch, "feature");
+    let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
+        crate::scm::MockPrList::MergedHead {
+            base: "main".to_string(),
+            head_oid: head,
+        },
+    ));
+
+    assert!(matches!(
+        pr_merge_status(&repo, "main", branch),
+        PrMergeStatus::Merged
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "refs/remotes/origin/main"]).stdout)
+            .trim(),
+        base,
+        "the proof must not rely on refreshing local origin/main"
+    );
+
+    std::fs::remove_dir_all(repo.parent().expect("repo parent")).ok();
+}
+
 fn bind_handler_repo(home: &Path, repo: &Path, agent: &str) {
     let binding_dir = home.join("runtime").join(agent);
     std::fs::create_dir_all(&binding_dir).expect("mkdir binding");

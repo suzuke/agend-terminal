@@ -1427,3 +1427,122 @@ fn create_instance_logs_no_provenance_when_rolled_back_3418() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// r2 correction 2 (spawn half): when `worktree::create` fails closed, the spawn
+/// path must NOT continue on the original `work_dir`. Before this fix
+/// `if let Some(info) = create(...)` simply skipped the assignment, so the agent
+/// launched and persisted against the SOURCE REPO instead of the worktree it
+/// asked for — a silent fallback that hands an agent the wrong tree.
+///
+/// The strongest single assertion is that the launch closure never runs: it
+/// captures no-launch AND no-fallback at once, since a fallback would have
+/// spawned with the original directory.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn spawn_fails_closed_when_worktree_creation_fails_no_launch_no_persist() {
+    let home = tmp_home_for_create_instance_team("spawn-wt-failclosed");
+    let repo = home.join("workspace").join("agent-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_ALLOW_PROTOCOL", "file:https:ssh")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+
+    // A submodule source that we then DELETE, so `init_submodules_strict` fails
+    // and `create` fail-closes. This is the same shape as the worktree-level RED.
+    let sub = home.join("sub-src");
+    std::fs::create_dir_all(&sub).unwrap();
+    assert!(git(&sub, &["init", "--quiet", "-b", "main"]));
+    std::fs::write(sub.join("payload.txt"), "nested\n").unwrap();
+    assert!(git(&sub, &["add", "payload.txt"]));
+    assert!(git(
+        &sub,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "init"
+        ]
+    ));
+
+    assert!(git(&repo, &["init", "--quiet", "-b", "main"]));
+    assert!(git(
+        &repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &sub.display().to_string(),
+            "vendor/dep"
+        ]
+    ));
+    assert!(git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "super"
+        ]
+    ));
+    std::fs::remove_dir_all(&sub).expect("remove submodule source");
+
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    if let Some(parent) = fleet_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&fleet_path, "instances: {}\n").unwrap();
+
+    let launched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = launched.clone();
+    let spawn_fn = move |_h: &std::path::Path,
+                         _req: &serde_json::Value|
+          -> anyhow::Result<serde_json::Value> {
+        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(serde_json::json!({"ok": true}))
+    };
+
+    let result = crate::mcp::handlers::instance_state::spawn::spawn_single_instance_impl(
+        &home,
+        "spawner",
+        &serde_json::json!({
+            "name": "wt-agent",
+            "backend": "claude",
+            "working_directory": repo.display().to_string(),
+            "branch": "feat/submod-fail"
+        }),
+        &spawn_fn,
+        None,
+    );
+
+    assert!(
+        result.get("error").is_some(),
+        "worktree creation failed, so the spawn must fail closed: {result}"
+    );
+    assert!(
+        !launched.load(std::sync::atomic::Ordering::SeqCst),
+        "no launch: the backend must never be spawned on the fallback work_dir"
+    );
+    let fleet_text = std::fs::read_to_string(&fleet_path).unwrap_or_default();
+    assert!(
+        !fleet_text.contains("wt-agent"),
+        "no persist: the instance must not reach fleet.yaml. Got: {fleet_text}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

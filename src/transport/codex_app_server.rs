@@ -1053,6 +1053,15 @@ fn launch_managed_server(
 }
 
 #[cfg(unix)]
+fn remove_managed_socket_file(endpoint: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(endpoint) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
 fn remove_managed_endpoint(
     home: &Path,
     instance: &str,
@@ -1099,7 +1108,7 @@ fn remove_managed_endpoint(
             endpoint.display()
         ));
     }
-    std::fs::remove_file(endpoint).map_err(|error| {
+    remove_managed_socket_file(endpoint).map_err(|error| {
         anyhow::anyhow!(
             "cannot remove Codex managed socket {}: {error}",
             endpoint.display()
@@ -2132,6 +2141,35 @@ mod tests {
         assert!(endpoint.exists(), "outside socket must survive cleanup");
         let _ = std::fs::remove_file(endpoint);
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_socket_final_unlink_is_idempotent_when_endpoint_disappears() {
+        let endpoint = std::env::temp_dir().join(format!(
+            "agend-codex-missing-managed-socket-{}.sock",
+            Uuid::new_v4()
+        ));
+
+        assert!(
+            remove_managed_socket_file(&endpoint).is_ok(),
+            "a socket disappearing after validation already reached the desired end state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_socket_final_unlink_keeps_other_errors_fail_closed() {
+        let endpoint = std::env::temp_dir().join(format!(
+            "agend-codex-non-socket-endpoint-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir(&endpoint).expect("endpoint fixture directory");
+
+        let error = remove_managed_socket_file(&endpoint)
+            .expect_err("a non-ENOENT unlink error must stay fatal");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        std::fs::remove_dir(&endpoint).expect("remove endpoint fixture directory");
     }
 
     #[test]

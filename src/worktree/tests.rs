@@ -253,7 +253,7 @@ fn create_initializes_nested_submodules_recursively() {
 /// (optional/private/offline), `create` must still return `Some` with a
 /// managed worktree — never hard-fail the lease. Nested content stays empty.
 #[test]
-fn create_soft_fails_when_submodule_source_unavailable() {
+fn create_fails_closed_when_submodule_source_unavailable() {
     let home = tmp_home("submod-soft");
     let root = std::env::temp_dir().join(format!(
         "agend-wt-soft-root-{}-{}",
@@ -282,20 +282,160 @@ fn create_soft_fails_when_submodule_source_unavailable() {
     // Make the recorded submodule URL unusable BEFORE production create.
     std::fs::remove_dir_all(&sub).expect("remove submodule source");
 
-    let info = create(&home, &super_repo, "agent-soft", Some("feat/submod-soft"))
-        .expect("create must soft-warn and still return Some when submodule init fails");
-
+    // #2755 follow-up A: a tree whose nested content cannot be provisioned is not
+    // build-ready, so `create` now FAILS CLOSED instead of soft-warning to success.
+    let wt_dir = crate::worktree::worktree_path(&home, "agent-soft", "feat/submod-soft");
+    let info = create(&home, &super_repo, "agent-soft", Some("feat/submod-soft"));
     assert!(
-        info.path.join(".agend-managed").is_file(),
-        "managed marker must still land on soft-fail path"
+        info.is_none(),
+        "create must fail closed when submodule init fails, not return a half-provisioned tree"
+    );
+    // Rollback proven by the DIRECTORY being gone, not merely by the return value:
+    // a `None` that leaked a half-managed dir would still be a leak.
+    assert!(
+        !wt_dir.exists(),
+        "the fresh worktree this attempt created must be rolled back, not left behind: {}",
+        wt_dir.display()
     );
     assert!(
-        !info.path.join("vendor/dep/payload.txt").is_file(),
-        "nested content must remain unavailable when source is gone"
+        !wt_dir.join(".agend-managed").is_file(),
+        "no managed-marker orphan may survive the rollback"
     );
 
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// Positive control for the fail-closed matrix: a HEALTHY submodule source must
+/// still provision normally. Without this, the negatives above and below could
+/// all be passing because `create` broke for some unrelated reason.
+#[test]
+fn create_succeeds_and_populates_healthy_submodule() {
+    let home = tmp_home("submod-healthy");
+    let super_repo = tmp_super_with_nested_submodules("failclosed-healthy");
+    let info = create(&home, &super_repo, "agent-ok", Some("feat/submod-ok"))
+        .expect("healthy submodule source must still provision");
+    assert!(
+        info.path.join(".agend-managed").is_file(),
+        "managed marker must land on the success path"
+    );
+    assert!(
+        info.path.join(".gitmodules").is_file(),
+        "fixture must actually carry submodules, or this control proves nothing"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Blast-radius guard for the overwhelmingly common case: a repo with NO
+/// `.gitmodules` must be byte-identically unaffected — both primitives early
+/// return `Ok`, so nothing about this path may change.
+#[test]
+fn create_without_gitmodules_is_unaffected() {
+    let home = tmp_home("submod-none");
+    let repo = tmp_repo_with_file("failclosed-plain", "a.txt", "hello\n");
+    let info = create(&home, &repo, "agent-plain", Some("feat/plain"))
+        .expect("a repo without submodules must be unaffected by the fail-closed contract");
+    assert!(!info.path.join(".gitmodules").exists(), "fixture sanity");
+    assert!(info.path.join(".agend-managed").is_file());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// REUSE is verify-only: an already-provisioned tree whose submodule sits at a
+/// DIFFERENT commit than the superproject gitlink must be REJECTED rather than
+/// silently reused — and rejection must not delete the reused tree, which
+/// belongs to whoever provisioned it (`WorktreeProvenance::Reused`).
+#[test]
+fn reuse_rejects_submodule_not_at_gitlink_and_keeps_the_tree() {
+    let home = tmp_home("submod-reuse");
+    let super_repo = tmp_super_with_nested_submodules("failclosed-reuse");
+    let first = create(&home, &super_repo, "agent-reuse", Some("feat/submod-reuse"))
+        .expect("first create must provision");
+    let wt = first.path.clone();
+
+    // Desync the submodule: empty its checkout so `submodule status --recursive`
+    // reports `-` (not initialized) against the recorded gitlink.
+    let sub_dir = wt.join("vendor/mid");
+    assert!(
+        sub_dir.exists(),
+        "fixture must have provisioned the submodule"
+    );
+    for entry in std::fs::read_dir(&sub_dir).unwrap().flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p).ok();
+        } else {
+            std::fs::remove_file(&p).ok();
+        }
+    }
+
+    let again = create(&home, &super_repo, "agent-reuse", Some("feat/submod-reuse"));
+    assert!(
+        again.is_none(),
+        "a reused tree whose submodules are not at their gitlinks must be rejected"
+    );
+    assert!(
+        wt.exists(),
+        "rejection must NOT delete a reused tree — it is not this attempt's to remove"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// r2 correction 1: on the REUSE path the submodule verify must run BEFORE the
+/// destructive `sync_worktree_to_head` (`reset --hard` + `clean -fd`). Rejecting
+/// AFTER the reset still destroys the occupant's work, which makes the guard
+/// worse than useless: the caller is told "no" and has already lost the WIP.
+///
+/// Both kinds of parent WIP are asserted, because `reset --hard` and `clean -fd`
+/// destroy different things: a TRACKED modification and an UNTRACKED file.
+#[test]
+fn reuse_verify_precedes_sync_so_parent_wip_survives_rejection() {
+    let home = tmp_home("submod-reuse-wip");
+    let super_repo = tmp_super_with_nested_submodules("failclosed-reuse-wip");
+    let first = create(&home, &super_repo, "agent-wip", Some("feat/submod-wip"))
+        .expect("first create must provision");
+    let wt = first.path.clone();
+
+    // Parent WIP of both kinds. `.gitmodules` is the fixture's only TRACKED
+    // regular file (the super repo commits just it plus the gitlink), so it is
+    // what a `reset --hard` would revert; an appended comment keeps the file
+    // valid for `submodule status`. The untracked file is what `clean -fd`
+    // would delete. Both are needed: the two halves of the destructive sync
+    // destroy different things.
+    let tracked = wt.join(".gitmodules");
+    let tracked_before = std::fs::read_to_string(&tracked).expect("fixture tracks .gitmodules");
+    let tracked_wip = format!("{tracked_before}# PARENT WIP tracked edit\n");
+    std::fs::write(&tracked, &tracked_wip).expect("write tracked WIP");
+    let untracked = wt.join("scratch-wip.txt");
+    std::fs::write(&untracked, "PARENT WIP untracked\n").expect("write untracked WIP");
+
+    // Desync the submodule so the read-only verify must reject.
+    let sub_dir = wt.join("vendor/mid");
+    assert!(
+        sub_dir.exists(),
+        "fixture must have provisioned the submodule"
+    );
+    for entry in std::fs::read_dir(&sub_dir).unwrap().flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p).ok();
+        } else {
+            std::fs::remove_file(&p).ok();
+        }
+    }
+
+    let again = create(&home, &super_repo, "agent-wip", Some("feat/submod-wip"));
+    assert!(again.is_none(), "an invalid reused submodule must reject");
+
+    assert!(
+        untracked.is_file(),
+        "untracked parent WIP must survive a rejection — `clean -fd` must not have run"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tracked).unwrap_or_default(),
+        tracked_wip,
+        "tracked parent WIP must be byte-identical — `reset --hard` must not have run"
+    );
+    std::fs::remove_dir_all(&home).ok();
 }
 
 // ── #2158-adjacent: dirty-WIP preservation helpers ──────────────────
@@ -2205,6 +2345,8 @@ fn resolve_auto_worktree_skips_workspace_default_allows_explicit_repo_1858() {
     assert!(
         got_b
             .as_ref()
+            .ok()
+            .and_then(|inner| inner.as_ref())
             .is_some_and(|p| p.to_string_lossy().contains("worktrees")),
         "#1858 (b): explicit real-repo working_directory must still auto-worktree, got {got_b:?}"
     );
@@ -2223,7 +2365,10 @@ fn resolve_auto_worktree_skips_workspace_default_allows_explicit_repo_1858() {
     assert!(is_git_repo(&work_dir), "fixture: workspace dir git-init'd");
     let resolved_c = mk_resolved(work_dir.clone(), Some(home_c.join("realrepo")), None, None);
     assert!(
-        resolve_auto_worktree(&home_c, "team-dev", &resolved_c).is_none(),
+        matches!(
+            resolve_auto_worktree(&home_c, "team-dev", &resolved_c),
+            Ok(None)
+        ),
         "#1858 (c): deploy non-branch (source_repo + default workspace dir) must not auto-worktree"
     );
 
@@ -2250,7 +2395,7 @@ fn resolve_auto_worktree_skips_workspace_default_allows_explicit_repo_1858() {
     );
     let resolved_d = mk_resolved(nested.clone(), Some(home_d.join("realrepo")), None, None);
     assert!(
-            resolve_auto_worktree(&home_d, "member1", &resolved_d).is_none(),
+            matches!(resolve_auto_worktree(&home_d, "member1", &resolved_d), Ok(None)),
             "#1919 (d): team-nested default workspace (workspace/<team>/<instance>) must not auto-worktree"
         );
 
@@ -2269,7 +2414,7 @@ fn resolve_auto_worktree_flag_off_workspace_none_2234() {
     let ws = crate::paths::workspace_dir(&home).join("agent");
     let resolved = mk_resolved(ws.clone(), Some(repo.clone()), None, None);
     assert!(
-        resolve_auto_worktree(&home, "agent", &resolved).is_none(),
+        matches!(resolve_auto_worktree(&home, "agent", &resolved), Ok(None)),
         "flag OFF → workspace stays a non-worktree (byte-identical)"
     );
     std::fs::remove_dir_all(&home).ok();
@@ -2292,7 +2437,7 @@ fn resolve_auto_worktree_flag_on_workspace_reconciles_2234() {
     };
 
     assert_eq!(
-        got.as_deref(),
+        got.as_ref().ok().and_then(|inner| inner.as_deref()),
         Some(ws.as_path()),
         "flag ON → gate returns the workspace path itself (cwd == worktree)"
     );

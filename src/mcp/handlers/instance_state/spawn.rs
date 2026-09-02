@@ -307,10 +307,24 @@ fn spawn_single_instance_impl_inner(
         // Sprint 57 Wave 4 (#546 Item 4): worktree creation now takes
         // `home` so the canonical external layout
         // `$AGEND_HOME/worktrees/<agent>/<branch>/` resolves correctly.
-        if let Some(info) = crate::worktree::create(home, &wd, name, Some(branch)) {
-            work_dir = info.path.display().to_string();
-            worktree_created_by_attempt =
-                info.provenance == crate::worktree::WorktreeProvenance::CreatedByThisAttempt;
+        // #2755 follow-up A r2: a failed provision is FAIL-CLOSED here. The old
+        // `if let Some(..)` simply skipped the assignment, so `work_dir` kept the
+        // SOURCE REPO and the agent was launched and persisted against the wrong
+        // tree — a silent fallback, not a degradation. The caller asked for a
+        // branch, so there is no "not applicable" case to confuse this with.
+        match crate::worktree::create(home, &wd, name, Some(branch)) {
+            Some(info) => {
+                work_dir = info.path.display().to_string();
+                worktree_created_by_attempt =
+                    info.provenance == crate::worktree::WorktreeProvenance::CreatedByThisAttempt;
+            }
+            None => {
+                return json!({"error": format!(
+                    "worktree provisioning failed for '{name}' on branch '{branch}' — \
+                     refusing to spawn on '{}' (fail-closed)",
+                    wd.display()
+                )});
+            }
         }
     }
 

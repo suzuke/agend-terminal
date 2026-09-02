@@ -55,6 +55,7 @@ fn disposable_review_task_terminal(home: &Path, task_id: &str) -> Option<bool> {
 /// branch-retention obligation.
 pub(crate) const RETENTION_TAG: &str = "branch-retention";
 const RETENTION_ORPHAN_TAG: &str = "branch-retention-orphan";
+const RETENTION_UNROUTED_TAG: &str = "branch-retention-unrouted";
 const RETENTION_DUE_DAYS: i64 = 14;
 
 /// Stable idempotency key over the EXACT (repo, branch, head) triple.
@@ -75,6 +76,13 @@ pub(crate) fn retention_key(repo: &str, branch: &str, head: &str) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(format!("{repo}\0{branch}\0{head}").as_bytes());
     format!("retention-key:{}", hex::encode(hasher.finalize()))
+}
+
+fn retention_lane_key(repo: &str, branch: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(format!("{repo}\0{branch}").as_bytes());
+    format!("retention-lane:{}", hex::encode(hasher.finalize()))
 }
 
 /// Record ONE owner-facing obligation for a branch that survived release with
@@ -100,34 +108,41 @@ fn record_retention_obligation(
         return;
     }
     let key_tag = retention_key(repo, branch, head);
-    // Bounded by the `branch-retention` tag, and read from the SAME board
-    // `task_events::append` writes to below — a different board would make the
-    // key invisible and duplicate the row on every release.
-    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
-    let existing = crate::tasks::list_all_at_checked(home, &board)
-        .map(|tasks| {
-            tasks
-                .iter()
-                .any(|t| t.tags.iter().any(|tag| tag == RETENTION_TAG) && t.tags.contains(&key_tag))
-        })
-        .unwrap_or(false);
-    if existing {
-        return;
-    }
+    let lane_tag = retention_lane_key(repo, branch);
+
+    let (routed_origin, unrouted) = if origin_task_id.is_empty() {
+        (None, false)
+    } else {
+        match crate::tasks::load_routed(home, origin_task_id) {
+            Ok(routed) => (Some(routed), false),
+            Err(error) => {
+                tracing::warn!(
+                    %repo, %branch, %origin_task_id, %error,
+                    "branch-retention origin could not be routed — recording visibly on default board"
+                );
+                (None, true)
+            }
+        }
+    };
+    let project = routed_origin
+        .as_ref()
+        .map(|routed| routed.project())
+        .unwrap_or(crate::task_events::DEFAULT_PROJECT);
+    let board = crate::task_events::board_root(home, project);
 
     let live = crate::runtime::list_agents_with_fallback(home);
     let is_live = |name: &str| live.is_empty() || live.iter().any(|a| a == name);
-    let created_by = (!origin_task_id.is_empty())
-        .then(|| crate::tasks::load_routed(home, origin_task_id).ok())
-        .flatten()
-        .map(|routed| routed.task.created_by);
+    let created_by = routed_origin.map(|routed| routed.task.created_by);
     let assignee = if is_live(owner) {
         Some(owner.to_string())
     } else {
         created_by.filter(|orchestrator| is_live(orchestrator))
     };
 
-    let mut tags = vec![RETENTION_TAG.to_string(), key_tag];
+    let mut tags = vec![RETENTION_TAG.to_string(), lane_tag.clone(), key_tag.clone()];
+    if unrouted {
+        tags.push(RETENTION_UNROUTED_TAG.to_string());
+    }
     if assignee.is_none() {
         tags.push(RETENTION_ORPHAN_TAG.to_string());
     }
@@ -137,8 +152,9 @@ fn record_retention_obligation(
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
     let seq = RETENTION_SEQ.fetch_add(1, Ordering::Relaxed);
     let id = format!("t-{ts}-{}-{seq}", std::process::id());
+    let successor_id = crate::task_events::TaskId(id);
     let event = crate::task_events::TaskEvent::Created {
-        task_id: crate::task_events::TaskId(id),
+        task_id: successor_id.clone(),
         title: format!("branch-retention: confirm '{branch}' is still needed"),
         description: format!(
             "Released with unmerged work and no merge authority is possible on this lane, \
@@ -167,12 +183,45 @@ fn record_retention_obligation(
         governing_decision_id: None,
         review_class: None,
     };
-    if let Err(error) = crate::task_events::append(
-        home,
-        &crate::task_events::InstanceName("system:branch-retention".to_string()),
-        event,
-    ) {
-        tracing::warn!(%repo, %branch, %error, "branch-retention obligation could not be recorded");
+    let actor = crate::task_events::InstanceName("system:branch-retention".to_string());
+    let legacy_lane = format!("\nrepo: {repo}\nbranch: {branch}\n");
+    let append = crate::task_events::append_batch_computed_at(&board, &actor, |state| {
+        if state.tasks.values().any(|task| {
+            task.tags.iter().any(|tag| tag == RETENTION_TAG) && task.tags.contains(&key_tag)
+        }) {
+            return Ok(Vec::new());
+        }
+
+        let stale_ids: Vec<_> = state
+            .tasks
+            .values()
+            .filter(|task| {
+                task.tags.iter().any(|tag| tag == RETENTION_TAG)
+                    && !task.status.is_terminal()
+                    && (task.tags.contains(&lane_tag) || task.description.contains(&legacy_lane))
+            })
+            .map(|task| task.id.clone())
+            .collect();
+        let mut events = vec![event];
+        events.extend(stale_ids.into_iter().map(|task_id| {
+            crate::task_events::TaskEvent::Superseded {
+                task_id,
+                by: actor.clone(),
+                successor_id: successor_id.clone(),
+            }
+        }));
+        Ok(events)
+    });
+    match append {
+        Err(error) => tracing::warn!(
+            %repo, %branch, %error,
+            "branch-retention obligation could not be recorded"
+        ),
+        Ok(Err(reason)) => tracing::warn!(
+            %repo, %branch, %reason,
+            "branch-retention obligation was refused"
+        ),
+        Ok(Ok(_)) => {}
     }
 }
 

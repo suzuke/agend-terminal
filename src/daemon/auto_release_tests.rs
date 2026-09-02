@@ -1047,7 +1047,7 @@ fn integration_merge_releases_via_real_scanner() {
 }
 
 #[test]
-fn merged_task_assignee_can_finish_after_auto_release_with_receipt() {
+fn merged_task_is_auto_closed_before_release_with_receipt() {
     let home = tmp_home("merge-receipt-task-done");
     let repo = itest_source_repo(&home, "owner/repo");
     let branch = "feat/receipt-done";
@@ -1099,22 +1099,18 @@ fn merged_task_assignee_can_finish_after_auto_release_with_receipt() {
     drain_queue(&home);
     assert!(!bound(&home, "dev"), "merge must auto-release the worktree");
 
-    let done = crate::tasks::handle(
-        &home,
-        "dev",
-        &serde_json::json!({"action": "done", "id": task_id}),
-    );
-    assert!(
-        done.get("error").is_none(),
-        "merge receipt should replace the intentionally released live binding: {done}"
-    );
+    let task = crate::tasks::list_all(&home)
+        .into_iter()
+        .find(|task| task.id.as_str() == task_id)
+        .expect("task present");
     assert_eq!(
-        done["status"], "done",
-        "task must reach terminal state: {done}"
+        task.status,
+        crate::task_events::TaskStatus::Done,
+        "merged PR-state must auto-close the structured task"
     );
     assert!(
-        crate::merge_receipt::find_for_task_completion(&home, task_id, "dev").is_none(),
-        "successful terminalization must settle the task-completion proof"
+        crate::merge_receipt::find_for_task_completion(&home, task_id, "dev").is_some(),
+        "system auto-close must not consume the assignee's merge receipt"
     );
     assert!(
         crate::merge_receipt::find(&home, "owner/repo", &merge_sha, task_id).is_some(),

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 mod auto_watch;
 mod branch_start_point;
+mod cleanup_trunk;
 mod from_ref;
 mod lifecycle_permit;
 mod live_binding;
@@ -496,12 +497,9 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // auto_created_branch / fetch_attempted) and shares one decision
     // tree with `repo action=checkout bind:true` (the #784 entry).
     //
-    // #2703: `from_ref` is the repo's DEFAULT branch (`origin/<default_branch>`
-    // via `git_helpers::default_branch`, reading `origin/HEAD`), NOT a hard-coded
-    // `origin/main` (the #784 default, which mis-based every dispatched branch in a
-    // dev-default repo). Invariant for main-default (and origin/HEAD-blind) repos:
-    // `default_branch` returns "main" → `origin/main`, byte-identical to the prior
-    // literal (pinned by `dispatch_auto_create_main_default_invariance_2703`).
+    // #2703: use `origin/<default_branch>`, not hard-coded `origin/main`.
+    // `git_helpers::default_branch` checks origin/HEAD, then local HEAD, then
+    // falls back to main. The main-default invariant remains byte-identical.
     //
     // Strict error contract (#781 Phase 3 r1, Path A — restored after
     // initial fail-soft fix was found to weaken Piece 7's structured-
@@ -517,10 +515,8 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     let (auto_created_branch, fetch_attempted) = if reused {
         (false, false)
     } else {
-        // #2703: base on the repo's default branch (origin/HEAD), not a literal
-        // origin/main. `default_branch` returns a bare branch name; qualify it with
-        // the push remote (`origin`, per #2047) so `resolve_from_ref_remote` splits
-        // it correctly for both the create base and the #1755 pre-create fetch.
+        // #2703: qualify the bare default branch with the push remote so both
+        // branch creation and the pre-create fetch use the same remote.
         let base = format!(
             "origin/{}",
             crate::git_helpers::default_branch(&source_repo)
@@ -535,8 +531,8 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // scan_existing_branch_binding) key on binding.json, NOT the worktree path,
     // so this swap leaves concurrency serialized exactly as before.
     let workspace_b = crate::worktree_pool::workspace_as_worktree_enabled(target);
-    // Build a lease-reject DispatchError from a PRE-classified `protected` flag +
-    // message. The two lease sinks classify differently: the typed `lease` path
+    // Build a lease-reject DispatchError from a PRE-classified `protected` flag + message.
+    // The two lease sinks classify differently: the typed `lease` path
     // uses `LeaseError::is_protected_branch()` (a variant check — finding D+H, no
     // stringly probe); the workspace-prepare path still returns an anyhow string,
     // classified by `contains("E4.5")` at its call site (`bind_self` dispatches on
@@ -553,7 +549,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         raw: Some(msg),
     };
     let wt_path = if let Some(wt) = reuse_live_worktree {
-        wt // #2158 partial-skip: reuse verbatim — NO lease/`sync_worktree_to_head` reset (wipe)
+        crate::worktree::verify_reused_submodules(wt).map_err(|m| lease_err(false, m))?
     } else if workspace_b {
         // (B): reconcile → free `branch` from stale legacy holders (work-at-risk
         // backed up before --force) → in-place checkout. Encapsulated helper.
@@ -1179,7 +1175,7 @@ fn run_git_idempotent(args: &[&str], cwd: &Path) -> std::io::Result<std::process
     Ok(last.expect("loop runs at least once"))
 }
 
-/// Remove empty commits with message "init" between origin/main and HEAD.
+/// Remove empty "init" commits between [`cleanup_trunk::resolve`] and HEAD.
 /// These come from BACKEND session checkpoints (claude-code / kiro-cli)
 /// that fire heartbeats every ~90s; not from agend-terminal production
 /// code (worktree.rs uses message "init (agend-terminal)" which the
@@ -1208,14 +1204,18 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
     // helper — worst case we get the same status 256 we had before.
     clear_stale_rebase_state(worktree);
 
+    // Resolve once so enumeration, reset, and rebase cannot disagree.
+    let trunk = cleanup_trunk::resolve(worktree)?;
+
     // #1787: retry — the confirmed #1783 windows flake was this command exiting
     // non-zero with empty stderr under scratch-repo lock contention.
-    let output = run_git_idempotent(&["log", "origin/main..HEAD", "--format=%H %s"], worktree);
+    let range = format!("{trunk}..HEAD");
+    let output = run_git_idempotent(&["log", &range, "--format=%H %s"], worktree);
     let output = match output {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             return Err(format!(
-                "git log origin/main..HEAD failed: {}",
+                "git log {range} failed: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             ));
         }
@@ -1263,11 +1263,11 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
         return Ok(0);
     }
 
-    // All commits between origin/main..HEAD are empty inits → soft reset.
+    // All commits between trunk..HEAD are empty inits → soft reset.
     let total_commits = log.lines().count();
     if empty_inits.len() == total_commits {
         // #1787: retry — soft-reset to a fixed ref is idempotent.
-        let status = run_git_idempotent(&["reset", "--soft", "origin/main"], worktree);
+        let status = run_git_idempotent(&["reset", "--soft", &trunk], worktree);
         match status {
             Ok(o) if o.status.success() => {
                 tracing::info!(
@@ -1279,7 +1279,7 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
             Ok(o) => {
                 tracing::warn!("failed to soft-reset empty init commits");
                 return Err(format!(
-                    "git reset --soft origin/main exited with status {:?}",
+                    "git reset --soft {trunk} exited with status {:?}",
                     o.status
                 ));
             }
@@ -1319,7 +1319,7 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
     // blind retry would trip over). `clear_stale_rebase_state` above pre-clears
     // that state, and the `Err` arm below already surfaces a failed abort.
     let status = std::process::Command::new("git")
-        .args(["-c", "core.abbrev=7", "rebase", "-i", "origin/main"])
+        .args(["-c", "core.abbrev=7", "rebase", "-i", &trunk])
         .current_dir(worktree)
         .env("AGEND_GIT_BYPASS", "1")
         .env("GIT_SEQUENCE_EDITOR", format!("sed -i.bak '{sed_script}'"))

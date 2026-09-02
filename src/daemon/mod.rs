@@ -1320,6 +1320,7 @@ fn serve_loop_post_select(
 struct TickKeepalive {
     _task_sweep: crate::daemon::task_sweep::TaskSweep,
     maintenance: crate::daemon::owned_maintenance::OwnedMaintenanceCycle,
+    _tick_driver: crate::daemon::ticker::MaintenanceTickDriver,
 }
 
 fn build_tick_infrastructure(
@@ -1381,26 +1382,16 @@ fn build_tick_infrastructure(
         home,
     );
 
-    let tick_rx = {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        // fire-and-forget: tick producer terminates when the bounded(1) tx
-        // returns Err (rx dropped during daemon shutdown). Self-terminating.
-        std::thread::Builder::new()
-            .name("daemon_tick".into())
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                if tx.send(()).is_err() {
-                    break;
-                }
-            })
-            .ok();
-        rx
-    };
+    let (_tick_driver, tick_rx) = crate::daemon::ticker::MaintenanceTickDriver::spawn(
+        "daemon_tick",
+        std::time::Duration::from_secs(10),
+    );
 
     (
         TickKeepalive {
             _task_sweep,
             maintenance,
+            _tick_driver,
         },
         tick_rx,
     )

@@ -139,6 +139,67 @@ fn terminal_pr_merged_feature_watch_removed_by_cas() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3470: the PR-state scanner can observe an external GitHub/`gh` merge
+/// before the CI poller. That terminal path must close the structured branch
+/// task even after its live binding was intentionally released.
+#[test]
+fn terminal_pr_merged_closes_structured_task_without_live_binding() {
+    use crate::task_events::{append_batch, InstanceName, TaskEvent, TaskId, TaskStatus};
+
+    let home = tmp_home("merged-task-no-binding");
+    let repo = "owner/repo";
+    let branch = "feat/external-merge";
+    let head = "abc1234def5678";
+    let task_id = "t-external-merge";
+
+    append_batch(
+        &home,
+        &InstanceName::from("test:seed"),
+        vec![
+            TaskEvent::Created {
+                task_id: TaskId(task_id.into()),
+                title: "external merge".into(),
+                description: "work".into(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
+            },
+            TaskEvent::Claimed {
+                task_id: TaskId(task_id.into()),
+                by: InstanceName::from("dev"),
+            },
+        ],
+    )
+    .expect("seed claimed task");
+    crate::tasks::link_branch_to_task(&home, task_id, branch).expect("link task branch");
+
+    write_merged_pr_state(&home, repo, branch, head);
+    write_watch(&home, repo, branch, head);
+    tests::write_team_fleet(&home, "lead", &["dev"]);
+    run_scan(&home);
+
+    let task = crate::tasks::list_all(&home)
+        .into_iter()
+        .find(|task| task.id.as_str() == task_id)
+        .expect("task present");
+    assert_eq!(
+        task.status,
+        TaskStatus::Done,
+        "an exact merged PR observation must close its structured branch task"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// R2: Head advanced (watch.head_sha != terminal head) preserves watch.
 #[test]
 fn head_advanced_watch_preserved_by_cas_mismatch() {
@@ -262,6 +323,59 @@ fn restart_rescan_settles_when_ledger_already_emitted() {
         !watch_exists(&home, repo, branch),
         "re-scan (replay-suppressed) must still remove watch via deferred settlement"
     );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3470 recovery: an older daemon may already have emitted the merge event
+/// and removed PR state before the task was repaired/relinked. Re-observing the
+/// same terminal generation must still settle the structured task.
+#[test]
+fn terminal_merge_replay_closes_late_structured_task() {
+    use crate::task_events::{append_batch, InstanceName, TaskEvent, TaskId, TaskStatus};
+
+    let home = tmp_home("merged-task-replay");
+    let repo = "owner/repo";
+    let branch = "feat/external-merge-replay";
+    let head = "abc1234def5678";
+    let task_id = "t-external-merge-replay";
+
+    write_merged_pr_state(&home, repo, branch, head);
+    tests::write_team_fleet(&home, "lead", &["dev"]);
+    run_scan(&home);
+
+    append_batch(
+        &home,
+        &InstanceName::from("test:seed"),
+        vec![TaskEvent::Created {
+            task_id: TaskId(task_id.into()),
+            title: "external merge replay".into(),
+            description: "work".into(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: vec![],
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+        }],
+    )
+    .expect("seed late task");
+    crate::tasks::link_branch_to_task(&home, task_id, branch).expect("link late task branch");
+    write_merged_pr_state(&home, repo, branch, head);
+
+    run_scan(&home);
+
+    let task = crate::tasks::list_all(&home)
+        .into_iter()
+        .find(|task| task.id.as_str() == task_id)
+        .expect("task present");
+    assert_eq!(task.status, TaskStatus::Done);
 
     std::fs::remove_dir_all(&home).ok();
 }
