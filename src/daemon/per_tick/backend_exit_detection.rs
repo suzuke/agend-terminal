@@ -138,14 +138,15 @@ impl PerTickHandler for BackendExitDetectionHandler {
             let Some(resolved) = fleet.resolve_instance(name) else {
                 continue;
             };
-            let expected_backend = declared_backend
-                .clone()
-                .or_else(|| Some(resolved.backend.clone()));
-            if backend_mismatch_declared(expected_backend.as_ref(), live_backend) {
+            // `None` is meaningful: this handle was spawned from a shell/raw
+            // command, so it has no managed backend identity to enforce.  Do
+            // not replace it with fleet.yaml's default backend.
+            let expected_backend = declared_backend.as_ref();
+            if backend_mismatch_declared(expected_backend, live_backend) {
                 mismatched.insert(name.clone());
             }
             if should_fire_backend_exit_declared(
-                expected_backend.as_ref(),
+                expected_backend,
                 live_backend,
                 spawned_at.elapsed(),
             ) {
@@ -156,7 +157,6 @@ impl PerTickHandler for BackendExitDetectionHandler {
                 if should_notify {
                     tracker.insert(name.clone(), now);
                     let expected = expected_backend
-                        .as_ref()
                         .map(|backend| backend.as_str().to_string())
                         .unwrap_or_else(|| resolved.backend.as_str().to_string());
                     to_notify.push((name.clone(), expected, live_backend.clone()));
@@ -257,6 +257,14 @@ mod tests {
             !backend_mismatch("/bin/bash", "codex"),
             "even a live codex under a shell-configured instance must not fire — the instance was \
              never declared to be running a managed backend"
+        );
+    }
+
+    #[test]
+    fn missing_declared_backend_stays_exempt_from_fleet_defaults() {
+        assert!(
+            !backend_mismatch_declared(None, "/bin/bash"),
+            "None identifies a shell/raw handle and must not inherit fleet.yaml's default backend"
         );
     }
 
