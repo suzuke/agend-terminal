@@ -16,11 +16,15 @@
 //! Scope of the scan: the target's inbox JSONL. `drain`/`ack` do NOT move rows
 //! to another file — they rewrite the same file with `read_at`/`delivering_at`
 //! stamped — so a delivered-and-processed notice is still visible to the scan
-//! and still suppresses a duplicate. `clear_compact` is the one operation that
-//! removes rows; a key whose row has been compacted away can be re-inserted.
-//! That is acceptable for this producer: the pending intent it replays lives
+//! and still suppresses a duplicate. PR #3495 r5 corrects what this paragraph
+//! used to say about clearing: `storage::clear_compact` does NOT remove rows
+//! either — it stamps `read_at` and writes every row back
+//! (`storage.rs`, the `None` obligation arm). The one operation that removes
+//! rows is `storage::sweep_expired` (TTL, plus the read-row size cap). A key
+//! whose row it swept can be re-inserted, which costs a DUPLICATE notice, never
+//! a lost one — and only in theory: the pending intent a producer replays lives
 //! for at most the gap between two per-tick passes, orders of magnitude shorter
-//! than a compaction cycle.
+//! than the shortest TTL.
 
 use super::lock::with_inbox_lock;
 use super::message::InboxMessage;

@@ -1896,6 +1896,13 @@ fn write_if_still_queued(
             );
             return Ok(GuardedWrite::AlreadyAdvanced(previous));
         }
+        // r5 P1: the rendezvous belongs HERE — after the snapshot the
+        // compare-and-append will name as its expected value, and before the
+        // append. Firing it any earlier only produces the `AlreadyAdvanced`
+        // branch above and never exercises the window this helper exists to
+        // close.
+        #[cfg(test)]
+        fire_post_202_rendezvous_hook_for_test(delivery_id, previous.state);
         // A `Queued` row carries no markers today; carrying them anyway means
         // this write can never DROP one a future writer parks there.
         let mut candidate = next.clone();
@@ -2033,18 +2040,6 @@ pub(crate) fn deliver_resident(
     let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
     accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
     accepted.backend_event = Some("webhook_accepted".to_string());
-    // RED SCAFFOLDING (r5, removed by the fix): the rendezvous still fires
-    // HERE, before `write_if_still_queued` runs its read — the r4 position the
-    // review rejected. The hook therefore advances the row before the helper
-    // ever reads it, so the helper takes the `AlreadyAdvanced` short circuit
-    // and no compare-and-append is ever attempted, let alone missed.
-    #[cfg(test)]
-    {
-        let observed = store
-            .latest(envelope.delivery_id)?
-            .map_or(DeliveryState::Queued, |receipt| receipt.state);
-        fire_post_202_rendezvous_hook_for_test(envelope.delivery_id, observed);
-    }
     let receipt = match write_if_still_queued(&store, envelope.delivery_id, &accepted)? {
         GuardedWrite::Appended(receipt) => receipt,
         // Claude acknowledged (or completed) the self-kick, or the watchdog
