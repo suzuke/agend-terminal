@@ -1063,6 +1063,84 @@ fn codex_update_dismiss_matches_only_the_live_centered_menu() {
     }
 }
 
+/// Verifier finding (round-2 addendum): [`crate::backend_profile::
+/// CODEX_UPDATE_MENU_LIVE`] hard-required the cursor glyph (`›`) on option 1.
+/// If codex ever repaints the menu with the cursor on option 2 or 3 — a stray
+/// Down keypress, or a build that restores a prior selection — the frame no
+/// longer classifies `PermissionPrompt` and the dismiss never fires: the exact
+/// strand this PR exists to prevent. The dismiss keystroke selects Skip BY
+/// NUMBER (`2\r`), so cursor position is irrelevant to what gets typed; the
+/// classifier must be equally irrelevant to it.
+#[test]
+fn codex_update_menu_is_recognized_with_the_cursor_on_any_option() {
+    let patterns = crate::state::StatePatterns::for_backend(&crate::backend::Backend::Codex);
+    let pattern = crate::backend::Backend::Codex
+        .preset()
+        .dismiss_patterns
+        .iter()
+        .find(|dp| dp.label.contains("Update available!"))
+        .expect("#1069: the codex update dismiss pattern must exist")
+        .label;
+    let re = regex::Regex::new(pattern).expect("pattern must compile");
+
+    let menu_with_cursor_on = |option: u8| -> String {
+        let line1 = if option == 1 {
+            "  › 1. Update now (runs `sh -c 'curl -fsSL https://codex.openai.com/install.sh | sh'`)"
+                .to_string()
+        } else {
+            "    1. Update now (runs `sh -c 'curl -fsSL https://codex.openai.com/install.sh | sh'`)"
+                .to_string()
+        };
+        let line2 = if option == 2 {
+            "  › 2. Skip"
+        } else {
+            "    2. Skip"
+        };
+        let line3 = if option == 3 {
+            "  › 3. Skip until next version"
+        } else {
+            "    3. Skip until next version"
+        };
+        format!(
+            "  ✨ Update available! 0.150.1 -> 0.152.0\n\n\
+             \x20 Release notes: https://github.com/openai/codex/releases\n\n\
+             {line1}\n{line2}\n{line3}\n\n\x20 Press enter to continue\n"
+        )
+    };
+
+    for option in [1u8, 2, 3] {
+        let frame = menu_with_cursor_on(option);
+        assert_eq!(
+            patterns.detect(&frame),
+            Some(crate::state::AgentState::PermissionPrompt),
+            "cursor on option {option}: the live menu must still classify as \
+             PermissionPrompt — the cursor is not what makes it live"
+        );
+        assert!(
+            re.is_match(&frame),
+            "cursor on option {option}: the dismiss label must still match the \
+             live menu"
+        );
+    }
+
+    // Negative: the same cursor-on-2 menu, QUOTED in transcript with codex's
+    // composer painted below it, must not classify as a prompt and must not
+    // match the dismiss label — cursor tolerance must not blind the
+    // live-vs-quoted distinction the tail anchor buys.
+    let quoted_with_composer = format!("{}\n▌ › \n", menu_with_cursor_on(2).trim_end_matches('\n'));
+    assert_ne!(
+        patterns.detect(&quoted_with_composer),
+        Some(crate::state::AgentState::PermissionPrompt),
+        "a quoted cursor-on-2 menu with codex's composer under it must not \
+         classify as a live prompt"
+    );
+    assert!(
+        !re.is_match(&quoted_with_composer),
+        "a quoted cursor-on-2 menu with codex's composer under it must not \
+         match the live dismiss label"
+    );
+}
+
 // ── F1: the backend-startup hint is a per-spawn one-shot ──
 //
 // Reviewer finding F1 (P1, both reviewers): the ungated hint had NO real
