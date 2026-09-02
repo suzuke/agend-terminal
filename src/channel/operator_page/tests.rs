@@ -9,6 +9,7 @@
 //! shortcut.
 
 use super::*;
+use crate::channel::channel_registry_test_guard;
 use crate::channel::{
     register_active_channel, reset_active_channel_for_test, BindingOpts, BindingRef, Channel,
     ChannelCapabilities, ChannelError, ChannelEvent, MsgRef, NotifySeverity, OutMsg,
@@ -25,30 +26,48 @@ use std::sync::Arc;
 /// (which is how the dedicated-topic decision is observed), the severity that
 /// passed the mode gate, and the exact text.
 struct Recorder {
+    /// Unique per test: `register_active_channel` keys by `kind()`, and other
+    /// suites register their own "telegram" channel without taking the registry
+    /// lock. Our own slot cannot be evicted by them, and the fan-out reaches
+    /// every registered channel anyway.
+    kind: &'static str,
     caps: ChannelCapabilities,
     authorized: AtomicBool,
     seen: PlMutex<Vec<(String, NotifySeverity, String)>>,
 }
 
 impl Recorder {
-    fn arc(authorized: bool) -> Arc<Self> {
+    fn arc(kind: &'static str, authorized: bool) -> Arc<Self> {
         Arc::new(Self {
+            kind,
             caps: ChannelCapabilities::default(),
             authorized: AtomicBool::new(authorized),
             seen: PlMutex::new(Vec::new()),
         })
     }
+    /// Only OUR pages. The channel registry is process-global and other suites
+    /// fan their own escalation notices through it while this test holds the
+    /// registry lock, so counting everything the recorder saw would count their
+    /// traffic too. Pages are identified by the prefix the tool itself stamps.
+    fn pages(&self) -> Vec<(String, NotifySeverity, String)> {
+        self.seen
+            .lock()
+            .iter()
+            .filter(|(_, _, text)| text.starts_with("[operator-page from "))
+            .cloned()
+            .collect()
+    }
     fn count(&self) -> usize {
-        self.seen.lock().len()
+        self.pages().len()
     }
     fn last(&self) -> Option<(String, NotifySeverity, String)> {
-        self.seen.lock().last().cloned()
+        self.pages().last().cloned()
     }
 }
 
 impl Channel for Recorder {
     fn kind(&self) -> &'static str {
-        "telegram"
+        self.kind
     }
     fn caps(&self) -> &ChannelCapabilities {
         &self.caps
@@ -123,13 +142,16 @@ fn setup(tag: &str, enabled: bool, allowlisted: bool) -> (std::path::PathBuf, Ar
         format!(
             "instances:\n  lead:\n    backend: claude\n  worker:\n    backend: claude\n\
              teams:\n  archfix:\n    orchestrator: lead\n    members: [lead, worker]\n\
-             channel:\n  type: telegram\n  group_id: -100123\n  mode: topic\n\
+             channel:\n  type: telegram\n\
+             \x20 bot_token_env: AGEND_TEST_UNSET_TOKEN_3480\n\
+             \x20 group_id: -100123\n  mode: topic\n\
              \x20 user_allowlist: [42]\n{page_stanza}"
         ),
     )
     .expect("write fleet.yaml");
     reset_active_channel_for_test();
-    let rec = Recorder::arc(allowlisted);
+    let kind: &'static str = Box::leak(format!("telegram-op-page-{tag}").into_boxed_str());
+    let rec = Recorder::arc(kind, allowlisted);
     register_active_channel(rec.clone());
     (home, rec)
 }
@@ -156,6 +178,7 @@ fn page(caller: &str, text: &str) -> serde_json::Value {
 #[serial]
 fn non_orchestrator_caller_is_refused() {
     let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
     let (home, rec) = setup("authz", true, true);
 
     let out = page("worker", "milestone");
@@ -175,6 +198,7 @@ fn non_orchestrator_caller_is_refused() {
 #[serial]
 fn disabled_switch_refuses_and_sends_nothing() {
     let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
     let (home, rec) = setup("disabled", false, true);
 
     let out = page("lead", "milestone");
@@ -190,6 +214,7 @@ fn disabled_switch_refuses_and_sends_nothing() {
 #[serial]
 fn fourth_page_in_the_hour_is_dropped_with_retry_after() {
     let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
     let (home, rec) = setup("rate", true, true);
 
     for i in 1..=RATE_LIMIT_PER_HOUR {
@@ -220,6 +245,7 @@ fn fourth_page_in_the_hour_is_dropped_with_retry_after() {
 #[serial]
 fn rate_counter_survives_a_simulated_restart() {
     let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
     let (home, rec) = setup("durable", true, true);
 
     for i in 1..=RATE_LIMIT_PER_HOUR {
@@ -234,7 +260,7 @@ fn rate_counter_survives_a_simulated_restart() {
     // Simulated restart: nothing in this process is reused — the next call must
     // rebuild its count from the sidecar alone.
     reset_active_channel_for_test();
-    let rec2 = Recorder::arc(true);
+    let rec2 = Recorder::arc("telegram-op-page-durable-2", true);
     register_active_channel(rec2.clone());
 
     let out = page("lead", "after restart");
@@ -254,6 +280,7 @@ fn rate_counter_survives_a_simulated_restart() {
 #[serial]
 fn dedicated_topic_is_used_when_registered() {
     let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
     let (home, rec) = setup("topic", true, true);
     // Pre-registering is what `create_topic_for_instance` finds on the reuse
     // path; creating one for real needs the Telegram API, which this suite
@@ -278,6 +305,7 @@ fn dedicated_topic_is_used_when_registered() {
 #[serial]
 fn topic_creation_failure_falls_back_to_sender_topic() {
     let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
     // No topics.json entry and no reachable Telegram API, so creation fails.
     let (home, rec) = setup("fallback", true, true);
 
@@ -297,6 +325,7 @@ fn topic_creation_failure_falls_back_to_sender_topic() {
 #[serial]
 fn page_carries_sender_prefix_and_respects_length_cap() {
     let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
     let (home, rec) = setup("content", true, true);
 
     let long = "x".repeat(MAX_PAGE_CHARS * 3);
@@ -321,6 +350,7 @@ fn page_carries_sender_prefix_and_respects_length_cap() {
 #[serial]
 fn unauthorized_channel_still_drops_the_page() {
     let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
     let (home, rec) = setup("allowlist", true, false);
 
     let out = page("lead", "milestone");
@@ -342,6 +372,7 @@ fn unauthorized_channel_still_drops_the_page() {
 #[serial]
 fn rate_gate_binds_even_though_severity_would_pass_the_mode_gate() {
     let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
     let (home, rec) = setup("mode", true, true);
     crate::operator_mode::set_mode(
         &home,

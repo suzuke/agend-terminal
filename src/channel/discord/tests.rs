@@ -1746,6 +1746,7 @@ fn discord_init_assembles_alongside_telegram_2642() {
             mode: "topic".into(),
             user_allowlist: Some(vec![]),
             fleet_binding: None,
+            operator_page: None,
         },
     );
     channels.insert(

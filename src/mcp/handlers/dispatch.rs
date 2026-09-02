@@ -783,6 +783,7 @@ mod tests {
             names,
             vec![
                 "reply",
+                "operator_page",
                 "download_attachment",
                 "send",
                 "inbox",
@@ -816,7 +817,7 @@ mod tests {
                 "usage_limit_takeover",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 32);
+        assert_eq!(crate::mcp::registry::all().len(), 33);
     }
 
     #[test]

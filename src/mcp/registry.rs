@@ -688,8 +688,8 @@ mod tests {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(
             all_names.len(),
-            32,
-            "registry baseline is 32 tools (+ usage_limit_takeover Architecture-14 item 5 Slice 2A)"
+            33,
+            "registry baseline is 33 tools (+ usage_limit_takeover Architecture-14 item 5 Slice 2A, + operator_page #3480)"
         );
         for role in [
             None,

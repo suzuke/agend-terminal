@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（32 個工具）
+# AgEnD MCP Tools Reference — 工具參考（33 個工具）
 
 Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance role 不同，實際顯示的工具可能是這 32 個已註冊工具的子集。
 
@@ -102,6 +102,28 @@ Drain 或管理 caller 的 durable inbox。
 - `message_id` 會依原始 inbox message 的 channel 路由，傳送成功後 settle 該列。
 - 可選 `task_id` 與 `correlation_id` 保留 reply-to correlation。
 - `default_action` 應搭配 `timeout_secs`，以記錄有 timeout default 的 decision。
+
+### `operator_page`
+
+在**不需要任何 inbound channel binding** 的情況下，把訊息推到 **operator 的 Telegram**——用於 operator 明確要求「離開或睡覺時有 milestone 要通知我」的場合。這補的是 harness 的缺口：`PushNotification` 的行動推播只有在 Remote Control 連線時才會送達，而 `reply` 需要一則 inbound 訊息才有回覆對象，operator 直接在 TUI 打字則不會產生 binding。
+
+- 必填：`message`。純文字，超過 1000 字元會截斷，並一律加上呼叫者的 instance 名稱前綴。
+- **僅限 orchestrator。** 只有呼叫者所屬 team 的現任 orchestrator 可以發送；其他人會收到 `not_orchestrator` 拒絕，並被告知該找哪一位 orchestrator 轉送。
+- **預設關閉。** 在 `fleet.yaml` 逐 fleet 開啟：
+
+  ```yaml
+  channel:
+    type: telegram
+    group_id: -100…
+    user_allowlist: [12345]      # 仍為必要——沒有它 outbound 一律 fail-closed
+    operator_page:
+      enabled: true
+      topic_name: operator-notifications   # 可選，此為預設值
+  ```
+
+- **每位 orchestrator 每滾動小時上限 3 則。** 超出的直接**丟棄**、不排隊；拒絕回應帶有 `retry_after_secs`，呼叫者應改把 milestone 寫進 `SESSION-HANDOFF.md`。計數器是持久化的，重啟 daemon 不會重置額度。
+- **路由。** 訊息送到專用的 forum topic（預設 `operator-notifications`），首次使用時自動建立並註冊，讓所有 page 集中在一個 operator 可以靜音的地方。若該 topic 無法建立，則退回發送者自己的 topic——兩者都在同一個 allowlist 群組內。
+- **operator 的 Away/Sleep 模式不會抑制 page。** 這是刻意的：這個功能存在的原因，正是 operator 在睡覺而且要求 milestone 要叫醒他。控制 page 的是 `enabled` 開關（總開關）與每小時上限，而不是 mode；一般 daemon 通知仍照舊受 mode 管制。
 
 ### `download_attachment`
 

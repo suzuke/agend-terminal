@@ -855,7 +855,7 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            32,
+            33,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
@@ -866,7 +866,8 @@ mod tests {
              into release_worktree(force:true)) = 27; + bind_topic (#991 Phase 2) = 28; \
              + instance (#2550 P1, folded read-only alias for list_instances/pane_snapshot) = 29; \
              + set_model (#2744 PR-A, typed fleet model intent) = 30; \
-             + revoke_review_assignment (#2782 slice 1) = 31; + usage_limit_takeover (Architecture-14 item 5 Slice 2A) = 32. \
+             + revoke_review_assignment (#2782 slice 1) = 31; + usage_limit_takeover (Architecture-14 item 5 Slice 2A) = 32; \
+             + operator_page (#3480 orchestrator-only operator page) = 33. \
              Current tools: {:?}",
             tools
                 .iter()
@@ -1414,6 +1415,10 @@ mod tests {
         const NON_COORDINATION: &[&str] = &[
             "set_model",
             "reply",
+            // #3480: addresses the OPERATOR, not the fleet. Its single field is
+            // opaque human-readable text, not a directive the daemon consumes —
+            // the same class as `reply`.
+            "operator_page",
             "download_attachment",
             "inbox",
             "list_instances",

@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (32 tools)
+# AgEnD MCP Tools Reference (33 tools)
 
 The daemon registry and live `tools/list` schema are authoritative. Role filtering can expose a subset of these 32 registered tools to an instance.
 
@@ -102,6 +102,28 @@ Reply to the user/operator through an external channel; do not use it for inter-
 - `message_id` routes by the original inbox message's channel and settles that row after a successful send.
 - Optional `task_id` and `correlation_id` preserve reply-to correlation.
 - Pair `default_action` with `timeout_secs` to record a timed default decision.
+
+### `operator_page`
+
+Page the **operator** on their Telegram, independent of any inbound channel binding — for milestones they explicitly asked to be told about while away or asleep. This is the agend-side answer to a gap in the harness: `PushNotification`'s mobile leg only reaches a phone when Remote Control is connected, and `reply` needs an inbound message to answer, which operator input typed in the TUI never creates.
+
+- Required: `message`. Plain text, truncated at 1000 characters, always prefixed with the calling instance's name.
+- **Orchestrator-only.** Only the current orchestrator of the caller's team may page; anyone else is refused with `not_orchestrator` and told which orchestrator to route through.
+- **Off by default.** Enable per fleet in `fleet.yaml`:
+
+  ```yaml
+  channel:
+    type: telegram
+    group_id: -100…
+    user_allowlist: [12345]      # still required — outbound is fail-closed without it
+    operator_page:
+      enabled: true
+      topic_name: operator-notifications   # optional, this is the default
+  ```
+
+- **Rate-capped at 3 per orchestrator per rolling hour.** The excess is DROPPED, never queued; the refusal carries `retry_after_secs` so the caller can fall back to recording the milestone in `SESSION-HANDOFF.md`. The counter is durable, so restarting the daemon does not refill the budget.
+- **Routing.** Pages land in a dedicated forum topic (default `operator-notifications`), auto-created and registered on first use, so they collect in one place the operator can mute. If that topic cannot be created the page falls back to the sender's own topic — both live inside the allowlisted group.
+- **Operator Away/Sleep mode does NOT suppress pages.** That is deliberate: the feature exists because the operator was asleep and asked to be woken for milestones. The controls for pages are the `enabled` switch (the master off) and the hourly cap — not the mode. Ordinary daemon notices remain mode-gated as before.
 
 ### `download_attachment`
 

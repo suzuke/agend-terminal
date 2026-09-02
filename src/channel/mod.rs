@@ -209,6 +209,19 @@ pub fn notify_all_escalation_channels(
     channels.len()
 }
 
+/// Test-only lock for the process-global channel registry.
+///
+/// #3480: `channels_registry()` is process-global, so any two tests that
+/// register or reset channels race unless they agree on one mutex. The M6
+/// fan-out tests had a private guard; sharing it here lets suites in other
+/// modules (`channel::operator_page`) exclude against them instead of
+/// intermittently finding an empty registry.
+#[cfg(test)]
+pub(crate) fn channel_registry_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    static GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    GUARD.lock()
+}
+
 /// Sprint 55 P0-A — test-only: clear all registered channels.
 #[cfg(test)]
 pub fn reset_active_channel_for_test() {
@@ -1125,8 +1138,7 @@ MONKEY=banana";
     /// Serialize the process-global channel registry across the registry-touching
     /// tests in this module (mirrors `daemon::router` / `mcp::handlers::channel`).
     fn m6_registry_guard() -> parking_lot::MutexGuard<'static, ()> {
-        static G: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        G.lock()
+        super::channel_registry_test_guard()
     }
 
     /// Recording channel with a configurable `kind()` (the registry is keyed by
