@@ -392,6 +392,163 @@ fn dispatch_with_branch_creates_binding_and_worktree() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+fn commit_and_advance_origin_main(repo: &std::path::Path, message: &str) -> String {
+    let commit = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+        ])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git commit");
+    assert!(
+        commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let head = crate::git_helpers::git_cmd(repo, &["rev-parse", "HEAD"]).expect("HEAD");
+    let head = head.trim().to_string();
+    let update = std::process::Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/main", &head])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git update-ref");
+    assert!(update.status.success(), "advance origin/main");
+    head
+}
+
+/// #3479 PR-B: the real untyped send entry may opt into an exact branch base.
+/// The expected head deliberately differs from the default tip, so silently
+/// ignoring the new field reproduces the production bug.
+#[test]
+fn untyped_send_expected_head_binds_exact_non_default_commit_3479() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!("agend-3479-exact-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "target-agent");
+    let expected = crate::git_helpers::git_cmd(&repo, &["rev-parse", "HEAD"])
+        .expect("initial HEAD")
+        .trim()
+        .to_string();
+    let default_tip = commit_and_advance_origin_main(&repo, "default-tip");
+    assert_ne!(
+        expected, default_tip,
+        "test requires distinct exact/default heads"
+    );
+    let tid = create_review_class_task(&home, "single");
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result = super::super::comms::handle_unified_send(
+        &home,
+        &serde_json::json!({
+            "instance": "target-agent",
+            "request_kind": "task",
+            "message": "review exact head",
+            "task_id": tid,
+            "branch": "review/3479-exact",
+            "expected_head": expected,
+        }),
+        &sender,
+        Some(&minimal_runtime()),
+    );
+    assert!(
+        result.get("error").is_none(),
+        "exact dispatch failed: {result}"
+    );
+    let binding = crate::binding::read(&home, "target-agent").expect("binding");
+    let worktree = std::path::Path::new(binding["worktree"].as_str().expect("worktree"));
+    let actual =
+        crate::git_helpers::git_cmd(worktree, &["rev-parse", "HEAD"]).expect("worktree HEAD");
+    assert_eq!(actual.trim(), expected, "dispatch must bind the exact head");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3479 PR-B: a nonexistent exact head is rejected through the real send entry
+/// before delivery and leaves no target binding behind.
+#[test]
+fn untyped_send_nonexistent_expected_head_rejects_without_binding_3479() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!("agend-3479-missing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+    let tid = create_review_class_task(&home, "single");
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result = super::super::comms::handle_unified_send(
+        &home,
+        &serde_json::json!({
+            "instance": "target-agent",
+            "request_kind": "task",
+            "message": "review missing head",
+            "task_id": tid,
+            "branch": "review/3479-missing",
+            "expected_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }),
+        &sender,
+        Some(&minimal_runtime()),
+    );
+    assert_eq!(result["code"], "expected_head_mismatch", "{result}");
+    assert!(
+        crate::binding::read(&home, "target-agent").is_none(),
+        "rejected exact-head dispatch must leave no binding: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3479 PR-B KISS control: omitting expected_head preserves today's default-tip
+/// branch creation behavior through the same real send entry.
+#[test]
+fn untyped_send_without_expected_head_keeps_default_tip_3479() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!("agend-3479-omit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "target-agent");
+    let default_tip = commit_and_advance_origin_main(&repo, "default-tip");
+    let tid = create_review_class_task(&home, "single");
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result = super::super::comms::handle_unified_send(
+        &home,
+        &serde_json::json!({
+            "instance": "target-agent",
+            "request_kind": "task",
+            "message": "ordinary dispatch",
+            "task_id": tid,
+            "branch": "feat/3479-default",
+        }),
+        &sender,
+        Some(&minimal_runtime()),
+    );
+    assert!(
+        result.get("error").is_none(),
+        "ordinary dispatch failed: {result}"
+    );
+    let binding = crate::binding::read(&home, "target-agent").expect("binding");
+    let worktree = std::path::Path::new(binding["worktree"].as_str().expect("worktree"));
+    let actual =
+        crate::git_helpers::git_cmd(worktree, &["rev-parse", "HEAD"]).expect("worktree HEAD");
+    assert_eq!(
+        actual.trim(),
+        default_tip,
+        "omitted field must keep default base"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn main_branch_rejects_dispatch() {
     let home = std::env::temp_dir().join(format!("agend-s53-prod-{}-main", std::process::id()));

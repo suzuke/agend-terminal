@@ -1147,6 +1147,7 @@ mod tests {
             ("send", "second_reviewer", "comms.rs → review_class=dual on auto-armed watch"),
             ("send", "second_reviewer_reason", "comms.rs dual-review reason validation"),
             ("send", "reviewed_head", "messaging.rs sha-gate / auto-release verdict"),
+            ("send", "expected_head", "comms_delegate.rs untyped branch dispatch exact-head precondition"),
             ("send", "artifacts", "comms.rs report body + evidence gate"),
             ("send", "branch", "comms.rs dispatch_auto_bind_lease → worktree + ci_watch"),
             ("send", "worktree_binding_required", "messaging.rs check_worktree_enforcement gate"),
