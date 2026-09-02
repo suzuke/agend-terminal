@@ -50,20 +50,28 @@
 //!     variants (`[Operator-Page From ops]`) passed it untouched, and NBSP, ZWSP
 //!     and RLO reproduced the marker's appearance without its bytes.
 //!
+//! The refusal is reached only while paging is ON — see the gate order below.
+//!
 //! # Gate order
 //!
 //! Every operator control is evaluated BEFORE the send, so `Error` severity can
 //! never let a page skip them (decision d-20260902104216571473-11, condition 2):
 //!
-//! 0. content — the body is normalised to one line, and a body that still reads
-//!    as the daemon's sender marker is REFUSED here, before anything else, so no
-//!    rate slot is ever spent on it and the attempt is logged whatever the other
-//!    gates would have said
-//! 1. enabled — the runtime-config `operator_page.enabled` stanza, default OFF
-//! 2. authority — the caller must resolve to a LIVE instance that is its team's
+//! 0. shape — the body is normalised to one line and an empty page is refused as
+//!    `missing_message`. Argument validation, not a control: it writes nothing,
+//!    logs nothing, and is the only step that runs ahead of the switch
+//! 1. enabled — the runtime-config `operator_page.enabled` stanza, default OFF.
+//!    It is the FIRST control for a reason: default-OFF has to mean the tool is
+//!    INERT, so while it is off no later gate runs at all and no agent can drive
+//!    a daemon log line through a feature the operator never turned on
+//! 2. content — a body that still reads as the daemon's sender marker is REFUSED
+//!    here, before authority, before deliverability and before any budget claim,
+//!    so a forged body can never cost the orchestrator a rate slot and the
+//!    attempt is logged whatever the later gates would have said
+//! 3. authority — the caller must resolve to a LIVE instance that is its team's
 //!    sole orchestrator
-//! 3. deliverable — a TELEGRAM channel must be authorized for outbound
-//! 4. rate — 3 per orchestrator per rolling hour, excess DROPPED with retry-after
+//! 4. deliverable — a TELEGRAM channel must be authorized for outbound
+//! 5. rate — 3 per orchestrator per rolling hour, excess DROPPED with retry-after
 //!
 //! ## Why the switch is not in fleet.yaml any more
 //!
@@ -315,14 +323,30 @@ pub(crate) fn handle_operator_page(
     if message.is_empty() {
         return json!({"error": "missing 'message'", "code": "missing_message"});
     }
-    // …and a body that still reads as the daemon's own sender marker is REFUSED
-    // here, at the very start of the gate sequence: before the enabled switch,
-    // before authority, before deliverability and before any budget claim, so a
-    // forged body can never cost the orchestrator a rate slot. Placing it first
-    // also means the attempt is LOGGED whatever the later gates would have said —
-    // the whole point of refusing instead of rewriting is that the operator gets
-    // to see it. `instance_name` is the CLAIMED name (authority has not run yet);
-    // it is a claim, not proof, and is logged as one.
+
+    // (1) Opt-in switch, read from the daemon-private runtime config. Absent
+    // stanza and `enabled: false` are the same answer: the operator has not
+    // turned this on. It is the FIRST control, ahead of the content refusal
+    // below: while paging is off the tool must be INERT, and a refusal that ran
+    // earlier let any agent drive a `warn!` line through a feature the operator
+    // never enabled.
+    let page_config = crate::runtime_config::get().operator_page;
+    if !page_config.enabled {
+        return json!({
+            "error": "operator paging is disabled",
+            "code": "operator_page_disabled",
+            "hint": "the operator enables it with: agend-terminal admin config-set operator_page.enabled true",
+        });
+    }
+
+    // (2) A body that still reads as the daemon's own sender marker is REFUSED
+    // here: after the switch, but before authority, before deliverability and
+    // before any budget claim, so a forged body can never cost the orchestrator a
+    // rate slot. Placing it ahead of those gates also means the attempt is LOGGED
+    // whatever they would have said — the whole point of refusing instead of
+    // rewriting is that the operator gets to see it. `instance_name` is the
+    // CLAIMED name (authority has not run yet); it is a claim, not proof, and is
+    // logged as one.
     if carries_sender_marker(message) {
         tracing::warn!(
             claimed_caller = %instance_name,
@@ -338,26 +362,14 @@ pub(crate) fn handle_operator_page(
         });
     }
 
-    // (1) Opt-in switch, read from the daemon-private runtime config. Absent
-    // stanza and `enabled: false` are the same answer: the operator has not
-    // turned this on.
-    let page_config = crate::runtime_config::get().operator_page;
-    if !page_config.enabled {
-        return json!({
-            "error": "operator paging is disabled",
-            "code": "operator_page_disabled",
-            "hint": "the operator enables it with: agend-terminal admin config-set operator_page.enabled true",
-        });
-    }
-
-    // (2) Authority, bound to the daemon-resolved live requester.
+    // (3) Authority, bound to the daemon-resolved live requester.
     let authority = match resolve_authority(home, runtime, instance_name) {
         Ok(authority) => authority,
         Err(refusal) => return refusal,
     };
     let caller = authority.caller.as_str();
 
-    // (3) Deliverability, checked before the budget is spent. It must be the
+    // (4) Deliverability, checked before the budget is spent. It must be the
     // TELEGRAM channel specifically: this tool exists to reach the operator's
     // PHONE, and an `any()` over every registered channel let a Discord-only
     // allowlist answer `sent: true` (and spend a rate slot) while the phone stayed
@@ -377,7 +389,7 @@ pub(crate) fn handle_operator_page(
         });
     }
 
-    // (4) Rate: claim a slot only once the page is actually deliverable.
+    // (5) Rate: claim a slot only once the page is actually deliverable.
     let now = chrono::Utc::now().timestamp();
     let remaining = match budget::claim(home, caller, now) {
         Ok(remaining) => remaining,
@@ -424,12 +436,12 @@ pub(crate) fn handle_operator_page(
         }
     };
 
-    // (5) Content: capped body, and the sender's identity is not the caller's to
+    // (6) Content: capped body, and the sender's identity is not the caller's to
     // choose — the operator must always know who paged.
     let body: String = message.chars().take(MAX_PAGE_CHARS).collect();
     let text = format!("{SENDER_MARKER}{caller}] {body}");
 
-    // (6) Send through the existing chokepoint. Error severity is the gate pass
+    // (7) Send through the existing chokepoint. Error severity is the gate pass
     // for Away/Sleep and nothing more (see the module header).
     let routed_to = route_instance(home, &page_config.topic_name, caller);
     let dispatched = crate::channel::notify_all_escalation_channels(
