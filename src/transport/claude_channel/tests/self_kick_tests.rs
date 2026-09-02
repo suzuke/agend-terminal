@@ -488,7 +488,26 @@ fn self_kick_late_ack_after_overdue_marks_and_reconciles_exactly_once() {
         "a repeated ack must not log a second late-ack event"
     );
 
-    // The watchdog reports the late ack once, then clears the marker.
+    // PR #3495 r3: the late ack does NOT supersede the overdue notice the
+    // watchdog persisted and nobody has sent yet (the r2 behaviour, ruled a
+    // violation: the operator was told to inspect the agent and never told
+    // the alarm was raised at all). The pass replays the OVERDUE intent
+    // first...
+    let outcomes = self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+        .expect("overdue replay pass");
+    assert_eq!(outcomes.len(), 1, "one outcome: {outcomes:?}");
+    assert!(
+        matches!(outcomes[0].kind, SelfKickOutcomeKind::AckOverdue { .. }),
+        "the unsent overdue alert comes first: {:?}",
+        outcomes[0].kind
+    );
+    assert!(
+        clear_self_kick_notice(&home, "claude-agent", envelope.delivery_id).expect("clear overdue"),
+        "the caller clears it once that notice is durably enqueued"
+    );
+
+    // ...and only then derives the distinct resolving notice from the
+    // `late_ack_secs` the same ack stamped.
     let outcomes = self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
         .expect("reconcile pass");
     assert_eq!(

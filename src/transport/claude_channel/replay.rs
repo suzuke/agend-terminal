@@ -28,7 +28,20 @@ pub(super) fn restore_prepared(
                     "prepared admission survived bridge restart; notification may have been emitted, so automatic replay is suppressed"
                         .to_string(),
                 );
-                if receipt_store.record_if_latest_state(delivery_id, current.state, ambiguous)? {
+                // PR #3495 r3: carry any durable notice markers across, and
+                // compare them in the CAS. No row in the three states above
+                // can carry one today, so this is behaviour-preserving — it
+                // just makes the sweep incapable of silently discarding an
+                // intent a future writer parks on a pre-terminal receipt.
+                ambiguous.late_ack_secs = current.late_ack_secs;
+                ambiguous.notice_pending = current.notice_pending.clone();
+                if receipt_store.record_if_marker(
+                    delivery_id,
+                    current.state,
+                    current.late_ack_secs,
+                    current.notice_pending.as_ref(),
+                    ambiguous,
+                )? {
                     stamped += 1;
                 }
             }

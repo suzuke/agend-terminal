@@ -50,7 +50,24 @@ pub(crate) fn enqueue_once_returning_unread_count(
 
     with_inbox_lock(home, name, move |path| {
         use std::io::Write;
-        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        // PR #3495 r3: FAIL CLOSED. `unwrap_or_default()` turned a permission
+        // or IO error — and invalid UTF-8 (`InvalidData`) — into "the inbox is
+        // empty", and the append below then wrote a SECOND row for a key that
+        // was already there. Only a genuinely absent file is empty; every
+        // other error returns BEFORE any append, and the caller (the per-tick
+        // self-kick announce, `daemon::per_tick::claude_self_kick::announce`)
+        // treats an `Err` as "retry next pass": it leaves the notice intent
+        // pending, warns once, and the next pass replays the enqueue.
+        let existing = match std::fs::read_to_string(path) {
+            Ok(existing) => existing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "idempotent inbox enqueue: cannot read inbox {} — refusing to append, a duplicate would be indistinguishable from a first delivery",
+                    path.display()
+                )))
+            }
+        };
         if content_has_key(&existing, &key) {
             return Ok(None);
         }

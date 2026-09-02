@@ -246,11 +246,18 @@ impl ReceiptStore {
 
     /// Append `next` only when the latest durable state is `expected`.
     ///
+    /// PR #3495 r3: TEST-ONLY. Every production writer now uses the
+    /// marker-aware [`Self::record_if_marker`] instead — a state-only
+    /// predicate cannot see a durable notice intent moving under it, which is
+    /// exactly how a late `ack_start` used to destroy one. Fixtures that need
+    /// to plant a receipt keep it.
+    ///
     /// The compare-and-append is held under the same per-instance lock as
     /// receipt writes. The self-kick ack and timeout watchdog therefore
     /// linearize: an ack that wins prevents the watchdog from emitting a
     /// stale Ambiguous receipt, and a timeout that wins cannot be overwritten
     /// by a late ack.
+    #[cfg(test)]
     pub(crate) fn record_if_latest_state(
         &self,
         delivery_id: Uuid,
@@ -388,6 +395,32 @@ impl ReceiptStore {
     pub(crate) fn pending_deliveries(
         &self,
     ) -> anyhow::Result<Vec<(DeliveryEnvelope, DeliveryReceipt)>> {
+        self.deliveries_where(|receipt| !receipt.state.is_terminal())
+    }
+
+    /// PR #3495 r3: what the self-kick watchdog must still reconcile — every
+    /// non-terminal delivery PLUS terminal ones that still carry an unfinished
+    /// notice intent or an unreconciled `late_ack_secs`.
+    ///
+    /// The consumer can complete a self-kick inside the gap between the
+    /// durable intent and the per-tick enqueue, and `Completed` is terminal:
+    /// filtering on state alone would strand the notices the operator is owed.
+    /// The markers are cleared only once their notices are durable, so this
+    /// widening keeps exactly the rows with outstanding work.
+    pub(crate) fn deliveries_owing_notices(
+        &self,
+    ) -> anyhow::Result<Vec<(DeliveryEnvelope, DeliveryReceipt)>> {
+        self.deliveries_where(|receipt| {
+            !receipt.state.is_terminal()
+                || receipt.notice_pending.is_some()
+                || receipt.late_ack_secs.is_some()
+        })
+    }
+
+    fn deliveries_where(
+        &self,
+        keep: impl Fn(&DeliveryReceipt) -> bool,
+    ) -> anyhow::Result<Vec<(DeliveryEnvelope, DeliveryReceipt)>> {
         let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
         restrict_permissions(&self.lock_path(), 0o600)?;
         if !self.path.exists() {
@@ -411,7 +444,7 @@ impl ReceiptStore {
             .into_values()
             .filter_map(|(envelope, receipt)| {
                 let receipt = receipt?;
-                if receipt.state.is_terminal() {
+                if !keep(&receipt) {
                     return None;
                 }
                 Some((envelope?, receipt))

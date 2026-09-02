@@ -456,27 +456,42 @@ impl ChannelRuntime {
         if current.state != DeliveryState::TurnStarted {
             anyhow::bail!("self-kick completion requires a prior exact start acknowledgement")
         }
-        let mut completed = DeliveryReceipt::for_state(&envelope, DeliveryState::Completed);
-        completed.protocol_request_id = current.protocol_request_id;
-        completed.backend_session_id = Some(self.session_id.clone());
-        completed.backend_event = Some("claude_channel_self_kick_completed".to_string());
-        completed.detail = Some("successor completed bounded restart recovery".to_string());
-        if store.record_if_latest_state(
-            delivery_id,
-            DeliveryState::TurnStarted,
-            completed.clone(),
-        )? {
-            Ok(completed)
-        } else {
+        // r3, the sibling of the `ack_start` finding: the consumer normally
+        // completes moments after it acknowledges, i.e. INSIDE the gap between
+        // the durable notice intent and the per-tick enqueue — and `Completed`
+        // is terminal. Dropping the markers here would put the owed notices
+        // permanently out of the watchdog's reach, so completion carries them
+        // and commits marker-aware, with one bounded retry.
+        let mut current = current;
+        for _ in 0..2 {
+            let mut completed = DeliveryReceipt::for_state(&envelope, DeliveryState::Completed);
+            completed.protocol_request_id = current.protocol_request_id.clone();
+            completed.backend_session_id = Some(self.session_id.clone());
+            completed.backend_event = Some("claude_channel_self_kick_completed".to_string());
+            completed.detail = Some("successor completed bounded restart recovery".to_string());
+            completed.late_ack_secs = current.late_ack_secs;
+            completed.notice_pending = current.notice_pending.clone();
+            if store.record_if_marker(
+                delivery_id,
+                DeliveryState::TurnStarted,
+                current.late_ack_secs,
+                current.notice_pending.as_ref(),
+                completed.clone(),
+            )? {
+                return Ok(completed);
+            }
             let latest = store.latest(delivery_id)?.ok_or_else(|| {
                 anyhow::anyhow!("self-kick receipt disappeared during completion")
             })?;
             if latest.state == DeliveryState::Completed {
-                Ok(latest)
-            } else {
+                return Ok(latest);
+            }
+            if latest.state != DeliveryState::TurnStarted {
                 anyhow::bail!("self-kick completion lost a receipt race")
             }
+            current = latest;
         }
+        anyhow::bail!("self-kick completion lost a receipt race")
     }
 
     fn reject_self_kick_reply(&self, delivery_id: Uuid) -> anyhow::Result<()> {
@@ -1325,7 +1340,17 @@ pub(crate) fn record_self_kick_turn_started(
         accepted.protocol_request_id = Some(delivery_id.to_string());
         accepted.backend_session_id = Some(session_id.to_string());
         accepted.backend_event = Some("webhook_accepted".to_string());
-        store.record_if_latest_state(delivery_id, DeliveryState::Queued, accepted)?;
+        // r3: marker-aware like every other write on this path. A `Queued`
+        // row carries no intent today, so the predicate is the same one the
+        // state-only CAS applied — but it can never SILENTLY overwrite a row
+        // whose markers moved under it.
+        store.record_if_marker(
+            delivery_id,
+            DeliveryState::Queued,
+            current.late_ack_secs,
+            current.notice_pending.as_ref(),
+            accepted,
+        )?;
         current = store
             .latest(delivery_id)?
             .ok_or_else(|| anyhow::anyhow!("self-kick receipt disappeared during accept"))?;
@@ -1340,7 +1365,11 @@ pub(crate) fn record_self_kick_turn_started(
     ) {
         anyhow::bail!("self-kick delivery is not protocol-accepted")
     }
-    loop {
+    // r3: ONE bounded retry against a freshly read snapshot. The CAS below is
+    // marker-aware, so it also fails when only the markers moved (the per-tick
+    // pass clearing the overdue intent concurrently); re-reading and retrying
+    // is correct there, and there is deliberately no state-only fallback.
+    for _ in 0..2 {
         // t-…-82348-105: a truthful ack that arrives AFTER the watchdog gave
         // up. The `AckOverdue` receipt still carries the ACCEPTED timestamp
         // (the watchdog transitions state in place and never restamps
@@ -1368,6 +1397,13 @@ pub(crate) fn record_self_kick_turn_started(
             .to_string(),
         );
         started.late_ack_secs = late_by_secs;
+        // r3 P0: the AckOverdue receipt may carry an UNSENT notice intent —
+        // the watchdog persists it in the same CAS that declares the state,
+        // and only the per-tick enqueue clears it. Carrying it forward is what
+        // keeps the overdue alert derivable from the durable log after this
+        // transition; the operator is owed BOTH notices, overdue first and
+        // then the late-ack resolution the stamp above feeds.
+        started.notice_pending = current.notice_pending.clone();
         started.detail = Some(match late_by_secs {
             Some(late) => format!(
                 "consumer acknowledged exact self-kick delivery_id {late}s after the {:?} ack window closed",
@@ -1375,7 +1411,16 @@ pub(crate) fn record_self_kick_turn_started(
             ),
             None => "consumer acknowledged exact self-kick delivery_id".to_string(),
         });
-        if store.record_if_latest_state(delivery_id, current.state, started.clone())? {
+        // Marker-aware: a concurrent pass that cleared (or moved) the intent
+        // between the read and here must make this attempt lose, otherwise the
+        // clone above would REINTRODUCE an intent whose notice is already out.
+        if store.record_if_marker(
+            delivery_id,
+            current.state,
+            current.late_ack_secs,
+            current.notice_pending.as_ref(),
+            started.clone(),
+        )? {
             if let Some(late) = late_by_secs {
                 crate::event_log::log(
                     home,
@@ -1403,6 +1448,7 @@ pub(crate) fn record_self_kick_turn_started(
         }
         current = latest;
     }
+    anyhow::bail!("self-kick start acknowledgement lost a receipt race")
 }
 
 /// Drive the real `ack_start` receipt transition for `delivery_id` without a
@@ -1474,7 +1520,7 @@ fn self_kick_watchdog_pass_at(
 ) -> anyhow::Result<Vec<SelfKickOutcome>> {
     let store = ReceiptStore::for_instance(home, instance)?;
     let mut outcomes = Vec::new();
-    for (envelope, current) in store.pending_deliveries()? {
+    for (envelope, current) in store.deliveries_owing_notices()? {
         if !envelope.self_kick {
             continue;
         }
@@ -1585,7 +1631,10 @@ fn self_kick_watchdog_pass_at(
                     kind: SelfKickOutcomeKind::AckOverdue { turn },
                 });
             }
-            DeliveryState::TurnStarted => {
+            // r3: `Completed` too — the consumer can finish its recovery
+            // before this pass runs, and the reconciliation notice is still
+            // owed. The CAS below preserves whatever state that is.
+            DeliveryState::TurnStarted | DeliveryState::Completed => {
                 // A late ack left a typed marker (`late_ack_secs`). Clear it
                 // with a STATE-PRESERVING compare-and-append so the
                 // reconciliation is reported exactly once per delivery, and
@@ -1610,7 +1659,7 @@ fn self_kick_watchdog_pass_at(
                 // before the caller enqueues anything.
                 if !store.record_if_marker(
                     envelope.delivery_id,
-                    DeliveryState::TurnStarted,
+                    current.state,
                     Some(late_by_secs),
                     None,
                     reconciled,
