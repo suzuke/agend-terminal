@@ -1313,6 +1313,138 @@ WARNING: Loading development channels
         assert_eq!(written.lock().as_slice(), b"\r");
     }
 
+    // ── codex 0.150.x "Update available!" startup modal (t-…-82348-29) ──
+    //
+    // The exact frame archfix-codex-dev was stranded on for ~11h on 2026-09-02
+    // (pane_snapshot capture, codex 0.150.1). The live child argv DID carry
+    // `-c check_for_update_on_startup=false` (#1626) and the modal appeared
+    // anyway, so the #1069 dismiss fallback is the defense that must be true —
+    // and it was structurally dead: codex's banner matches ready_pattern
+    // ("OpenAI Codex|›") seconds before the update check returns, the startup
+    // latch closes, and `Update available!` was in neither re-arm class, so the
+    // post-latch scan never considered it.
+    const CODEX_UPDATE_MODAL_0150: &str = "\
+  ✨ Update available! 0.150.1 -> 0.152.0
+
+  Release notes: https://github.com/openai/codex/releases
+
+  › 1. Update now (runs `sh -c 'curl -fsSL https://codex.openai.com/install.sh | sh'`)
+    2. Skip
+    3. Skip until next version
+
+  Press enter to continue
+";
+
+    fn codex_prepared_patterns() -> Vec<PreparedDismissPattern> {
+        let patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::Codex
+            .preset()
+            .dismiss_patterns
+            .iter()
+            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+            .collect();
+        prepare_dismiss_patterns(&patterns)
+    }
+
+    /// RED (t-…-82348-29): the codex update modal rendered AFTER the startup
+    /// latch closed (banner matched the ready pattern first) must still be
+    /// dismissed while the agent has never reached Idle — it is a backend-caused
+    /// startup modal with a fixed safe answer ("2" = Skip), never an operator
+    /// decision. Drives the production path: real codex preset patterns, real
+    /// matcher, the exact stranded frame.
+    #[test]
+    fn codex_update_modal_is_dismissed_on_a_post_latch_rearm() {
+        let prepared = codex_prepared_patterns();
+
+        let mut st = crate::state::StateTracker::new(Some(&crate::backend::Backend::Codex));
+        st.feed(CODEX_UPDATE_MODAL_0150);
+        assert!(
+            is_dismissible_prompt_state(st.get_state()),
+            "precondition (#2473): the update modal frame must re-arm the scan — got {:?}",
+            st.get_state()
+        );
+
+        let (writer, written) = recording_writer_3314();
+        // The gate is UNARMED — codex spawns never pass the dev-channel flag, so
+        // this is the production gate state; the update pattern must not route
+        // through the dev-modal generation gate at all (its fingerprint is the
+        // dev modal's static lines and would refuse this frame outright).
+        assert!(
+            try_prepared_dismiss_dialog(
+                "codex-update-postlatch",
+                CODEX_UPDATE_MODAL_0150,
+                &writer,
+                &prepared,
+                DismissScanScope::RearmPreIdle,
+                &mut DevModalGate::new(false),
+                LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+            ),
+            "a codex update modal rendered after the startup latch closed must still be \
+             skipped pre-Idle — the #1069 comment promises this fallback degrades the \
+             failure from blocking hang to auto-skip, and that promise must be true"
+        );
+        for _ in 0..20 {
+            if written.lock().as_slice() == b"2\r" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            written.lock().as_slice(),
+            b"2\r",
+            "the dismissal selects option 2 (Skip) — least invasive, never auto-updates"
+        );
+    }
+
+    /// The #2474 bound for the update-modal hint: once the agent has settled, a
+    /// quoted "Update available!" line is transcript (this literal circulates in
+    /// issue bodies and this very file), and any live modal under it is the
+    /// operator's — the settled re-arm must refuse it. Passes before AND after
+    /// the fix; with the Startup control below it proves the RED failure is the
+    /// SCOPE, not the regex or the ✨-prefixed frame text.
+    #[test]
+    fn codex_update_marker_is_not_dismissed_when_settled() {
+        let prepared = codex_prepared_patterns();
+        let (writer, written) = recording_writer_3314();
+        assert!(
+            !try_prepared_dismiss_dialog(
+                "codex-update-settled",
+                CODEX_UPDATE_MODAL_0150,
+                &writer,
+                &prepared,
+                DismissScanScope::RearmSettled,
+                &mut ungated_3314().0,
+                LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+            ),
+            "a settled agent's re-arm must not fire the update pattern — after Idle this \
+             text is transcript (#2474 r6)"
+        );
+        assert!(written.lock().is_empty());
+
+        // Startup-window control: the same exact frame (leading `  ✨ `) fires
+        // inside the startup window, so the regex and the rendered text were
+        // never the problem — only the post-latch scope was.
+        let (writer, written) = recording_writer_3314();
+        assert!(
+            try_prepared_dismiss_dialog(
+                "codex-update-startup-control",
+                CODEX_UPDATE_MODAL_0150,
+                &writer,
+                &prepared,
+                DismissScanScope::Startup,
+                &mut ungated_stable_3314(CODEX_UPDATE_MODAL_0150).0,
+                LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+            ),
+            "control: the exact ✨-prefixed frame fires inside the startup window"
+        );
+        for _ in 0..20 {
+            if written.lock().as_slice() == b"2\r" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(written.lock().as_slice(), b"2\r");
+    }
+
     // ── #3314 r1: real-capture frames, generation gate, byte-count contract ──
     //
     // Provenance and the version rules are in
