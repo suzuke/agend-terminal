@@ -295,6 +295,12 @@ pub enum ChannelConfig {
         /// are described in `docs/FEATURE-channels.md`.
         #[serde(default)]
         fleet_binding: Option<FleetBindingConfig>,
+        /// #3480: opt-in switch + routing for the orchestrator-only operator
+        /// page tool. Omitted = the tool is OFF (the operator decided default
+        /// off, decision d-20260902104216571473-11). Additive optional field
+        /// with a serde default, so it does NOT bump `FLEET_SCHEMA_VERSION`.
+        #[serde(default)]
+        operator_page: Option<OperatorPageConfig>,
     },
     /// Discord adapter. Bootstrap wiring landed #2562 P1; the adapter
     /// implementation is behind the `discord` feature gate.
@@ -367,6 +373,37 @@ pub enum FleetBindingStruct {
     /// display name used to find or create the topic; resolution (map
     /// name → topic_id) happens at bootstrap, not at parse time.
     Topic { name: String },
+}
+
+/// #3480: fleet-level configuration for the operator page tool.
+///
+/// Default-off is the operator's decision, not a conservative guess: with the
+/// field omitted the tool refuses every call. `topic_name` names the dedicated
+/// forum topic pages are routed to, so pages collect in one mutable place
+/// instead of scattering across per-orchestrator topics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorPageConfig {
+    /// Master switch. `false` (the default) makes the tool refuse with a
+    /// structured `operator_page_disabled` and send nothing.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Forum topic that pages are routed to; auto-created and registered on
+    /// first use.
+    #[serde(default = "default_operator_page_topic")]
+    pub topic_name: String,
+}
+
+impl Default for OperatorPageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            topic_name: default_operator_page_topic(),
+        }
+    }
+}
+
+fn default_operator_page_topic() -> String {
+    "operator-notifications".to_string()
 }
 
 fn default_mode() -> String {
@@ -791,6 +828,16 @@ impl FleetConfig {
             .into_iter()
             .map(|(_, c)| c)
             .find(|c| matches!(c, ChannelConfig::Telegram { .. }))
+    }
+
+    /// #3480: the operator-page configuration of the first configured Telegram
+    /// channel. `None` when there is no Telegram channel or the stanza is
+    /// omitted — both mean the tool is off, so callers treat `None` as disabled.
+    pub fn operator_page_config(&self) -> Option<&OperatorPageConfig> {
+        match self.telegram_channel() {
+            Some(ChannelConfig::Telegram { operator_page, .. }) => operator_page.as_ref(),
+            _ => None,
+        }
     }
 
     /// #2642: the first configured Discord channel — Discord counterpart of

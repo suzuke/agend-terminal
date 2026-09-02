@@ -340,6 +340,7 @@ mod tests {
                 mode: "topic".into(),
                 user_allowlist: Some(vec![crate::fleet::AllowlistEntry::Id(42)]),
                 fleet_binding: None,
+                operator_page: None,
             }),
             ..Default::default()
         };

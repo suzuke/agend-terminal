@@ -275,6 +275,7 @@ mod tests {
                     .collect()
             }),
             fleet_binding: None,
+            operator_page: None,
         }
     }
 

@@ -36,6 +36,13 @@ pub(crate) fn def_reply() -> Value {
         }, "required": []}})
 }
 
+pub(crate) fn def_operator_page() -> Value {
+    json!({"name": "operator_page", "description": "#3480: page the OPERATOR on their Telegram, independent of any inbound channel binding — for milestones the operator explicitly asked to be told about while away or asleep. Orchestrator-only: only the current orchestrator of your team may call it; every other agent must ask its own orchestrator. Off by default (fleet.yaml `channel.operator_page.enabled`), capped at 3 pages per orchestrator per rolling hour with the excess DROPPED, never queued — a refusal carries `retry_after_secs` so you can fall back to writing the milestone into SESSION-HANDOFF.md. Pages are NOT suppressed by operator Away/Sleep mode (that is the point); the switch is how the operator silences them. Plain text only, capped at 1000 characters, and always prefixed with your instance name.",
+        "inputSchema": {"type": "object", "properties": {
+            "message": {"type": "string", "description": "The page text. Plain text, no formatting passthrough; truncated at 1000 characters. Your instance name is prefixed automatically, so do not repeat it."}
+        }, "required": ["message"]}})
+}
+
 pub(crate) fn def_download_attachment() -> Value {
     json!({"name": "download_attachment", "description": "Download a file attachment (telegram multimedia: images, audio, documents). Returns local path. Requires daemon API.",
         "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]}})

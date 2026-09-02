@@ -135,6 +135,7 @@ mod tests {
                 mode: "topic".into(),
                 user_allowlist: None,
                 fleet_binding: None,
+                operator_page: None,
             }),
             channels: None,
             templates: None,

@@ -280,6 +280,12 @@ macro_rules! action_adapter {
 // Flat adapters — one per simple (non-action-based) tool.
 // ---------------------------------------------------------------------
 
+/// #3480: orchestrator-only operator page. The handler owns every gate; this
+/// is a plain adapter so the registry entry stays uniform with its neighbours.
+pub(crate) fn dispatch_operator_page(ctx: &HandlerCtx<'_>) -> Value {
+    crate::channel::operator_page::handle_operator_page(ctx.home, ctx.args, ctx.instance_name)
+}
+
 pub(crate) fn dispatch_list_instances(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_list_instances_with_runtime(ctx.home, ctx.args, ctx.instance_name, ctx.runtime)
 }

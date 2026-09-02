@@ -347,12 +347,18 @@ pub(crate) fn tool_allowed_for_role_action(
     tool_allowed_for_role(role_kind, tool)
 }
 
-static ALL_TOOLS: [ToolEntry; 32] = [
+static ALL_TOOLS: [ToolEntry; 33] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
         definition: super::tools::def_reply,
         handler: super::handlers::dispatch::dispatch_reply,
+        class: ToolClass::SIDE_EFFECT,
+    },
+    ToolEntry {
+        name: "operator_page",
+        definition: super::tools::def_operator_page,
+        handler: super::handlers::dispatch::dispatch_operator_page,
         class: ToolClass::SIDE_EFFECT,
     },
     ToolEntry {
