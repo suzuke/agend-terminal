@@ -1436,6 +1436,7 @@ mod tests {
                 "ephemeral_reap",
                 "checkout_txn_recover",
                 "context_thresholds",
+                "codex_mcp_refusal",
                 "inject_delivery",
                 "claude_self_kick",
                 "anti_stall",
