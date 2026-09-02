@@ -502,7 +502,17 @@ pub(crate) fn list_with_live_instances(home: &Path, live_agents: &HashSet<String
     serde_json::json!({"teams": teams})
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeamUpdateCaller<'a> {
+    Operator,
+    Managed(&'a str),
+}
+
 pub fn update(home: &Path, args: &Value) -> Value {
+    update_authorized(home, args, TeamUpdateCaller::Operator)
+}
+
+pub fn update_authorized(home: &Path, args: &Value, caller: TeamUpdateCaller<'_>) -> Value {
     let name = match args["name"].as_str() {
         Some(n) => n.to_string(),
         None => return serde_json::json!({"error": "missing 'name'"}),
@@ -551,6 +561,21 @@ pub fn update(home: &Path, args: &Value) -> Value {
     let Some(current) = fleet.teams.get(&name).cloned() else {
         return serde_json::json!({"error": format!("team '{name}' not found")});
     };
+    let orchestrator_changed = new_orchestrator
+        .as_deref()
+        .is_some_and(|new| current.orchestrator.as_deref() != Some(new));
+    if orchestrator_changed {
+        if let TeamUpdateCaller::Managed(requester) = caller {
+            if current.orchestrator.as_deref() != Some(requester) {
+                return serde_json::json!({
+                    "error": format!(
+                        "only the current orchestrator or operator may change team '{name}' orchestrator"
+                    ),
+                    "denied_by": "team_orchestrator_authority",
+                });
+            }
+        }
+    }
 
     // Block removing the orchestrator
     if let Some(ref orch) = current.orchestrator {
@@ -630,9 +655,27 @@ pub fn update(home: &Path, args: &Value) -> Value {
         project_id: new_project_id,
         accept_from: new_accept_from,
     };
+    if orchestrator_changed {
+        let old = current.orchestrator.as_deref().unwrap_or("<none>");
+        let new = cfg.orchestrator.as_deref().unwrap_or("<none>");
+        let (caller_name, channel) = match caller {
+            TeamUpdateCaller::Operator => ("operator", "operator"),
+            TeamUpdateCaller::Managed(requester) => (requester, "mcp"),
+        };
+        if let Err(error) = crate::event_log::try_log(
+            home,
+            "team_orchestrator_change_authorized",
+            caller_name,
+            &format!("team={name} old={old} new={new} caller={caller_name} channel={channel}"),
+        ) {
+            return serde_json::json!({
+                "error": format!("could not durably audit orchestrator change: {error}")
+            });
+        }
+    }
     match crate::fleet::update_team_in_yaml(home, &name, &cfg) {
         Ok(crate::fleet::TeamWriteOutcome::Written) => {
-            if cfg.orchestrator.is_some() {
+            if orchestrator_changed && matches!(caller, TeamUpdateCaller::Operator) {
                 cleanup_orchestrator_tasks_for_team(home, &name);
             }
             serde_json::json!({"status": "updated", "name": name})
@@ -794,9 +837,17 @@ pub struct TeamUpdateOutcome {
 /// added/removed member diff. Callers own transport-specific response mapping
 /// and notification; this service owns the single roster mutation path.
 pub fn update_with_diff(home: &Path, args: &Value) -> TeamUpdateOutcome {
+    update_with_diff_authorized(home, args, TeamUpdateCaller::Operator)
+}
+
+pub fn update_with_diff_authorized(
+    home: &Path,
+    args: &Value,
+    caller: TeamUpdateCaller<'_>,
+) -> TeamUpdateOutcome {
     let team_name = args["name"].as_str().unwrap_or("");
     let before = get_members(home, team_name);
-    let result = update(home, args);
+    let result = update_authorized(home, args, caller);
     let after = get_members(home, team_name);
     let before_set: std::collections::HashSet<&String> = before.iter().collect();
     let after_set: std::collections::HashSet<&String> = after.iter().collect();

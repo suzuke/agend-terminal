@@ -174,8 +174,31 @@ pub(super) fn handle_update_team(
     args: &Value,
     runtime: Option<&RuntimeContext>,
 ) -> Value {
+    handle_update_team_as(home, args, runtime, None)
+}
+
+pub(super) fn handle_update_team_as(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+    requester: Option<&str>,
+) -> Value {
     let team_name = args["name"].as_str().unwrap_or("");
-    let outcome = crate::teams::update_with_diff(home, args);
+    let outcome = match requester {
+        Some(requester) => crate::teams::update_with_diff_authorized(
+            home,
+            args,
+            crate::teams::TeamUpdateCaller::Managed(requester),
+        ),
+        None => {
+            if args.get("orchestrator").is_some() {
+                return serde_json::json!({
+                    "error": "team orchestrator update requires a live managed requester"
+                });
+            }
+            crate::teams::update_with_diff(home, args)
+        }
+    };
     if outcome.result.get("error").is_none() {
         if let Some(notifier) = runtime.and_then(|runtime| runtime.notifier.as_ref()) {
             if !outcome.added.is_empty() || !outcome.removed.is_empty() {

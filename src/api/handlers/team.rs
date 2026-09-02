@@ -13,7 +13,11 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
         Some(n) => n.to_string(),
         None => return json!({"ok": false, "error": "missing name"}),
     };
-    let outcome = crate::teams::update_with_diff(ctx.home, params);
+    let outcome = crate::teams::update_with_diff_authorized(
+        ctx.home,
+        params,
+        crate::teams::TeamUpdateCaller::Operator,
+    );
     if outcome.result.get("error").is_none() {
         if let Some(n) = ctx.notifier {
             let diff_nonempty = !outcome.added.is_empty() || !outcome.removed.is_empty();

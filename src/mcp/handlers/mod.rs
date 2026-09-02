@@ -264,6 +264,9 @@ pub(crate) fn handle_tool_with_runtime_and_requester(
             None => dispatch::dispatch_restart_daemon(&dispatch_ctx),
         };
     }
+    if tool == "team" && args["action"].as_str() == Some("update") {
+        return dispatch::dispatch_scoped_team(&dispatch_ctx, requester_id);
+    }
     if let Some(value) = dispatch::try_dispatch(tool, &dispatch_ctx) {
         return value;
     }

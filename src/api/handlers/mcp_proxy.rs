@@ -186,9 +186,10 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
             ),
         });
     }
-    let requester_id = match (tool, ctx.capability, instance.is_empty()) {
+    let requester_id = match (tool, action.as_deref(), ctx.capability, instance.is_empty()) {
         (
             "restart_daemon",
+            _,
             crate::api::RestartCapability::App | crate::api::RestartCapability::Daemon,
             false,
         ) => match live_requester_id(ctx.registry, &instance) {
@@ -197,6 +198,15 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
                 return json!({
                     "ok": false,
                     "error": "restart_daemon requires the managed caller's stable InstanceId from a live handle; fleet intact — no restart"
+                })
+            }
+        },
+        ("team", Some("update"), _, false) => match live_requester_id(ctx.registry, &instance) {
+            Some(id) => Some(id),
+            None => {
+                return json!({
+                    "ok": false,
+                    "error": "team update requires an unambiguous live managed caller"
                 })
             }
         },

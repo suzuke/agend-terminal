@@ -528,11 +528,32 @@ action_adapter!(dispatch_set_metadata, "set_metadata", [
 /// transport-neutral service; public legacy wrappers remain for callers that
 /// do not have an in-process daemon context.
 pub(crate) fn dispatch_team(ctx: &HandlerCtx<'_>) -> Value {
+    dispatch_scoped_team(ctx, None)
+}
+
+pub(crate) fn dispatch_scoped_team(
+    ctx: &HandlerCtx<'_>,
+    requester_id: Option<crate::types::InstanceId>,
+) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
         "create" => task::handle_create_team(ctx.home, ctx.args, ctx.runtime),
         "delete" => task::handle_delete_team(ctx.home, ctx.args, ctx.runtime),
         "list" => task::handle_list_teams(ctx.home, ctx.runtime),
-        "update" => task::handle_update_team(ctx.home, ctx.args, ctx.runtime),
+        "update" => {
+            let requester = requester_id.and_then(|id| {
+                ctx.runtime.and_then(|runtime| {
+                    crate::agent::lock_registry(&runtime.registry)
+                        .get(&id)
+                        .map(|handle| handle.name.clone())
+                })
+            });
+            match requester.as_deref() {
+                Some(requester) => {
+                    task::handle_update_team_as(ctx.home, ctx.args, ctx.runtime, Some(requester))
+                }
+                None => task::handle_update_team(ctx.home, ctx.args, ctx.runtime),
+            }
+        }
         other => json!({"error": format!("unknown team action: {other}")}),
     }
 }

@@ -128,7 +128,10 @@ fn current_orchestrator_can_hand_over_through_real_mcp_ingress() {
     );
 
     assert_eq!(response["result"]["status"], "updated", "{response}");
-    assert_eq!(crate::teams::list(&home.path)["teams"][0]["orchestrator"], "member");
+    assert_eq!(
+        crate::teams::list(&home.path)["teams"][0]["orchestrator"],
+        "member"
+    );
 }
 
 #[test]
@@ -145,7 +148,10 @@ fn operator_api_channel_can_hand_over() {
     );
 
     assert_eq!(response["result"]["status"], "updated", "{response}");
-    assert_eq!(crate::teams::list(&home.path)["teams"][0]["orchestrator"], "member");
+    assert_eq!(
+        crate::teams::list(&home.path)["teams"][0]["orchestrator"],
+        "member"
+    );
 }
 
 #[test]
@@ -162,11 +168,17 @@ fn unknown_or_dead_claimed_instance_is_refused() {
         "member",
     );
 
-    assert_eq!(response["ok"], false, "dead claimed identity must fail: {response}");
+    assert_eq!(
+        response["ok"], false,
+        "dead claimed identity must fail: {response}"
+    );
     assert!(response["error"]
         .as_str()
         .is_some_and(|error| error.contains("live")));
-    assert_eq!(crate::teams::list(&home.path)["teams"][0]["orchestrator"], "lead");
+    assert_eq!(
+        crate::teams::list(&home.path)["teams"][0]["orchestrator"],
+        "lead"
+    );
 }
 
 #[test]
@@ -191,6 +203,43 @@ fn orchestrator_handover_writes_old_new_and_caller_audit() {
     assert!(audit.contains("old=lead"), "{audit}");
     assert!(audit.contains("new=member"), "{audit}");
     assert!(audit.contains("caller=lead"), "{audit}");
+}
+
+#[test]
+fn only_operator_handover_clears_missing_orchestrator_task() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = TestHome::new("operator-only-cleanup");
+    seed_team(&home.path);
+    let created = crate::tasks::handle(
+        &home.path,
+        "system",
+        &json!({
+            "action": "create",
+            "title": "Team 'devs' needs new orchestrator (test)",
+            "priority": "urgent",
+        }),
+    );
+    assert!(created.get("error").is_none(), "{created}");
+
+    let registry: crate::agent::AgentRegistry = Default::default();
+    insert_live(&registry, "lead");
+    let configs = Default::default();
+    let externals = Default::default();
+    let ctx = test_ctx(&home.path, &registry, &configs, &externals);
+    let response = call_team_update(&ctx, "lead", "member");
+    assert_eq!(response["result"]["status"], "updated", "{response}");
+    assert!(crate::tasks::list_all(&home.path)
+        .iter()
+        .any(|task| !task.status.is_terminal()));
+
+    let response = crate::api::handlers::team::handle_update_team(
+        &json!({"name": "devs", "orchestrator": "lead"}),
+        &ctx,
+    );
+    assert_eq!(response["result"]["status"], "updated", "{response}");
+    assert!(crate::tasks::list_all(&home.path)
+        .iter()
+        .all(|task| task.status.is_terminal()));
 }
 
 /// The API cookie authenticates same-uid daemon access, not a distinct agent.
