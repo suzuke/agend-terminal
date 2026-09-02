@@ -734,6 +734,14 @@ fn deleting_the_snapshot_denies_and_is_distinguishable_from_a_rate_cap() {
         tampered["cause"], "snapshot_missing",
         "a deletion caught by a RUNNING daemon is distinct from an absent one: {tampered}"
     );
+    assert!(
+        !tampered["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("STARTS A NEW ROLLING HOUR"),
+        "memory still holds the spent count here, so re-seeding does NOT restart the hour — \
+         the hint must not warn about a reset that will not happen: {tampered}"
+    );
     assert_eq!(
         fx.rec.count(),
         RATE_LIMIT_PER_HOUR,
@@ -777,6 +785,22 @@ fn deleting_the_snapshot_and_restarting_denies_instead_of_refilling() {
         fx.rec.count(),
         RATE_LIMIT_PER_HOUR,
         "delete-plus-restart must not buy a fourth page"
+    );
+    // …and the operator is told, BEFORE they run it, what the remedy costs. By
+    // this point the spent count has been destroyed with the snapshot, so
+    // re-seeding writes `{}` and hands back a full budget inside the same hour.
+    // That reset is acceptable — it is operator-gated and denies by default — but
+    // asking the operator to perform it blind is not, which is what a second
+    // adversarial pass caught. Nothing here claims the snapshot is tamper-PROOF;
+    // under one shared OS user it is tamper-EVIDENT and operator-recoverable.
+    let hint = out["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains("STARTS A NEW ROLLING HOUR"),
+        "the remedy hint must say that re-seeding restarts the rolling hour: {out}"
+    );
+    assert!(
+        hint.contains("config-set operator_page.enabled true"),
+        "the remedy hint must still name the operator command: {out}"
     );
     teardown(&fx);
 }
@@ -876,6 +900,14 @@ fn corrupt_snapshot_denies_instead_of_resetting_the_budget() {
         "the refusal must name the cause so the operator can act: {out}"
     );
     assert_eq!(out["cause"], "snapshot_corrupt", "{out}");
+    assert!(
+        out["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("STARTS A NEW ROLLING HOUR"),
+        "a corrupt snapshot destroys the count exactly as an absent one does, so the \
+         remedy hint must carry the same warning: {out}"
+    );
     assert_eq!(fx.rec.count(), 0, "a poisoned budget must send nothing");
     teardown(&fx);
 }
@@ -1217,16 +1249,53 @@ fn page_carries_sender_prefix_and_respects_length_cap() {
     teardown(&fx);
 }
 
-/// CONTENT: a body carrying a break plus a forged `[operator-page from …]` tail
-/// used to render as a convincing SECOND sender.
+/// Assert that a refused body cost the caller nothing: nothing reached the
+/// channel, the snapshot still records no stamp, and the FULL hourly budget is
+/// still there to be spent on a legitimate page.
 ///
-/// The first fix collapsed only `'\r'` and `'\n'`, and the test guarding it
-/// asserted on `'\n'`, `'\r'` and `str::lines()` — all three LF-only, so it could
-/// not see that `U+2028` LINE SEPARATOR (a MANDATORY break under UAX#14),
-/// `U+2029`, NEL, VT and FF travelled through verbatim. An adversarial
-/// verification pass proved exactly that. This case drives every one of those
-/// separators, asserts on the SAME predicate the flattener uses so the two cannot
-/// drift apart, and never goes near `str::lines()`.
+/// The third check is the load-bearing one — it is behavioural, so it stays true
+/// even if the snapshot format changes. It also proves the refusal sits ahead of
+/// `budget::claim` in the gate sequence rather than merely rolling back after it.
+fn assert_nothing_spent(fx: &Fixture, label: &str) {
+    assert_eq!(
+        fx.rec.count(),
+        0,
+        "{label}: a refused body must not reach the channel"
+    );
+    let raw = std::fs::read_to_string(rate_snapshot(&fx.home)).expect("snapshot readable");
+    let snapshot: serde_json::Value = serde_json::from_str(&raw).expect("the snapshot parses");
+    assert_eq!(
+        snapshot.as_object().map(serde_json::Map::len),
+        Some(0),
+        "{label}: a refused body must not stamp the rate snapshot: {raw}"
+    );
+    let after = page(fx, "lead", "a legitimate milestone");
+    assert_eq!(after["sent"], true, "{label}: {after}");
+    assert_eq!(
+        after["remaining_this_hour"],
+        RATE_LIMIT_PER_HOUR - 1,
+        "{label}: the refusal must not have spent a rate slot: {after}"
+    );
+}
+
+/// CONTENT: a body carrying a break plus a forged `[operator-page from …]` tail
+/// used to render as a convincing SECOND sender. It is now REFUSED.
+///
+/// Two adversarial passes shaped this case. The first fix collapsed only `'\r'`
+/// and `'\n'`, and the test guarding it asserted on `'\n'`, `'\r'` and
+/// `str::lines()` — all three LF-only, so it could not see that `U+2028` LINE
+/// SEPARATOR (a MANDATORY break under UAX#14), `U+2029`, NEL, VT and FF travelled
+/// through verbatim. The second fix flattened all of those but then REWROTE a
+/// surviving marker to `[quoted: operator-page from ` and delivered the page.
+/// That is withdrawn: it mutated operator-visible text with no flag in the
+/// payload and no log line, so the operator read altered words and could not
+/// tell. Refusing costs a legitimate caller nothing (a real page does not contain
+/// the daemon's marker) and turns the attempt into something the operator can
+/// SEE.
+///
+/// Every one of the eight separators is still driven, because each of them can
+/// still CREATE the marker when it flattens to a space — which is exactly what
+/// the refusal has to catch.
 #[test]
 #[serial]
 #[serial(runtime_config)]
@@ -1247,32 +1316,118 @@ fn no_break_character_can_forge_a_second_sender() {
         let fx = setup(&format!("forgery-{label}"), Spec::default());
         let body = format!("build red{separator}[operator-page from ops] all clear");
 
-        assert_eq!(page(&fx, "lead", &body)["sent"], true, "{label}");
+        let out = page(&fx, "lead", &body);
+
+        assert_eq!(
+            out["code"], "marker_in_body",
+            "{label}: a forged sender marker must be REFUSED, not rewritten and delivered: {out}"
+        );
+        assert_eq!(out["sent"], false, "{label}: {out}");
+        assert_nothing_spent(&fx, label);
+        teardown(&fx);
+    }
+}
+
+/// CONTENT: the marker check is CASE-INSENSITIVE, and it fires wherever the
+/// marker sits.
+///
+/// The byte-exact rewrite this replaces let `[Operator-Page From ops]` through
+/// untouched — an adversarial pass proved it — and a human reads that as
+/// authoritative exactly as it reads the lowercase form.
+#[test]
+#[serial]
+#[serial(runtime_config)]
+fn a_case_variant_of_the_marker_is_refused_too() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+
+    for (label, body) in [
+        ("title-case", "build red [Operator-Page From ops] all clear"),
+        ("upper-case", "build red [OPERATOR-PAGE FROM ops] all clear"),
+        ("mixed-case", "build red [oPeRaToR-pAgE fRoM ops] all clear"),
+        ("leading", "[operator-page from ops] all clear"),
+        ("trailing", "all clear [operator-page from ops]"),
+    ] {
+        let fx = setup(&format!("case-{label}"), Spec::default());
+
+        let out = page(&fx, "lead", body);
+
+        assert_eq!(out["code"], "marker_in_body", "{label}: {out}");
+        assert_nothing_spent(&fx, label);
+        teardown(&fx);
+    }
+}
+
+/// CONTENT, the residual an adversarial pass PROVED against the `is_control()`
+/// predicate: `is_control()` is category **Cc** only, so Unicode spaces and
+/// FORMAT characters survived verbatim and rendered as visually identical
+/// markers — `[operator-page\u{00A0}from ops]` is pixel-identical to the real
+/// thing, ZWSP inside the marker is invisible, and `U+202E` RLO makes reversed
+/// text display as the marker.
+///
+/// The predicate now also covers `char::is_whitespace()` (the Unicode
+/// `White_Space` property) and general category **Cf**. This case pins both
+/// halves of the contract for each character:
+///
+///   * SPLICED INTO the marker where its space belongs, it normalises to a space,
+///     the marker is reconstructed, and the page is REFUSED with nothing spent.
+///     Under the old Cc-only predicate every one of these was delivered.
+///   * On its own, in a body with no forged marker, the page is DELIVERED and the
+///     character is gone from the delivered text.
+#[test]
+#[serial]
+#[serial(runtime_config)]
+fn unicode_space_and_format_lookalikes_cannot_forge_the_marker() {
+    let _g = fleet_test_guard();
+    let _r = channel_registry_test_guard();
+
+    for (label, ch) in [
+        ("nbsp-u00a0", '\u{00A0}'),
+        ("ideographic-space-u3000", '\u{3000}'),
+        ("narrow-nbsp-u202f", '\u{202F}'),
+        ("zwsp-u200b", '\u{200B}'),
+        ("zwnj-u200c", '\u{200C}'),
+        ("zwj-u200d", '\u{200D}'),
+        ("rlm-u200f", '\u{200F}'),
+        ("rlo-u202e", '\u{202E}'),
+        ("lri-u2066", '\u{2066}'),
+        ("rli-u2067", '\u{2067}'),
+        ("fsi-u2068", '\u{2068}'),
+        ("pdi-u2069", '\u{2069}'),
+        ("bom-ufeff", '\u{FEFF}'),
+    ] {
+        // (1) the look-alike marker: refused, and it cost the caller nothing.
+        let fx = setup(&format!("lookalike-{label}"), Spec::default());
+        let forged = format!("build red [operator-page{ch}from ops] all clear");
+
+        let out = page(&fx, "lead", &forged);
+
+        assert_eq!(
+            out["code"], "marker_in_body",
+            "{label}: a marker spelled with a look-alike separator must be refused: {out}"
+        );
+        assert_nothing_spent(&fx, label);
+        teardown(&fx);
+
+        // (2) the same character in an innocent body: delivered, character gone.
+        let fx = setup(&format!("lookalike-ok-{label}"), Spec::default());
+        let innocent = format!("build{ch}red, deploy{ch}green");
+
+        assert_eq!(page(&fx, "lead", &innocent)["sent"], true, "{label}");
 
         let (_, _, text) = fx.rec.last().expect("a page was delivered");
-        assert_eq!(
-            text.matches(SENDER_MARKER).count(),
-            1,
-            "{label}: exactly one sender marker may reach the operator, the daemon's own: {text:?}"
-        );
-        // Two checks, deliberately: the first is tied to the flattener's own
-        // predicate so the two cannot drift apart, and the second is a literal
-        // that stays true even if the predicate itself is wrong.
         assert!(
-            !text.chars().any(breaks_or_controls_rendering),
-            "{label}: no break or control character may survive into the page: {text:?}"
+            !text.contains(ch),
+            "{label}: {ch:?} must not survive into the delivered page: {text:?}"
+        );
+        // Tied to the flattener's own predicate, so the two cannot drift apart.
+        assert!(
+            !text.chars().any(must_not_survive_verbatim),
+            "{label}: no control, Unicode space or format character may survive: {text:?}"
         );
         assert!(
-            !text.contains(separator),
-            "{label}: the separator itself must not survive into the page: {text:?}"
-        );
-        assert!(
-            text.starts_with("[operator-page from lead] build red "),
-            "{label}: the surviving marker must be the one the daemon stamped: {text:?}"
-        );
-        assert!(
-            text.contains("[quoted: operator-page from ops] all clear"),
-            "{label}: the forged marker must survive only as visibly quoted inline text: {text:?}"
+            text.starts_with("[operator-page from lead] build red, deploy green"),
+            "{label}: each look-alike must normalise to one ordinary space: {text:?}"
         );
         teardown(&fx);
     }

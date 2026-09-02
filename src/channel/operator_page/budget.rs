@@ -32,7 +32,20 @@
 //! answer is the same refusal, logged with the path — and that the only way back
 //! is the operator re-running the enable command. Deletion is therefore
 //! DETECTABLE and RECOVERABLE ONLY BY THE OPERATOR. An agent can silence its own
-//! pager; it can never refill the hour.
+//! pager; it can never refill the hour by itself.
+//!
+//! **What the operator's remedy costs, said out loud.** Re-seeding after a
+//! snapshot that was ABSENT or CORRUPT at initialisation writes `{}` and hands
+//! back a full budget INSIDE the current hour: by that point the spent count has
+//! been destroyed with the snapshot and this process has nothing to restore it
+//! from. So an agent that deletes the file and gets the daemon restarted CAN, in
+//! effect, have the hour reset — but only by persuading the operator to run an
+//! operator-only command, and only after every page in between has been denied.
+//! A second adversarial pass showed the old remedy hint did not mention this at
+//! all, which is the part that was unacceptable: the reset itself is a fair price
+//! for a control that denies by default, being asked to perform it blind is not.
+//! [`seed_snapshot`] now logs the reset at `warn!` and the refusal hint states it
+//! before the operator acts.
 //!
 //! The two denial modes are deliberately distinguishable at the API boundary:
 //! [`ClaimError::RateLimited`] means "you have used your pages this hour" and
@@ -195,10 +208,23 @@ fn ensure_init(state: &mut Budget, home: &Path) {
 ///     back what MEMORY holds, not an empty map. So re-seeding after a deletion
 ///     restores service without handing back the pages already spent.
 ///
+/// `paging_was_already_enabled` is the caller's answer to "had the operator
+/// turned paging on for this home BEFORE this call?". It is the only signal that
+/// separates a genuine first-ever seed from a RE-seed after the snapshot went
+/// away, because a restart destroys the in-memory poison latch too. Its one blind
+/// spot is deliberate and narrow: enable → DISABLE → delete → enable seeds with
+/// the flag false and is logged as a first seed. Nothing on disk or in memory
+/// distinguishes that from a fresh install, and it costs an operator act at both
+/// ends.
+///
 /// The honest limit is the same one the module header states: under one shared OS
-/// user this file is not tamper-proof, and re-seeding after a CORRUPT snapshot is
-/// removed does start the hour over — but only an operator can do it.
-pub(crate) fn seed_snapshot(home: &Path) -> anyhow::Result<()> {
+/// user this file is not tamper-proof. Where the in-memory count is gone too —
+/// absent or corrupt at initialisation, or a restart before the first claim —
+/// re-seeding genuinely DOES start the rolling hour over. That is accepted (only
+/// an operator can do it, and the default is to deny), but it is never silent: it
+/// is logged at `warn!` here, and the refusal that sent the operator to this
+/// command says so before they run it.
+pub(crate) fn seed_snapshot(home: &Path, paging_was_already_enabled: bool) -> anyhow::Result<()> {
     use std::io::Write;
 
     let mut state = budget().lock();
@@ -212,11 +238,27 @@ pub(crate) fn seed_snapshot(home: &Path) -> anyhow::Result<()> {
             file.write_all(b"{}\n")?;
             file.flush()?;
         }
-        // Already seeded: leave it alone. This is the no-clobber guarantee.
+        // Already seeded: leave it alone. This is the no-clobber guarantee. No
+        // counter changed, so there is no new hour to announce either.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
         Err(error) => return Err(error.into()),
     }
-    if state.initialised && state.home == home {
+    let initialised_for_home = state.initialised && state.home == home;
+    // Is the spent count for this home GONE? It is whenever this process never
+    // built state from a real snapshot for the home: either it has not
+    // initialised for it at all (a restart, before the first claim), or it did
+    // and the snapshot was ABSENT or CORRUPT at that moment, so memory was never
+    // populated. `SnapshotMissing` and a healthy state are the opposite case —
+    // memory holds the truth and the write-back below restores it byte-for-byte.
+    let spent_count_lost = !initialised_for_home
+        || matches!(
+            state.poison,
+            Some(Poison::SnapshotAbsent) | Some(Poison::CorruptSnapshot)
+        );
+    // …and `paging_was_already_enabled` is what makes this a RE-seed rather than a
+    // genuine first-ever one. A first enable for a home has no hour to lose.
+    let starts_new_hour = paging_was_already_enabled && spent_count_lost;
+    if initialised_for_home {
         state.poison = None;
         let stamps = std::mem::take(&mut state.stamps);
         let outcome = persist(&path, &stamps);
@@ -228,7 +270,17 @@ pub(crate) fn seed_snapshot(home: &Path) -> anyhow::Result<()> {
             );
         }
     }
-    tracing::info!(snapshot = %path.display(), "operator-page rate snapshot seeded by the operator");
+    if starts_new_hour {
+        tracing::warn!(
+            snapshot = %path.display(),
+            "operator-page rate snapshot re-seeded EMPTY — the spent count for this home was destroyed with the old snapshot, so the rolling hour STARTS NOW; pages spent before this are forgotten"
+        );
+    } else {
+        tracing::info!(
+            snapshot = %path.display(),
+            "operator-page rate snapshot seeded by the operator"
+        );
+    }
     Ok(())
 }
 
@@ -385,7 +437,7 @@ mod tests {
         reset_for_test();
         let home = tmp_home("seed-clears");
         assert!(claim(&home, "lead", 1_000).is_err());
-        seed_snapshot(&home).expect("operator seeds the snapshot");
+        seed_snapshot(&home, false).expect("operator seeds the snapshot");
         assert!(
             claim(&home, "lead", 1_000).is_ok(),
             "re-seeding is the documented remedy — it has to actually restore service"
@@ -403,7 +455,7 @@ mod tests {
         let home = tmp_home("no-clobber");
         let existing = serde_json::json!({ "lead": [1_000, 1_001] }).to_string();
         std::fs::write(snapshot_path(&home), &existing).expect("write existing snapshot");
-        seed_snapshot(&home).expect("seed is a no-op here");
+        seed_snapshot(&home, false).expect("seed is a no-op here");
         assert_eq!(
             std::fs::read_to_string(snapshot_path(&home)).expect("snapshot readable"),
             existing,
@@ -420,7 +472,7 @@ mod tests {
     fn re_seeding_after_a_deletion_does_not_refund_the_hour() {
         reset_for_test();
         let home = tmp_home("reseed");
-        seed_snapshot(&home).expect("operator seeds the snapshot");
+        seed_snapshot(&home, false).expect("operator seeds the snapshot");
         for _ in 0..RATE_LIMIT_PER_HOUR {
             assert!(claim(&home, "lead", 1_000).is_ok());
         }
@@ -429,13 +481,66 @@ mod tests {
             claim(&home, "lead", 1_000),
             Err(ClaimError::Unavailable { .. })
         ));
-        seed_snapshot(&home).expect("operator re-seeds");
+        seed_snapshot(&home, true).expect("operator re-seeds");
         assert!(
             matches!(
                 claim(&home, "lead", 1_000),
                 Err(ClaimError::RateLimited { .. })
             ),
             "re-seeding restores service but must not hand back spent pages"
+        );
+        reset_for_test();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The operator's remedy is ALLOWED to start a new rolling hour — by the time
+    /// an absent or corrupt snapshot is noticed, the spent count has been destroyed
+    /// with it and nothing in this process can reconstruct it. What it may not do
+    /// is start one SILENTLY, which is what a second adversarial pass caught: the
+    /// hint sent the operator to `admin config-set operator_page.enabled true`
+    /// without saying that re-running it hands back a full budget inside the same
+    /// hour. This pins both ends of that: a genuine FIRST seed says nothing about a
+    /// reset, and a RE-seed after the count was lost warns.
+    ///
+    /// Nothing here makes the snapshot tamper-proof. Under one shared OS user it is
+    /// tamper-EVIDENT, and the reset costs a deliberate human act.
+    #[test]
+    #[serial]
+    #[tracing_test::traced_test]
+    fn re_seeding_after_the_count_was_lost_warns_about_the_new_rolling_hour() {
+        reset_for_test();
+        let home = tmp_home("new-hour-log");
+
+        seed_snapshot(&home, false).expect("the operator enables paging for the first time");
+        assert!(
+            !logs_contain("STARTS NOW"),
+            "a first-ever seed has no hour to lose and must not be reported as a reset"
+        );
+        for _ in 0..RATE_LIMIT_PER_HOUR {
+            assert!(claim(&home, "lead", 1_000).is_ok());
+        }
+
+        // The proved scenario: an agent deletes the snapshot and the daemon
+        // restarts, so the spent count is gone from memory as well as from disk.
+        std::fs::remove_file(snapshot_path(&home)).expect("delete the snapshot");
+        reset_for_test();
+        assert!(
+            matches!(
+                claim(&home, "lead", 1_000),
+                Err(ClaimError::Unavailable { cause, .. }) if cause == "snapshot_absent"
+            ),
+            "the deletion must DENY first — the reset is only reachable through the operator"
+        );
+
+        seed_snapshot(&home, true).expect("the operator re-runs the enable command");
+
+        assert!(
+            logs_contain("rolling hour STARTS NOW"),
+            "re-seeding after the count was destroyed must warn that the hour restarts"
+        );
+        assert!(
+            claim(&home, "lead", 1_000).is_ok(),
+            "…and it really does restart — the warning must describe what happens, not soften it"
         );
         reset_for_test();
         std::fs::remove_dir_all(&home).ok();
@@ -448,7 +553,7 @@ mod tests {
     fn editing_the_snapshot_cannot_grant_a_slot() {
         reset_for_test();
         let home = tmp_home("edit");
-        seed_snapshot(&home).expect("operator seeds the snapshot");
+        seed_snapshot(&home, false).expect("operator seeds the snapshot");
         for _ in 0..RATE_LIMIT_PER_HOUR {
             assert!(claim(&home, "lead", 1_000).is_ok());
         }
@@ -471,7 +576,7 @@ mod tests {
     fn a_restart_rebuilds_the_spent_budget_from_the_snapshot() {
         reset_for_test();
         let home = tmp_home("restart");
-        seed_snapshot(&home).expect("operator seeds the snapshot");
+        seed_snapshot(&home, false).expect("operator seeds the snapshot");
         for _ in 0..RATE_LIMIT_PER_HOUR {
             assert!(claim(&home, "lead", 1_000).is_ok());
         }

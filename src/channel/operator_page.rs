@@ -26,19 +26,39 @@
 //! identity at all: the switch is default-OFF and lives where an agent cannot
 //! write it, the budget is 3 per rolling hour, is seeded only by the operator and
 //! fails CLOSED, delivery is confined to the dedicated topic inside the
-//! allowlisted Telegram group, and the body is flattened to ONE line with the
-//! daemon's own sender marker defanged inside it, so a forged
-//! `[operator-page from …]` can neither begin a line nor reproduce the marker
-//! verbatim. What that does NOT buy: a client that soft-wraps a long page can
+//! allowlisted Telegram group, and the body is flattened to ONE line and then
+//! REFUSED outright if what is left still carries the daemon's own sender
+//! marker. What that does NOT buy: a client that soft-wraps a long page can
 //! still start a visual row mid-body, and a forger can still write prose that
-//! merely resembles a sender. Flattening removes the mandatory breaks; it cannot
-//! make text unimpersonatable.
+//! merely resembles a sender. Flattening removes the mandatory breaks and the
+//! invisible look-alikes; it cannot make text unimpersonatable.
+//!
+//! ## Why a forged marker is REFUSED and not rewritten
+//!
+//! The previous fix rewrote a literal `[operator-page from ` in the body to
+//! `[quoted: operator-page from ` and delivered the page anyway. That is
+//! withdrawn, for three reasons a second adversarial pass made plain:
+//!
+//!   * It MUTATED operator-visible message text with no signal anywhere. The
+//!     success payload carried no "body was modified" flag and nothing was
+//!     logged, so the operator read altered words and could not tell.
+//!   * A legitimate page essentially never contains the literal marker, so
+//!     refusing costs nothing, while refusing turns an attack attempt into a
+//!     DETECTABLE event — a `warn!` naming the caller — instead of one the daemon
+//!     quietly absorbs.
+//!   * The rewrite was defeated by look-alikes it never saw anyway: case
+//!     variants (`[Operator-Page From ops]`) passed it untouched, and NBSP, ZWSP
+//!     and RLO reproduced the marker's appearance without its bytes.
 //!
 //! # Gate order
 //!
 //! Every operator control is evaluated BEFORE the send, so `Error` severity can
 //! never let a page skip them (decision d-20260902104216571473-11, condition 2):
 //!
+//! 0. content — the body is normalised to one line, and a body that still reads
+//!    as the daemon's sender marker is REFUSED here, before anything else, so no
+//!    rate slot is ever spent on it and the attempt is logged whatever the other
+//!    gates would have said
 //! 1. enabled — the runtime-config `operator_page.enabled` stanza, default OFF
 //! 2. authority — the caller must resolve to a LIVE instance that is its team's
 //!    sole orchestrator
@@ -81,38 +101,79 @@ pub(crate) const RATE_LIMIT_PER_HOUR: usize = 3;
 pub(crate) const RATE_WINDOW_SECS: i64 = 3600;
 
 /// The marker the daemon stamps in front of every page. Only the daemon may
-/// emit it; [`defang_sender_marker`] takes it away from anyone else.
+/// emit it; a body that still reads as this after normalisation is REFUSED —
+/// see [`carries_sender_marker`].
+///
+/// Kept lowercase because [`carries_sender_marker`] compares against a lowercased
+/// body.
 pub(crate) const SENDER_MARKER: &str = "[operator-page from ";
 
-/// Characters that may not survive into a page body.
+/// Unicode general category **Cf** (format characters): ZWSP `U+200B`, ZWNJ/ZWJ,
+/// the bidi set LRM/RLM/LRE/RLE/PDF/LRO/RLO, the `U+2066`–`U+2069` isolates,
+/// `U+FEFF` and the rest.
 ///
-/// Everything `char::is_control()` covers — LF, CR, TAB, VT (`U+000B`), FF
-/// (`U+000C`), NEL (`U+0085`) and the rest of C0/C1 — plus `U+2028` LINE
-/// SEPARATOR and `U+2029` PARAGRAPH SEPARATOR, which are not control characters
-/// but ARE mandatory breaks under UAX#14 and do start a new line in Telegram
-/// clients. A page body is plain text with no formatting passthrough, so nothing
-/// in this set has a legitimate use here.
+/// `char` has no `is_format()`, and `char::is_control()` is Cc ONLY. The category
+/// data comes from `regex`, which is already a direct dependency of this crate
+/// (`Cargo.toml`, `regex = "1"`, default features, so `unicode-gencat` is on) —
+/// no dependency is added for this, and the table tracks the `regex` crate's
+/// Unicode version rather than a hand-copied list that would silently go stale.
+/// The pattern is a constant and the `expect` follows the convention already used
+/// for static patterns elsewhere in the crate (`task_events.rs:103`,
+/// `backend.rs:2401`): a build that could not classify Cf must fail loudly, never
+/// silently classify nothing and let the look-alikes through.
+fn is_format_char(ch: char) -> bool {
+    static CF: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let cf = CF.get_or_init(|| {
+        regex::Regex::new(r"^\p{Cf}$").expect("the static \\p{Cf} pattern must compile")
+    });
+    let mut buf = [0u8; 4];
+    cf.is_match(ch.encode_utf8(&mut buf))
+}
+
+/// Characters that may not survive verbatim into a page body. Each one becomes a
+/// single ordinary space.
 ///
-/// The first version of this predicate tested `'\r'` and `'\n'` and nothing
-/// else. An adversarial verification pass proved that `U+2028`, `U+2029`, NEL, VT
-/// and FF all travelled through verbatim, which put a forged marker on a line of
-/// its own — the exact forgery the flattening exists to stop.
-fn breaks_or_controls_rendering(ch: char) -> bool {
-    ch.is_control() || ch == '\u{2028}' || ch == '\u{2029}'
+/// Three families, and every one of them can make a forged sender read as the
+/// daemon's own:
+///
+///   * `char::is_control()` — category Cc: LF, CR, TAB, VT (`U+000B`), FF
+///     (`U+000C`), NEL (`U+0085`) and the rest of C0/C1. These start a new line.
+///   * `char::is_whitespace()` — the Unicode `White_Space` property: NBSP
+///     (`U+00A0`), `U+1680`, `U+2000`–`U+200A`, `U+202F`, `U+205F`, `U+3000`, and
+///     the two mandatory UAX#14 breaks `U+2028`/`U+2029`. A space look-alike is
+///     not a cosmetic problem: `[operator-page\u{00A0}from ops]` renders
+///     pixel-identically to the real marker.
+///   * [`is_format_char`] — category Cf. ZWSP inside the marker
+///     (`[operator-page fr\u{200B}om ops]`) is invisible; RLO makes
+///     `\u{202E}]spo morf egap-rotarepo[` display as the marker, read backwards.
+///
+/// The ordinary space is deliberately NOT in this set: it is what everything
+/// here becomes, and `flatten_to_single_line` collapses runs of it separately.
+///
+/// Two adversarial passes shaped this. The first predicate tested `'\r'` and
+/// `'\n'` only, and `U+2028`, `U+2029`, NEL, VT and FF travelled through
+/// verbatim. The second predicate was `is_control()` + `U+2028`/`U+2029`, which
+/// is Cc-only, and NBSP, ZWSP and RLO travelled through verbatim. A page body is
+/// plain text with no formatting passthrough, so nothing in this set has a
+/// legitimate use here.
+fn must_not_survive_verbatim(ch: char) -> bool {
+    ch != ' ' && (ch.is_control() || ch.is_whitespace() || is_format_char(ch))
 }
 
 /// Flatten a body to a single line: every character matched by
-/// [`breaks_or_controls_rendering`] becomes a space, then runs of spaces collapse
+/// [`must_not_survive_verbatim`] becomes a space, then runs of spaces collapse
 /// to one.
 ///
-/// Applied BEFORE the cap and before the sender prefix. The prefix the daemon
-/// stamps is only trustworthy while it is the only thing that can begin a line,
-/// so with no break left in the payload a forged marker cannot open one.
+/// Applied BEFORE the marker check, the cap and the sender prefix, in that
+/// order. The prefix the daemon stamps is only trustworthy while it is the only
+/// thing that can begin a line, so with no break left in the payload a forged
+/// marker cannot open one — and normalising FIRST is also what lets the marker
+/// check see through `[operator-page\u{00A0}from ops]`.
 fn flatten_to_single_line(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut in_space = false;
     for ch in raw.chars() {
-        if breaks_or_controls_rendering(ch) || ch == ' ' {
+        if ch == ' ' || must_not_survive_verbatim(ch) {
             if !in_space {
                 out.push(' ');
                 in_space = true;
@@ -125,20 +186,18 @@ fn flatten_to_single_line(raw: &str) -> String {
     out
 }
 
-/// Take the daemon's exact sender marker away from the body.
+/// Does the NORMALISED body still read as the daemon's own sender marker?
 ///
-/// Flattening alone leaves `"… [operator-page from ops] all clear"` sitting
-/// inline, one delimiter away from reading as a second sender — and flattening
-/// can even CREATE the marker, since `"[operator-page\u{2028}from ops]"` becomes
-/// `"[operator-page from ops]"` once the break turns into a space. Run this
-/// AFTER the flattening for that reason.
+/// Run AFTER [`flatten_to_single_line`], because flattening can CREATE the marker
+/// as well as reveal one: `"[operator-page\u{2028}from ops]"` and
+/// `"[operator-page\u{00A0}from ops]"` both become the literal marker once the
+/// separator turns into a space.
 ///
-/// This is a narrow claim: after this, `SENDER_MARKER` appears exactly once in
-/// the delivered text and it is the daemon's own. It does NOT make the page
-/// unimpersonatable — a body is free to contain any other sender-looking prose,
-/// and no sanitiser here can decide what a human will read as authoritative.
-fn defang_sender_marker(body: &str) -> String {
-    body.replace(SENDER_MARKER, "[quoted: operator-page from ")
+/// Case-INSENSITIVE. `[Operator-Page From ops]` reads as authoritative to a human
+/// exactly as the lowercase form does, and an adversarial pass proved case
+/// variants walked past the byte-exact rewrite this replaces.
+fn carries_sender_marker(body: &str) -> bool {
+    body.to_lowercase().contains(SENDER_MARKER)
 }
 
 /// The dedicated operator-notification topic, or the sender's own as fallback.
@@ -252,9 +311,31 @@ pub(crate) fn handle_operator_page(
     // (0) Content is sanitized FIRST so the emptiness test sees what will actually
     // be sent: a body of nothing but line breaks is an empty page.
     let flattened = flatten_to_single_line(args["message"].as_str().unwrap_or(""));
-    let message = defang_sender_marker(flattened.trim());
+    let message = flattened.trim();
     if message.is_empty() {
         return json!({"error": "missing 'message'", "code": "missing_message"});
+    }
+    // …and a body that still reads as the daemon's own sender marker is REFUSED
+    // here, at the very start of the gate sequence: before the enabled switch,
+    // before authority, before deliverability and before any budget claim, so a
+    // forged body can never cost the orchestrator a rate slot. Placing it first
+    // also means the attempt is LOGGED whatever the later gates would have said —
+    // the whole point of refusing instead of rewriting is that the operator gets
+    // to see it. `instance_name` is the CLAIMED name (authority has not run yet);
+    // it is a claim, not proof, and is logged as one.
+    if carries_sender_marker(message) {
+        tracing::warn!(
+            claimed_caller = %instance_name,
+            "operator page REFUSED: the body carries the daemon's sender marker — a forged-sender attempt, or a page quoting one"
+        );
+        return json!({
+            "sent": false,
+            "error": "the page body may not contain the daemon's sender marker",
+            "code": "marker_in_body",
+            "hint": format!(
+                "`{SENDER_MARKER}…]` is stamped by the daemon and identifies who paged; a body containing it (in any case, or spelled with look-alike spaces or invisible characters) is refused so it cannot read as a second sender. Reword the message and page again — no rate slot was spent."
+            ),
+        });
     }
 
     // (1) Opt-in switch, read from the daemon-private runtime config. Absent
@@ -316,12 +397,29 @@ pub(crate) fn handle_operator_page(
             // one call for different operator actions, so they must not look alike.
             // `cause` is the machine-readable half so an operator tool can tell an
             // absent snapshot from a corrupt one without matching on prose.
+            //
+            // The remedy is the same command in every case, but its CONSEQUENCE is
+            // not, and the operator is entitled to know before they run it. When
+            // the poison was latched at INITIALISATION — `snapshot_absent` (the
+            // file was gone before this process started) or `snapshot_corrupt` —
+            // this process holds no stamps for the home, so re-seeding writes `{}`
+            // and the rolling hour STARTS OVER from that moment. The information
+            // needed to preserve the hour was destroyed with the snapshot; the
+            // reset is accepted because it is operator-gated and denies by
+            // default, but it must not be silent. `snapshot_missing` and
+            // `snapshot_unwritable` are different: memory still holds the true
+            // spent count, so re-seeding writes it back and the hour survives.
+            let resets_the_hour = if matches!(cause, "snapshot_absent" | "snapshot_corrupt") {
+                " WARNING: this daemon no longer holds the spent count for this home, so re-seeding STARTS A NEW ROLLING HOUR — pages already spent inside the current hour are forgotten and the caller gets a full budget again."
+            } else {
+                ""
+            };
             return json!({
                 "sent": false,
                 "error": format!("operator paging is unavailable — {reason}"),
                 "code": "budget_unavailable",
                 "cause": cause,
-                "hint": "the page was DROPPED. Only the operator can restore paging: re-run `agend-terminal admin config-set operator_page.enabled true`, which re-seeds $AGEND_HOME/operator_page_rate.json (repair or delete a corrupt snapshot first). Under one shared OS user that file is not tamper-proof — what this buys is that tampering DENIES, is logged, and is recoverable only by the operator.",
+                "hint": format!("the page was DROPPED. Only the operator can restore paging: re-run `agend-terminal admin config-set operator_page.enabled true`, which re-seeds $AGEND_HOME/operator_page_rate.json (repair or delete a corrupt snapshot first).{resets_the_hour} Under one shared OS user that file is not tamper-proof — what this buys is that tampering DENIES, is logged, and is recoverable only by the operator."),
             });
         }
     };

@@ -107,7 +107,11 @@ Drain 或管理 caller 的 durable inbox。
 
 在**不需要任何 inbound channel binding** 的情況下，把訊息推到 **operator 的 Telegram**——用於 operator 明確要求「離開或睡覺時有 milestone 要通知我」的場合。這補的是 harness 的缺口：`PushNotification` 的行動推播只有在 Remote Control 連線時才會送達，而 `reply` 需要一則 inbound 訊息才有回覆對象，operator 直接在 TUI 打字則不會產生 binding。
 
-- 必填：`message`。純文字，超過 1000 字元會截斷，並一律加上呼叫者的 instance 名稱前綴。在截斷與加前綴之前，內容會先被壓成**一行**：所有 control character（LF、CR、TAB、VT、FF、NEL 以及其餘 C0/C1）連同 `U+2028` LINE SEPARATOR、`U+2029` PARAGRAPH SEPARATOR 一律換成空白，連續空白再收斂成一個；內容裡若出現字面的 `[operator-page from `，會被改寫成 `[quoted: operator-page from `。因此送到 operator 眼前的 `[operator-page from …]` 標記剛好只有一個，而且是 daemon 自己蓋的。誠實的界線：client 對長訊息 soft-wrap 時仍可能讓某個視覺行從內容中段開始，而內容本來就可以寫出其他「看起來像發件者」的文字。這道處理擋的是「複製標記」與「另起一行」，擋不掉「寫得像」。
+- 必填：`message`。純文字，超過 1000 字元會截斷，並一律加上呼叫者的 instance 名稱前綴。在截斷與加前綴之前，內容會先被正規化成**一行**：所有 **Cc** control character（LF、CR、TAB、VT、FF、NEL 以及其餘 C0/C1）、所有 Unicode **White_Space** 字元（NBSP `U+00A0`、`U+1680`、`U+2000`–`U+200A`、`U+202F`、`U+205F`、`U+3000`，以及兩個強制換行 `U+2028`／`U+2029`）、以及所有 general category **Cf** 的 format 字元（ZWSP `U+200B`、ZWNJ／ZWJ、LRM／RLM／LRE／RLE／PDF／LRO／RLO 這組 bidi 控制、`U+2066`–`U+2069` isolate、`U+FEFF`），一律換成**一個**空白，連續空白再收斂成一個。
+
+  正規化之後若內容仍帶有 daemon 的發件標記 `[operator-page from `——比對**不分大小寫**，所以 `[Operator-Page From ops]` 同樣算——這則 page 會被**拒絕**，代碼 `marker_in_body`。這道檢查排在**所有 gate 的最前面**：在 enabled 開關、authority、可送達性與任何額度扣減之前，所以偽造的內容永遠不會花掉呼叫者的額度；同時以 `warn!` 記下呼叫者名稱，讓 operator 看得到有人試過。先前的版本是把字面標記改寫成 `[quoted: operator-page from ` 後照樣送出；那等於**在沒有任何提示的情況下竄改 operator 看到的文字**（回應裡沒有旗標、log 裡沒有紀錄），而且大小寫變體與 NBSP／ZWSP／RLO 這類同形字根本繞得過去，所以整個作法撤掉。正常的 page 幾乎不可能含有這個標記，拒絕的代價是零，換來的是「攻擊嘗試變成看得見的事件」。
+
+  誠實的界線：client 對長訊息 soft-wrap 時仍可能讓某個視覺行從內容中段開始，而內容本來就可以寫出其他「看起來像發件者」的文字。這道處理擋的是「複製標記」「用同形字拼出標記」與「另起一行」，擋不掉「寫得像」。
 - **僅限 orchestrator，且綁定到「活的」instance。** 呼叫所帶的 `instance` 會先拿去 daemon 的 live registry 解析：沒有對應到任何執行中 instance（或對應到兩個）的名字以 `unknown_caller` 拒絕；同時屬於兩個 team 的呼叫者以 `ambiguous_team` 拒絕（而不是拿 map 順序亂猜）；不是所屬 team 現任 orchestrator 的以 `not_orchestrator` 拒絕並告知該找誰轉送。沒有 daemon runtime 的 standalone bridge 呼叫無從解析，以 `no_live_identity` 拒絕。
 
   誰都別騙自己：所有 agent 與 daemon 共用**同一個 OS 使用者**，所以拿 orchestrator 活著的名字來呼叫的座位**依設計會被放行**。這道 gate 擋的是「指向不存在之物的名字」，擋不住「說謎的座位」。真正限住損害的是下面這些：預設關閉、只有 operator 能開的開關、每小時 3 則、單一專用 topic（仍在 allowlist 群組內），以及 fail-closed 的額度狀態。
@@ -125,7 +129,9 @@ Drain 或管理 caller 的 durable inbox。
 
   所有不可信狀態一律以 `budget_unavailable` 拒絕（與 `rate_limited` 明確區分），並附上 `cause` 指出是哪一種：`snapshot_absent`、`snapshot_corrupt`、`snapshot_missing`（daemon 執行中被刪）、`snapshot_unusable`、`snapshot_unwritable`。**每一種的解法都是請 operator 重跑那道 enable 指令**來重新種下快照；快照壞掉的情況要先修好或刪掉。
 
-  話說清楚：所有 agent 與 daemon 共用**同一個 OS 使用者**，所以這個檔案**不是防竄改的**，agent 隨時刪得掉。這個設計換到的是：竄改只會導致**拒絕**、會連同快照路徑寫進 log、而且只有 operator 的指令能救回來。Agent 可以讓自己的 pager 靜音，但拿不回額度。
+  **執行這道解法之前，先知道它的代價。** 對 `snapshot_absent` 與 `snapshot_corrupt` 來說，daemon 已經不再持有這個 home 的已用次數——它跟著快照一起被毀掉了——所以重新種下的是一份空的計數器，等於**重新開始一個滾動小時**：當前這個小時裡已經用掉的 page 會被遺忘，呼叫者拿回完整額度。拒絕訊息的 hint 會在 operator 動手之前把這件事講明，種快照本身也會以 `warn!` 記下快照路徑。至於 `snapshot_missing` 與 `snapshot_unwritable`，記憶體裡仍有真實的已用次數，重新種下時會把它寫回去，小時不會被重置；這兩種的 hint 不會帶這段警告。這段話**不是**在宣稱快照防得了竄改——見下一段。它只是 tamper-EVIDENT，而且重置一定要經過一個明確的人為動作。
+
+  話說清楚：所有 agent 與 daemon 共用**同一個 OS 使用者**，所以這個檔案**不是防竄改的**，agent 隨時刪得掉。這個設計換到的是：竄改只會導致**拒絕**、會連同快照路徑寫進 log、而且只有 operator 的指令能救回來。Agent 可以讓自己的 pager 靜音，但**自己**拿不回額度——唯一回到滿額度的路徑要經過上面那道 operator 指令，而該指令現在會在執行前就講明它會重開一個滾動小時。
 - **路由。** 訊息送到專用的 forum topic（預設 `operator-notifications`），首次使用時自動建立並註冊，讓所有 page 集中在一個 operator 可以靜音的地方。若該 topic 無法建立，則退回發送者自己的 topic——兩者都在同一個 allowlist 群組內。
 - **operator 的 Away/Sleep 模式不會抑制 page。** 這是刻意的：這個功能存在的原因，正是 operator 在睡覺而且要求 milestone 要叫醒他。控制 page 的是 `enabled` 開關（總開關）與每小時上限，而不是 mode；一般 daemon 通知仍照舊受 mode 管制。
 

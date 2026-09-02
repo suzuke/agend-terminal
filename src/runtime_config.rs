@@ -439,6 +439,12 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
     // #3480: turning operator paging ON is the operator-gated act that SEEDS the
     // rate snapshot. Recorded here, acted on only after the config write succeeds.
     let mut seed_operator_page_budget = false;
+    // …and whether paging was ALREADY on tells the seeder whether this is a
+    // first-ever seed or a RE-seed of a snapshot that has since gone missing. Only
+    // the latter can start a new rolling hour, and only the latter is warned about.
+    // Read from the on-disk config above, not from the process global, so a daemon
+    // that has not reloaded cannot make a re-seed look like a first one.
+    let operator_page_was_enabled = config.operator_page.enabled;
     match key {
         "dev_idle_threshold_secs" => {
             config.dev_idle_threshold_secs = value
@@ -589,7 +595,9 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
         // the switch is on but the budget stays poisoned, so paging denies with
         // `budget_unavailable` until the snapshot can be written. Failing closed is
         // the right direction; hiding it is not.
-        if let Err(error) = crate::channel::operator_page::budget::seed_snapshot(home) {
+        if let Err(error) =
+            crate::channel::operator_page::budget::seed_snapshot(home, operator_page_was_enabled)
+        {
             tracing::error!(
                 %error,
                 "#3480: operator_page.enabled was set but the rate snapshot could not be seeded — paging will refuse with budget_unavailable until it can be"
