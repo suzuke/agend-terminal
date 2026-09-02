@@ -1485,7 +1485,7 @@ pub(crate) fn ack_start_for_test(
 /// durable state transition and the escalation-channel/event-log record; the
 /// per-tick handler owns the operator-facing inbox notice, because that is
 /// the layer that holds the fleet, the recipient and the agent registry.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct SelfKickOutcome {
     pub delivery_id: Uuid,
     /// `AckOverdue`: when the bridge accepted the delivery (the accepted
@@ -1493,6 +1493,17 @@ pub(crate) struct SelfKickOutcome {
     /// `AckLate`: when the late `ack_start` was recorded.
     pub at: DateTime<Utc>,
     pub kind: SelfKickOutcomeKind,
+    /// PR #3495 r4: the EXACT durable marker this pass observed and acted on.
+    ///
+    /// It is the token the caller must hand back to
+    /// [`clear_self_kick_notice`]: the clear is only allowed to erase the very
+    /// marker whose notice was just delivered. Re-reading the row and clearing
+    /// "whatever is there now" is not a compare-and-swap — a stale scanner
+    /// finishing its enqueue would erase a NEWER marker (the late-ack
+    /// resolution) that nobody has enqueued yet, and that notice would be lost.
+    /// `PendingNotice` carries `created_at`, so equality here is an identity
+    /// test on the marker, not just on its kind.
+    pub observed_notice: PendingNotice,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1559,6 +1570,7 @@ fn self_kick_watchdog_pass_at(
                 delivery_id: envelope.delivery_id,
                 at: recorded_at,
                 kind,
+                observed_notice: pending,
             });
             continue;
         }
@@ -1581,7 +1593,8 @@ fn self_kick_watchdog_pass_at(
                 // caller clears it only after the inbox notice is durably
                 // enqueued, so a crash — or a failed enqueue — in that gap
                 // cannot swallow the alert the way the pre-#3495 order could.
-                overdue.notice_pending = Some(PendingNotice::new(PendingNotice::ACK_OVERDUE, None));
+                let intent = PendingNotice::new(PendingNotice::ACK_OVERDUE, None);
+                overdue.notice_pending = Some(intent.clone());
                 // The CAS is the exactly-once latch: only the pass that moves
                 // ProtocolAccepted -> AckOverdue may alert. It is marker-aware,
                 // so a scanner holding a stale pre-intent snapshot loses.
@@ -1629,6 +1642,7 @@ fn self_kick_watchdog_pass_at(
                     delivery_id: envelope.delivery_id,
                     at: recorded_at,
                     kind: SelfKickOutcomeKind::AckOverdue { turn },
+                    observed_notice: intent,
                 });
             }
             // r3: `Completed` too — the consumer can finish its recovery
@@ -1644,10 +1658,8 @@ fn self_kick_watchdog_pass_at(
                 };
                 let mut reconciled = current.clone();
                 reconciled.late_ack_secs = None;
-                reconciled.notice_pending = Some(PendingNotice::new(
-                    PendingNotice::LATE_ACK,
-                    Some(late_by_secs),
-                ));
+                let intent = PendingNotice::new(PendingNotice::LATE_ACK, Some(late_by_secs));
+                reconciled.notice_pending = Some(intent.clone());
                 reconciled.backend_event =
                     Some("claude_channel_turn_started_late_reconciled".to_string());
                 // PR #3495: MARKER-AWARE CAS. The transition preserves
@@ -1670,6 +1682,7 @@ fn self_kick_watchdog_pass_at(
                     delivery_id: envelope.delivery_id,
                     at: recorded_at,
                     kind: SelfKickOutcomeKind::AckLate { late_by_secs },
+                    observed_notice: intent,
                 });
             }
             _ => {}
@@ -1700,7 +1713,12 @@ pub(crate) fn clear_self_kick_notice(
     home: &Path,
     instance: &str,
     delivery_id: Uuid,
+    observed: &PendingNotice,
 ) -> anyhow::Result<bool> {
+    // r4 SCAFFOLDING (RED): `observed` is threaded through but not yet honoured
+    // — the CAS below still expects whatever a fresh re-read finds, which is
+    // exactly the defect the RED tests pin.
+    let _ = observed;
     let store = ReceiptStore::for_instance(home, instance)?;
     let Some(current) = store.latest(delivery_id)? else {
         return Ok(false);
@@ -2257,6 +2275,30 @@ pub(crate) fn stop_instance_state(home: &Path, instance: &str) {
     }
 }
 
+// A one-shot rendezvous armed by a test, fired inside `deliver_resident`
+// between the read of the latest receipt and the post-202 write. It exists so
+// the "another writer advanced the row in the window" interleaving is a
+// deterministic test rather than a thread race; production builds do not
+// compile it.
+#[cfg(test)]
+thread_local! {
+    static POST_202_RENDEZVOUS_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(Uuid)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_post_202_rendezvous_hook_for_test(hook: impl FnOnce(Uuid) + 'static) {
+    POST_202_RENDEZVOUS_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn fire_post_202_rendezvous_hook_for_test(delivery_id: Uuid) {
+    let hook = POST_202_RENDEZVOUS_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(delivery_id);
+    }
+}
+
 pub(crate) fn deliver_resident(
     home: &Path,
     instance: &str,
@@ -2306,7 +2348,14 @@ pub(crate) fn deliver_resident(
     let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
     receipt.protocol_request_id = Some(envelope.delivery_id.to_string());
     receipt.backend_event = Some("webhook_accepted".to_string());
-    if let Some(previous) = store.latest(envelope.delivery_id)? {
+    let previous_snapshot = store.latest(envelope.delivery_id)?;
+    // The rendezvous the r4 tests need: the read above and the write below are
+    // two separate store operations, and the consumer's `ack_start` or the
+    // watchdog can land in between. The hook fires exactly here so a test can
+    // drive that interleaving deterministically instead of racing threads.
+    #[cfg(test)]
+    fire_post_202_rendezvous_hook_for_test(envelope.delivery_id);
+    if let Some(previous) = previous_snapshot {
         if previous.state.is_terminal()
             || matches!(
                 previous.state,

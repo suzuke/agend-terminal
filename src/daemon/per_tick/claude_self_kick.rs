@@ -263,7 +263,11 @@ fn announce(
         ),
     };
     // NOTE: no `recipient == agent` skip. See the module doc, item 5.
-    let key = notice_idempotency_key(&delivery_id, marker_kind);
+    debug_assert_eq!(marker_kind, outcome.observed_notice.kind.as_str());
+    // r4: the key comes from the OBSERVED durable marker, the same value the
+    // clear below must match, so the enqueue and the clear can never disagree
+    // about which notice this pass is discharging.
+    let key = notice_idempotency_key(&delivery_id, &outcome.observed_notice.kind);
     match crate::inbox::notify_system_once(
         ctx.home,
         recipient,
@@ -287,7 +291,12 @@ fn announce(
         Ok(true) => {}
     }
     // Durably enqueued — only now may the intent be cleared.
-    if let Err(error) = clear_self_kick_notice(ctx.home, agent, outcome.delivery_id) {
+    if let Err(error) = clear_self_kick_notice(
+        ctx.home,
+        agent,
+        outcome.delivery_id,
+        &outcome.observed_notice,
+    ) {
         tracing::warn!(agent = %agent, delivery_id = %delivery_id, error = %error, "claude_self_kick: clearing the notice intent failed; the next pass replays it idempotently");
     }
     tracing::warn!(agent = %agent, %recipient, delivery_id = %delivery_id, state, "claude_self_kick: notified orchestrator");
@@ -436,6 +445,13 @@ mod tests {
             .expect("latest")
             .expect("receipt")
             .state
+    }
+
+    /// One transport-layer watchdog pass, keeping its outcomes — the caller
+    /// needs the OBSERVED marker each outcome carries.
+    fn watchdog_outcomes(home: &Path) -> Vec<crate::transport::claude_channel::SelfKickOutcome> {
+        crate::transport::claude_channel::self_kick_watchdog_pass(home, AGENT, &|_| None)
+            .expect("watchdog pass")
     }
 
     /// Run ONE watchdog pass at the transport layer and throw the outcomes
@@ -1024,5 +1040,76 @@ mod tests {
         assert!(pending_marker(&h.home, delivery_id).is_none());
         h.tick(&handler);
         assert!(h.notices(LEAD).is_empty(), "exactly one of each overall");
+    }
+
+    /// PR #3495 r4 (a) — NO-LOSS. The clear that follows an enqueue must erase
+    /// the marker the pass OBSERVED, never "whatever the row carries now".
+    ///
+    /// Two scanners A and B both observe the same replayed `ack_overdue`
+    /// intent. A's notice goes out and A clears. A late `ack_start` then lands
+    /// and the next pass parks a NEW `late_ack` intent on the row. B — stale,
+    /// still holding the overdue marker — finishes its own enqueue and clears.
+    /// If that clear is a re-read-and-CAS it erases the late-ack marker nobody
+    /// has enqueued yet, and the operator never learns the alarm was resolved.
+    /// The late-ack notice is a delivery obligation, so losing it is a
+    /// correctness defect, not a dedup blemish.
+    #[test]
+    fn stale_overdue_clear_cannot_erase_newer_late_ack_marker() {
+        let h = Harness::new("stale-clear-newer-marker", LEAD);
+        let handler = ClaudeSelfKickHandler::new(1);
+        let delivery_id = seed_accepted_kick(&h.home, Utc::now() - ChronoDuration::seconds(35));
+
+        // Scanner A latches the overdue condition and persists the intent.
+        let a = watchdog_outcomes(&h.home).pop().expect("scanner A outcome");
+        // Scanner B replays the SAME unfinished intent — the marker is still
+        // pending, so both hold the identical observed token.
+        let b = watchdog_outcomes(&h.home).pop().expect("scanner B outcome");
+        assert_eq!(
+            a.observed_notice, b.observed_notice,
+            "both scanners observed the same durable marker"
+        );
+
+        // A's pass enqueues the overdue notice and clears what it observed.
+        h.tick(&handler);
+        let overdue = h.notices(LEAD);
+        assert_eq!(overdue.len(), 1, "one overdue notice: {overdue:?}");
+        assert!(
+            pending_marker(&h.home, delivery_id).is_none(),
+            "A cleared the marker it observed"
+        );
+
+        // The consumer acknowledges late; the next pass parks the late-ack
+        // reconciliation intent on the row.
+        crate::transport::claude_channel::ack_start_for_test(&h.home, AGENT, delivery_id)
+            .expect("late ack");
+        assert_eq!(crash_after_intent_cas(&h.home), 1);
+        let late_marker = pending_marker(&h.home, delivery_id).expect("late-ack marker");
+        assert_eq!(late_marker.kind, crate::transport::PendingNotice::LATE_ACK);
+
+        // B now finishes ITS enqueue and clears the marker IT observed.
+        assert!(
+            !clear_self_kick_notice(&h.home, AGENT, delivery_id, &b.observed_notice)
+                .expect("stale clear"),
+            "a clear whose observed marker is gone must not touch the row"
+        );
+        assert_eq!(
+            pending_marker(&h.home, delivery_id).as_ref(),
+            Some(&late_marker),
+            "the newer late-ack marker survives the stale clear"
+        );
+
+        // And the notice it stands for is still delivered.
+        h.tick(&handler);
+        let late = h.notices(LEAD);
+        assert_eq!(late.len(), 1, "one late-ack notice: {late:?}");
+        assert!(
+            late[0].contains("arrived late"),
+            "the resolution notice: {late:?}"
+        );
+        h.tick(&handler);
+        assert!(
+            h.notices(LEAD).is_empty(),
+            "exactly one of each notice overall"
+        );
     }
 }

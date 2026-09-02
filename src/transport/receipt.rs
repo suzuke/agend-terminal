@@ -1248,4 +1248,196 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(home);
     }
+
+    /// PR #3495 r4: the store-level non-regression GUARD.
+    ///
+    /// Every "unreachable" claim about an unconditional writer is replaced by
+    /// this invariant: the lowest-level append REFUSES an unconditional write
+    /// that would move a self-kick delivery BACKWARDS, or that would drop the
+    /// durable notice markers the row is carrying. Only a marker-aware
+    /// compare-and-append may change those markers.
+    fn self_kick_home(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("agend-transport-receipt-{tag}-{}", Uuid::new_v4()))
+    }
+
+    fn self_kick_envelope() -> DeliveryEnvelope {
+        DeliveryEnvelope::self_kick(
+            "claude-agent",
+            SessionLocator::claude(
+                "http://127.0.0.1:1".to_string(),
+                "self-kick-session".to_string(),
+                "token".to_string(),
+            ),
+            "[AGEND-RESUME] id=guard",
+        )
+    }
+
+    /// (i) An unconditional `record` may not regress `TurnStarted` back to
+    /// `ProtocolAccepted` — the shape `deliver_resident`'s post-202 write had.
+    #[test]
+    fn unconditional_record_refuses_to_regress_a_self_kick_row() {
+        let home = self_kick_home("guard-regress");
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let envelope = self_kick_envelope();
+        store.record_queued(&envelope).expect("queued");
+        store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::TurnStarted,
+            ))
+            .expect("turn started");
+
+        let error = store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::ProtocolAccepted,
+            ))
+            .expect_err("a regressing unconditional append must be refused");
+        assert!(
+            error.to_string().contains("would regress"),
+            "the refusal must name the invariant: {error}"
+        );
+        assert_eq!(
+            store
+                .latest(envelope.delivery_id)
+                .expect("latest")
+                .expect("receipt")
+                .state,
+            DeliveryState::TurnStarted,
+            "and must leave the row untouched"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (ii) An unconditional append over an `AckOverdue` row carrying an
+    /// unsent notice intent must be refused with the intent intact — dropping
+    /// it is the loss bug the guard exists to make impossible.
+    #[test]
+    fn unconditional_record_refuses_to_drop_a_pending_notice_intent() {
+        let home = self_kick_home("guard-intent");
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let envelope = self_kick_envelope();
+        store.record_queued(&envelope).expect("queued");
+        let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+        let mut overdue = DeliveryReceipt::for_state(&envelope, DeliveryState::AckOverdue);
+        let intent = PendingNotice::new(PendingNotice::ACK_OVERDUE, None);
+        overdue.notice_pending = Some(intent.clone());
+        assert!(store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::ProtocolAccepted,
+                None,
+                None,
+                overdue,
+            )
+            .expect("overdue CAS"));
+
+        // A same-state unconditional append that simply forgets the marker.
+        let mut forgetful = DeliveryReceipt::for_state(&envelope, DeliveryState::AckOverdue);
+        forgetful.detail = Some("a writer that never heard of notice_pending".to_string());
+        let error = store
+            .record(forgetful)
+            .expect_err("dropping a pending notice intent must be refused");
+        assert!(
+            error.to_string().contains("notice_pending"),
+            "the refusal must name the marker: {error}"
+        );
+        assert_eq!(
+            store
+                .latest(envelope.delivery_id)
+                .expect("latest")
+                .expect("receipt")
+                .notice_pending,
+            Some(intent),
+            "the unsent intent survives"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (iii) The legitimate marker-aware transitions are unaffected: the
+    /// guard fences unconditional writers, not the CAS that owns the markers.
+    #[test]
+    fn marker_aware_cas_transitions_still_apply() {
+        let home = self_kick_home("guard-cas");
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let envelope = self_kick_envelope();
+        store.record_queued(&envelope).expect("queued");
+        let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+
+        let mut overdue = DeliveryReceipt::for_state(&envelope, DeliveryState::AckOverdue);
+        let intent = PendingNotice::new(PendingNotice::ACK_OVERDUE, None);
+        overdue.notice_pending = Some(intent.clone());
+        assert!(store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::ProtocolAccepted,
+                None,
+                None,
+                overdue,
+            )
+            .expect("overdue CAS"));
+
+        // Clearing the marker is a state-preserving CAS — allowed.
+        let mut cleared = DeliveryReceipt::for_state(&envelope, DeliveryState::AckOverdue);
+        cleared.notice_pending = None;
+        assert!(store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::AckOverdue,
+                None,
+                Some(&intent),
+                cleared,
+            )
+            .expect("clear CAS"));
+        let latest = store
+            .latest(envelope.delivery_id)
+            .expect("latest")
+            .expect("receipt");
+        assert_eq!(latest.state, DeliveryState::AckOverdue);
+        assert!(latest.notice_pending.is_none());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (iv) Non-self-kick deliveries are untouched by the guard: every other
+    /// transport still appends terminal receipts unconditionally, and the
+    /// codex/opencode adapters legitimately overwrite a row in place.
+    #[test]
+    fn non_self_kick_deliveries_are_unaffected_by_the_guard() {
+        let home = self_kick_home("guard-other");
+        let store = ReceiptStore::for_instance(&home, "agent/one").expect("store");
+        let envelope = DeliveryEnvelope::new(
+            "agent/one",
+            SessionLocator::codex(PathBuf::from("/tmp/sock"), Some("thread".to_string())),
+            DeliveryKind::Prompt,
+            "body",
+            None,
+        );
+        assert!(!envelope.self_kick);
+        store.record_queued(&envelope).expect("queued");
+        store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::TurnStarted,
+            ))
+            .expect("turn started");
+        store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::ProtocolAccepted,
+            ))
+            .expect("a non-self-kick row keeps its unconditional semantics");
+        assert_eq!(
+            store
+                .latest(envelope.delivery_id)
+                .expect("latest")
+                .expect("receipt")
+                .state,
+            DeliveryState::ProtocolAccepted
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
 }
