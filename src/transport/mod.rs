@@ -14,8 +14,8 @@ mod registry;
 
 pub(crate) use envelope::{DeliveryEnvelope, DeliveryKind, SessionLocator};
 pub(crate) use receipt::{
-    delivery_path_for_instance, safe_component, DeliveryReceipt, DeliveryState, PendingNotice,
-    ReceiptStore,
+    delivery_path_for_instance, safe_component, DeliveryReceipt, DeliveryState, DroppedNoticeDebt,
+    PendingNotice, ReceiptStore,
 };
 #[cfg(test)]
 pub(crate) use registry::mode_for_backend;
@@ -35,10 +35,13 @@ pub(crate) use registry::{
     prepare_opencode_tui_session,
 };
 
+/// See [`receipt::remove_instance_delivery_state`] for the policy: this is the
+/// one receipt-store writer allowed to discard unfinished notice debt, and the
+/// returned rows are the audit evidence that it never does so silently.
 pub(crate) fn remove_instance_delivery_state(
     home: &std::path::Path,
     instance: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<DroppedNoticeDebt>> {
     codex_app_server::stop_instance_server(home, instance)?;
     opencode_server::stop_instance_server(home, instance);
     opencode_server::remove_instance_rollover_state(home, instance)?;

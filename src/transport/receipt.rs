@@ -5,13 +5,74 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 /// Receipt metadata is intentionally bounded.  The first record for a
 /// delivery owns the durable envelope body; compaction keeps that owner and
 /// the latest receipt, while dropping superseded metadata records.
+///
+/// PR #3495 r5 — BOUNDED-OVERFLOW POLICY. These two limits are the budget for
+/// EVICTABLE rows only. A delivery that carries unfinished notice debt (see
+/// [`DeliveryHistory::pinned`]) is PINNED: compaction may never evict it,
+/// because `deliveries_owing_notices` can only rediscover a parked notice
+/// through the durable row, and losing the row loses the operator notice —
+/// the NO-LOSS half of the contract. The file is therefore bounded by
+/// `MAX_RECEIPT_BYTES` PLUS the live debt, not by `MAX_RECEIPT_BYTES` alone.
+/// The debt is self-limiting: at most one unfinished notice per in-flight
+/// self-kick, each cleared within a per-tick pass of its enqueue. If the
+/// pinned set alone ever exceeds the byte budget, compaction FAILS CLOSED —
+/// it evicts nothing at all and the log is allowed to exceed the limit
+/// (logged once per exceedance episode) rather than dropping owed debt.
 const MAX_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RETAINED_DELIVERIES: usize = 1024;
+
+// The retention budget in force for this thread.
+//
+// Production always reads the two constants above. Tests lower them (via
+// `set_retention_limits_for_test`) so a compaction test can run in
+// milliseconds instead of writing 4 MiB; the override is thread-local, so it
+// cannot leak into a test running in parallel, and a guard restores it.
+#[cfg(test)]
+thread_local! {
+    static RETENTION_LIMITS_OVERRIDE: std::cell::RefCell<Option<(u64, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct RetentionLimitsGuard;
+
+#[cfg(test)]
+impl Drop for RetentionLimitsGuard {
+    fn drop(&mut self) {
+        RETENTION_LIMITS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_retention_limits_for_test(
+    max_bytes: u64,
+    max_deliveries: usize,
+) -> RetentionLimitsGuard {
+    RETENTION_LIMITS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some((max_bytes, max_deliveries)));
+    RetentionLimitsGuard
+}
+
+fn max_receipt_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some((bytes, _)) = RETENTION_LIMITS_OVERRIDE.with(|slot| *slot.borrow()) {
+        return bytes;
+    }
+    MAX_RECEIPT_BYTES
+}
+
+fn max_retained_deliveries() -> usize {
+    #[cfg(test)]
+    if let Some((_, deliveries)) = RETENTION_LIMITS_OVERRIDE.with(|slot| *slot.borrow()) {
+        return deliveries;
+    }
+    MAX_RETAINED_DELIVERIES
+}
 const OPENCODE_MESSAGE_ID_PREFIX: &str = "msg_";
 const OPENCODE_MESSAGE_ID_NATIVE_SUFFIX_LEN: usize = 12 + 14;
 
@@ -640,7 +701,7 @@ impl ReceiptStore {
         line.push(b'\n');
         file.write_all(&line)?;
         file.sync_data()?;
-        let should_compact = file.metadata()?.len() > MAX_RECEIPT_BYTES;
+        let should_compact = file.metadata()?.len() > max_receipt_bytes();
         drop(file);
         if should_compact {
             self.compact_locked()?;
@@ -668,6 +729,7 @@ impl ReceiptStore {
                     envelope: None,
                     latest: None,
                     last_index: index,
+                    pinned: false,
                 });
             if record.envelope.is_some() && entry.envelope.is_none() {
                 entry.envelope = Some(record.clone());
@@ -680,7 +742,7 @@ impl ReceiptStore {
         histories.sort_by_key(|history| std::cmp::Reverse(history.last_index));
         let mut retained = Vec::new();
         let mut retained_bytes = 0_u64;
-        for history in histories.into_iter().take(MAX_RETAINED_DELIVERIES) {
+        for history in histories.into_iter().take(max_retained_deliveries()) {
             let Some(latest) = history.latest else {
                 continue;
             };
@@ -702,7 +764,7 @@ impl ReceiptStore {
             }
             // Always retain the newest delivery, even if its one required
             // envelope exceeds the normal aggregate byte budget.
-            if !retained.is_empty() && retained_bytes.saturating_add(bytes) > MAX_RECEIPT_BYTES {
+            if !retained.is_empty() && retained_bytes.saturating_add(bytes) > max_receipt_bytes() {
                 continue;
             }
             retained_bytes = retained_bytes.saturating_add(bytes);
@@ -725,6 +787,18 @@ impl ReceiptStore {
     fn lock_path(&self) -> PathBuf {
         self.path.with_extension("jsonl.lock")
     }
+
+    /// How many compaction-overflow `tracing::error!` lines this log has
+    /// emitted. The contract the tests pin: ONE per exceedance episode, no
+    /// matter how many appends run while the pinned set is over budget.
+    #[cfg(test)]
+    pub(crate) fn compaction_overflow_log_count_for_test(&self) -> usize {
+        compaction_overflow_episodes()
+            .lock()
+            .expect("receipt overflow episode registry")
+            .get(&self.path)
+            .map_or(0, |episode| episode.logs)
+    }
 }
 
 #[derive(Debug)]
@@ -732,6 +806,58 @@ struct DeliveryHistory {
     envelope: Option<DurableRecord>,
     latest: Option<DurableRecord>,
     last_index: usize,
+    /// PR #3495 r5: this delivery carries unfinished notice debt, or can still
+    /// acquire some, so compaction may not evict it. See
+    /// [`DeliveryHistory::is_pinned`].
+    pinned: bool,
+}
+
+impl DeliveryHistory {
+    /// The PIN rule, in one place.
+    ///
+    /// A delivery is pinned when its latest receipt carries an unfinished
+    /// operator notice — `notice_pending` or an unreconciled `late_ack_secs` —
+    /// or when it is a NONTERMINAL self-kick, which has not yet reached a state
+    /// from which it can no longer acquire debt (`ProtocolAccepted` becomes
+    /// `AckOverdue` with an intent on the very next watchdog pass). Everything
+    /// else is evictable.
+    fn is_pinned(latest: &DeliveryReceipt, envelope: Option<&DeliveryEnvelope>) -> bool {
+        if latest.notice_pending.is_some() || latest.late_ack_secs.is_some() {
+            return true;
+        }
+        envelope.is_some_and(|envelope| envelope.self_kick) && !latest.state.is_terminal()
+    }
+}
+
+/// PR #3495 r5: notice debt that [`remove_instance_delivery_state`] destroyed.
+///
+/// Deleting an instance's delivery state is a WRITER of the receipt store by
+/// the r4 rubric (writer = append ∪ delete ∪ compact ∪ rewrite), and it is the
+/// one writer that is allowed to discard debt — see the doc on that function.
+/// It never does so silently: every dropped intent is returned to the caller
+/// and logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedNoticeDebt {
+    pub delivery_id: Uuid,
+    pub notice_kind: Option<String>,
+    pub late_ack_secs: Option<i64>,
+}
+
+/// One receipt log's compaction OVERFLOW episode: a stretch of appends during
+/// which the pinned set alone exceeds the byte budget, so compaction fails
+/// closed. `logs` counts the `tracing::error!` lines emitted for this log —
+/// exactly one per episode, not one per append.
+#[derive(Debug, Default, Clone, Copy)]
+struct OverflowEpisode {
+    open: bool,
+    logs: usize,
+}
+
+/// Overflow episodes keyed by log path, so the episode is per-instance (and,
+/// in tests, per temp home) rather than process-global.
+fn compaction_overflow_episodes() -> &'static Mutex<HashMap<PathBuf, OverflowEpisode>> {
+    static EPISODES: OnceLock<Mutex<HashMap<PathBuf, OverflowEpisode>>> = OnceLock::new();
+    EPISODES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn restrict_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
@@ -760,9 +886,39 @@ pub(crate) fn delivery_path_for_instance(home: &Path, instance: &str) -> PathBuf
 /// Remove all durable delivery state for an instance, including the advisory
 /// lock sidecar. The caller must hold the delivery-worker cleanup guard so no
 /// queued or in-flight transport job can recreate the files after removal.
-pub(crate) fn remove_instance_delivery_state(home: &Path, instance: &str) -> anyhow::Result<()> {
+///
+/// PR #3495 r5 — THE ONE WRITER ALLOWED TO DISCARD DEBT, and why.
+///
+/// By the sharpened rubric a "writer" of the receipt store is any path that
+/// changes what the store returns for a delivery: append ∪ delete ∪ compact ∪
+/// rewrite. This is the delete. Its four production callers each destroy the
+/// instance the receipts describe, under a `DeleteFence`:
+///
+///  * `agent_ops::delete_instance_with_exit_status` (src/agent_ops.rs:339)
+///  * `daemon::lifecycle::delete_transaction` (src/daemon/lifecycle.rs:132)
+///  * `mcp::handlers::instance_state::lifecycle` full delete
+///    (src/mcp/handlers/instance_state/lifecycle.rs:311)
+///  * restart with `mode != "resume"`
+///    (src/mcp/handlers/instance_state/mod.rs:605), which destroys the backend
+///    session every receipt is keyed to
+///
+/// The debt these rows carry is a notice ABOUT a self-kick of that instance,
+/// addressed to its orchestrator. Keeping it would mean announcing an
+/// unacknowledged resume for a session the operator deliberately destroyed —
+/// which is precisely the escalation the restart path's comment refuses. So
+/// deletion DISCHARGES the debt by policy rather than delivering it, and this
+/// function is the documented exception to NO-LOSS.
+///
+/// What is NOT allowed is discharging it silently: every dropped intent is
+/// scanned out of the log before the removal, returned to the caller, and
+/// logged at `warn!`. Callers treat the value as advisory audit evidence.
+pub(crate) fn remove_instance_delivery_state(
+    home: &Path,
+    instance: &str,
+) -> anyhow::Result<Vec<DroppedNoticeDebt>> {
     let path = delivery_path_for_instance(home, instance);
     let lock_path = path.with_extension("jsonl.lock");
+    let dropped = Vec::new();
     for candidate in [&path, &lock_path] {
         match std::fs::remove_file(candidate) {
             Ok(()) => {}
@@ -777,7 +933,7 @@ pub(crate) fn remove_instance_delivery_state(home: &Path, instance: &str) -> any
             std::fs::remove_dir(&dir)?;
         }
     }
-    Ok(())
+    Ok(dropped)
 }
 
 pub(crate) fn safe_component(value: &str) -> String {
@@ -1564,6 +1720,334 @@ mod tests {
                 .state,
             DeliveryState::ProtocolAccepted
         );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    // ── PR #3495 r5: compaction is a WRITER, and it may not evict debt ─────
+    //
+    // The r4 review's P0: `append_locked` compacts once the log passes the byte
+    // budget, and `compact_locked` kept the newest N deliveries with no
+    // exemption for a row carrying an owed notice. Enough later traffic to the
+    // same instance therefore EVICTED the envelope and latest receipt of a
+    // delivery with a parked intent, and `deliveries_owing_notices` — which
+    // needs both — could never rediscover it. The notice was gone for good.
+
+    /// An ordinary (non-self-kick) delivery compaction is free to evict, padded
+    /// so a lowered byte budget is reached in a handful of appends.
+    fn filler_delivery(store: &ReceiptStore, index: usize) -> Uuid {
+        let envelope = DeliveryEnvelope::new(
+            "claude-agent",
+            SessionLocator::codex(PathBuf::from("/tmp/sock"), Some("thread".to_string())),
+            DeliveryKind::Prompt,
+            format!("filler-{index}-{}", "x".repeat(512)),
+            None,
+        );
+        store.record_queued(&envelope).expect("filler queued");
+        store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::Completed,
+            ))
+            .expect("filler completed");
+        envelope.delivery_id
+    }
+
+    /// A self-kick delivery parked at `AckOverdue` with an UNSENT notice intent
+    /// — the debt the operator is owed.
+    fn parked_ack_overdue(store: &ReceiptStore) -> (DeliveryEnvelope, PendingNotice) {
+        let envelope = self_kick_envelope();
+        store.record_queued(&envelope).expect("queued");
+        let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+        let intent = PendingNotice::new(PendingNotice::ACK_OVERDUE, None);
+        let mut overdue = DeliveryReceipt::for_state(&envelope, DeliveryState::AckOverdue);
+        overdue.notice_pending = Some(intent.clone());
+        assert!(store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::ProtocolAccepted,
+                None,
+                None,
+                overdue,
+            )
+            .expect("overdue CAS"));
+        (envelope, intent)
+    }
+
+    /// Every delivery id the compacted log still holds an ENVELOPE for — the
+    /// only rows `deliveries_owing_notices` can return.
+    fn surviving_body_owners(store: &ReceiptStore) -> std::collections::HashSet<Uuid> {
+        let file = File::open(store.path()).expect("receipt log");
+        let mut owners = std::collections::HashSet::new();
+        for line in BufReader::new(file).lines() {
+            let record: DurableRecord =
+                serde_json::from_str(&line.expect("line")).expect("valid record");
+            if record.envelope.is_some() {
+                owners.insert(record.receipt.delivery_id);
+            }
+        }
+        owners
+    }
+
+    fn log_len(store: &ReceiptStore) -> u64 {
+        std::fs::metadata(store.path()).expect("receipt log").len()
+    }
+
+    /// (a) A parked `notice_pending` survives any amount of later traffic, and
+    /// the per-tick pass still finds and delivers it.
+    #[test]
+    fn compaction_pins_a_delivery_with_a_pending_notice_intent() {
+        let home = self_kick_home("compaction-pin-intent");
+        let _limits = set_retention_limits_for_test(16 * 1024, 4);
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let (envelope, intent) = parked_ack_overdue(&store);
+        for index in 0..40 {
+            filler_delivery(&store, index);
+        }
+        assert!(
+            log_len(&store) < 40 * 1024,
+            "compaction must actually have run: {} bytes",
+            log_len(&store)
+        );
+
+        let (retained, latest) = store
+            .delivery(envelope.delivery_id)
+            .expect("delivery")
+            .expect("the delivery carrying an owed notice must survive compaction");
+        assert_eq!(retained.delivery_id, envelope.delivery_id);
+        assert_eq!(
+            latest.notice_pending,
+            Some(intent),
+            "and must keep its unsent intent: {latest:?}"
+        );
+        assert!(
+            store
+                .deliveries_owing_notices()
+                .expect("owing")
+                .iter()
+                .any(|(candidate, _)| candidate.delivery_id == envelope.delivery_id),
+            "the watchdog must still be able to rediscover the owed notice"
+        );
+
+        let outcomes = crate::transport::claude_channel::self_kick_watchdog_pass_at(
+            &home,
+            "claude-agent",
+            Utc::now(),
+            &|_| None,
+        )
+        .expect("per-tick pass");
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the per-tick pass delivers the owed notice exactly once: {outcomes:?}"
+        );
+        assert_eq!(outcomes[0].delivery_id, envelope.delivery_id);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (b) The same for the other two pinned shapes: a TERMINAL row still
+    /// carrying an unreconciled `late_ack_secs`, and a NONTERMINAL self-kick
+    /// that carries no debt yet but can acquire some on the next pass.
+    #[test]
+    fn compaction_pins_late_ack_secs_and_nonterminal_self_kicks() {
+        let home = self_kick_home("compaction-pin-late-ack");
+        let _limits = set_retention_limits_for_test(16 * 1024, 4);
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+
+        // A completed self-kick whose late ack has not been reconciled yet.
+        let late = self_kick_envelope();
+        store.record_queued(&late).expect("queued");
+        let mut accepted = DeliveryReceipt::for_state(&late, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(late.delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+        let mut completed = DeliveryReceipt::for_state(&late, DeliveryState::Completed);
+        completed.late_ack_secs = Some(7);
+        assert!(store
+            .record_if_marker(
+                late.delivery_id,
+                DeliveryState::ProtocolAccepted,
+                None,
+                None,
+                completed,
+            )
+            .expect("late-ack CAS"));
+
+        // A self-kick the bridge has accepted and nothing has acknowledged: no
+        // debt yet, but the next watchdog pass parks an AckOverdue intent on it.
+        let inflight = self_kick_envelope();
+        store.record_queued(&inflight).expect("queued");
+        let mut inflight_accepted =
+            DeliveryReceipt::for_state(&inflight, DeliveryState::ProtocolAccepted);
+        inflight_accepted.protocol_request_id = Some(inflight.delivery_id.to_string());
+        store.record(inflight_accepted).expect("accepted");
+
+        for index in 0..40 {
+            filler_delivery(&store, index);
+        }
+
+        assert_eq!(
+            store
+                .latest(late.delivery_id)
+                .expect("latest")
+                .expect("the late-ack row must survive compaction")
+                .late_ack_secs,
+            Some(7)
+        );
+        assert!(
+            surviving_body_owners(&store).contains(&late.delivery_id),
+            "and must keep the envelope `deliveries_owing_notices` needs"
+        );
+        assert_eq!(
+            store
+                .latest(inflight.delivery_id)
+                .expect("latest")
+                .expect("a nonterminal self-kick must survive compaction")
+                .state,
+            DeliveryState::ProtocolAccepted
+        );
+        assert!(surviving_body_owners(&store).contains(&inflight.delivery_id));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (c) The bounded-overflow policy: when the PINNED set alone exceeds the
+    /// byte budget there is nothing safe to evict, so compaction evicts
+    /// NOTHING, the log is allowed to exceed the limit, and the exceedance is
+    /// logged once per episode — not once per append. Once the debt is
+    /// discharged, the next append compacts normally.
+    #[test]
+    fn compaction_refuses_to_evict_debt_when_pinned_set_exceeds_budget() {
+        let home = self_kick_home("compaction-overflow");
+        let _limits = set_retention_limits_for_test(4 * 1024, 4);
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let parked: Vec<_> = (0..12).map(|_| parked_ack_overdue(&store)).collect();
+        assert!(
+            log_len(&store) > 4 * 1024,
+            "the pinned set alone must already exceed the budget: {} bytes",
+            log_len(&store)
+        );
+
+        // Several more appends, each of which finds the log over budget and
+        // therefore attempts a compaction that must fail closed.
+        for index in 0..5 {
+            filler_delivery(&store, index);
+        }
+        let owners = surviving_body_owners(&store);
+        for (envelope, intent) in &parked {
+            assert!(
+                owners.contains(&envelope.delivery_id),
+                "no pinned delivery may be evicted while compaction is over budget"
+            );
+            assert_eq!(
+                store
+                    .latest(envelope.delivery_id)
+                    .expect("latest")
+                    .expect("pinned receipt")
+                    .notice_pending
+                    .as_ref(),
+                Some(intent)
+            );
+        }
+        assert!(
+            log_len(&store) > 4 * 1024,
+            "failing closed means the log is ALLOWED to exceed the limit"
+        );
+        assert_eq!(
+            store.compaction_overflow_log_count_for_test(),
+            1,
+            "the exceedance episode is logged exactly once, not once per append"
+        );
+
+        // Discharge every notice, then append again: compaction resumes.
+        for (envelope, intent) in &parked {
+            let mut cleared = DeliveryReceipt::for_state(envelope, DeliveryState::Completed);
+            cleared.notice_pending = None;
+            assert!(store
+                .record_if_marker(
+                    envelope.delivery_id,
+                    DeliveryState::AckOverdue,
+                    None,
+                    Some(intent),
+                    cleared,
+                )
+                .expect("discharge CAS"));
+        }
+        let before = log_len(&store);
+        filler_delivery(&store, 99);
+        assert!(
+            log_len(&store) < before,
+            "with the debt discharged the log compacts normally: {} -> {}",
+            before,
+            log_len(&store)
+        );
+        assert_eq!(
+            store.compaction_overflow_log_count_for_test(),
+            1,
+            "and the closed episode is not re-logged"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (d) Control: pinning is an exemption for debt, not a licence to keep
+    /// everything. Non-pinned deliveries are still evicted down to the limits
+    /// while pinned rows are present.
+    #[test]
+    fn compaction_still_evicts_non_debt_rows() {
+        let home = self_kick_home("compaction-evicts-non-debt");
+        let _limits = set_retention_limits_for_test(16 * 1024, 4);
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let (pinned, _intent) = parked_ack_overdue(&store);
+        let fillers: Vec<Uuid> = (0..40)
+            .map(|index| filler_delivery(&store, index))
+            .collect();
+
+        let owners = surviving_body_owners(&store);
+        assert!(owners.contains(&pinned.delivery_id));
+        let surviving_fillers = fillers.iter().filter(|id| owners.contains(id)).count();
+        assert!(
+            surviving_fillers <= 4,
+            "non-pinned rows stay inside the retention count: {surviving_fillers} survived"
+        );
+        assert!(
+            !owners.contains(&fillers[0]),
+            "the oldest non-pinned delivery must still be evicted"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (f) The delete path is the one writer allowed to discard debt — and it
+    /// must never do so silently. It reports every intent it destroyed.
+    #[test]
+    fn removing_instance_delivery_state_reports_the_debt_it_discards() {
+        let home = self_kick_home("delete-reports-debt");
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let (envelope, intent) = parked_ack_overdue(&store);
+        let dropped = remove_instance_delivery_state(&home, "claude-agent").expect("removal");
+        assert_eq!(
+            dropped,
+            vec![DroppedNoticeDebt {
+                delivery_id: envelope.delivery_id,
+                notice_kind: Some(intent.kind.clone()),
+                late_ack_secs: None,
+            }],
+            "deleting an instance discharges its notice debt BY POLICY, and the \
+             audit must name what it discarded"
+        );
+        assert!(!delivery_path_for_instance(&home, "claude-agent").exists());
+
+        // A delete with nothing owed reports nothing.
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let settled = self_kick_envelope();
+        store.record_queued(&settled).expect("queued");
+        store
+            .record(DeliveryReceipt::for_state(
+                &settled,
+                DeliveryState::Completed,
+            ))
+            .expect("completed");
+        assert!(remove_instance_delivery_state(&home, "claude-agent")
+            .expect("removal")
+            .is_empty());
         let _ = std::fs::remove_dir_all(home);
     }
 }

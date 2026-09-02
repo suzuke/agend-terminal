@@ -1910,6 +1910,8 @@ fn write_if_still_queued(
         )? {
             return Ok(GuardedWrite::Appended(candidate));
         }
+        #[cfg(test)]
+        note_post_202_cas_miss_for_test();
     }
     // Lost the CAS twice: something else owns the row. Report what is durable
     // rather than forcing this receipt over it.
@@ -1924,30 +1926,52 @@ fn write_if_still_queued(
     Ok(GuardedWrite::AlreadyAdvanced(latest))
 }
 
-// A one-shot rendezvous armed by a test, fired inside `deliver_resident`
-// between the read of the latest receipt and the post-202 write. It exists so
-// the "another writer advanced the row in the window" interleaving is a
-// deterministic test rather than a thread race; production builds do not
-// compile it.
+// A one-shot rendezvous armed by a test, fired INSIDE `write_if_still_queued`
+// — after the snapshot read that the compare-and-append will compare against,
+// and before the append itself. That position is the whole point: a hook that
+// fires BEFORE the read only ever produces the `AlreadyAdvanced` short circuit
+// and never exercises a CAS miss, which is the interleaving the guarded write
+// exists for. The hook receives the state the helper actually OBSERVED so a
+// test can assert it read `Queued` and still lost the append.
 #[cfg(test)]
-type Post202RendezvousHook = std::cell::RefCell<Option<Box<dyn FnOnce(Uuid)>>>;
+type Post202RendezvousHook = std::cell::RefCell<Option<Box<dyn FnOnce(Uuid, DeliveryState)>>>;
 
 #[cfg(test)]
 thread_local! {
     static POST_202_RENDEZVOUS_HOOK: Post202RendezvousHook =
         const { std::cell::RefCell::new(None) };
+    /// How many times the post-202 compare-and-append has been REFUSED because
+    /// the row moved between the observed read and the append.
+    static POST_202_CAS_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
-pub(crate) fn set_post_202_rendezvous_hook_for_test(hook: impl FnOnce(Uuid) + 'static) {
+pub(crate) fn set_post_202_rendezvous_hook_for_test(
+    hook: impl FnOnce(Uuid, DeliveryState) + 'static,
+) {
+    POST_202_CAS_MISSES.with(std::cell::Cell::take);
     POST_202_RENDEZVOUS_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
+/// CAS misses observed since the hook was armed. A test that drives the
+/// rendezvous asserts this is exactly 1: the helper read `Queued`, the hook
+/// advanced the row, the append was refused, and the bounded retry re-read the
+/// advanced row instead of forcing its receipt over it.
 #[cfg(test)]
-fn fire_post_202_rendezvous_hook_for_test(delivery_id: Uuid) {
+pub(crate) fn post_202_cas_miss_count_for_test() -> usize {
+    POST_202_CAS_MISSES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_post_202_cas_miss_for_test() {
+    POST_202_CAS_MISSES.with(|misses| misses.set(misses.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn fire_post_202_rendezvous_hook_for_test(delivery_id: Uuid, observed: DeliveryState) {
     let hook = POST_202_RENDEZVOUS_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
-        hook(delivery_id);
+        hook(delivery_id, observed);
     }
 }
 
@@ -2009,12 +2033,18 @@ pub(crate) fn deliver_resident(
     let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
     accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
     accepted.backend_event = Some("webhook_accepted".to_string());
-    // The rendezvous the r4 tests need: `write_if_still_queued` reads and then
-    // writes, and the consumer's `ack_start` or the watchdog can land in
-    // between. The hook fires just before that read/write pair so a test can
-    // drive the interleaving deterministically instead of racing threads.
+    // RED SCAFFOLDING (r5, removed by the fix): the rendezvous still fires
+    // HERE, before `write_if_still_queued` runs its read — the r4 position the
+    // review rejected. The hook therefore advances the row before the helper
+    // ever reads it, so the helper takes the `AlreadyAdvanced` short circuit
+    // and no compare-and-append is ever attempted, let alone missed.
     #[cfg(test)]
-    fire_post_202_rendezvous_hook_for_test(envelope.delivery_id);
+    {
+        let observed = store
+            .latest(envelope.delivery_id)?
+            .map_or(DeliveryState::Queued, |receipt| receipt.state);
+        fire_post_202_rendezvous_hook_for_test(envelope.delivery_id, observed);
+    }
     let receipt = match write_if_still_queued(&store, envelope.delivery_id, &accepted)? {
         GuardedWrite::Appended(receipt) => receipt,
         // Claude acknowledged (or completed) the self-kick, or the watchdog

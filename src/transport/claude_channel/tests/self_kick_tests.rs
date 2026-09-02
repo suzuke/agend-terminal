@@ -1024,16 +1024,24 @@ fn deliver_resident_does_not_regress_turn_started() {
         .expect("locator publication");
 
     let hook_home = home.clone();
-    crate::transport::claude_channel::set_post_202_rendezvous_hook_for_test(move |delivery_id| {
-        // The consumer acknowledges the exact delivery_id while the daemon-side
-        // worker is still between its read and its write.
-        crate::transport::claude_channel::ack_start_for_test(
-            &hook_home,
-            "claude-agent",
-            delivery_id,
-        )
-        .expect("ack_start inside the post-202 window");
-    });
+    let observed_at_hook = Arc::new(Mutex::new(None));
+    let hook_observed = Arc::clone(&observed_at_hook);
+    crate::transport::claude_channel::set_post_202_rendezvous_hook_for_test(
+        move |delivery_id, observed| {
+            // r5: the hook fires INSIDE the guarded write, after the snapshot
+            // the compare-and-append will compare against. Record what that
+            // snapshot said, then let the consumer acknowledge the exact
+            // delivery_id underneath it — a real `ack_start`, not a planted
+            // receipt — so the append that follows must MISS its CAS.
+            *hook_observed.lock() = Some(observed);
+            crate::transport::claude_channel::ack_start_for_test(
+                &hook_home,
+                "claude-agent",
+                delivery_id,
+            )
+            .expect("ack_start inside the post-202 window");
+        },
+    );
 
     let accepted = super::super::super::registry::deliver_self_kick_notification(
         &home,
@@ -1057,6 +1065,18 @@ fn deliver_resident_does_not_regress_turn_started() {
         accepted.state,
         DeliveryState::TurnStarted,
         "and deliver_resident must report the already-advanced row: {accepted:?}"
+    );
+    assert_eq!(
+        *observed_at_hook.lock(),
+        Some(DeliveryState::Queued),
+        "the rendezvous must fire on the snapshot the guarded write OBSERVED, \
+         which is still Queued — otherwise the test never exercises a CAS miss"
+    );
+    assert_eq!(
+        crate::transport::claude_channel::post_202_cas_miss_count_for_test(),
+        1,
+        "exactly one compare-and-append must have been refused: the observed \
+         Queued row moved under the write, and the bounded retry then re-read it"
     );
     let _ = channel.stop_and_join();
     let _ = fs::remove_dir_all(home);
@@ -1089,31 +1109,37 @@ fn deliver_resident_does_not_regress_ack_overdue_intent() {
         .expect("locator publication");
 
     let hook_home = home.clone();
-    crate::transport::claude_channel::set_post_202_rendezvous_hook_for_test(move |delivery_id| {
-        let store = ReceiptStore::for_instance(&hook_home, "claude-agent").expect("store");
-        let (envelope, current) = store
-            .delivery(delivery_id)
-            .expect("delivery")
-            .expect("receipt");
-        // The row the bridge already accepted, backdated past the ack window
-        // — the state the real watchdog acts on.
-        let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
-        accepted.protocol_request_id = Some(delivery_id.to_string());
-        accepted.backend_event = Some("webhook_accepted".to_string());
-        accepted.recorded_at = (Utc::now()
-            - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64 + 5))
-        .to_rfc3339();
-        assert!(store
-            .record_if_latest_state(delivery_id, current.state, accepted)
-            .expect("backdate"));
-        // The REAL watchdog latches the overdue condition and parks the intent.
-        assert_eq!(
-            self_kick_watchdog_pass_at(&hook_home, "claude-agent", Utc::now(), &|_| None)
-                .expect("watchdog in the post-202 window")
-                .len(),
-            1
-        );
-    });
+    let observed_at_hook = Arc::new(Mutex::new(None));
+    let hook_observed = Arc::clone(&observed_at_hook);
+    crate::transport::claude_channel::set_post_202_rendezvous_hook_for_test(
+        move |delivery_id, observed| {
+            *hook_observed.lock() = Some(observed);
+            let store = ReceiptStore::for_instance(&hook_home, "claude-agent").expect("store");
+            let (envelope, current) = store
+                .delivery(delivery_id)
+                .expect("delivery")
+                .expect("receipt");
+            // The row the bridge already accepted, backdated past the ack window
+            // — the state the real watchdog acts on.
+            let mut accepted =
+                DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+            accepted.protocol_request_id = Some(delivery_id.to_string());
+            accepted.backend_event = Some("webhook_accepted".to_string());
+            accepted.recorded_at = (Utc::now()
+                - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64 + 5))
+            .to_rfc3339();
+            assert!(store
+                .record_if_latest_state(delivery_id, current.state, accepted)
+                .expect("backdate"));
+            // The REAL watchdog latches the overdue condition and parks the intent.
+            assert_eq!(
+                self_kick_watchdog_pass_at(&hook_home, "claude-agent", Utc::now(), &|_| None)
+                    .expect("watchdog in the post-202 window")
+                    .len(),
+                1
+            );
+        },
+    );
 
     let accepted = super::super::super::registry::deliver_self_kick_notification(
         &home,
@@ -1140,6 +1166,17 @@ fn deliver_resident_does_not_regress_ack_overdue_intent() {
             .map(|notice| notice.kind.as_str()),
         Some(crate::transport::PendingNotice::ACK_OVERDUE),
         "and must not drop the unsent notice intent: {latest:?}"
+    );
+    assert_eq!(
+        *observed_at_hook.lock(),
+        Some(DeliveryState::Queued),
+        "the rendezvous must fire on the snapshot the guarded write OBSERVED"
+    );
+    assert_eq!(
+        crate::transport::claude_channel::post_202_cas_miss_count_for_test(),
+        1,
+        "the real watchdog moved the observed Queued row, so exactly one \
+         compare-and-append must have been refused"
     );
 
     // The next pass still owes exactly one overdue notice, and only one.
