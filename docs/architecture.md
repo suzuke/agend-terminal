@@ -56,11 +56,11 @@ the implementation shape but does not override that protocol.
 An AgEnD agent seat is trusted code running as the operator's OS user. MCP
 caller identity is a claimed live name: `mcp_proxy::live_requester_id` resolves
 the request's name or UUID to exactly one live handle
-([implementation](../src/api/handlers/mcp_proxy.rs#L72-L93)). This protects
+([implementation](../src/api/handlers/mcp_proxy.rs#L72-L94)). This protects
 against mistakes and stale callers; it is not authentication between hostile
 seats. The remaining boundary is recorded by
 `auth_cookie::SAME_UID_OPERATOR_ISOLATION`
-([source](../src/auth_cookie.rs#L55-L69)).
+([declaration](../src/auth_cookie.rs#L94); [boundary rationale](../src/auth_cookie.rs#L55-L69)).
 
 A hostile same-UID seat can already rewrite same-owner fleet/runtime state and
 managed worktrees, read same-owner credentials including `api.operator`, and

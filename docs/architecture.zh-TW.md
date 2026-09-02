@@ -54,10 +54,10 @@ Task Scheduler service 負責 supervise，而不是靠行程內的自我 supervi
 AgEnD agent seat 是以 operator 的 OS 使用者身分執行的受信任程式碼。MCP
 caller identity 是宣告的 live name：`mcp_proxy::live_requester_id` 會將 request
 中的 name 或 UUID 解析成唯一的 live handle
-（[實作](../src/api/handlers/mcp_proxy.rs#L72-L93)）。這能防止誤用與 stale caller；
+（[實作](../src/api/handlers/mcp_proxy.rs#L72-L94)）。這能防止誤用與 stale caller；
 它不是 hostile seat 之間的 authentication。尚未解決的邊界記錄於
 `auth_cookie::SAME_UID_OPERATOR_ISOLATION`
-（[原始碼](../src/auth_cookie.rs#L55-L69)）。
+（[宣告](../src/auth_cookie.rs#L94)；[邊界說明](../src/auth_cookie.rs#L55-L69)）。
 
 Hostile 的同 UID seat 已經可以改寫同 owner 的 fleet/runtime state 與 managed
 worktree、讀取同 owner 的 credential（包括 `api.operator`），也能 signal 或
