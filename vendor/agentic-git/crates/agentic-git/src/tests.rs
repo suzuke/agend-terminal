@@ -4905,3 +4905,111 @@ fn arch14_detect_sibling_passes_scratch_nested_under_sibling() {
     assert_eq!(result, None, "independent scratch repo nested under sibling must pass");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #3479 PR-C: bare-checkout deny message steers to `git restore` ──────────
+// The classifier cannot tell a tracked-file pathspec from a branch name without
+// repo queries (spike SPIKE-3479.md, sub-problem 3), so the DENY stays exactly
+// as it is; only its MESSAGE now points at the two shapes that already pass the
+// shim. These four tests pin: the recommendation (RED), and three negative
+// controls proving the permission surface is byte-identical.
+
+/// RED (#3479): a bare `git checkout <path>` is denied as cross-branch — the
+/// message must recommend the two working alternatives so the agent is not
+/// steered to `cp` from a manual backup.
+#[test]
+fn bare_checkout_pathspec_deny_recommends_restore_3479() {
+    let action = classify(
+        "checkout",
+        &s(&["checkout", "scripts/foo.js"]),
+        &bound_binding("review/x", "/tmp/.worktrees/dev"),
+        false,
+        false,
+        true,
+    );
+    match action {
+        Action::Deny(r) => {
+            assert!(
+                r.contains("cross-branch — assigned to 'review/x', cannot switch to 'scripts/foo.js'"),
+                "existing cross-branch sentence must stay intact: {r}"
+            );
+            assert!(
+                r.contains("git restore"),
+                "deny must recommend `git restore <path>`: {r}"
+            );
+            assert!(
+                r.contains("git checkout --"),
+                "deny must recommend `git checkout -- <path>`: {r}"
+            );
+        }
+        other => panic!("bare checkout <path> must stay a cross-branch DENY, got {other:?}"),
+    }
+}
+
+/// Negative control (#3479): the deny DISPOSITION for a bare pathspec checkout
+/// is unchanged — still `Action::Deny`, no permission widening.
+#[test]
+fn bare_checkout_pathspec_still_denied_3479() {
+    let action = classify(
+        "checkout",
+        &s(&["checkout", "scripts/foo.js"]),
+        &bound_binding("review/x", "/tmp/.worktrees/dev"),
+        false,
+        false,
+        true,
+    );
+    assert!(
+        matches!(action, Action::Deny(_)),
+        "bare `git checkout <path>` must remain denied (message-only change), got {action:?}"
+    );
+}
+
+/// Negative control (#3479): the two already-working restore shapes still pass —
+/// `checkout -- <path>` (is_pathspec_restore) and bare `restore <path>`.
+#[test]
+fn restore_shapes_still_pass_the_shim_3479() {
+    assert_eq!(
+        classify(
+            "checkout",
+            &s(&["checkout", "--", "scripts/foo.js"]),
+            &bound_binding("review/x", "/tmp/.worktrees/dev"),
+            false,
+            false,
+            true,
+        ),
+        Action::ChdirPass("/tmp/.worktrees/dev".into()),
+        "`git checkout -- <path>` must keep passing (pathspec restore)"
+    );
+    assert_eq!(
+        classify(
+            "restore",
+            &s(&["restore", "scripts/foo.js"]),
+            &bound_binding("review/x", "/tmp/.worktrees/dev"),
+            false,
+            false,
+            true,
+        ),
+        Action::ChdirPass("/tmp/.worktrees/dev".into()),
+        "bare `git restore <path>` must keep passing"
+    );
+}
+
+/// Negative control (#3479): a genuine branch switch is still denied and its
+/// existing cross-branch sentence survives verbatim inside the message.
+#[test]
+fn real_branch_switch_still_denied_with_existing_text_3479() {
+    let action = classify(
+        "checkout",
+        &s(&["checkout", "other-branch"]),
+        &bound_binding("review/x", "/tmp/.worktrees/dev"),
+        false,
+        false,
+        true,
+    );
+    match action {
+        Action::Deny(r) => assert!(
+            r.contains("cross-branch — assigned to 'review/x', cannot switch to 'other-branch'"),
+            "existing branch-switch deny sentence must survive verbatim: {r}"
+        ),
+        other => panic!("real branch switch must stay denied, got {other:?}"),
+    }
+}
