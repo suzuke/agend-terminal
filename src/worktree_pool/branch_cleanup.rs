@@ -58,7 +58,7 @@ const RETENTION_ORPHAN_TAG: &str = "branch-retention-orphan";
 const RETENTION_UNROUTED_TAG: &str = "branch-retention-unrouted";
 const RETENTION_DUE_DAYS: i64 = 14;
 
-/// Stable idempotency key over the EXACT (repo, branch, head) triple.
+/// Stable audit key over the EXACT (repo, branch, head) triple.
 ///
 /// A FULL SHA-256 digest, not a short hash: this key is persisted in a tag and
 /// compared across processes and toolchains, so it must be stable forever.
@@ -86,9 +86,8 @@ fn retention_lane_key(repo: &str, branch: &str) -> String {
 }
 
 /// Record ONE owner-facing obligation for a branch that survived release with
-/// work the ledger can never settle by merge. Idempotent on (repo, branch,
-/// head): the bounded `branch-retention` tag scan plus the exact key tag makes a
-/// second release at the same head a no-op.
+/// work the ledger can never settle by merge. While one obligation for the
+/// (repo, branch) lane is open, later releases are no-ops.
 ///
 /// Escheatment, because agents are ephemeral: the recorded owner takes it when
 /// live; otherwise the originating task's `created_by` orchestrator; otherwise
@@ -118,17 +117,17 @@ fn record_retention_obligation(
             Err(error) => {
                 tracing::warn!(
                     %repo, %branch, %origin_task_id, %error,
-                    "branch-retention origin could not be routed — recording visibly on default board"
+                    "branch-retention origin could not be routed — using owner's project board"
                 );
                 (None, true)
             }
         }
     };
-    let project = routed_origin
-        .as_ref()
-        .map(|routed| routed.project())
-        .unwrap_or(crate::task_events::DEFAULT_PROJECT);
-    let board = crate::task_events::board_root(home, project);
+    // The origin task may already be absent or live on a stale/default board.
+    // Route from the branch's owning repository, applying the same team-level
+    // project override/source_repo derivation as `task action=create`.
+    let project = crate::tasks::resolve_repository_project(home, Path::new(repo));
+    let board = crate::task_events::board_root(home, &project);
 
     let live = crate::runtime::list_agents_with_fallback(home);
     let is_live = |name: &str| live.is_empty() || live.iter().any(|a| a == name);
@@ -192,25 +191,14 @@ fn record_retention_obligation(
             return Ok(Vec::new());
         }
 
-        let stale_ids: Vec<_> = state
-            .tasks
-            .values()
-            .filter(|task| {
-                task.tags.iter().any(|tag| tag == RETENTION_TAG)
-                    && !task.status.is_terminal()
-                    && (task.tags.contains(&lane_tag) || task.description.contains(&legacy_lane))
-            })
-            .map(|task| task.id.clone())
-            .collect();
-        let mut events = vec![event];
-        events.extend(stale_ids.into_iter().map(|task_id| {
-            crate::task_events::TaskEvent::Superseded {
-                task_id,
-                by: actor.clone(),
-                successor_id: successor_id.clone(),
-            }
-        }));
-        Ok(events)
+        if state.tasks.values().any(|task| {
+            task.tags.iter().any(|tag| tag == RETENTION_TAG)
+                && !task.status.is_terminal()
+                && (task.tags.contains(&lane_tag) || task.description.contains(&legacy_lane))
+        }) {
+            return Ok(Vec::new());
+        }
+        Ok(vec![event])
     });
     match append {
         Err(error) => tracing::warn!(

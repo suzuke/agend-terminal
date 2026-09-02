@@ -288,7 +288,7 @@ pub use handler::register_subscriber as register_cascade_subscriber;
 // the strict `load_routed` / `caller_can_mutate_task` above instead.
 pub(crate) use board_router::{
     list_all_boards, list_all_boards_checked, list_all_strict, project_id_from_source_repo,
-    resolve_target_project, stable_project_id_from_source_repo,
+    resolve_repository_project, resolve_target_project, stable_project_id_from_source_repo,
 };
 // #2760: the per-board mutation ACL is no longer re-exported for external callers
 // (reclaim now routes through the strict `caller_can_mutate_task` above). It stays
@@ -749,12 +749,6 @@ pub struct RoutedTask {
 }
 
 impl RoutedTask {
-    /// The authoritative project label for consumers that must select the same
-    /// board. This deliberately does not expose the router's resolved path.
-    pub(crate) fn project(&self) -> &str {
-        self.board.project()
-    }
-
     /// The opaque board this task was routed to — `tasks`-private, so only the
     /// high-level task operations (which own branch-link / usage-limit writes)
     /// can reach it.

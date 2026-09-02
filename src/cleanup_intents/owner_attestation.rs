@@ -72,14 +72,8 @@ pub(super) fn settle_by_owner_attestation(
 /// different board would make every answer invisible. The tag narrows WHAT is
 /// cloned; the exact retention key, not this tag, is what authorizes anything
 /// downstream.
-pub(super) fn retention_project(home: &Path, origin_task_id: &str) -> String {
-    if origin_task_id.is_empty() {
-        crate::task_events::DEFAULT_PROJECT.to_string()
-    } else {
-        crate::tasks::load_routed(home, origin_task_id)
-            .map(|routed| routed.project().to_string())
-            .unwrap_or_else(|_| crate::task_events::DEFAULT_PROJECT.to_string())
-    }
+pub(super) fn retention_project(home: &Path, repo: &str) -> String {
+    crate::tasks::resolve_repository_project(home, Path::new(repo))
 }
 
 pub(super) fn retention_obligations(

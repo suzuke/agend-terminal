@@ -72,6 +72,31 @@ fn project_id_for_team(team: &crate::teams::Team) -> Option<String> {
         .or_else(|| team.source_repo.as_deref().map(project_id_from_source_repo))
 }
 
+/// The project board owned by a repository. This is the repository-keyed
+/// counterpart of caller routing: a matching team's explicit `project_id`
+/// wins, otherwise its `source_repo` derivation is used. No unique team match
+/// falls back to the default board, matching a caller with no owning team.
+pub(crate) fn resolve_repository_project(home: &Path, repo: &Path) -> String {
+    let canonical_repo = dunce::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let mut projects: Vec<_> = crate::teams::list_all(home)
+        .into_iter()
+        .filter(|team| {
+            team.source_repo.as_deref().is_some_and(|source| {
+                dunce::canonicalize(source).unwrap_or_else(|_| source.to_path_buf())
+                    == canonical_repo
+            })
+        })
+        .filter_map(|team| project_id_for_team(&team))
+        .collect();
+    projects.sort();
+    projects.dedup();
+    if projects.len() == 1 {
+        projects.remove(0)
+    } else {
+        DEFAULT_PROJECT.to_string()
+    }
+}
+
 /// The project a caller currently acts in: its team's `project_id` override or
 /// `source_repo`-derived guess, else the fleet-wide [`DEFAULT_PROJECT`]. (No
 /// team / neither set → default → the `home` board → byte-identical for

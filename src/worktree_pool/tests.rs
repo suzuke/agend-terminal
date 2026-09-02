@@ -6116,23 +6116,17 @@ fn retention_tasks_at(home: &Path, project: &str) -> Vec<crate::task_events::Tas
 }
 
 #[test]
-fn retention_obligation_uses_originating_tasks_project_board() {
+fn retention_obligation_uses_owning_repository_board() {
     let home = tmp_home("retention-project-route");
     let repo = tmp_repo("retention-project-route-repo");
-    let project = "org_project-route";
+    let project = crate::tasks::project_id_from_source_repo(&repo);
     plant_live_agents(&home, &["agent-route"]);
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
-        r#"
-instances:
-  agent-route:
-    backend: codex
-teams:
-  route-team:
-    members:
-      - agent-route
-    source_repo: /repos/org/project-route
-"#,
+        format!(
+            "instances:\n  agent-route:\n    backend: codex\nteams:\n  route-team:\n    members: [agent-route]\n    source_repo: {}\n",
+            repo.display()
+        ),
     )
     .expect("fleet");
     let created = crate::tasks::handle(
@@ -6182,13 +6176,13 @@ teams:
 
     assert!(
         retention_tasks(&home).is_empty(),
-        "an origin-routed obligation must not leak onto the default board"
+        "a repository-routed obligation must not leak onto the default board"
     );
-    let obligations = retention_tasks_at(&home, project);
+    let obligations = retention_tasks_at(&home, &project);
     assert_eq!(
         obligations.len(),
         1,
-        "the obligation must live beside its originating task"
+        "the obligation must live on its repository's board"
     );
     let answered = crate::tasks::handle(
         &home,
@@ -6221,12 +6215,12 @@ teams:
 fn missing_origin_routes_retention_to_owners_repository_board() {
     let home = tmp_home("retention-missing-origin");
     let repo = tmp_repo("retention-missing-origin-repo");
-    let project = crate::tasks::project_id_from_source_repo(&repo);
+    let project = "owner-board";
     plant_live_agents(&home, &["agent-missing"]);
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
         format!(
-            "instances:\n  agent-missing:\n    backend: codex\nteams:\n  route-team:\n    members: [agent-missing]\n    source_repo: {}\n",
+            "instances:\n  agent-missing:\n    backend: codex\nteams:\n  route-team:\n    members: [agent-missing]\n    source_repo: {}\n    project_id: {project}\n",
             repo.display()
         ),
     )
@@ -6269,7 +6263,7 @@ fn missing_origin_routes_retention_to_owners_repository_board() {
         retention_tasks(&home).is_empty(),
         "the real creator must not leak the obligation onto the default board"
     );
-    let obligations = retention_tasks_at(&home, &project);
+    let obligations = retention_tasks_at(&home, project);
     assert_eq!(obligations.len(), 1, "the obligation must not disappear");
     let answered = crate::tasks::handle(
         &home,
@@ -6619,11 +6613,8 @@ fn retention_obligation_is_orphan_tagged_when_neither_owner_nor_orchestrator_liv
     std::fs::remove_dir_all(&repo).ok();
 }
 
-/// RED B1 (key scope): the idempotency key is over (repo, branch, HEAD), not
-/// (repo, branch). New commits on the same branch are new work the owner has
-/// not attested to, so a release at a DIFFERENT head must raise a fresh
-/// obligation. Without this the previous test passes even if `head` is dropped
-/// from the key — it only ever releases at one head.
+/// Once the owner answers the existing lane obligation, a later release at a
+/// different head must raise a fresh task for the newly unreviewed work.
 #[test]
 fn release_at_a_new_head_raises_a_fresh_retention_obligation() {
     fn commit(dir: &Path, name: &str) {
@@ -6661,8 +6652,19 @@ fn release_at_a_new_head_raises_a_fresh_retention_obligation() {
         1,
         "first head raises one obligation"
     );
+    let first = retention_tasks(&home).remove(0);
+    let answered = crate::tasks::handle(
+        &home,
+        "agent-nh",
+        &serde_json::json!({
+            "action": "done",
+            "id": first.id.0,
+            "result": "keep: still needed"
+        }),
+    );
+    assert_eq!(answered["status"], "done");
 
-    // Same branch, one more commit → a head the owner has never attested to.
+    // Same branch, one more commit after the prior task was answered.
     let l2 = lease_bound(&home, &repo, "agent-nh", "feat/moving");
     commit(&l2.path, "b.txt");
     release_full(&home, "agent-nh", false);
@@ -6684,10 +6686,10 @@ fn release_at_a_new_head_raises_a_fresh_retention_obligation() {
     assert_eq!(
         obligations
             .iter()
-            .filter(|task| task.status == crate::task_events::TaskStatus::Superseded)
+            .filter(|task| task.status == crate::task_events::TaskStatus::Done)
             .count(),
         1,
-        "the older head must be superseded"
+        "the answered older-head task remains auditable"
     );
 
     std::fs::remove_dir_all(&home).ok();

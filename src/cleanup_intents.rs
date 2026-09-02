@@ -320,7 +320,7 @@ pub(crate) fn sweep_settle_merged(home: &Path) {
         let Some(pr_num) = observed_pr else {
             // No merge evidence exists for this branch — the seam where the
             // merge ledger gives up. Ask the owner's recorded answer instead.
-            let project = retention_project(home, &intent.task_id);
+            let project = retention_project(home, &intent.repo);
             let obligations = obligations_by_project
                 .entry(project.clone())
                 .or_insert_with(|| retention_obligations(home, &project));
@@ -2279,7 +2279,7 @@ mod tests {
             &home,
             &intent,
             expired,
-            &retention_obligations(&home, &retention_project(&home, &intent.task_id)),
+            &retention_obligations(&home, &retention_project(&home, &intent.repo)),
         );
 
         let reopened = obligation(&home, &id);
@@ -2318,7 +2318,7 @@ mod tests {
             &home,
             &intent,
             inside,
-            &retention_obligations(&home, &retention_project(&home, &intent.task_id)),
+            &retention_obligations(&home, &retention_project(&home, &intent.repo)),
         );
 
         assert_eq!(
@@ -2350,7 +2350,7 @@ mod tests {
             &home,
             &intent,
             expired,
-            &retention_obligations(&home, &retention_project(&home, &intent.task_id)),
+            &retention_obligations(&home, &retention_project(&home, &intent.repo)),
         );
         assert_eq!(
             obligation(&home, &id).status,
@@ -2381,7 +2381,7 @@ mod tests {
             &home,
             &intent,
             old_deadline,
-            &retention_obligations(&home, &retention_project(&home, &intent.task_id)),
+            &retention_obligations(&home, &retention_project(&home, &intent.repo)),
         );
 
         assert_eq!(
