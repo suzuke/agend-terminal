@@ -51,6 +51,38 @@ Development and fleet-process invariants are normative in
 [FLEET-DEV-PROTOCOL.md](FLEET-DEV-PROTOCOL.md); this architecture map explains
 the implementation shape but does not override that protocol.
 
+### 1.2 Shared-UID trust model
+
+An AgEnD agent seat is trusted code running as the operator's OS user. MCP
+caller identity is a claimed live name: `mcp_proxy::live_requester_id` resolves
+the request's name or UUID to exactly one live handle
+([implementation](../src/api/handlers/mcp_proxy.rs#L72-L93)). This protects
+against mistakes and stale callers; it is not authentication between hostile
+seats. The remaining boundary is recorded by
+`auth_cookie::SAME_UID_OPERATOR_ISOLATION`
+([source](../src/auth_cookie.rs#L55-L69)).
+
+A hostile same-UID seat can already rewrite same-owner fleet/runtime state and
+managed worktrees, read same-owner credentials including `api.operator`, and
+signal or terminate peer processes. On the measured macOS host, a sibling's
+environment was not readable through `ps` or `KERN_PROCARGS2`, while same-owner
+files and process signals remained fully reachable. Environment opacity is
+therefore not a hostile-seat security boundary.
+
+The boundary test
+`same_uid_live_orchestrator_name_claim_is_trusted_by_design`
+([PR #3490](https://github.com/suzuke/agend-terminal/pull/3490)) pins this
+accepted limitation. If caller identity later becomes OS- or
+cryptographically bound, invert that test before marking
+`SAME_UID_OPERATOR_ISOLATION` resolved.
+
+OS isolation—distinct user identities or enforced per-seat sandboxes—is the
+only hostile-seat containment in this model. It requires a separate execution
+architecture with private credentials, state and worktree ownership plus a
+narrowly authorized broker; another shared-UID token is not sufficient. See
+the verified [identity spike at `51cdc646`](https://github.com/suzuke/agend-terminal/blob/51cdc646160803dd53f6ab407748b3383a4cc271/SPIKE-identity.md)
+for the full analysis and option costs.
+
 ## 2. Subsystem map
 
 Six subsystems, by size. Each has a dedicated survey trail in the #2050

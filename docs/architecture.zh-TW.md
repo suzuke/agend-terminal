@@ -49,6 +49,35 @@ Task Scheduler service 負責 supervise，而不是靠行程內的自我 supervi
 [FLEET-DEV-PROTOCOL.zh-TW.md](FLEET-DEV-PROTOCOL.zh-TW.md)為規範；本架構地圖
 只解釋實作形狀，不會覆蓋該 protocol。
 
+### 1.2 共用 UID 信任模型
+
+AgEnD agent seat 是以 operator 的 OS 使用者身分執行的受信任程式碼。MCP
+caller identity 是宣告的 live name：`mcp_proxy::live_requester_id` 會將 request
+中的 name 或 UUID 解析成唯一的 live handle
+（[實作](../src/api/handlers/mcp_proxy.rs#L72-L93)）。這能防止誤用與 stale caller；
+它不是 hostile seat 之間的 authentication。尚未解決的邊界記錄於
+`auth_cookie::SAME_UID_OPERATOR_ISOLATION`
+（[原始碼](../src/auth_cookie.rs#L55-L69)）。
+
+Hostile 的同 UID seat 已經可以改寫同 owner 的 fleet/runtime state 與 managed
+worktree、讀取同 owner 的 credential（包括 `api.operator`），也能 signal 或
+terminate peer process。在實測的 macOS host 上，無法透過 `ps` 或
+`KERN_PROCARGS2` 讀取 sibling 的 environment；但同 owner 的檔案與 process
+signal 仍完全可達。因此 environment 不透明並不是 hostile-seat security
+boundary。
+
+Boundary test
+`same_uid_live_orchestrator_name_claim_is_trusted_by_design`
+（[PR #3490](https://github.com/suzuke/agend-terminal/pull/3490)）釘住這項已接受的
+限制。若 caller identity 日後改為 OS-bound 或 cryptographically bound，應先
+反轉此測試，再把 `SAME_UID_OPERATOR_ISOLATION` 標記為 resolved。
+
+此模型中，只有 OS isolation——不同使用者身分或強制的 per-seat sandbox——能
+contain hostile seat。這需要一套獨立的 execution architecture：私有
+credential、state 與 worktree ownership，再加上一個 narrowly authorized
+broker；再增加一個共用 UID token 並不足夠。完整分析與各選項成本請見已驗證的
+[`51cdc646` identity spike](https://github.com/suzuke/agend-terminal/blob/51cdc646160803dd53f6ab407748b3383a4cc271/SPIKE-identity.md)。
+
 ## 2. 子系統地圖
 
 六個子系統，依規模排列。每個子系統在 #2050 盤點中都有專屬的調查軌跡；
