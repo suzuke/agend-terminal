@@ -4988,3 +4988,43 @@ fn dispatch_bind_failure_arms_no_ci_watch_3419() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #3479 PR-A negative controls: `repository` derivation is byte-identical ──
+// The PR-A diff declares `repository` on the def_send SCHEMA only; these pin the
+// handler's two derivation paths so any accidental behavior change would fail.
+
+/// The explicit-slug path (mod.rs `resolve_review_assignment_repo` consumes
+/// `args["repository"]` FIRST): a canonical slug passes through unchanged, and
+/// never touches home/target resolution.
+#[test]
+fn review_assignment_repo_explicit_repository_is_consumed_first_3479() {
+    let home = std::env::temp_dir().join(format!("agend-3479a-explicit-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let args = serde_json::json!({"repository": "suzuke/agend-terminal"});
+    let resolved = super::resolve_review_assignment_repo(&home, &args, "any-target");
+    assert_eq!(
+        resolved.ok().as_deref(),
+        Some("suzuke/agend-terminal"),
+        "an explicit owner/repo slug must be consumed first and canonicalized"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The absent-field fallback stays fail-closed: with no explicit slug and no
+/// resolvable source_repo for the target, the dispatch is rejected with the
+/// same `review_assignment_repo_unresolved` code (same-board derivation
+/// behavior byte-identical — the schema declaration changes nothing here).
+#[test]
+fn review_assignment_repo_absent_field_fallback_fails_closed_3479() {
+    let home = std::env::temp_dir().join(format!("agend-3479a-absent-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let args = serde_json::json!({});
+    let resolved = super::resolve_review_assignment_repo(&home, &args, "agent-with-no-source");
+    let err = resolved.expect_err("no explicit slug + no resolvable source_repo must fail closed");
+    assert_eq!(
+        err["code"].as_str(),
+        Some("review_assignment_repo_unresolved"),
+        "absent-field fallback must keep the fail-closed unresolved code"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

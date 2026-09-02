@@ -1551,6 +1551,42 @@ mod tests {
         );
     }
 
+    /// #3479 PR-A: the review_assignment dispatch handler already consumes an
+    /// explicit `repository` slug FIRST (dispatch_hook/mod.rs
+    /// `resolve_review_assignment_repo` — its fail-closed error even instructs
+    /// callers to set it), but `def_send` never declared the property, so a
+    /// cross-board caller cannot discover it and falls back to a plain query —
+    /// losing the typed assignment's post-merge settle linkage (#3470 feeder).
+    /// The live tool schema is the first authority layer a caller reads; it
+    /// must declare what the handler accepts.
+    #[test]
+    fn send_schema_declares_repository_for_review_assignment_3479() {
+        let d = def_send();
+        let prop = &d["inputSchema"]["properties"]["repository"];
+        assert!(
+            prop.is_object(),
+            "def_send must declare `repository` for review_assignment dispatches"
+        );
+        assert_eq!(
+            prop["type"].as_str(),
+            Some("string"),
+            "repository must be a string owner/repo slug"
+        );
+        let desc = prop["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.contains("review_assignment"),
+            "repository description must scope the field to review_assignment dispatches"
+        );
+        assert!(
+            desc.contains("owner/repo"),
+            "repository description must name the owner/repo slug shape"
+        );
+        assert!(
+            desc.contains("source_repo"),
+            "repository description must state the absent-field fallback (target's source_repo)"
+        );
+    }
+
     #[test]
     fn instance_tool_describes_weak_observation_uncertainty_3349() {
         for tool in [def_list_instances(), def_instance()] {
