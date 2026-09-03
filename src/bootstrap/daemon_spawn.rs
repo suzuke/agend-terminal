@@ -213,6 +213,14 @@ pub fn spawn_successor_handoff(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // #3499: deliberately `process_group(0)` and NOT `setsid()`, unlike
+        // `spawn_detached` above. A successor is spawned BY a running daemon,
+        // which `spawn_detached` already left sessionless, so the successor
+        // inherits "no controlling terminal" and terminal close cannot reach
+        // it either way. The remaining case — a `start --foreground` daemon
+        // self-respawning — legitimately keeps the terminal it was launched
+        // in. And `bootstrap::signals::install` runs in the successor too, so
+        // its SIGHUP handling is the same regardless of session.
         cmd.process_group(0);
     }
     #[cfg(windows)]
