@@ -33,6 +33,46 @@ pub fn install(shutdown: Arc<AtomicBool>, shutdown_tx: crossbeam_channel::Sender
     }) {
         tracing::warn!(error = %e, "signal handler install failed, use `stop`");
     }
+
+    // #3499: `ctrlc`'s `termination` feature (Cargo.toml) bundles SIGINT,
+    // SIGTERM AND SIGHUP into the ONE callback above — it cannot tell them
+    // apart, so it registered SIGHUP as a shutdown trigger too. That is
+    // wrong for a detached daemon: SIGHUP means "controlling terminal
+    // closed" (or an explicit `kill -HUP`), neither of which is a reason
+    // for a background daemon to exit. Installed AFTER `ctrlc::set_handler`
+    // so this `sigaction` OVERRIDES its SIGHUP registration; SIGINT/SIGTERM
+    // are untouched and keep going through `ctrlc`.
+    //
+    // A real handler function, NOT `SIG_IGN`: an ignored (SIG_IGN)
+    // disposition is inherited across `exec` by every backend agent this
+    // daemon spawns, which would silently change those children's SIGHUP
+    // behavior too. An installed handler resets to SIG_DFL across `exec`,
+    // so children are unaffected. `SA_RESTART` so a delivered SIGHUP
+    // doesn't turn a blocking syscall in the daemon into an EINTR storm.
+    //
+    // The handler body does nothing at all (trivially async-signal-safe —
+    // no `tracing` call, no allocation); the "operator can't see why it
+    // died" visibility the issue asks for is covered by logging the policy
+    // ONCE here, at install time, instead.
+    #[cfg(unix)]
+    unsafe {
+        extern "C" fn ignore_sighup(_signum: libc::c_int) {}
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = ignore_sighup as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        if libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut()) != 0 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "sigaction(SIGHUP) failed, daemon may not survive a lost controlling terminal"
+            );
+        } else {
+            tracing::info!(
+                "SIGHUP is ignored by this daemon (detached background process; \
+                 SIGHUP is not a shutdown signal here) — see issue #3499"
+            );
+        }
+    }
 }
 
 static TERM_REQUESTED: AtomicBool = AtomicBool::new(false);

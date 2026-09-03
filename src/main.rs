@@ -1752,6 +1752,13 @@ fn daemon_not_running_hint() {
     eprintln!("Daemon is not running.");
     eprintln!("  Start it with:  agend-terminal start");
     eprintln!("  Or first setup: agend-terminal quickstart");
+    // #3499: if it WAS running and died unexpectedly, "just start it again"
+    // is a dead end for diagnosing why. Point at the two places that answer
+    // that: `doctor` for a live health check, and the daemon's own log for
+    // its last words before it exited.
+    eprintln!("  Did it die unexpectedly?");
+    eprintln!("    Diagnose with: agend-terminal doctor");
+    eprintln!("    Check the log: $AGEND_HOME/daemon.log");
 }
 
 fn list_running_agents(home: &std::path::Path) {

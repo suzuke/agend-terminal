@@ -117,9 +117,12 @@ pub(crate) enum ShutdownReason {
     /// daemon migration.
     SignalSigterm = 7,
     /// Sprint 63 W1 PR-3 (Sprint 58 P2 #6): SIGHUP specifically.
-    /// Set by future per-signal daemon migration. No current
-    /// production handler distinguishes SIGHUP from the bundled
-    /// `Signal` reason.
+    /// #3499: the daemon's `bootstrap::signals::install` now installs a
+    /// dedicated SIGHUP handler that does NOT shut the daemon down (a
+    /// detached daemon must survive losing its controlling terminal), so
+    /// this reason is never recorded by that handler — SIGHUP simply does
+    /// not trigger a shutdown, bundled or otherwise. Kept in the taxonomy
+    /// (not deleted) in case a future caller records it deliberately.
     SignalSighup = 8,
 }
 

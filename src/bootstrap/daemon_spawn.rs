@@ -25,10 +25,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// `DaemonHandle` carries the child's PID (read from `.daemon` after it
 /// publishes its run dir) so the caller can surface it to the user.
 ///
-/// On Unix the child is placed in its own process group via
-/// `CommandExt::process_group(0)` — this detaches it from the parent terminal
-/// so Ctrl+C in the parent doesn't also kill the daemon. stdio is redirected
-/// to `{home}/daemon.log` (appending, so repeated starts keep history).
+/// On Unix the child calls `libc::setsid()` (via `pre_exec`) to start a new
+/// session and process group — this detaches it from the parent's
+/// controlling terminal entirely (#3499), so neither Ctrl+C nor closing the
+/// launching terminal reaches the daemon. stdio is redirected to
+/// `{home}/daemon.log` (appending, so repeated starts keep history).
 ///
 /// On Windows the child gets `CREATE_NEW_PROCESS_GROUP` + `DETACHED_PROCESS`
 /// for the equivalent behavior.
@@ -77,7 +78,33 @@ pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHa
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+        // #3499: `setsid()` SUPERSEDES `process_group(0)` — it creates a new
+        // session AND a new process group in one call, so `pgid == pid` still
+        // holds and `crate::process::kill_process_tree`'s
+        // `getpgid(pid) != pid` refusal guard still passes for the daemon.
+        // `process_group(0)` alone only detached the process GROUP; the
+        // daemon kept its parent's controlling terminal, so closing that
+        // terminal delivered SIGHUP to it. `setsid()` detaches the
+        // controlling terminal entirely — with none, terminal close cannot
+        // deliver SIGHUP at all.
+        //
+        // The two calls MUST NOT be combined: `setsid()` returns EPERM when
+        // the caller is already a process-group leader, which is exactly
+        // what `process_group(0)` makes it — so a `process_group(0)`
+        // followed by `setsid()` would fail, silently leaving the daemon
+        // still attached to the terminal while looking fixed. Failure is
+        // therefore checked and turned into a loud `io::Error` in the child
+        // rather than ignored (this closure runs in the child, post-fork,
+        // pre-exec — it is `unsafe` because only async-signal-safe calls are
+        // sound there; `setsid()` qualifies).
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     #[cfg(windows)]
     {
