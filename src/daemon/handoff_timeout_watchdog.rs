@@ -36,6 +36,16 @@ const RENUDGE_AFTER_MINS: i64 = 2;
 /// (anti-storm). Combined with the idle gate, a busy/working target is retried at
 /// most once per interval and a target that has read the handoff stops entirely.
 const RENUDGE_INTERVAL_MINS: i64 = 2;
+/// RCA 2026-09-03: once a self-orchestrator operator page has been DISPATCHED,
+/// the agent re-nudge BACKS OFF to this interval instead of stopping. #2729
+/// introduced the throttle to kill the 2-min storm — correct intent — but
+/// implemented it as a hard gate, and because every re-escalation refreshes
+/// `last_escalated` the gate never reopened: an orchestrator idle past
+/// `HANDOFF_TIMEOUT_MINS` stopped being told about its own pending handoffs
+/// permanently. The page is "a route/throttle fact, NOT a delivery receipt"
+/// (see the escalation branch below), so it must never be the last word on
+/// in-band delivery.
+const SELF_ORCH_RENUDGE_INTERVAL_MINS: i64 = 10;
 /// Fallback recipient when the target isn't in any team.
 const FALLBACK_RECIPIENT: &str = "lead";
 /// Inbox kind of a CI handoff message.
@@ -276,8 +286,16 @@ pub(crate) fn scan_and_emit_with<F, G>(
                 .get(&key)
                 .copied()
                 .or_else(|| parse_stamp(&track.last_renudged_at));
+            // RCA 2026-09-03: a dispatched self-orch page WIDENS this interval; it
+            // does not close the path. Suppressing outright meant the flag — which
+            // every re-escalation refreshes — silenced the agent permanently.
+            let renudge_interval = if self_orch_dispatched_recently {
+                SELF_ORCH_RENUDGE_INTERVAL_MINS
+            } else {
+                RENUDGE_INTERVAL_MINS
+            };
             let renudge_due = effective_last_renudged.is_none_or(|prev| {
-                now.signed_duration_since(prev).num_minutes() >= RENUDGE_INTERVAL_MINS
+                now.signed_duration_since(prev).num_minutes() >= renudge_interval
             });
             // info!-level so it lands in the production daemon.log (default filter
             // is `agend_terminal=info`); bounded — at most once per UNREAD ci-handoff
@@ -292,14 +310,11 @@ pub(crate) fn scan_and_emit_with<F, G>(
                 renudge_due,
                 age_ok = age_min >= RENUDGE_AFTER_MINS,
                 self_orch_dispatched_recently,
-                will_fire = age_min >= RENUDGE_AFTER_MINS && !busy && renudge_due && !self_orch_dispatched_recently,
+                renudge_interval,
+                will_fire = age_min >= RENUDGE_AFTER_MINS && !busy && renudge_due,
                 "ci-handoff re-nudge decision"
             );
-            if age_min >= RENUDGE_AFTER_MINS
-                && !busy
-                && renudge_due
-                && !self_orch_dispatched_recently
-            {
+            if age_min >= RENUDGE_AFTER_MINS && !busy && renudge_due {
                 // Stamp EVERY due key (per-key cross-tick interval honesty — so a
                 // collapsed key isn't treated as never-nudged next scan, which would
                 // let the target re-fire inside the interval).
@@ -906,6 +921,67 @@ mod tests {
                 .all(|m| !m.text.contains("handoff_timeout_watchdog")),
             "orchestrator must not be escalated about its own handoff"
         );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// RCA 2026-09-03: a dispatched self-orch operator page must BACK OFF the
+    /// agent re-nudge, never silence it. Before the fix `self_orch_dispatched_recently`
+    /// was a hard gate on the fire condition, and because each re-escalation
+    /// refreshes `last_escalated` (REALERT window) the gate never reopened — an
+    /// orchestrator idle past HANDOFF_TIMEOUT_MINS stopped being told about its own
+    /// pending handoffs FOREVER. Production evidence: 117 suppressed decisions with
+    /// `agent_is_busy=false` and every other gate true, versus 25 fires that differed
+    /// only in this flag; the orchestrator's inbox silently accumulated 8 messages
+    /// over 1h47m. The operator page is explicitly "a route/throttle fact, NOT a
+    /// delivery receipt", so it must not be load-bearing for in-band delivery.
+    #[test]
+    fn self_orch_operator_page_backs_off_the_renudge_it_does_not_silence_it() {
+        let home = tmp_home("self-orch-renudge-backoff");
+        write_fleet(&home); // orchestrator = lead ⇒ target "lead" is self-orch
+        seed_handoff(&home, "lead", "o/r@feat", 15, false);
+        seed_snapshot(&home, "lead", "idle");
+
+        let t0 = chrono::Utc::now();
+        let mut escalated = HashMap::new();
+        let mut renudged = HashMap::new();
+
+        // Scan 1: nudges AND dispatches the operator page (1 registered route),
+        // which stamps `last_escalated` and opens the REALERT window.
+        let first = run_watchdog_pageable(&home, &t0, &mut escalated, &mut renudged, |_, _| 1);
+        assert!(
+            first.contains(&"lead".to_string()),
+            "baseline: a self-orch idle handoff past threshold must re-nudge: {first:?}"
+        );
+        assert!(
+            !escalated.is_empty(),
+            "baseline: the operator page must have stamped last_escalated"
+        );
+
+        // Scan 2, inside the back-off window: #2729's anti-storm intent still holds.
+        let inside = t0 + chrono::Duration::minutes(3);
+        let second = run_watchdog_pageable(&home, &inside, &mut escalated, &mut renudged, |_, _| 1);
+        assert!(
+            !second.contains(&"lead".to_string()),
+            "anti-storm: inside the back-off window the re-nudge must stay suppressed: {second:?}"
+        );
+
+        // Scan 3, past the back-off but still INSIDE the REALERT window: the agent
+        // must be told again. This is the assertion that was red before the fix.
+        // Compile-time, not runtime: if someone ever narrows the REALERT window (or
+        // widens the back-off) past each other, this test would silently stop proving
+        // anything — it would be probing AFTER the escalation throttle expired, where
+        // the re-nudge fires for an unrelated reason. Fail the build instead.
+        const _: () = assert!(
+            SELF_ORCH_RENUDGE_INTERVAL_MINS + 1 < REALERT_AFTER_MINS,
+            "the back-off probe must stay inside the REALERT window or the test proves nothing"
+        );
+        let past = t0 + chrono::Duration::minutes(SELF_ORCH_RENUDGE_INTERVAL_MINS + 1);
+        let third = run_watchdog_pageable(&home, &past, &mut escalated, &mut renudged, |_, _| 1);
+        assert!(
+            third.contains(&"lead".to_string()),
+            "a dispatched operator page must not silence the agent past the back-off: {third:?}"
+        );
+
         std::fs::remove_dir_all(home).ok();
     }
 
