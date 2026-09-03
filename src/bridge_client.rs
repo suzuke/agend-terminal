@@ -47,6 +47,14 @@ pub struct BridgeClient {
 }
 
 impl BridgeClient {
+    #[cfg(test)]
+    pub(crate) fn from_stream_for_test(stream: TcpStream) -> Self {
+        Self {
+            writer: stream.try_clone().expect("clone test bridge stream"),
+            reader: Some(stream),
+        }
+    }
+
     /// Connect to `name` on the local daemon, send the cookie, verify the
     /// protocol version, and send the initial resize frame.
     ///

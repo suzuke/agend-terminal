@@ -449,6 +449,9 @@ mod tests {
     use crate::layout::{Layout, Pane, PaneSource, Tab};
     use crate::vterm::VTerm;
     use std::collections::HashMap;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     fn test_pane(id: usize, name: &str) -> Pane {
         Pane {
@@ -735,6 +738,109 @@ mod tests {
             !focused_last_input_some(&ctx),
             "#2435: a failed clipboard capture injects nothing"
         );
+    }
+
+    fn disconnected_remote_pane(id: usize, name: &str) -> (Pane, TcpStream) {
+        let listener = TcpListener::bind((crate::ipc::LOOPBACK, 0)).expect("bind test bridge");
+        let client_stream = TcpStream::connect(listener.local_addr().expect("listener addr"))
+            .expect("connect test bridge");
+        let (server_stream, _) = listener.accept().expect("accept test bridge");
+        let client = crate::bridge_client::BridgeClient::from_stream_for_test(client_stream);
+        let mut pane = test_pane(id, name);
+        pane.fleet_instance_name = Some(name.to_string());
+        pane.source = PaneSource::Remote(
+            Arc::new(parking_lot::Mutex::new(client)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        (pane, server_stream)
+    }
+
+    #[test]
+    fn reconnect_disconnected_pane_replaces_only_bridge_without_respawn() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir().join(format!(
+            "agend-tui-reconnect-negative-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create test home");
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let (mut disconnected, _server) = disconnected_remote_pane(7, "healthy-agent");
+        let original_instance_id = crate::types::InstanceId::new();
+        disconnected.instance_id = original_instance_id;
+        layout.add_tab(Tab::new("healthy-agent".to_string(), disconnected));
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+        let events_before = std::fs::read(home.join("event-log.jsonl")).ok();
+        let registry_before = crate::agent::lock_registry(&registry).len();
+
+        let feedback = reconnect_focused_pane_with(&mut ctx, |name, _, _, layout, _, _, _| {
+            let mut fresh = test_pane(layout.next_pane_id(), name);
+            fresh.fleet_instance_name = Some(name.to_string());
+            fresh.instance_id = original_instance_id;
+            Ok(fresh)
+        });
+
+        assert_eq!(
+            feedback,
+            ReconnectFeedback::Reconnected("healthy-agent".into())
+        );
+        let pane = ctx
+            .layout
+            .active_tab()
+            .and_then(|tab| tab.focused_pane())
+            .expect("focused pane remains");
+        assert_eq!(pane.id, 7, "existing pane position/id must be retained");
+        assert_eq!(
+            pane.instance_id, original_instance_id,
+            "agent identity is unchanged"
+        );
+        assert_eq!(
+            crate::agent::lock_registry(&registry).len(),
+            registry_before
+        );
+        assert_eq!(
+            std::fs::read(home.join("event-log.jsonl")).ok(),
+            events_before,
+            "bridge reconnect must emit no restart/respawn event"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn reconnect_action_reports_already_connected_without_mutation() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("healthy".to_string(), test_pane(1, "healthy")));
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+
+        let result = dispatch(Action::ReconnectPane, &mut ctx);
+
+        assert!(matches!(
+            result.new_overlay,
+            Some(Overlay::ReconnectNotice { message }) if message.contains("already connected")
+        ));
+        assert_eq!(ctx.layout.tabs.len(), 1);
+        assert_eq!(ctx.layout.active_tab().unwrap().focus_id, 1);
     }
 
     #[test]

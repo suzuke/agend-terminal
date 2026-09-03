@@ -334,6 +334,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keybind_ctrl_b_r_reconnects_focused_pane() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('r'), KeyModifiers::empty()),
+            Action::ReconnectPane
+        );
+    }
+
     // --- i: PasteImage (#2435) ---
 
     #[test]
