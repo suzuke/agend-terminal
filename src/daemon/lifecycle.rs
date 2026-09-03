@@ -107,6 +107,15 @@ pub(crate) mod test_support {
         fn process_id(&self) -> Option<u32> {
             None
         }
+        /// Windows-only trait item (`portable_pty::Child`, lib.rs:144-145).
+        /// A fake child owns no OS handle, and this build only ever reaches
+        /// `try_wait`. Without it the crate compiles on unix and fails on the
+        /// Windows CI runner — the class `scripts/preflight.sh`'s cross-check
+        /// exists to catch.
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
     }
 
     /// An `AgentHandle` whose child never reports exit, so
@@ -1174,6 +1183,108 @@ mod tests {
             "RED: the recipient is still alive (teardown refused), so its owed \
              notice must survive — the durable log must not be deleted for a \
              refused teardown"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P0 (external reviewer, PR #3495), site 1: the public runtime DELETE
+    /// entry (`delete_instance_with_exit_status`) must not remove the
+    /// instance's durable receipt log ahead of a confirmed teardown. A
+    /// refused teardown (child-exit timeout) leaves the instance alive and
+    /// retained for retry, so its parked operator-notice debt must survive.
+    ///
+    /// It lives here rather than in `agent_ops::tests` because `agent_ops.rs`
+    /// sits just under the 2500-LOC anti-monolith ceiling that
+    /// `tests/src_file_size_invariant.rs` enforces; this is also where its
+    /// `never_exiting_handle` fixture and deadline override live.
+    #[test]
+    fn refused_teardown_via_public_delete_entry_retains_owed_notice_debt() {
+        let home = tmp_home("delete-refused-retains-debt-public-entry");
+        let registry = empty_registry();
+        let configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let handle = test_support::never_exiting_handle("epsilon");
+        let epsilon_id = handle.id;
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  epsilon:\n    id: {}\n", epsilon_id.full()),
+        )
+        .expect("write fleet.yaml");
+        registry.lock().insert(epsilon_id, handle);
+
+        let store = crate::transport::ReceiptStore::for_instance(&home, "epsilon").expect("store");
+        let envelope = crate::transport::DeliveryEnvelope::self_kick(
+            "epsilon",
+            crate::transport::SessionLocator::claude(
+                "http://127.0.0.1:1".to_string(),
+                "self-kick-session".to_string(),
+                "token".to_string(),
+            ),
+            "[AGEND-RESUME] id=refused-teardown-public-entry",
+        );
+        store.record_queued(&envelope).expect("queued");
+        let mut accepted = crate::transport::DeliveryReceipt::for_state(
+            &envelope,
+            crate::transport::DeliveryState::ProtocolAccepted,
+        );
+        accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+        let intent = crate::transport::PendingNotice::new(
+            crate::transport::PendingNotice::ACK_OVERDUE,
+            None,
+        );
+        let mut overdue = crate::transport::DeliveryReceipt::for_state(
+            &envelope,
+            crate::transport::DeliveryState::AckOverdue,
+        );
+        overdue.notice_pending = Some(intent.clone());
+        assert!(store
+            .record_if_marker(
+                envelope.delivery_id,
+                crate::transport::DeliveryState::ProtocolAccepted,
+                None,
+                None,
+                overdue,
+            )
+            .expect("overdue CAS"));
+
+        assert!(
+            store
+                .deliveries_owing_notices()
+                .expect("owing")
+                .iter()
+                .any(|(candidate, _)| candidate.delivery_id == envelope.delivery_id),
+            "precondition: the parked notice must be discoverable before delete"
+        );
+
+        let context = crate::agent_ops::DeleteContext {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+        };
+        let _deadline = set_child_exit_timeout_for_test(std::time::Duration::from_millis(100));
+        let (_outcome, observed_exit) =
+            crate::agent_ops::delete_instance_with_exit_status(&home, "epsilon", &context, false);
+        assert!(
+            !observed_exit,
+            "a never-exiting child must make the public delete entry refuse teardown"
+        );
+
+        assert!(
+            registry.lock().contains_key(&epsilon_id),
+            "teardown refused ⇒ registry entry must be retained for retry"
+        );
+        assert!(
+            store
+                .deliveries_owing_notices()
+                .expect("owing")
+                .iter()
+                .any(|(candidate, _)| candidate.delivery_id == envelope.delivery_id),
+            "the recipient is still alive (teardown refused), so its owed notice \
+             must survive through the public runtime DELETE entry too"
         );
 
         std::fs::remove_dir_all(&home).ok();
