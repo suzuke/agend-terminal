@@ -116,6 +116,9 @@ pub(super) enum Overlay {
         split_dir: crate::layout::SplitDir,
     },
     Help,
+    ReconnectNotice {
+        message: String,
+    },
     /// Keyboard scroll mode (j/k/PgUp/PgDn). Pane's scroll_offset is used directly.
     Scroll,
     /// Command palette (:command input).
@@ -575,6 +578,9 @@ pub(super) fn handle_key(
             }
         }
         Overlay::Help => {
+            *overlay = Overlay::None;
+        }
+        Overlay::ReconnectNotice { .. } => {
             *overlay = Overlay::None;
         }
         Overlay::Scroll => match key.code {

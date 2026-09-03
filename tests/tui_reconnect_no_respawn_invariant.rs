@@ -6,7 +6,7 @@
 fn focused_pane_reconnect_cannot_restart_or_respawn_the_agent() {
     let source = include_str!("../src/app/dispatch.rs");
     let start = source
-        .find("fn reconnect_focused_pane_with")
+        .find("fn reconnect_focused_pane(")
         .expect("focused-pane reconnect helper must exist");
     let end = source[start..]
         .find("\nfn paste_image")

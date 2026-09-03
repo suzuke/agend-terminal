@@ -38,6 +38,8 @@ pub enum Action {
     NextLayout,
     RenameTab,
     RenamePane,
+    /// Rebuild the focused remote pane's daemon bridge without restarting its agent.
+    ReconnectPane,
     /// Open the move-pane target menu (cross-tab relocation of the focused pane).
     MovePaneMenu,
     ListTabs,
@@ -186,6 +188,7 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char('z') => Action::ToggleZoom,
         KeyCode::Char(' ') => Action::NextLayout,
         KeyCode::Char('.') => Action::RenamePane,
+        KeyCode::Char('r') => Action::ReconnectPane,
         // tmux uses `!` for break-pane (split pane to new window). We reuse
         // the same key, but open a menu that lets the user pick an EXISTING
         // tab OR spawn a new one — covering both move-pane and break-pane.

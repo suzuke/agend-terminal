@@ -15,7 +15,7 @@ pub use core_render::{
 };
 pub use overlay::{
     render_command_palette, render_confirm, render_help, render_menu, render_move_pane_target,
-    render_rename, render_scroll_indicator, render_tab_list,
+    render_notice, render_rename, render_scroll_indicator, render_tab_list,
 };
 pub use panels::{
     board_column_for_status, render_decisions, render_tasks, selectable_len, task_board_columns,

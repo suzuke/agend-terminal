@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::agent::AgentRegistry;
 use crate::keybinds::Action;
-use crate::layout::{Layout, SplitDir};
+use crate::layout::{Layout, Pane, SplitDir};
 
 use super::overlay::{CloseTarget, Overlay};
 
@@ -83,6 +83,12 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 .map(|p| p.label().to_string())
                 .unwrap_or_default();
             out.new_overlay = Some(Overlay::RenamePane { input: current });
+        }
+        Action::ReconnectPane => {
+            let feedback = reconnect_focused_pane(ctx);
+            let message = feedback.message();
+            tracing::info!(%message, "focused pane bridge reconnect requested");
+            out.new_overlay = Some(Overlay::ReconnectNotice { message });
         }
         Action::RenameTab => {
             let current_name = ctx
@@ -417,6 +423,89 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
         Action::PasteImage => paste_image(ctx, crate::image_paste::capture_clipboard_image),
     }
     out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReconnectFeedback {
+    Reconnected(String),
+    AlreadyConnected(String),
+    Failed(String),
+}
+
+impl ReconnectFeedback {
+    fn message(self) -> String {
+        match self {
+            Self::Reconnected(name) => {
+                format!("Reconnected bridge for {name}. Agent process was not restarted.")
+            }
+            Self::AlreadyConnected(name) => {
+                format!("{name} is already connected. Agent process was not restarted.")
+            }
+            Self::Failed(reason) => format!("Bridge reconnect failed: {reason}"),
+        }
+    }
+}
+
+fn reconnect_focused_pane(ctx: &mut DispatchCtx<'_>) -> ReconnectFeedback {
+    reconnect_focused_pane_with(ctx, super::pane_factory::create_remote_pane)
+}
+
+fn reconnect_focused_pane_with<F>(
+    ctx: &mut DispatchCtx<'_>,
+    create_remote_pane: F,
+) -> ReconnectFeedback
+where
+    F: FnOnce(
+        &str,
+        &Path,
+        &Path,
+        &mut Layout,
+        u16,
+        u16,
+        &crossbeam_channel::Sender<usize>,
+    ) -> anyhow::Result<Pane>,
+{
+    let Some((name, disconnected)) = ctx
+        .layout
+        .active_tab()
+        .and_then(|tab| tab.focused_pane())
+        .map(|pane| {
+            (
+                pane.fleet_instance_name
+                    .clone()
+                    .unwrap_or_else(|| pane.agent_name.to_string()),
+                pane.is_disconnected(),
+            )
+        })
+    else {
+        return ReconnectFeedback::Failed("no focused pane".to_string());
+    };
+
+    if !disconnected {
+        return ReconnectFeedback::AlreadyConnected(name);
+    }
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    match create_remote_pane(
+        &name,
+        ctx.home,
+        ctx.fleet_path,
+        ctx.layout,
+        cols.saturating_sub(2),
+        rows.saturating_sub(4),
+        ctx.wakeup_tx,
+    ) {
+        Ok(pane) => {
+            if ctx.layout.reconnect_or_append_agent_pane(&name, pane) {
+                ReconnectFeedback::Reconnected(name)
+            } else {
+                ReconnectFeedback::Failed(format!(
+                    "focused pane for {name} disappeared before replacement"
+                ))
+            }
+        }
+        Err(error) => ReconnectFeedback::Failed(format!("{name}: {error:#}")),
+    }
 }
 
 /// Capture a clipboard image (via `capture`) and inject its `[AGEND-IMAGE-PASTE]`
@@ -821,7 +910,14 @@ mod tests {
         let home = std::env::temp_dir();
         let (tx, _rx) = crossbeam_channel::bounded(1);
         let mut layout = Layout::new();
-        layout.add_tab(Tab::new("healthy".to_string(), test_pane(1, "healthy")));
+        let (connected, _server) = {
+            let (pane, server) = disconnected_remote_pane(1, "healthy");
+            if let PaneSource::Remote(_, connected) = &pane.source {
+                connected.store(true, std::sync::atomic::Ordering::Release);
+            }
+            (pane, server)
+        };
+        layout.add_tab(Tab::new("healthy".to_string(), connected));
         let mut last_tab = 0;
         let mut names = HashMap::new();
         let mut ctx = make_ctx(
@@ -840,7 +936,47 @@ mod tests {
             Some(Overlay::ReconnectNotice { message }) if message.contains("already connected")
         ));
         assert_eq!(ctx.layout.tabs.len(), 1);
-        assert_eq!(ctx.layout.active_tab().unwrap().focus_id, 1);
+        assert_eq!(
+            ctx.layout
+                .active_tab()
+                .expect("connected pane tab remains")
+                .focus_id,
+            1
+        );
+    }
+
+    #[test]
+    fn reconnect_failure_reports_the_bridge_error() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let (disconnected, _server) = disconnected_remote_pane(1, "healthy");
+        layout.add_tab(Tab::new("healthy".to_string(), disconnected));
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+
+        let feedback = reconnect_focused_pane_with(&mut ctx, |_, _, _, _, _, _, _| {
+            Err(anyhow::anyhow!("connection refused"))
+        });
+
+        assert_eq!(
+            feedback.message(),
+            "Bridge reconnect failed: healthy: connection refused"
+        );
+        assert!(ctx
+            .layout
+            .active_tab()
+            .and_then(|tab| tab.focused_pane())
+            .is_some_and(Pane::is_disconnected));
     }
 
     #[test]

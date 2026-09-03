@@ -261,6 +261,7 @@ pub fn render_help(frame: &mut Frame) {
         "    Ctrl+B Space   Next layout preset",
         "    Ctrl+B .       Rename pane",
         "    Ctrl+B !       Move pane to another tab (menu)",
+        "    Ctrl+B r       Reconnect focused pane bridge",
         "",
         "  Scroll",
         "    Mouse wheel    Scroll focused pane",
@@ -309,6 +310,27 @@ pub fn render_help(frame: &mut Frame) {
         .map(|l| Line::from(Span::styled(*l, Style::default().fg(Color::White))))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+pub fn render_notice(frame: &mut Frame, message: &str) {
+    let area = frame.area();
+    let content_w = u16::try_from(message.width()).unwrap_or(u16::MAX);
+    let notice_area = centered_overlay_rect(area, 3, content_w.saturating_add(4), 2, 4);
+    let inner = render_titled_popup(
+        frame,
+        notice_area,
+        Color::Cyan,
+        " Bridge Reconnect (press any key to close) ",
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            message,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        inner,
+    );
 }
 
 pub fn render_scroll_indicator(frame: &mut Frame, offset: usize) {

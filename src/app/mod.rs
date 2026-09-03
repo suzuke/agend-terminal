@@ -334,6 +334,9 @@ fn render_active_overlay(
         Overlay::Help => {
             render::render_help(frame);
         }
+        Overlay::ReconnectNotice { message } => {
+            render::render_notice(frame, message);
+        }
         Overlay::Scroll => {
             let so = layout
                 .active_tab()
