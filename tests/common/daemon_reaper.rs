@@ -83,7 +83,7 @@ pub fn assert_no_process_references_home(home: &Path, context: &str) {
 /// integration test binary cannot import (it is not part of the lib's public
 /// surface here). `kill(pid, 0)` is the only option available: these processes
 /// are not our children, so `waitpid` cannot be used to observe their death.
-fn is_pid_alive(pid: u32) -> bool {
+pub fn pid_is_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -105,7 +105,7 @@ fn live_daemon_pids(home: &Path) -> Vec<u32> {
     entries
         .flatten()
         .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
-        .filter(|pid| is_pid_alive(*pid))
+        .filter(|pid| pid_is_alive(*pid))
         .collect()
 }
 
@@ -148,7 +148,7 @@ fn process_snapshot() -> Vec<(u32, u32)> {
 fn wait_for_death(pids: &[u32], budget: std::time::Duration) -> Vec<u32> {
     let deadline = std::time::Instant::now() + budget;
     loop {
-        let alive: Vec<u32> = pids.iter().copied().filter(|p| is_pid_alive(*p)).collect();
+        let alive: Vec<u32> = pids.iter().copied().filter(|p| pid_is_alive(*p)).collect();
         if alive.is_empty() || std::time::Instant::now() >= deadline {
             return alive;
         }

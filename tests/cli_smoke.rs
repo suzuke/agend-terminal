@@ -5,6 +5,9 @@
 
 mod common;
 
+// Only the two real-daemon tests below are `#[cfg(unix)]`; this file also
+// builds on Windows, where `daemon_reaper` does not exist.
+#[cfg(unix)]
 use common::daemon_reaper::FixtureHome;
 
 use assert_cmd::Command;

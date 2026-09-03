@@ -30,20 +30,10 @@
 
 mod common;
 
-use common::daemon_reaper::FixtureHome;
+use common::daemon_reaper::{pid_is_alive, FixtureHome};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
-
-/// Mirrors `daemon_reaper::is_pid_alive` — not reachable from here (private),
-/// so duplicated at the three-line level rather than exposed just for this.
-fn is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    // SAFETY: signal 0 performs the permission/existence check only.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
 
 /// Direct children of `ppid`, from a fresh `ps` snapshot. Used only to widen
 /// the assertion to the descendant's OWN child (a third generation) when one
@@ -174,7 +164,7 @@ fn reaper_kills_descendants_a_root_only_signal_would_orphan() {
         "descendant must be a distinct process from root — real parentage, not a self-match"
     );
     assert!(
-        is_alive(descendant_pid),
+        pid_is_alive(descendant_pid),
         "synthetic descendant must be alive before the reap runs"
     );
     // A third generation, if it has started by now — best-effort widening,
@@ -207,14 +197,14 @@ fn reaper_kills_descendants_a_root_only_signal_would_orphan() {
     // otherwise multiply the cost of a silent hang by 20).
     let confirm_budget = Duration::from_secs(10);
     let all_dead = wait_until(confirm_budget, || {
-        must_be_dead.iter().all(|&pid| !is_alive(pid))
+        must_be_dead.iter().all(|&pid| !pid_is_alive(pid))
     });
 
     if !all_dead {
         let survivors: Vec<u32> = must_be_dead
             .iter()
             .copied()
-            .filter(|&pid| is_alive(pid))
+            .filter(|&pid| pid_is_alive(pid))
             .collect();
         // `_hard_kill` (still in scope) SIGKILLs the whole synthetic process
         // group when this panic unwinds past it below — nothing is left
