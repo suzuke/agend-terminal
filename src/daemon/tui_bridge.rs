@@ -1560,6 +1560,81 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    #[tracing_test::traced_test]
+    fn retirement_read_emfile_keeps_existing_bridge_live_and_warns() {
+        let dir = scratch_run_dir("retirement-emfile");
+        publish_port(&dir, "agent", 4242);
+        let mut reads = 0;
+
+        let retired = super::is_retired_with(
+            &dir,
+            "agent",
+            4242,
+            |_| {
+                reads += 1;
+                Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+            },
+            |_| panic!("an inconclusive read must not enter retirement confirmation"),
+        );
+
+        assert!(!retired, "EMFILE is not evidence that a successor exists");
+        assert_eq!(reads, 1);
+        assert!(logs_contain("TUI bridge retirement port read failed"));
+        assert!(logs_contain("Too many open files") || logs_contain("os error 24"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn retirement_requires_two_matching_observations() {
+        let dir = scratch_run_dir("retirement-confirmation");
+        let reads = AtomicUsize::new(0);
+        let sleeps = AtomicUsize::new(0);
+
+        let retired = super::is_retired_with(
+            &dir,
+            "agent",
+            4242,
+            |_| match reads.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok("4343".to_string()),
+                _ => Ok("4242".to_string()),
+            },
+            |duration| {
+                assert_eq!(duration, super::RETIREMENT_POLL);
+                sleeps.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        assert!(!retired, "one stale observation is insufficient evidence");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(sleeps.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn confirmed_missing_or_republished_port_retires_bridge() {
+        let dir = scratch_run_dir("retirement-explicit");
+        let missing = super::is_retired_with(
+            &dir,
+            "agent",
+            4242,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            |_| {},
+        );
+        assert!(
+            missing,
+            "two NotFound reads are explicit retirement evidence"
+        );
+
+        let republished =
+            super::is_retired_with(&dir, "agent", 4242, |_| Ok("4343".to_string()), |_| {});
+        assert!(
+            republished,
+            "two reads of a successor's port are explicit retirement evidence"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// A fleet pane reaches this branch through `PaneSource::Remote`. A silent
     /// resize changes geometry but writes no bytes, so it must not invalidate a
     /// queued Claude development-channel confirmation. Any child repaint still
