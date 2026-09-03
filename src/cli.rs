@@ -177,6 +177,11 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     check("Home directory", home, " ✗ (not found)");
     check(".env file", &home.join(".env"), " - (optional)");
 
+    println!(
+        "\n  File descriptors: {}",
+        crate::resource_limits::doctor_fd_usage()
+    );
+
     println!("\n  Protocol:");
     print_protocol_human(home);
 

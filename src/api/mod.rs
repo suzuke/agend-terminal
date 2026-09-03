@@ -414,6 +414,7 @@ fn serve_inner(
                 let (should_log, should_break) =
                     accept_error_disposition(consecutive_accept_errors);
                 if should_log {
+                    let _ = crate::resource_limits::record_fd_exhaustion(home, "api_accept", &e);
                     tracing::warn!(
                         error = %e,
                         consecutive = consecutive_accept_errors,

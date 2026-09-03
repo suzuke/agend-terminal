@@ -30,11 +30,21 @@
 macro_rules! persist_or_log {
     ($call:expr, $op:expr $(,)?) => {
         if let Err(e) = $call {
+            let _ = crate::resource_limits::record_fd_exhaustion(
+                &crate::home_dir(),
+                $op,
+                &e,
+            );
             tracing::error!(error = %e, op = $op, "op failed — result dropped (silent-loss #1630/#1647)");
         }
     };
     ($call:expr, $op:expr, $target:expr $(,)?) => {
         if let Err(e) = $call {
+            let _ = crate::resource_limits::record_fd_exhaustion(
+                &crate::home_dir(),
+                $op,
+                &e,
+            );
             tracing::error!(error = %e, op = $op, target = %$target, "op failed — result dropped (silent-loss #1630/#1647)");
         }
     };

@@ -944,6 +944,9 @@ fn main() -> anyhow::Result<()> {
             // to register with the supervisor in detached mode), so the
             // detach branch only fires when a fleet path is in play.
             let force_foreground = foreground || !agents.is_empty();
+            if force_foreground {
+                resource_limits::raise_daemon_nofile_limit();
+            }
 
             // Wave 1 CLI consolidation: `--agents` subsumes the former
             // `daemon` subcommand. When provided, skip fleet loading and
