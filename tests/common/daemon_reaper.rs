@@ -16,12 +16,20 @@
 //! Unix-only by decision — both leaking targets are already `#[cfg(unix)]`.
 
 #![cfg(unix)]
+// `tests/common` is compiled fresh into EVERY integration-test binary that
+// declares `mod common;` (each `tests/*.rs` is its own crate). Only
+// `app_singleton_fail_closed.rs` and `cli_smoke.rs` actually construct
+// `FixtureHome` today; every other binary that pulls this module in sees its
+// entire contents as unreachable, and `-D warnings` (dead_code) turns that
+// into a hard build failure for binaries that never asked to use it. One
+// module-level allow, rather than five scattered per-item ones, because the
+// reasoning is file-wide, not item-by-item.
+#![allow(dead_code)]
 
 use std::path::Path;
 use std::process::Command;
 
 /// A process still referencing a fixture home, as observed in the process table.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct HomeReferencingProcess {
     pub pid: u32,
@@ -34,10 +42,6 @@ pub struct HomeReferencingProcess {
 /// `ps` scan is the right tool: it sees a leaked daemon even after its run dir
 /// has been destroyed. Killing uses the authoritative `<home>/run/<pid>` handle
 /// instead (see `FixtureHome`), never a command-line match.
-///
-/// `#[allow(dead_code)]` because `tests/common` is compiled into several test
-/// binaries, not all of which use this helper.
-#[allow(dead_code)]
 pub fn processes_referencing_home(home: &Path) -> Vec<HomeReferencingProcess> {
     let needle = home.display().to_string();
     let out = match Command::new("ps").args(["-eo", "pid=,command="]).output() {
@@ -64,9 +68,6 @@ pub fn processes_referencing_home(home: &Path) -> Vec<HomeReferencingProcess> {
 
 /// Panic naming every process still holding `home`, for use immediately before
 /// the fixture directory is torn down.
-///
-/// `#[allow(dead_code)]`: see `processes_referencing_home`.
-#[allow(dead_code)]
 pub fn assert_no_process_references_home(home: &Path, context: &str) {
     let leaked = processes_referencing_home(home);
     assert!(
@@ -210,16 +211,11 @@ fn reap_daemons_under(home: &Path) {
 ///   3. SIGTERM deepest-first, poll, escalate to SIGKILL;
 ///   4. only THEN remove the directory — the run dir lives INSIDE the home, so
 ///      removing it first would destroy the only authoritative handle.
-///
-/// `#[allow(dead_code)]`: `tests/common` is compiled into several test
-/// binaries, not all of which use this guard.
-#[allow(dead_code)]
 pub struct FixtureHome {
     path: std::path::PathBuf,
     context: String,
 }
 
-#[allow(dead_code)]
 impl FixtureHome {
     /// Create `std::env::temp_dir()/<name>`. `name` is the directory basename
     /// the test already uses, kept verbatim so fixture paths do not change.
