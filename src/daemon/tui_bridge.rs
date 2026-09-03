@@ -26,7 +26,60 @@ pub(crate) struct TuiListenerMeta {
 /// non-blocking so it can notice; this bounds the notice delay.
 const RETIREMENT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// True when `{name}.port` is gone or no longer names `my_port`.
+/// Read one retirement observation. `Some(true)` is explicit evidence that the
+/// port file is gone or names a different port; `Some(false)` still names this
+/// bridge. Every ambiguous read or parse failure is warned and returns `None`.
+fn retirement_observation(
+    port_file: &Path,
+    name: &str,
+    my_port: u16,
+    read_port: &mut impl FnMut(&Path) -> std::io::Result<String>,
+) -> Option<bool> {
+    match read_port(port_file) {
+        Ok(text) => match text.trim().parse::<u16>() {
+            Ok(port) => Some(port != my_port),
+            Err(error) => {
+                tracing::warn!(
+                    agent = name,
+                    port = my_port,
+                    path = %port_file.display(),
+                    error = %error,
+                    "TUI bridge retirement port was invalid; keeping listener alive"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                agent = name,
+                port = my_port,
+                path = %port_file.display(),
+                error = %error,
+                error_kind = ?error.kind(),
+                "TUI bridge retirement port read failed"
+            );
+            (error.kind() == std::io::ErrorKind::NotFound).then_some(true)
+        }
+    }
+}
+
+/// True only after two explicit retirement observations separated by one poll.
+fn is_retired_with(
+    run_dir: &Path,
+    name: &str,
+    my_port: u16,
+    mut read_port: impl FnMut(&Path) -> std::io::Result<String>,
+    sleep: impl FnOnce(std::time::Duration),
+) -> bool {
+    let port_file = run_dir.join(format!("{name}.port"));
+    if retirement_observation(&port_file, name, my_port, &mut read_port) != Some(true) {
+        return false;
+    }
+    sleep(RETIREMENT_POLL);
+    retirement_observation(&port_file, name, my_port, &mut read_port) == Some(true)
+}
+
+/// True when `{name}.port` is confirmed gone or no longer names `my_port`.
 ///
 /// #3373: `restart_instance(mode:"fresh")` is delete(no-wait) + spawn. The
 /// delete already removes the port file (`ipc::remove_port`) and the successor
@@ -37,14 +90,13 @@ const RETIREMENT_POLL: std::time::Duration = std::time::Duration::from_millis(25
 /// and kept its clients' sockets healthy, so a retained APP pane never went
 /// `[DISCONNECTED]` and #3380's reconnect never fired.
 fn is_retired(run_dir: &Path, name: &str, my_port: u16) -> bool {
-    match std::fs::read_to_string(run_dir.join(format!("{name}.port"))) {
-        Ok(text) => text
-            .trim()
-            .parse::<u16>()
-            .map(|p| p != my_port)
-            .unwrap_or(true),
-        Err(_) => true,
-    }
+    is_retired_with(
+        run_dir,
+        name,
+        my_port,
+        |path| std::fs::read_to_string(path),
+        std::thread::sleep,
+    )
 }
 
 /// Synchronously bind the agent's TUI loopback socket and publish
@@ -1553,9 +1605,9 @@ mod tests {
         std::fs::write(&port_file, "4242").unwrap();
         assert!(!super::is_retired(&dir, "agent", 4242));
 
-        // Unparseable is treated as not-ours rather than assumed live.
+        // Unparseable content is ambiguous, not explicit successor evidence.
         std::fs::write(&port_file, "not-a-port").unwrap();
-        assert!(super::is_retired(&dir, "agent", 4242));
+        assert!(!super::is_retired(&dir, "agent", 4242));
 
         std::fs::remove_dir_all(&dir).ok();
     }
