@@ -146,6 +146,31 @@ fn agendharness_users_are_in_the_flake_gate_filter() {
 /// forces this list to be corrected the day one of them is migrated, and
 /// nothing new may be added to it — a new direct-boot test must use
 /// `FixtureHome`, full stop.
+/// Every entry below shares ONE shape, and the reasoning the assertion above
+/// demands of a future author is recorded here for them:
+///
+/// Each spawns `agend-terminal start --foreground` as a DIRECT child
+/// (`restart_smoke.rs:32-40`, `ready_marker_invariants.rs:116-134`,
+/// `self_respawn_handoff.rs:136`, `attached_path_mcp_invariants.rs:204`) and
+/// kills + waits that child explicitly at the end of each test. That reaches
+/// the daemon — unlike `app_singleton_fail_closed`, where the daemon is a
+/// GRANDCHILD of the `app` process and `Child::kill` never touched it.
+///
+/// So these do not leak on the success path, and that is measured, not
+/// assumed: a full `cargo test --tests --features tray --no-fail-fast` run
+/// (159 targets) leaked exactly one daemon, the `app_singleton` one, and left
+/// zero orphaned stub agents.
+///
+/// What they are still missing is the PANIC path: an explicit kill at the end
+/// of a test body is skipped when an assertion above it fires, and nothing
+/// else reaps then. `FixtureHome` closes exactly that gap, which is why they
+/// belong on a shrinking list rather than being declared safe. Migrating them
+/// is deferred because each carries its own teardown shape (own pgid logic, or
+/// `stop` + kill) that has to be unpicked one at a time — real work, and not
+/// this ticket's.
+///
+/// NO NEW ENTRY MAY BE ADDED HERE for a newly written test: a new direct-boot
+/// test uses `FixtureHome`. This list may only shrink.
 const KNOWN_UNGUARDED_DIRECT_BOOT_DEBT: &[&str] = &[
     "restart_smoke",
     "self_respawn_handoff",
