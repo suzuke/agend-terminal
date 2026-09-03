@@ -19,11 +19,17 @@ use uuid::Uuid;
 /// through the durable row, and losing the row loses the operator notice —
 /// the NO-LOSS half of the contract. The file is therefore bounded by
 /// `MAX_RECEIPT_BYTES` PLUS the live debt, not by `MAX_RECEIPT_BYTES` alone.
-/// The debt is self-limiting: at most one unfinished notice per in-flight
-/// self-kick, each cleared within a per-tick pass of its enqueue. If the
-/// pinned set alone ever exceeds the byte budget, compaction FAILS CLOSED —
-/// it evicts nothing at all and the log is allowed to exceed the limit
-/// (logged once per exceedance episode) rather than dropping owed debt.
+/// The debt is at most one unfinished notice per in-flight self-kick, and it
+/// clears within a per-tick pass of its enqueue ONLY while the pass still
+/// visits the instance: `daemon/per_tick/claude_self_kick.rs` iterates
+/// `fleet.instances` and skips any agent not in `ChannelBridge` mode, so debt
+/// parked by an agent later removed from `fleet.yaml` — or moved off
+/// ChannelBridge — is never drained and stays pinned for good. That is growth
+/// in the safe direction (the notice is kept, never lost), but it is NOT
+/// self-limiting; draining orphaned debt is a follow-up. If the pinned set
+/// alone ever exceeds the byte budget, compaction FAILS CLOSED — it evicts
+/// nothing at all and the log is allowed to exceed the limit (logged once per
+/// exceedance episode) rather than dropping owed debt.
 const MAX_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RETAINED_DELIVERIES: usize = 1024;
 
