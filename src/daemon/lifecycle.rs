@@ -32,6 +32,44 @@ pub const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// long enough to avoid spinning the CPU under contention.
 const CHILD_EXIT_POLL: Duration = Duration::from_millis(50);
 
+// The child-exit deadline in force for this thread.
+//
+// Production always reads `CHILD_EXIT_TIMEOUT` (5 s). Tests lower it (via
+// `set_child_exit_timeout_for_test`) so a refused-teardown test can run in
+// ~100 ms instead of waiting out the real timeout; the override is
+// thread-local, so it cannot leak into a test running in parallel, and a
+// guard restores it. The production code path is byte-identical in a
+// release build — the override read is compiled out entirely.
+#[cfg(test)]
+thread_local! {
+    static CHILD_EXIT_DEADLINE_OVERRIDE: std::cell::RefCell<Option<Duration>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ChildExitDeadlineGuard;
+
+#[cfg(test)]
+impl Drop for ChildExitDeadlineGuard {
+    fn drop(&mut self) {
+        CHILD_EXIT_DEADLINE_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_child_exit_timeout_for_test(timeout: Duration) -> ChildExitDeadlineGuard {
+    CHILD_EXIT_DEADLINE_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(timeout));
+    ChildExitDeadlineGuard
+}
+
+fn child_exit_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = CHILD_EXIT_DEADLINE_OVERRIDE.with(|slot| *slot.borrow()) {
+        return timeout;
+    }
+    CHILD_EXIT_TIMEOUT
+}
+
 type ChildArc = Arc<Mutex<Box<dyn portable_pty::Child + Send>>>;
 
 /// Owns the two deletion fences whose teardown order is load-bearing. The
@@ -81,7 +119,7 @@ impl Drop for DeleteFence {
 /// Returns `true` if the child exited within the budget; `false` if the
 /// timeout fired (caller must preserve the registry entry and refuse teardown).
 pub fn wait_for_child_exit(child: &ChildArc) -> bool {
-    let deadline = std::time::Instant::now() + CHILD_EXIT_TIMEOUT;
+    let deadline = std::time::Instant::now() + child_exit_timeout();
     loop {
         {
             let mut guard = child.lock();
@@ -943,6 +981,182 @@ mod tests {
             reg.lock().is_empty(),
             "registry entry must be removed after delete"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A child that never reports exit — `try_wait` always returns `Ok(None)`.
+    /// Deterministic lever for exercising the `wait_for_child_exit` timeout
+    /// path (`make_placeholder_handle`'s `true` exits immediately, so it
+    /// cannot reach the refusal branch).
+    #[derive(Debug)]
+    struct NeverExitingChild;
+
+    impl portable_pty::ChildKiller for NeverExitingChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(NeverExitingChild)
+        }
+    }
+
+    impl portable_pty::Child for NeverExitingChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            unreachable!("delete_transaction's bounded wait only polls try_wait")
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    /// Same shape as `make_placeholder_handle`, but with a child that never
+    /// reports exit, so `wait_for_child_exit` runs out its (overridden) budget
+    /// and `delete_transaction` must refuse teardown.
+    fn make_never_exiting_handle(name: &str) -> crate::agent::AgentHandle {
+        use portable_pty::{native_pty_system, PtySize};
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        drop(pair.slave);
+        let pty_writer: crate::agent::PtyWriter =
+            Arc::new(Mutex::new(pair.master.take_writer().expect("take_writer")));
+        let pty_master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
+            Arc::new(Mutex::new(pair.master));
+        let core = Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
+            vterm: crate::vterm::VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
+            subscribers: Vec::new(),
+            state: crate::state::StateTracker::new(None),
+            health: crate::health::HealthTracker::new(),
+            api_activity: crate::agent::ApiActivity::default(),
+            observed_status: None,
+        }));
+        let child: Box<dyn portable_pty::Child + Send> = Box::new(NeverExitingChild);
+        crate::agent::AgentHandle {
+            id: crate::types::InstanceId::default(),
+            name: name.to_string().into(),
+            declared_backend: None,
+            backend_command: "never-exits".to_string(),
+            pty_writer,
+            pty_master,
+            published_state: crate::agent::published_state_of(&core),
+            published_observed: crate::agent::published_observed_of(&core),
+            core,
+            child: Arc::new(Mutex::new(child)),
+            submit_key: "\r".to_string(),
+            inject_prefix: String::new(),
+            typed_inject: false,
+            typed_inject_contaminated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            spawned_at: std::time::Instant::now(),
+            spawned_at_epoch_ms: 0,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// P0 (external reviewer, PR #3495): `remove_instance_delivery_state` is
+    /// an AUDITED policy discharge legitimate ONLY because the instance is
+    /// being destroyed — no recipient survives to be owed anything. When
+    /// teardown is REFUSED (child-exit timeout), the instance stays alive and
+    /// retained for retry. Deleting its durable receipt log on that path
+    /// silently drops any parked operator-notice debt for a recipient that is
+    /// still there. This is the RED for the invariant: `delete_transaction`
+    /// must leave the log intact whenever it returns `false`.
+    #[test]
+    fn refused_teardown_retains_the_instance_and_its_owed_notice_debt() {
+        let home = tmp_home("delete-refused-retains-debt");
+        let reg = empty_registry();
+        let handle = make_never_exiting_handle("delta");
+        let delta_id = handle.id;
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  delta:\n    id: {}\n", delta_id.full()),
+        )
+        .expect("write fleet.yaml");
+        reg.lock().insert(delta_id, handle);
+
+        // Park real notice debt in the instance's receipt store.
+        let store = crate::transport::ReceiptStore::for_instance(&home, "delta").expect("store");
+        let envelope = crate::transport::DeliveryEnvelope::self_kick(
+            "delta",
+            crate::transport::SessionLocator::claude(
+                "http://127.0.0.1:1".to_string(),
+                "self-kick-session".to_string(),
+                "token".to_string(),
+            ),
+            "[AGEND-RESUME] id=refused-teardown",
+        );
+        store.record_queued(&envelope).expect("queued");
+        let mut accepted = crate::transport::DeliveryReceipt::for_state(
+            &envelope,
+            crate::transport::DeliveryState::ProtocolAccepted,
+        );
+        accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+        let intent = crate::transport::PendingNotice::new(
+            crate::transport::PendingNotice::ACK_OVERDUE,
+            None,
+        );
+        let mut overdue = crate::transport::DeliveryReceipt::for_state(
+            &envelope,
+            crate::transport::DeliveryState::AckOverdue,
+        );
+        overdue.notice_pending = Some(intent.clone());
+        assert!(store
+            .record_if_marker(
+                envelope.delivery_id,
+                crate::transport::DeliveryState::ProtocolAccepted,
+                None,
+                None,
+                overdue,
+            )
+            .expect("overdue CAS"));
+
+        // Precondition: the watchdog can currently find the owed notice.
+        assert!(
+            store
+                .deliveries_owing_notices()
+                .expect("owing")
+                .iter()
+                .any(|(candidate, _)| candidate.delivery_id == envelope.delivery_id),
+            "precondition: the parked notice must be discoverable before delete"
+        );
+
+        // Force the timeout path in ~100ms instead of the real 5s budget.
+        let _deadline = set_child_exit_timeout_for_test(Duration::from_millis(100));
+        let observed_exit = delete_transaction(&home, "delta", &reg, None, false);
+        assert!(
+            !observed_exit,
+            "a never-exiting child must make delete_transaction refuse teardown"
+        );
+
+        assert!(
+            reg.lock().contains_key(&delta_id),
+            "teardown refused ⇒ registry entry must be retained for retry"
+        );
+
+        assert!(
+            store
+                .deliveries_owing_notices()
+                .expect("owing")
+                .iter()
+                .any(|(candidate, _)| candidate.delivery_id == envelope.delivery_id),
+            "RED: the recipient is still alive (teardown refused), so its owed \
+             notice must survive — the durable log must not be deleted for a \
+             refused teardown"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 }

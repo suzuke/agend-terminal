@@ -754,8 +754,9 @@ impl ReceiptStore {
     ///    safe to evict, so compaction FAILS CLOSED: it rewrites nothing at
     ///    all, the log is allowed to exceed the limit, and the exceedance is
     ///    reported once per episode. Bounded overflow is a smaller harm than a
-    ///    lost operator notice, and the debt is self-limiting (see the
-    ///    constants).
+    ///    lost operator notice. The debt is bounded only for instances the
+    ///    per-tick pass still visits, and NOT self-limiting for the rest (see
+    ///    the constants doc).
     fn compact_locked(&self) -> anyhow::Result<()> {
         if !self.path.exists() {
             return Ok(());
