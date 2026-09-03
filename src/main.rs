@@ -82,6 +82,7 @@ mod ready;
 mod render;
 #[cfg_attr(windows, allow(dead_code))]
 mod reply_ledger;
+#[cfg_attr(windows, allow(dead_code))]
 mod resource_limits;
 mod review_receipt;
 #[cfg(test)]

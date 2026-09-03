@@ -186,6 +186,8 @@ pub fn record_fd_exhaustion(home: &Path, operation: &str, error: &impl Display) 
     if !normalized.contains("too many open files") && !normalized.contains("os error 24") {
         return false;
     }
+    // Best effort: event-log persistence opens files itself, so a process that
+    // has completely exhausted its descriptors may be unable to record this.
     if let Err(log_error) = crate::event_log::try_log(
         home,
         "fd_exhausted",
@@ -289,6 +291,22 @@ mod tests {
 
         assert!(line.contains("900/1000"));
         assert!(line.contains("90.0%"));
+        assert!(line.contains("WARNING: near file descriptor limit"));
+    }
+
+    #[test]
+    fn doctor_does_not_warn_below_fd_usage_threshold() {
+        let line = super::format_fd_usage(799, 1_000);
+
+        assert!(line.contains("79.9%"));
+        assert!(!line.contains("WARNING"));
+    }
+
+    #[test]
+    fn doctor_warns_at_exact_fd_usage_threshold() {
+        let line = super::format_fd_usage(800, 1_000);
+
+        assert!(line.contains("80.0%"));
         assert!(line.contains("WARNING: near file descriptor limit"));
     }
 

@@ -178,7 +178,7 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     check(".env file", &home.join(".env"), " - (optional)");
 
     println!(
-        "\n  File descriptors: {}",
+        "\n  File descriptors (this process): {}",
         crate::resource_limits::doctor_fd_usage()
     );
 

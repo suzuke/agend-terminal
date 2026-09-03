@@ -34,7 +34,20 @@ fn doctor_reports_live_fd_usage_against_the_soft_limit() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("File descriptors:"), "stdout:\n{stdout}");
-    assert!(stdout.contains('/'), "current/soft missing:\n{stdout}");
+    let fd_line = stdout
+        .lines()
+        .find(|line| {
+            line.trim_start()
+                .starts_with("File descriptors (this process):")
+        })
+        .unwrap_or_else(|| panic!("file-descriptor line missing:\n{stdout}"));
+    let usage = regex::Regex::new(
+        r"^  File descriptors \(this process\): [0-9]+/[0-9]+ \([0-9]+\.[0-9]%\)(?: — WARNING: near file descriptor limit)?$",
+    )
+    .expect("fd usage regex");
+    assert!(
+        usage.is_match(fd_line),
+        "malformed fd usage line: {fd_line}"
+    );
     std::fs::remove_dir_all(home).ok();
 }
