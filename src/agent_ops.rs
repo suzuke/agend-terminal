@@ -334,16 +334,25 @@ pub(crate) fn delete_instance_with_exit_status(
     // The public runtime entry owns the complete deletion fence even for an
     // external agent. External-first resolution must not bypass transport
     // invalidation: a queued job for the same name can otherwise outlive the
-    // early return and recreate delivery state or reach an adapter.
+    // early return and recreate delivery state or reach an adapter. The fence
+    // still fronts the whole window (it drops at the end of this function),
+    // but the delivery-state removal itself must wait until teardown is
+    // confirmed: a refused teardown (child-exit timeout) leaves the instance
+    // alive and retained for retry, and that surviving recipient can still be
+    // owed a parked operator notice — deleting the log unconditionally would
+    // discard it silently.
     let _delete_fence = crate::daemon::lifecycle::DeleteFence::new(home, name, true);
-    if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
-        tracing::warn!(
-            agent = %name,
-            error = %error,
-            "delete: transport delivery cleanup failed"
-        );
+    let (outcome, observed_exit) = delete_instance_impl(home, name, context, skip_exit_wait);
+    if observed_exit {
+        if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
+            tracing::warn!(
+                agent = %name,
+                error = %error,
+                "delete: transport delivery cleanup failed"
+            );
+        }
     }
-    delete_instance_impl(home, name, context, skip_exit_wait)
+    (outcome, observed_exit)
 }
 
 /// Delete through the shared transaction body when the caller already owns the
@@ -2467,6 +2476,108 @@ mod tests {
             api_bridge_delivery_mode(&malformed),
             UNVERIFIED_DELIVERY_MODE
         );
+    }
+
+    /// P0 (external reviewer, PR #3495), site 1: the public runtime DELETE
+    /// entry (`delete_instance_with_exit_status`) must not remove the
+    /// instance's durable receipt log ahead of a confirmed teardown. A
+    /// refused teardown (child-exit timeout) leaves the instance alive and
+    /// retained for retry, so its parked operator-notice debt must survive.
+    #[test]
+    fn refused_teardown_via_public_delete_entry_retains_owed_notice_debt() {
+        let home = tmp_home("agent-ops-delete-refused-retains-debt");
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs: crate::api::ConfigRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let externals: agent::ExternalRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        let handle = crate::daemon::lifecycle::test_support::never_exiting_handle("epsilon");
+        let epsilon_id = handle.id;
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  epsilon:\n    id: {}\n", epsilon_id.full()),
+        )
+        .expect("write fleet.yaml");
+        registry.lock().insert(epsilon_id, handle);
+
+        let store = crate::transport::ReceiptStore::for_instance(&home, "epsilon").expect("store");
+        let envelope = crate::transport::DeliveryEnvelope::self_kick(
+            "epsilon",
+            crate::transport::SessionLocator::claude(
+                "http://127.0.0.1:1".to_string(),
+                "self-kick-session".to_string(),
+                "token".to_string(),
+            ),
+            "[AGEND-RESUME] id=refused-teardown-public-entry",
+        );
+        store.record_queued(&envelope).expect("queued");
+        let mut accepted = crate::transport::DeliveryReceipt::for_state(
+            &envelope,
+            crate::transport::DeliveryState::ProtocolAccepted,
+        );
+        accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+        let intent = crate::transport::PendingNotice::new(
+            crate::transport::PendingNotice::ACK_OVERDUE,
+            None,
+        );
+        let mut overdue = crate::transport::DeliveryReceipt::for_state(
+            &envelope,
+            crate::transport::DeliveryState::AckOverdue,
+        );
+        overdue.notice_pending = Some(intent.clone());
+        assert!(store
+            .record_if_marker(
+                envelope.delivery_id,
+                crate::transport::DeliveryState::ProtocolAccepted,
+                None,
+                None,
+                overdue,
+            )
+            .expect("overdue CAS"));
+
+        assert!(
+            store
+                .deliveries_owing_notices()
+                .expect("owing")
+                .iter()
+                .any(|(candidate, _)| candidate.delivery_id == envelope.delivery_id),
+            "precondition: the parked notice must be discoverable before delete"
+        );
+
+        let context = DeleteContext {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+        };
+        let _deadline = crate::daemon::lifecycle::set_child_exit_timeout_for_test(
+            std::time::Duration::from_millis(100),
+        );
+        let (_outcome, observed_exit) =
+            delete_instance_with_exit_status(&home, "epsilon", &context, false);
+        assert!(
+            !observed_exit,
+            "a never-exiting child must make the public delete entry refuse teardown"
+        );
+
+        assert!(
+            registry.lock().contains_key(&epsilon_id),
+            "teardown refused ⇒ registry entry must be retained for retry"
+        );
+        assert!(
+            store
+                .deliveries_owing_notices()
+                .expect("owing")
+                .iter()
+                .any(|(candidate, _)| candidate.delivery_id == envelope.delivery_id),
+            "the recipient is still alive (teardown refused), so its owed notice \
+             must survive through the public runtime DELETE entry too"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }
 

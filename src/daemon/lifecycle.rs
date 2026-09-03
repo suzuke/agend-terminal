@@ -72,6 +72,97 @@ fn child_exit_timeout() -> Duration {
 
 type ChildArc = Arc<Mutex<Box<dyn portable_pty::Child + Send>>>;
 
+/// Test-only fixtures shared across this module's tests and other modules'
+/// tests that need to force `wait_for_child_exit`'s refusal path (e.g.
+/// `agent_ops::tests`, which exercises `delete_instance_with_exit_status`
+/// against a real `DeleteContext`).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    /// A child that never reports exit — `try_wait` always returns `Ok(None)`.
+    /// Deterministic lever for exercising the `wait_for_child_exit` timeout
+    /// path (a real spawned `true` exits immediately, so it cannot reach the
+    /// refusal branch).
+    #[derive(Debug)]
+    struct NeverExitingChild;
+
+    impl portable_pty::ChildKiller for NeverExitingChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(NeverExitingChild)
+        }
+    }
+
+    impl portable_pty::Child for NeverExitingChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            unreachable!("delete_transaction's bounded wait only polls try_wait")
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    /// An `AgentHandle` whose child never reports exit, so
+    /// `wait_for_child_exit` runs out its (overridden) budget and teardown
+    /// must be refused.
+    pub(crate) fn never_exiting_handle(name: &str) -> crate::agent::AgentHandle {
+        use portable_pty::{native_pty_system, PtySize};
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        drop(pair.slave);
+        let pty_writer: crate::agent::PtyWriter =
+            Arc::new(Mutex::new(pair.master.take_writer().expect("take_writer")));
+        let pty_master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
+            Arc::new(Mutex::new(pair.master));
+        let core = Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
+            vterm: crate::vterm::VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
+            subscribers: Vec::new(),
+            state: crate::state::StateTracker::new(None),
+            health: crate::health::HealthTracker::new(),
+            api_activity: crate::agent::ApiActivity::default(),
+            observed_status: None,
+        }));
+        let child: Box<dyn portable_pty::Child + Send> = Box::new(NeverExitingChild);
+        crate::agent::AgentHandle {
+            id: crate::types::InstanceId::default(),
+            name: name.to_string().into(),
+            declared_backend: None,
+            backend_command: "never-exits".to_string(),
+            pty_writer,
+            pty_master,
+            published_state: crate::agent::published_state_of(&core),
+            published_observed: crate::agent::published_observed_of(&core),
+            core,
+            child: Arc::new(Mutex::new(child)),
+            submit_key: "\r".to_string(),
+            inject_prefix: String::new(),
+            typed_inject: false,
+            typed_inject_contaminated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            spawned_at: std::time::Instant::now(),
+            spawned_at_epoch_ms: 0,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
 /// Owns the two deletion fences whose teardown order is load-bearing. The
 /// deleting marker is cleared first while the keyed transport state/lane is
 /// still active; the transport guard then performs its final epoch bump and
@@ -166,15 +257,24 @@ pub fn delete_transaction(
     configs: Option<&Arc<Mutex<HashMap<String, super::AgentConfig>>>>,
     skip_exit_wait: bool,
 ) -> bool {
+    // The fence still fronts the whole window (it drops at the end of this
+    // function), but the delivery-state removal waits until teardown is
+    // confirmed committed: a refused teardown (child-exit timeout) leaves the
+    // instance alive and retained for retry, and that surviving recipient can
+    // still be owed a parked operator notice — deleting the log
+    // unconditionally would discard it silently.
     let _delete_fence = DeleteFence::new(home, name, true);
-    if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
-        tracing::warn!(
-            agent = %name,
-            error = %error,
-            "delete: transport delivery cleanup failed"
-        );
+    let committed = delete_transaction_under_guard(home, name, registry, configs, skip_exit_wait);
+    if committed {
+        if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
+            tracing::warn!(
+                agent = %name,
+                error = %error,
+                "delete: transport delivery cleanup failed"
+            );
+        }
     }
-    delete_transaction_under_guard(home, name, registry, configs, skip_exit_wait)
+    committed
 }
 
 /// Shared delete transaction body. Callers must already hold the deleting mark
@@ -984,87 +1084,6 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// A child that never reports exit — `try_wait` always returns `Ok(None)`.
-    /// Deterministic lever for exercising the `wait_for_child_exit` timeout
-    /// path (`make_placeholder_handle`'s `true` exits immediately, so it
-    /// cannot reach the refusal branch).
-    #[derive(Debug)]
-    struct NeverExitingChild;
-
-    impl portable_pty::ChildKiller for NeverExitingChild {
-        fn kill(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
-            Box::new(NeverExitingChild)
-        }
-    }
-
-    impl portable_pty::Child for NeverExitingChild {
-        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-            Ok(None)
-        }
-        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
-            unreachable!("delete_transaction's bounded wait only polls try_wait")
-        }
-        fn process_id(&self) -> Option<u32> {
-            None
-        }
-    }
-
-    /// Same shape as `make_placeholder_handle`, but with a child that never
-    /// reports exit, so `wait_for_child_exit` runs out its (overridden) budget
-    /// and `delete_transaction` must refuse teardown.
-    fn make_never_exiting_handle(name: &str) -> crate::agent::AgentHandle {
-        use portable_pty::{native_pty_system, PtySize};
-        let pty = native_pty_system();
-        let pair = pty
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-        drop(pair.slave);
-        let pty_writer: crate::agent::PtyWriter =
-            Arc::new(Mutex::new(pair.master.take_writer().expect("take_writer")));
-        let pty_master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
-            Arc::new(Mutex::new(pair.master));
-        let core = Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
-            vterm: crate::vterm::VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
-            subscribers: Vec::new(),
-            state: crate::state::StateTracker::new(None),
-            health: crate::health::HealthTracker::new(),
-            api_activity: crate::agent::ApiActivity::default(),
-            observed_status: None,
-        }));
-        let child: Box<dyn portable_pty::Child + Send> = Box::new(NeverExitingChild);
-        crate::agent::AgentHandle {
-            id: crate::types::InstanceId::default(),
-            name: name.to_string().into(),
-            declared_backend: None,
-            backend_command: "never-exits".to_string(),
-            pty_writer,
-            pty_master,
-            published_state: crate::agent::published_state_of(&core),
-            published_observed: crate::agent::published_observed_of(&core),
-            core,
-            child: Arc::new(Mutex::new(child)),
-            submit_key: "\r".to_string(),
-            inject_prefix: String::new(),
-            typed_inject: false,
-            typed_inject_contaminated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                false,
-            )),
-            spawned_at: std::time::Instant::now(),
-            spawned_at_epoch_ms: 0,
-            spawn_mode: crate::backend::SpawnMode::Fresh,
-            generation: crate::agent::crash_disposition::SpawnGeneration::default(),
-            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
     /// P0 (external reviewer, PR #3495): `remove_instance_delivery_state` is
     /// an AUDITED policy discharge legitimate ONLY because the instance is
     /// being destroyed — no recipient survives to be owed anything. When
@@ -1077,7 +1096,7 @@ mod tests {
     fn refused_teardown_retains_the_instance_and_its_owed_notice_debt() {
         let home = tmp_home("delete-refused-retains-debt");
         let reg = empty_registry();
-        let handle = make_never_exiting_handle("delta");
+        let handle = test_support::never_exiting_handle("delta");
         let delta_id = handle.id;
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),

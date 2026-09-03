@@ -593,28 +593,36 @@ pub(super) fn handle_restart_instance_with_runtime(
 
     if mode != "resume" {
         crate::inbox::requeue_delivering_for_session_reset(home, name);
-        // A fresh restart destroys the session, so every transport receipt keyed
-        // to it is unresolvable — the consumer that owed the acknowledgement no
-        // longer exists. Left behind, the self-kick watchdog escalates it to every
-        // channel as an unacknowledged delivery on an instance the operator
-        // deliberately restarted. A resume restores the SAME session, so its
-        // receipts stay resolvable and are preserved. Only under the fence:
-        // `remove_instance_delivery_state` requires the cleanup guard so no
-        // in-flight transport job can recreate the files behind it.
-        if fence.is_some() {
-            if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
-                tracing::warn!(
-                    agent = %name,
-                    error = %error,
-                    "restart: transport delivery cleanup failed"
-                );
-            }
-        }
     }
 
     // Restart intentionally uses no-wait deletion: admission of the kill signal,
     // followed by the replacement spawn, is this path's existing contract.
-    let _ = lifecycle::delete_with_runtime_or_legacy(home, name, delete_context.as_ref(), true);
+    let torn_down =
+        lifecycle::delete_with_runtime_or_legacy(home, name, delete_context.as_ref(), true);
+    // A fresh restart destroys the session, so every transport receipt keyed
+    // to it is unresolvable — the consumer that owed the acknowledgement no
+    // longer exists. Left behind, the self-kick watchdog escalates it to every
+    // channel as an unacknowledged delivery on an instance the operator
+    // deliberately restarted. A resume restores the SAME session, so its
+    // receipts stay resolvable and are preserved. Only under the fence:
+    // `remove_instance_delivery_state` requires the cleanup guard so no
+    // in-flight transport job can recreate the files behind it. Only after a
+    // CONFIRMED teardown: `remove_instance_delivery_state` is an audited
+    // policy discharge legitimate solely because no recipient survives to be
+    // owed anything, so it must not run ahead of that outcome. Restart's
+    // `skip_exit_wait=true` above makes the teardown call always report `Ok`
+    // today (the refusal branch inside it is unreachable while that argument
+    // stays `true`), but gating on the result here keeps the invariant local
+    // instead of depending on that argument never changing.
+    if mode != "resume" && fence.is_some() && torn_down.is_ok() {
+        if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
+            tracing::warn!(
+                agent = %name,
+                error = %error,
+                "restart: transport delivery cleanup failed"
+            );
+        }
+    }
     // SPAWN refuses a name that is mid-delete (`agent::spawn_agent`), so the fence
     // must close before the replacement spawn.
     drop(fence);
