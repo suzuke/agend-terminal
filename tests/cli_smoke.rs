@@ -3,6 +3,8 @@
 //! Exercises the compiled `agend-terminal` binary end-to-end for
 //! version, help, bugreport, and completions subcommands.
 
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
@@ -209,6 +211,10 @@ fn connect_failed_spawn_deregisters_external_agent() {
                 .env("AGEND_HOME", &self.0)
                 .arg("stop")
                 .output();
+            common::daemon_reaper::assert_no_process_references_home(
+                &self.0,
+                "connect_failed_spawn_deregisters_external_agent",
+            );
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
@@ -268,6 +274,10 @@ fn second_detached_start_rejects_existing_daemon() {
                 .env("AGEND_HOME", &self.0)
                 .arg("stop")
                 .output();
+            common::daemon_reaper::assert_no_process_references_home(
+                &self.0,
+                "second_detached_start_rejects_existing_daemon",
+            );
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }

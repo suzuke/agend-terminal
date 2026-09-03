@@ -21,6 +21,9 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::daemon_reaper::assert_no_process_references_home;
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -186,6 +189,7 @@ fn app_refuses_to_boot_while_daemon_lock_is_held() {
         "a refused app must not publish a run dir; found {published:?}"
     );
 
+    assert_no_process_references_home(&home, "app_refuses_to_boot_while_daemon_lock_is_held");
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -208,6 +212,7 @@ fn app_proceeds_past_singleton_check_when_lock_is_free() {
     let still_running = early_exit.is_none();
     let _ = child.kill();
     let _ = child.wait();
+    assert_no_process_references_home(&home, "app_proceeds_past_singleton_check_when_lock_is_free");
     std::fs::remove_dir_all(&home).ok();
 
     assert!(
