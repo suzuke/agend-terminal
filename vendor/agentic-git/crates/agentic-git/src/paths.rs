@@ -150,7 +150,7 @@ pub(crate) fn resolve_commondir(start: &Path) -> Option<PathBuf> {
 }
 
 /// #1463 (A): the pure object-store-identity comparison behind
-/// `cwd_is_foreign_repo` — `true` iff both paths resolve to a commondir AND the
+/// `target_is_foreign_repo` — `true` iff both paths resolve to a commondir AND the
 /// two commondirs differ. Fail-closed (`false`) if either side is unresolvable.
 /// Split out so the adversarial matrix is hermetically testable without
 /// touching the process cwd.

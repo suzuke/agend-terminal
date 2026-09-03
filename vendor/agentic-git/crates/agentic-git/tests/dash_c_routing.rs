@@ -163,6 +163,8 @@ fn explicit_dash_c_add_and_commit_mutate_foreign_repo_only() {
     let foreign = foreign_repo(&home);
     let file = foreign.join("foreign-only.txt");
     std::fs::write(&file, "foreign change\n").unwrap();
+    let bound_status_before = real_git(&worktree, &["status", "--porcelain"]);
+    assert!(bound_status_before.status.success());
 
     let add = run_shim(
         &worktree,
@@ -200,10 +202,10 @@ fn explicit_dash_c_add_and_commit_mutate_foreign_repo_only() {
     assert_eq!(commit_count(&worktree), "1", "bound worktree stays untouched");
     let status = real_git(&worktree, &["status", "--porcelain"]);
     assert!(status.status.success());
-    assert!(
-        status.stdout.is_empty(),
-        "bound worktree must remain clean: {}",
-        String::from_utf8_lossy(&status.stdout)
+    assert_eq!(
+        status.stdout,
+        bound_status_before.stdout,
+        "bound worktree state must remain unchanged"
     );
 
     std::fs::remove_dir_all(home).unwrap();

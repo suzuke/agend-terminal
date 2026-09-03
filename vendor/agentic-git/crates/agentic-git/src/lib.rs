@@ -253,13 +253,16 @@ fn shim_main() {
         None => &args,
     };
 
+    // Resolve git's effective directory once. Both the cross-agent boundary and
+    // foreign-repo routing must evaluate the explicit leading `-C` target, not
+    // the process cwd that git will replace before running the subcommand.
+    let effective_target = effective_cwd_through_globals(&args, sub_idx.unwrap_or(args.len()));
+
     // Arch14: cross-agent sibling read boundary. A bound agent whose effective
     // read target (cwd or leading -C) is another agent's daemon-managed
     // same-source worktree must fail loudly — never silently return fabricated
     // data via ChdirPass or leak the target's real data via Passthrough.
     if is_bound(&binding) {
-        let effective_target =
-            effective_cwd_through_globals(&args, sub_idx.unwrap_or(args.len()));
         if let Some(target_agent) =
             detect_cross_agent_sibling_target(&agent, &binding, &effective_target)
         {
@@ -333,10 +336,10 @@ fn shim_main() {
     // from polluting canonical worktrees with stale refs.
     let is_agent_caller = env_compat_os("AGENTIC_GIT_AGENT").is_some();
 
-    // #1463 (A): a bound agent's mutating command whose cwd is a FOREIGN git
-    // repo (separate object store — e.g. a test scratch repo) should operate on
-    // THAT repo, not be redirected into the worktree. Post-process the classify
-    // result so the (unchanged, unit-tested) `classify` stays cwd-agnostic.
+    // #1463/#3498: a bound agent's mutating command whose effective target is a
+    // FOREIGN git repo (separate object store — e.g. a test scratch repo) should
+    // operate on THAT repo, not be redirected into the worktree. The effective
+    // target includes leading `-C`; env-based retargets still fail closed.
     let action = apply_nonrepo_read_passthrough(
         apply_foreign_repo_passthrough(
             classify_argv(
@@ -348,7 +351,7 @@ fn shim_main() {
             ),
             subcommand,
             norm_args,
-            cwd_is_foreign_repo(&binding),
+            target_is_foreign_repo(&binding, &effective_target),
         ),
         subcommand,
         cwd_is_nonrepo(),

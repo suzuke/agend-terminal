@@ -246,10 +246,11 @@ fn foreign_cwd_sparse_checkout_routes_to_foreign_repo() {
 
 /// The leading-global shape: cwd = the agent's own bound worktree, the target
 /// travels via `-C <foreign>`. This must stay FAIL-CLOSED (the unknown-global
-/// deny): with cwd = the bound worktree, `cwd_is_foreign_repo` is false, the
-/// action stays `ChdirPass`, and the surviving `-C` would carry the write to
-/// the caller's target — the same mechanism reaches the canonical source repo
-/// (see the negative control below), so the whole `-C` form is denied.
+/// deny): classification rejects `sparse-checkout` behind leading globals
+/// before foreign-target post-processing, because the surviving `-C` could
+/// carry the write to the caller's target — the same mechanism reaches the
+/// canonical source repo (see the negative control below), so the whole `-C`
+/// form is denied.
 #[test]
 fn leading_dash_c_sparse_checkout_stays_fail_closed() {
     let home = fixture_home("dashc");

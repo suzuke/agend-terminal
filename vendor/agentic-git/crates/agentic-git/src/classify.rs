@@ -42,7 +42,7 @@ pub(crate) enum Action {
 // source, so there is nothing left to drift. Call sites use it directly.
 pub(crate) use agentic_git_core::protected_refs::is_protected_ref;
 
-/// #1463 (A): is the current working directory a git repo whose object store is
+/// #1463/#3498: is the effective git target a repo whose object store is
 /// SEPARATE from the bound worktree's (a foreign / scratch repo, e.g. a test
 /// incubator)? When true a mutating command was aimed at THAT repo, not the
 /// worktree — passing it through avoids hijacking it into the worktree (the
@@ -51,9 +51,11 @@ pub(crate) use agentic_git_core::protected_refs::is_protected_ref;
 /// protection). SAFETY: canonical and EVERY sibling worktree resolve to
 /// canonical's commondir, so a `true` here can ONLY mean a genuinely-separate
 /// store the agent cannot use to reach canonical / shared refs / a sibling.
-pub(crate) fn cwd_is_foreign_repo(binding: &Binding) -> bool {
+/// Leading `-C` routing passes its resolved effective directory here so an
+/// explicit target is not mistaken for the bound process cwd.
+pub(crate) fn target_is_foreign_repo(binding: &Binding, target: &Path) -> bool {
     // GIT_DIR / GIT_COMMON_DIR / GIT_WORK_TREE retarget git independently of the
-    // cwd `.git` discovery this check relies on → fail-closed.
+    // target's `.git` discovery this check relies on → fail-closed.
     if env::var_os("GIT_DIR").is_some()
         || env::var_os("GIT_COMMON_DIR").is_some()
         || env::var_os("GIT_WORK_TREE").is_some()
@@ -64,11 +66,7 @@ pub(crate) fn cwd_is_foreign_repo(binding: &Binding) -> bool {
         Some(ref w) => w,
         None => return false,
     };
-    let cwd = match env::current_dir() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    paths_are_foreign(&cwd, Path::new(wt))
+    paths_are_foreign(target, Path::new(wt))
 }
 
 /// #3142: a bound agent's read-only git command must stay in a cwd that is not
