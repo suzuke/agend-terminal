@@ -23,7 +23,7 @@
 
 mod common;
 
-use common::daemon_reaper::assert_no_process_references_home;
+use common::daemon_reaper::FixtureHome;
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -35,14 +35,16 @@ fn bin() -> PathBuf {
     assert_cmd::cargo::cargo_bin("agend-terminal")
 }
 
-fn tmp_home(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+/// The fixture home, owned by a guard that reaps any daemon (and stub agents)
+/// booted under it before removing the directory. Tests must NOT call
+/// `remove_dir_all` themselves: the run dir that names the daemon's pid lives
+/// inside the home, so removing it first destroys the only handle on the daemon.
+fn tmp_home(tag: &str) -> FixtureHome {
+    FixtureHome::new(&format!(
         "agend-app-singleton-{}-{}",
         std::process::id(),
         tag
-    ));
-    std::fs::create_dir_all(&dir).expect("mkdir temp home");
-    dir
+    ))
 }
 
 /// One shell instance: if the guard ever regresses and the app boots Owned, the
@@ -153,11 +155,12 @@ fn wait_for_exit(child: &mut Child, budget: Duration) -> Option<std::process::Ex
 
 #[test]
 fn app_refuses_to_boot_while_daemon_lock_is_held() {
-    let home = tmp_home("held");
-    write_fleet(&home);
-    let _lock = hold_daemon_lock(&home);
+    let home_guard = tmp_home("held");
+    let home = home_guard.path();
+    write_fleet(home);
+    let _lock = hold_daemon_lock(home);
 
-    let mut child = boot_app_under_pty(&home);
+    let mut child = boot_app_under_pty(home);
     let status = wait_for_exit(&mut child, Duration::from_secs(30));
 
     let status = match status {
@@ -165,7 +168,6 @@ fn app_refuses_to_boot_while_daemon_lock_is_held() {
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            std::fs::remove_dir_all(&home).ok();
             panic!(
                 "`app` kept running while another process held .daemon.lock — it \
                  degraded to Owned mode and is spawning a second fleet (split-brain)"
@@ -188,9 +190,6 @@ fn app_refuses_to_boot_while_daemon_lock_is_held() {
         published.is_empty(),
         "a refused app must not publish a run dir; found {published:?}"
     );
-
-    assert_no_process_references_home(&home, "app_refuses_to_boot_while_daemon_lock_is_held");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 /// Control: with the lock free, the very same invocation gets PAST the singleton
@@ -202,18 +201,17 @@ fn app_refuses_to_boot_while_daemon_lock_is_held() {
 /// the pair a real RED/GREEN discriminator rather than a one-sided assertion.
 #[test]
 fn app_proceeds_past_singleton_check_when_lock_is_free() {
-    let home = tmp_home("free");
-    write_fleet(&home);
+    let home_guard = tmp_home("free");
+    let home = home_guard.path();
+    write_fleet(home);
     // Deliberately NO lock held.
 
-    let mut child = boot_app_under_pty(&home);
+    let mut child = boot_app_under_pty(home);
     let early_exit = wait_for_exit(&mut child, Duration::from_secs(10));
 
     let still_running = early_exit.is_none();
     let _ = child.kill();
     let _ = child.wait();
-    assert_no_process_references_home(&home, "app_proceeds_past_singleton_check_when_lock_is_free");
-    std::fs::remove_dir_all(&home).ok();
 
     assert!(
         still_running,

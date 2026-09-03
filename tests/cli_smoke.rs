@@ -5,6 +5,8 @@
 
 mod common;
 
+use common::daemon_reaper::FixtureHome;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
@@ -189,7 +191,12 @@ fn bugreport_with_nonexistent_home_errors_clearly() {
 #[test]
 fn connect_failed_spawn_deregisters_external_agent() {
     let stamp = std::process::id();
-    let home = std::env::temp_dir().join(format!("agend-cli-smoke-connect-home-{stamp}"));
+    // `FixtureHome` owns teardown: it reaps any daemon this fixture booted (and
+    // its setsid'd stub agents) BEFORE removing the directory. `start` spawns
+    // the daemon with `process_group(0)`, so it is not this process's child and
+    // no `Child` handle can reach it.
+    let home_guard = FixtureHome::new(&format!("agend-cli-smoke-connect-home-{stamp}"));
+    let home = home_guard.path().to_path_buf();
     let shell_dir = home.join("workspace/shell");
     let ext_dir = home.join("workspace/ext");
     std::fs::create_dir_all(&shell_dir).expect("create shell dir");
@@ -203,6 +210,9 @@ fn connect_failed_spawn_deregisters_external_agent() {
     )
     .expect("write fleet.yaml");
 
+    /// Graceful teardown only. `stop` is asynchronous and its result was
+    /// already being ignored; `home_guard` drops after this and does the
+    /// verifying + escalation to SIGTERM/SIGKILL, then removes the directory.
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -211,11 +221,6 @@ fn connect_failed_spawn_deregisters_external_agent() {
                 .env("AGEND_HOME", &self.0)
                 .arg("stop")
                 .output();
-            common::daemon_reaper::assert_no_process_references_home(
-                &self.0,
-                "connect_failed_spawn_deregisters_external_agent",
-            );
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
     let _cleanup = Cleanup(home.clone());
@@ -258,14 +263,17 @@ fn connect_failed_spawn_deregisters_external_agent() {
 #[test]
 fn second_detached_start_rejects_existing_daemon() {
     let stamp = std::process::id();
-    let home = std::env::temp_dir().join(format!("agend-cli-smoke-second-start-{stamp}"));
-    std::fs::create_dir_all(&home).expect("create home dir");
+    let home_guard = FixtureHome::new(&format!("agend-cli-smoke-second-start-{stamp}"));
+    let home = home_guard.path().to_path_buf();
     std::fs::write(
         home.join("fleet.yaml"),
         "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
+    /// Graceful teardown only. `stop` is asynchronous and its result was
+    /// already being ignored; `home_guard` drops after this and does the
+    /// verifying + escalation to SIGTERM/SIGKILL, then removes the directory.
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -274,11 +282,6 @@ fn second_detached_start_rejects_existing_daemon() {
                 .env("AGEND_HOME", &self.0)
                 .arg("stop")
                 .output();
-            common::daemon_reaper::assert_no_process_references_home(
-                &self.0,
-                "second_detached_start_rejects_existing_daemon",
-            );
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
     let _cleanup = Cleanup(home.clone());
