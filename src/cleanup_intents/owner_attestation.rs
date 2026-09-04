@@ -190,7 +190,11 @@ pub(super) fn reraise_drifted_merged_lane(home: &Path, intent: &CleanupIntent) {
     if lane_rows.iter().any(|task| !task.status.is_terminal()) {
         return;
     }
-    lane_rows.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+    // Generation order, and it is fixed when a row is created. `updated_at`
+    // answers "most recently written to" instead, which any touch on a closed
+    // row is enough to change
+    // (`a_touch_on_a_closed_row_does_not_make_it_the_lanes_latest_3517`).
+    lane_rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     // Only the LAST obligation speaks for the lane. Searching backward for any
     // result-less row walks past a newer owner answer into an older
     // system-closed one and re-asks a question that has been answered
