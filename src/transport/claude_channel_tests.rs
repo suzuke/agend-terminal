@@ -2245,5 +2245,49 @@ fn shutdown_signals_every_event_worker_before_joining_3515() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// #3515 follow-up: the join is BOUNDED. Before this, `stop_instance_state`
+/// called `join.join()` with no timeout, so a worker that never observed its
+/// stop flag held teardown open forever. Abandoning it is the right trade at
+/// teardown — the daemon is dropping this instance, usually on its way out — but
+/// it must never be silent, hence the `warn!` on the give-up path.
+///
+/// The grace is a parameter precisely so this can be proven in milliseconds
+/// rather than the 25s production window.
+#[test]
+fn wedged_event_worker_is_abandoned_after_its_grace_3515() {
+    use std::time::{Duration, Instant};
+
+    let release = Arc::new(AtomicBool::new(false));
+    let thread_release = Arc::clone(&release);
+    // A worker that ignores its stop flag entirely — the wedged case.
+    let join = std::thread::Builder::new()
+        .name("test-wedged-sse".to_string())
+        .spawn(move || {
+            while !thread_release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .expect("spawn wedged worker");
+
+    let grace = Duration::from_millis(150);
+    let started = Instant::now();
+    join_worker_bounded("claude-agent", join, grace);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < grace * 6,
+        "a wedged worker must be abandoned once its grace expires, not waited on \
+         forever: {elapsed:?} (grace {grace:?})"
+    );
+    assert!(
+        elapsed >= grace,
+        "the grace must actually be honoured before giving up — a worker that is \
+         merely slow must still be joined: {elapsed:?} (grace {grace:?})"
+    );
+
+    // Let the stand-in thread finish so the test leaves nothing running.
+    release.store(true, Ordering::Release);
+}
+
 #[path = "claude_channel/tests/self_kick_tests.rs"]
 mod self_kick_tests;

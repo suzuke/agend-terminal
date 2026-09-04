@@ -1833,12 +1833,61 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
     );
 }
 
+/// #3515 follow-up: set an events worker's stop flag WITHOUT waiting for it.
+///
+/// A worker only observes its flag when the SSE read it is blocked in returns,
+/// which `SSE_READ_TIMEOUT` bounds at 20s. [`stop_instance_state`] both signals
+/// and joins, so walking a fleet one instance at a time paid that window N
+/// times: each wait began only after the previous one ended. Signalling every
+/// worker first lets the windows overlap, so a fleet-wide stop costs about one
+/// of them. Nothing is skipped — the worker stays in the map and its own
+/// `stop_instance_state` still removes and joins it.
+pub(crate) fn signal_instance_stop(home: &Path, instance: &str) {
+    if let Some(worker) = event_workers().lock().get(&worker_key(home, instance)) {
+        worker.stop.store(true, Ordering::Release);
+    }
+}
+
+/// How long [`stop_instance_state`] waits for a signalled events worker before
+/// giving up on it. Deliberately ABOVE `SSE_READ_TIMEOUT`: a worker blocked in a
+/// normal read must still be joined properly, because it writes receipts and the
+/// caller is about to delete the instance's state underneath it. The give-up
+/// path is for a wedged worker, not a merely slow one.
+const WORKER_JOIN_GRACE: Duration = Duration::from_secs(25);
+/// Poll interval while waiting out [`WORKER_JOIN_GRACE`]. Short enough that the
+/// common case (worker already gone) adds nothing measurable.
+const WORKER_JOIN_POLL: Duration = Duration::from_millis(25);
+
+/// Join a signalled events worker, but never wait longer than `grace`
+/// ([`WORKER_JOIN_GRACE`] in production; a parameter so the give-up path is
+/// testable in milliseconds instead of tens of seconds). On expiry the handle is
+/// dropped, which detaches the
+/// thread: the daemon is tearing this instance down (and usually the process
+/// with it), so an unbounded wait buys nothing. Never silent — the give-up is
+/// the kind of thing an operator needs to see in the log.
+fn join_worker_bounded(instance: &str, join: JoinHandle<()>, grace: Duration) {
+    let deadline = Instant::now() + grace;
+    while !join.is_finished() {
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                instance = %instance,
+                grace_secs = grace.as_secs(),
+                "claude channel events worker did not stop within its grace window; \
+                 abandoning the thread and continuing teardown"
+            );
+            return;
+        }
+        thread::sleep(WORKER_JOIN_POLL);
+    }
+    let _ = join.join();
+}
+
 pub(crate) fn stop_instance_state(home: &Path, instance: &str) {
     let key = worker_key(home, instance);
     if let Some(mut worker) = event_workers().lock().remove(&key) {
         worker.stop.store(true, Ordering::Release);
         if let Some(join) = worker.join.take() {
-            let _ = join.join();
+            join_worker_bounded(instance, join, WORKER_JOIN_GRACE);
         }
     }
     let _ = std::fs::remove_dir_all(channel_state_dir(home, instance));

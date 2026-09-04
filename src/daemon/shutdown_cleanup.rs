@@ -25,6 +25,15 @@ use std::path::Path;
 pub(crate) fn cleanup_managed_transports(home: &Path, instances: &[String]) -> (usize, usize) {
     let mut cleaned = 0usize;
     let mut failed = 0usize;
+    // #3515 follow-up: signal EVERY instance's transport workers before joining
+    // any of them. A resident worker can take until its read timeout to notice a
+    // stop flag, and the loop below waits for each instance in turn — so setting
+    // the flags one at a time made that wait accumulate across the fleet. Setting
+    // them all up front lets the waits overlap; the loop below is unchanged and
+    // still removes and waits for every instance, so nothing is skipped.
+    for instance in instances {
+        crate::transport::signal_instance_transport_stop(home, instance);
+    }
     for instance in instances {
         match crate::transport::remove_instance_delivery_state(home, instance) {
             Ok(dropped) => {

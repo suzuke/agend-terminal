@@ -631,6 +631,21 @@ pub(crate) fn retire_resident_adapter(home: &Path, instance: &str) {
     }
 }
 
+/// #3515 follow-up: ask an instance's resident workers to stop, without waiting
+/// for any of them — the sibling of `claude_channel::signal_instance_stop`.
+///
+/// The resident event loop only re-checks its stop flag between reads, and a read
+/// can block for `IO_TIMEOUT`. [`stop_instance_server`] below signals and then
+/// joins, so a fleet-wide teardown that walks instances one at a time paid that
+/// window once per instance. Signalling everything first lets the windows
+/// overlap. Nothing is skipped: the worker stays registered and its own
+/// `stop_instance_server` still removes and joins it.
+pub(crate) fn signal_instance_stop(home: &Path, instance: &str) {
+    if let Some(worker) = resident_workers().lock().get(&resident_key(home, instance)) {
+        worker.stop.store(true, Ordering::Release);
+    }
+}
+
 pub(crate) fn stop_instance_server(home: &Path, instance: &str) {
     let workers = {
         let mut all = resident_workers().lock();

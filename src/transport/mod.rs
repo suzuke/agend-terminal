@@ -35,6 +35,21 @@ pub(crate) use registry::{
     prepare_opencode_tui_session,
 };
 
+/// #3515 follow-up: ask an instance's resident transport workers to stop, without
+/// waiting for any of them. Pairs with [`remove_instance_delivery_state`], which
+/// still does the removal and the waiting per instance — calling this for the
+/// WHOLE set first is what lets those waits overlap instead of accumulating
+/// (a worker can take until its read timeout to notice, and paying that once per
+/// instance made shutdown grow with fleet size).
+pub(crate) fn signal_instance_transport_stop(home: &std::path::Path, instance: &str) {
+    claude_channel::signal_instance_stop(home, instance);
+    // Same shape, smaller window: the OpenCode resident loop re-checks its flag
+    // between reads that can block for `IO_TIMEOUT`. Both transports that keep a
+    // resident worker are pre-signalled, so the linearity is gone for a mixed
+    // fleet too, not just an all-Claude one.
+    opencode_server::signal_instance_stop(home, instance);
+}
+
 /// See [`receipt::remove_instance_delivery_state`] for the policy: this is the
 /// one receipt-store writer allowed to discard unfinished notice debt, and the
 /// returned rows are the audit evidence that it never does so silently.
