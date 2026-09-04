@@ -411,9 +411,10 @@ fn direct_boot_tests_use_the_reaping_guard() {
     );
     assert!(
         violations.is_empty(),
-        "these test binaries direct-boot a real daemon (`start` + `--foreground`, or `app` \
-         under a real pty) without using the `FixtureHome` reaping guard from \
-         `tests/common/daemon_reaper.rs` — add `let _home = FixtureHome::new(..)` (see \
+        "these test binaries direct-boot a real daemon (they build the crate binary and \
+         pass `start` — with or without `--foreground`, since the CLI detaches on its \
+         own — or pass `app` under a real pty) without holding a reaping guard \
+         (`FixtureHome`, `AgendHarness` or `TestDaemon`) — add `let _home = FixtureHome::new(..)` (see \
          `app_singleton_fail_closed.rs` / `cli_smoke.rs`) or, if it truly cannot leak, say why \
          and add it to KNOWN_UNGUARDED_DIRECT_BOOT_DEBT with that reasoning:\n  {violations:#?}"
     );
