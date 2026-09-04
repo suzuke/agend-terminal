@@ -1240,14 +1240,15 @@ fn handle_update(
     let board = routed.board().path().to_path_buf();
     let record = routed.record().clone();
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    // #3511: `update` carries cancellation (no separate `cancel` action), so a
-    // row's own assignee reaches it across boards; the owner-ACL still gates WHO.
+    // #3511: cancellation rides `update` (there is no separate `cancel`), so the
+    // exception is offered ONLY for a pure cancellation — every other update
+    // mutation stays board-isolated. See `acl::update_settlement_owner`.
     if let Some(deny) = super::acl::cross_board_denied(
         home,
         &caller,
         &id,
         routed.board().project(),
-        record.owner.as_ref().map(|o| o.0.as_str()),
+        super::acl::update_settlement_owner(&record, args),
     ) {
         return deny;
     }

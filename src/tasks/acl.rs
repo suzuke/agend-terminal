@@ -199,8 +199,48 @@ pub(super) fn caller_project_resolvable(home: &Path, caller: &str) -> bool {
 // re-resolves (nor silently defaults). `None` = allowed.
 //
 // #3511: `owner` is the row's assignee when the call site has already resolved
-// the record, and carries the ONE exception below; `None` means "this action
-// grants no owner exception" and each such call site says why.
+// the record AND the requested operation is settlement; it carries the ONE
+// exception below. `None` means "this call grants no owner exception" — either
+// the action has none at all, or (see [`update_settlement_owner`]) this
+// particular request is not a pure cancellation.
+/// #3511 — which `update` requests may use the board exception at all.
+///
+/// `update` is the GENERAL mutation verb: `priority`, `assignee`, `description`,
+/// `tags` and `result` all ride the same call as `status`. Handing
+/// [`cross_board_denied`] the owner unconditionally therefore turned "close your
+/// own tail" into general write authority over a row on someone else's board —
+/// caught in review by a behavioural probe that changed a foreign board's row to
+/// `priority=urgent` and nothing else. `assignee` is the sharper version of the
+/// same hole: it hands the work to a third party.
+///
+/// So the exception is OPERATION-aware, not just identity-aware. It is offered
+/// only for a pure terminal cancellation, expressed as an ALLOW-list of the keys
+/// such a request may carry. An allow-list is the point: a future mutable field
+/// added to `update` is board-isolated by default and only becomes exception-
+/// eligible when someone deliberately adds it here. Any extra key — even
+/// alongside a genuine `status=cancelled` — puts the whole call back behind
+/// board isolation, so nothing can ride along with a settlement.
+///
+/// `done` needs no equivalent: it is terminal by construction.
+pub(super) fn update_settlement_owner<'a>(
+    record: &'a crate::task_events::TaskRecord,
+    args: &Value,
+) -> Option<&'a str> {
+    /// Routing / identity keys only — none of them mutate the row.
+    const PURE_CANCELLATION_KEYS: &[&str] = &["action", "id", "task_id", "status", "project"];
+    if args["status"].as_str() != Some("cancelled") {
+        return None;
+    }
+    let only_settlement_keys = args.as_object().is_some_and(|obj| {
+        obj.keys()
+            .all(|k| PURE_CANCELLATION_KEYS.contains(&k.as_str()))
+    });
+    if !only_settlement_keys {
+        return None;
+    }
+    record.owner.as_ref().map(|o| o.0.as_str())
+}
+
 pub(super) fn cross_board_denied(
     home: &Path,
     caller: &str,
