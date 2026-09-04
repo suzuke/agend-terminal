@@ -419,6 +419,61 @@ fn an_orphan_lane_is_reraised_when_it_drifts_3517() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// The other half of the ownerless case, and the one place this fix does not
+/// do what it was literally asked to do.
+///
+/// The instruction was to raise the replacement `owner: None` plus the orphan
+/// tag whenever the retired row was ownerless. Passing the absence through to
+/// `record_retention_obligation` instead means liveness is decided AGAIN at
+/// re-raise time, so a lane orphaned while everyone was away escheats to the
+/// originating task's creator once they are back — asked, not orphaned. That
+/// is the release path's own rule (`retention_obligation_escheats…`), applied
+/// to the same lane a second time, and it is strictly better than raising a
+/// row nobody owns while somebody is there to own it. Orphaning stays the
+/// answer when nobody is
+/// (`an_orphan_lane_is_reraised_when_it_drifts_3517`).
+#[test]
+fn an_orphan_lane_escheats_to_a_live_creator_when_it_drifts_3517() {
+    let home = tmp_dir("drift-escheat");
+    let repo = tmp_repo("drift-escheat-repo");
+    let branch = "feat/orphan-then-someone-returns";
+    let rs = repo.display().to_string();
+    // `seed_obligation` creates the originating task as "test"; that is the
+    // creator the projection escheats to, and here it is live.
+    plant_live_agents(&home, &["test"]);
+    let merged_head = make_branch(&repo, branch);
+    persist_intent(&home, &rs, branch, &merged_head, "t-origin", None, None).expect("persist");
+    let orphan_row = seed_obligation(&home, &rs, branch, &merged_head, None);
+    assert!(
+        obligation(&home, &orphan_row).owner.is_none(),
+        "precondition: the retired row is ownerless"
+    );
+
+    owner_attestation::retire_merged_lane(&home, &rs, branch);
+    commit_onto(&repo, branch, "late.txt");
+
+    sweep_settle_merged(&home);
+
+    let rows = open_lane_rows(&home, &rs, branch);
+    assert_eq!(rows.len(), 1, "the drift still raises exactly one row");
+    assert_eq!(
+        rows[0].owner.as_ref().map(|owner| owner.0.as_str()),
+        Some("test"),
+        "a live creator is asked rather than orphaned — the absence on the old \
+         row is not carried forward as a verdict about who is around now"
+    );
+    assert!(
+        !rows[0]
+            .tags
+            .iter()
+            .any(|tag| tag == "branch-retention-orphan"),
+        "and a row with an owner is not tagged orphan"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// #3517 follow-up — the reachability fact the whole fix rests on, pinned rather
 /// than argued.
 ///
