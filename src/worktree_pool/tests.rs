@@ -6404,12 +6404,18 @@ fn open_pr_branch_release_creates_no_retention_obligation() {
     let repo = tmp_repo("retention-openpr-a-repo");
     crate::git_helpers::git_bypass(
         &repo,
-        &["remote", "add", "origin", "https://github.com/example/repo.git"],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/repo.git",
+        ],
     )
     .expect("add origin");
-    let provider = crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Branches(
-        vec!["feat/openpr".to_string()],
-    ));
+    let provider =
+        crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Branches(vec![
+            "feat/openpr".to_string(),
+        ]));
     let _provider_guard = crate::scm::set_test_scm_provider(provider);
 
     plant_live_agents(&home, &["agent-own"]);
@@ -6447,7 +6453,12 @@ fn unknown_pr_status_branch_release_creates_no_retention_obligation() {
     let repo = tmp_repo("retention-openpr-unknown-repo");
     crate::git_helpers::git_bypass(
         &repo,
-        &["remote", "add", "origin", "https://example.com/not-github.git"],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/not-github.git",
+        ],
     )
     .expect("add origin");
 
@@ -6550,7 +6561,11 @@ fn merged_branch_retires_open_retention_obligation() {
     crate::cleanup_intents::settle_intent(&home, &repo_str, "feat/willmerge", true, None);
 
     let obligations = retention_tasks(&home);
-    assert_eq!(obligations.len(), 1, "the row must still exist, now terminal");
+    assert_eq!(
+        obligations.len(),
+        1,
+        "the row must still exist, now terminal"
+    );
     assert!(
         obligations[0].status.is_terminal(),
         "merge must retire the open retention row, got status {:?}",

@@ -76,6 +76,58 @@ pub(super) fn retention_project(home: &Path, repo: &str) -> String {
     crate::tasks::resolve_repository_project(home, Path::new(repo))
 }
 
+/// #3503: retire every OPEN branch-retention obligation on this (repo,
+/// branch) lane once the branch is confirmed merged. Called from
+/// [`super::settle_intent`] — the single chokepoint both the event-driven
+/// CI-watch merge notice and the periodic sweep funnel through once `merged`
+/// is authoritative — so this fires regardless of which path observed the
+/// merge, and regardless of whether the local branch-delete below succeeds.
+///
+/// Deliberately does NOT reuse [`exact_retention_obligation`]'s ambiguity
+/// refusal: that rule exists because settling by owner attestation must pick
+/// exactly one row to read an ANSWER from, and two rows sharing a key make
+/// that choice undefined. Retirement reads no answer — a merge is a fact, not
+/// an answer to consult — so every open row on the lane is closed and how
+/// many is logged. Uses the LANE key (repo, branch), not the exact key: the
+/// head recorded at release time can differ from the merged head, so the
+/// exact key would miss the very row this exists to retire.
+pub(super) fn retire_merged_lane(home: &Path, repo: &str, branch: &str) {
+    let project = retention_project(home, repo);
+    let lane_tag = crate::worktree_pool::retention_lane_key(repo, branch);
+    let open: Vec<_> = retention_obligations(home, &project)
+        .into_iter()
+        .filter(|task| task.tags.contains(&lane_tag) && !task.status.is_terminal())
+        .collect();
+    if open.is_empty() {
+        return;
+    }
+    let board = crate::task_events::board_root(home, &project);
+    let actor = crate::task_events::InstanceName(RETENTION_ACTOR.to_string());
+    let mut retired = 0usize;
+    for task in &open {
+        let event = crate::task_events::TaskEvent::Done {
+            task_id: task.id.clone(),
+            by: actor.clone(),
+            source: crate::task_events::DoneSource::AutoCloseOnPrMerge {
+                branch: branch.to_string(),
+                merged_at: chrono::Utc::now().to_rfc3339(),
+            },
+        };
+        match crate::task_events::append_done_if_legal_at(&board, &actor, &task.id.0, vec![event]) {
+            Ok(true) => retired += 1,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                %repo, %branch, task_id = %task.id.0, %error,
+                "branch-retention obligation retire failed — will retry next sweep"
+            ),
+        }
+    }
+    tracing::info!(
+        %repo, %branch, retired, total = open.len(),
+        "branch-retention obligations retired by merge"
+    );
+}
+
 pub(super) fn retention_obligations(
     home: &Path,
     project: &str,

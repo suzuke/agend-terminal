@@ -78,7 +78,7 @@ pub(crate) fn retention_key(repo: &str, branch: &str, head: &str) -> String {
     format!("retention-key:{}", hex::encode(hasher.finalize()))
 }
 
-fn retention_lane_key(repo: &str, branch: &str) -> String {
+pub(crate) fn retention_lane_key(repo: &str, branch: &str) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(format!("{repo}\0{branch}").as_bytes());
@@ -366,17 +366,35 @@ pub(super) fn resolve_branch_cleanup(
             // which a local-only lane never produces — so ask the recorded owner.
             // Runs in the post-lock notice phase (every flock is already dropped
             // above), so the task-board write takes no worktree/branch/binding lock.
-            let head = crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
-                .map(|tip| tip.trim().to_string())
-                .unwrap_or_default();
-            record_retention_obligation(
-                home,
-                sr_str,
-                branch,
-                &head,
-                task_id,
-                binding["agent"].as_str().unwrap_or(""),
-            );
+            //
+            // #3503: that premise is false when the branch has an open PR —
+            // merge minutes later WILL settle the intent above, and
+            // `cleanup_intents::sweep_settle_merged` retires any row raised
+            // in the meantime once the merge lands. Same fail-closed idiom as
+            // `cleanup_intents.rs`'s `open_pr_status` preserve check:
+            // `Unknown` (SCM lookup failure) is treated like `Open`, so only
+            // a confirmed `NotOpen` lane raises the obligation.
+            let default = crate::git_helpers::default_branch(Path::new(sr_str));
+            let open_pr_status =
+                crate::branch_sweep::open_pr_status(Path::new(sr_str), &default, branch);
+            if matches!(open_pr_status, crate::branch_sweep::OpenPrStatus::NotOpen) {
+                let head = crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
+                    .map(|tip| tip.trim().to_string())
+                    .unwrap_or_default();
+                record_retention_obligation(
+                    home,
+                    sr_str,
+                    branch,
+                    &head,
+                    task_id,
+                    binding["agent"].as_str().unwrap_or(""),
+                );
+            } else {
+                tracing::info!(
+                    %branch, ?open_pr_status,
+                    "branch-retention obligation skipped — open PR can still settle by merge"
+                );
+            }
         }
     } else if branch.is_empty() {
         out.branch_cleanup_skipped_reason = Some("no branch in binding".to_string());

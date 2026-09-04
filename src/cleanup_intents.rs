@@ -183,6 +183,14 @@ pub(crate) fn settle_intent(
         _ => {}
     }
 
+    // #3503: merge is confirmed and (when both sides carry generation) the
+    // generation matches — retire any OPEN branch-retention obligation on
+    // this lane now, independent of the local branch-delete outcome below.
+    // This is the chokepoint both the CI-watch event path (`settle_by_scm_slug`)
+    // and the periodic sweep (`sweep_settle_merged`) funnel through once
+    // `merged` is authoritative, so retirement fires from either source.
+    owner_attestation::retire_merged_lane(home, repo, branch);
+
     let source_repo = Path::new(&intent.repo);
     if !source_repo.is_dir() {
         return Some(SettleOutcome::GitError(format!(
