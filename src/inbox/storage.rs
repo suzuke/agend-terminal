@@ -722,7 +722,10 @@ fn supersede_by_nonce_inner(
                         if msg.read_at.is_some() {
                             outcome.was_read = true;
                         }
-                        if msg.read_at.is_some() || msg.delivering_at.is_some() {
+                        if msg.read_at.is_some()
+                            || msg.delivering_at.is_some()
+                            || msg.delivery_count > 0
+                        {
                             outcome.was_delivered = true;
                         }
                         if msg.read_at.is_none() && msg.superseded_by.is_none() {
