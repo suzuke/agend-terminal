@@ -191,10 +191,13 @@ pub(super) fn reraise_drifted_merged_lane(home: &Path, intent: &CleanupIntent) {
         return;
     }
     lane_rows.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+    // Only the LAST obligation speaks for the lane. Searching backward for any
+    // result-less row walks past a newer owner answer into an older
+    // system-closed one and re-asks a question that has been answered
+    // (`a_later_owner_answer_outranks_an_older_system_retirement_3517`).
     let Some(owner) = lane_rows
-        .iter()
-        .rev()
-        .find(|task| task.result.is_none())
+        .last()
+        .filter(|task| task.result.is_none())
         .and_then(|task| task.owner.clone())
     else {
         return;
