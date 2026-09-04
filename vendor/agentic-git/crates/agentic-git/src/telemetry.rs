@@ -172,14 +172,12 @@ pub(crate) fn deny_remedy_lines(binding: Option<&Binding>) -> Vec<String> {
         // its provisioning tool from its own prompt; a standalone user gets a
         // literal command. No orchestrator-specific vocab hardcoded here.
         _ => vec![
-            "           no active worktree binding here — this git call isn't inside a"
-                .to_string(),
+            "           no active worktree binding here — this git call isn't inside a".to_string(),
             "           guarded session. Get one by either:".to_string(),
             "             - launching the agent via `agentic-git run --branch <branch> -- <cmd>`"
                 .to_string(),
             "               (standalone: provisions + binds a worktree), or".to_string(),
-            "             - having your orchestrator bind this agent to a worktree,"
-                .to_string(),
+            "             - having your orchestrator bind this agent to a worktree,".to_string(),
             "               then running git from inside it.".to_string(),
         ],
     }
@@ -283,7 +281,10 @@ pub(crate) fn disposition_for(event_type: &str) -> Disposition {
         // warning but is not blocked.
         // #26: audited-bypass mutations and unattributed canonical HEAD-touches
         // are advisory-noteworthy instrumentation, never terminal denials.
-        "cwd_worktree_drift" | "git_conflict" | "snapshot_failed" | "bypass_mutating_op"
+        "cwd_worktree_drift"
+        | "git_conflict"
+        | "snapshot_failed"
+        | "bypass_mutating_op"
         | "canonical_passthrough_checkout" => Disposition::Warn,
         // #26: heartbeat-pile forensics are routine instrumentation.
         "post_merge_cleanup_exempt" | "init_heartbeat_forensics" => Disposition::Info,
@@ -369,7 +370,8 @@ mod tests {
     /// Fully-qualified name of the stress test, used to re-exec ourselves as a
     /// worker. Kept next to the test so a rename breaks loudly rather than
     /// silently spawning nothing.
-    const STRESS_TEST_PATH: &str = "telemetry::tests::concurrent_append_git_event_writes_only_parseable_records";
+    const STRESS_TEST_PATH: &str =
+        "telemetry::tests::concurrent_append_git_event_writes_only_parseable_records";
     const WORKERS: usize = 8;
     const RECORDS_PER_WORKER: usize = 400;
 
@@ -435,8 +437,7 @@ mod tests {
         append_git_event(home.to_str().unwrap(), &sample_event("shim", 0));
         let elapsed = started.elapsed();
 
-        let written =
-            std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
+        let written = std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
         assert!(
             written.trim().is_empty(),
             "best-effort sink must skip while the lock is held, never append unlocked; found: {written}"
@@ -506,8 +507,15 @@ mod tests {
             .filter(|l| !l.trim().is_empty())
             .map(|l| serde_json::from_str(l).expect("row written after release must be parseable"))
             .collect();
-        assert_eq!(rows.len(), 1, "exactly the post-release record, got: {content}");
-        assert_eq!(rows[0]["seq"], 1, "the skipped record must not reappear later");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly the post-release record, got: {content}"
+        );
+        assert_eq!(
+            rows[0]["seq"], 1,
+            "the skipped record must not reappear later"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -562,7 +570,8 @@ mod tests {
         // must not claim zero loss. Delivery is pinned separately, on the bounded
         // path, in the appender crate's own tests.
         assert_eq!(
-            corrupt, 0,
+            corrupt,
+            0,
             "every record that reaches the log must be intact; {corrupt} corrupt of {} lines",
             parsed + corrupt
         );
@@ -576,7 +585,9 @@ mod tests {
         // retry wrote twice; a malformed row would mean a partial write survived.
         let mut seen = std::collections::HashSet::new();
         for (raw, row) in &rows {
-            let agent = row["agent"].as_str().expect("surviving row must carry agent");
+            let agent = row["agent"]
+                .as_str()
+                .expect("surviving row must carry agent");
             let seq = row["seq"].as_u64().expect("surviving row must carry seq");
             assert!(
                 seen.insert((agent.to_string(), seq)),

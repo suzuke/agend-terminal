@@ -77,7 +77,9 @@ impl Default for BindingV1 {
 pub enum BindingDecodeError {
     /// The document declares a version this crate does not implement.
     /// `found` is 0 when the field is present but not a positive integer.
-    UnsupportedVersion { found: u64 },
+    UnsupportedVersion {
+        found: u64,
+    },
     Parse(serde_json::Error),
 }
 
@@ -98,8 +100,7 @@ impl std::error::Error for BindingDecodeError {}
 /// Decode a binding document. The version gate runs FIRST on the raw value so
 /// an unsupported version fails closed even when other fields are malformed.
 pub fn decode(json: &str) -> Result<BindingV1, BindingDecodeError> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(BindingDecodeError::Parse)?;
+    let value: serde_json::Value = serde_json::from_str(json).map_err(BindingDecodeError::Parse)?;
     if let Some(version) = value.get("version") {
         let found = version.as_u64().unwrap_or(0);
         if found != u64::from(BINDING_FORMAT_VERSION) {
@@ -166,7 +167,10 @@ mod tests {
     fn unknown_fields_are_bounded_extensions_preserved_roundtrip() {
         let json = r#"{"version":1,"task_id":"t-1","custom_lease":"abc","nested":{"k":1}}"#;
         let doc = decode(json).unwrap();
-        assert_eq!(doc.extra.get("custom_lease").and_then(|v| v.as_str()), Some("abc"));
+        assert_eq!(
+            doc.extra.get("custom_lease").and_then(|v| v.as_str()),
+            Some("abc")
+        );
         let re = encode(&doc).unwrap();
         let back = decode(&re).unwrap();
         assert_eq!(back, doc, "extension fields must survive a round-trip");
@@ -175,12 +179,18 @@ mod tests {
     #[test]
     fn golden_fixtures_decode() {
         for (rel, task_id) in [
-            ("../agentic-git/tests/fixtures/binding-agend-v1.json", "t-20260719-golden-agend"),
-            ("../agentic-git/tests/fixtures/binding-run-v1.json", "run-session-1789000000"),
+            (
+                "../agentic-git/tests/fixtures/binding-agend-v1.json",
+                "t-20260719-golden-agend",
+            ),
+            (
+                "../agentic-git/tests/fixtures/binding-run-v1.json",
+                "run-session-1789000000",
+            ),
         ] {
             let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
-            let content = std::fs::read_to_string(&p)
-                .unwrap_or_else(|e| panic!("golden fixture {rel}: {e}"));
+            let content =
+                std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("golden fixture {rel}: {e}"));
             let doc = decode(&content).unwrap_or_else(|e| panic!("golden {rel}: {e}"));
             assert_eq!(doc.version, 1, "golden {rel}");
             assert_eq!(doc.task_id.as_deref(), Some(task_id), "golden {rel}");

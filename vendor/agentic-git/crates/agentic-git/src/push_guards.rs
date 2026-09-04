@@ -46,7 +46,8 @@ pub(crate) fn cleanup_init_pile_pre_push(worktree: &str) {
     let log_out = match Command::new("git")
         .args(["log", &range, "--format=%H %s"])
         .current_dir(worktree)
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -95,7 +96,8 @@ pub(crate) fn cleanup_init_pile_pre_push(worktree: &str) {
         let reset = Command::new("git")
             .args(["reset", "--soft", &base])
             .current_dir(worktree)
-            .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+            .env("AGENTIC_GIT_BYPASS", "1")
+            .env("AGEND_GIT_BYPASS", "1")
             .status();
         match reset {
             Ok(s) if s.success() => {
@@ -134,7 +136,8 @@ pub(crate) fn cleanup_init_pile_pre_push(worktree: &str) {
     let rebase = Command::new("git")
         .args(["-c", "core.abbrev=7", "rebase", "-i", &base])
         .current_dir(worktree)
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
         .env("GIT_SEQUENCE_EDITOR", format!("sed -i.bak '{sed_script}'"))
         .status();
     match rebase {
@@ -151,7 +154,8 @@ pub(crate) fn cleanup_init_pile_pre_push(worktree: &str) {
             let _abort = Command::new("git")
                 .args(["rebase", "--abort"])
                 .current_dir(worktree)
-                .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+                .env("AGENTIC_GIT_BYPASS", "1")
+                .env("AGEND_GIT_BYPASS", "1")
                 .status();
             eprintln!(
                 "agentic-git: #883 pre-push cleanup rebase failed; aborted to leave worktree clean. \
@@ -182,7 +186,8 @@ pub(crate) fn commit_is_empty_heartbeat(worktree: &str, hash: &str) -> bool {
     let body_out = match Command::new("git")
         .args(["log", "-1", "--format=%b", hash])
         .current_dir(worktree)
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -220,7 +225,8 @@ pub(crate) fn commit_is_empty_heartbeat(worktree: &str, hash: &str) -> bool {
     let diff_out = match Command::new("git")
         .args(["diff-tree", "--no-commit-id", "--name-only", "-r", hash])
         .current_dir(worktree)
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -288,7 +294,10 @@ pub(crate) fn trust_root_basename_denied(repo_relative_path: &str) -> bool {
 /// should not delegate to someone else's normalisation.
 fn under_tests_fixtures(repo_relative_path: &str) -> bool {
     let parts: Vec<&str> = repo_relative_path.split('/').collect();
-    if parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || *p == "." || *p == "..")
+    {
         return false;
     }
     parts
@@ -324,7 +333,8 @@ pub(crate) fn resolve_default_branch_base(worktree: &str) -> Result<String, Stri
     if let Ok(o) = Command::new("git")
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .current_dir(worktree)
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
     {
         if o.status.success() {
@@ -372,7 +382,8 @@ pub(crate) fn trunk_exists(worktree: &str, rev: &str) -> bool {
             &format!("{rev}^{{commit}}"),
         ])
         .current_dir(worktree)
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -391,7 +402,8 @@ pub(crate) fn push_range_files(worktree: &str) -> Result<Vec<String>, String> {
     let out = Command::new("git")
         .args(["log", "--name-only", "--pretty=format:", &range])
         .current_dir(worktree)
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map_err(|e| format!("git log spawn failed: {e}"))?;
     if !out.status.success() {
@@ -825,7 +837,9 @@ pub(crate) fn push_cross_branch_violation(
     }
     let mut idx = 0;
     while idx < refspecs.len() {
-        let rs = refspecs[idx].strip_prefix('+').unwrap_or(refspecs[idx].as_str());
+        let rs = refspecs[idx]
+            .strip_prefix('+')
+            .unwrap_or(refspecs[idx].as_str());
         if rs == "tag" {
             idx += 2; // `tag <name>` — a tag push, not a branch (skip both tokens)
             continue;

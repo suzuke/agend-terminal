@@ -107,7 +107,14 @@ fn worktree_of(root: &Path, real_git: &Path, repo: &Path, branch: &str) -> PathB
     let wt = root.join("wt");
     setup_git(
         real_git,
-        &["worktree", "add", wt.to_str().unwrap(), "-b", branch, "main"],
+        &[
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "-b",
+            branch,
+            "main",
+        ],
         repo,
     );
     wt
@@ -169,11 +176,7 @@ fn setup_parent_with_submodule(root: &Path, real_git: &Path) -> (PathBuf, PathBu
         &["submodule", "add", &sub_url, "vendor/sub"],
         &parent,
     );
-    setup_git(
-        real_git,
-        &["commit", "-q", "-m", "add submodule"],
-        &parent,
-    );
+    setup_git(real_git, &["commit", "-q", "-m", "add submodule"], &parent);
     (parent, sub_repo)
 }
 
@@ -187,7 +190,14 @@ fn unbound_submodule_status_passes_through() {
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
 
-    let out = run_shim(&parent, &home, "test-agent", &real_git, &[], &["submodule", "status"]);
+    let out = run_shim(
+        &parent,
+        &home,
+        "test-agent",
+        &real_git,
+        &[],
+        &["submodule", "status"],
+    );
     assert!(
         out.status.success() || out.status.code() == Some(0),
         "unbound submodule status must pass through; stderr={}",
@@ -204,7 +214,14 @@ fn unbound_submodule_update_denied() {
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
 
-    let out = run_shim(&parent, &home, "test-agent", &real_git, &[], &["submodule", "update"]);
+    let out = run_shim(
+        &parent,
+        &home,
+        "test-agent",
+        &real_git,
+        &[],
+        &["submodule", "update"],
+    );
     assert!(
         !out.status.success(),
         "unbound submodule update must be denied"
@@ -298,7 +315,14 @@ fn bound_submodule_status_routes_to_worktree() {
     let wt = worktree_of(&root, &real_git, &parent, "fix/test");
     write_binding(&home, "test-agent", "fix/test", &wt);
 
-    let out = run_shim(&wt, &home, "test-agent", &real_git, &[], &["submodule", "status"]);
+    let out = run_shim(
+        &wt,
+        &home,
+        "test-agent",
+        &real_git,
+        &[],
+        &["submodule", "status"],
+    );
     assert!(
         out.status.success(),
         "bound submodule status must succeed via ChdirPass; stderr={}",

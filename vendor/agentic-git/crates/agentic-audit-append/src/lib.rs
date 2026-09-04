@@ -218,7 +218,9 @@ fn append_audit_line(
     acquire(&lock, mode)?;
 
     // (2) Exactly one `write_all` while the lock is held.
-    let result = target.write_all(line.as_bytes()).map_err(AppendError::Write);
+    let result = target
+        .write_all(line.as_bytes())
+        .map_err(AppendError::Write);
 
     // Released by the OS on close; explicit so the critical section's end is
     // visible rather than implied by scope.
@@ -369,7 +371,10 @@ mod tests {
         for i in 0..N {
             append_audit_line_bounded(&home, &row(i), DEFAULT_BOUNDED_BUDGET).unwrap();
         }
-        let mut seqs: Vec<u64> = rows(&home).iter().filter_map(|r| r["seq"].as_u64()).collect();
+        let mut seqs: Vec<u64> = rows(&home)
+            .iter()
+            .filter_map(|r| r["seq"].as_u64())
+            .collect();
         seqs.sort_unstable();
         assert_eq!(
             seqs,

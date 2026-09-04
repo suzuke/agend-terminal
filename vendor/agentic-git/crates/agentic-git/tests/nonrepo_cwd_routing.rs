@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn real_git() -> PathBuf {
-    for candidate in ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"] {
+    for candidate in [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ] {
         let path = PathBuf::from(candidate);
         if path.exists() {
             return path;
@@ -103,14 +107,25 @@ fn bound_agent_nonrepo_cwd_keeps_read_only_git_at_real_cwd() {
 
     run_real_git(&real_git, &source, &["init", "-q", "-b", "main"]);
     run_real_git(&real_git, &source, &["config", "user.name", "test"]);
-    run_real_git(&real_git, &source, &["config", "user.email", "test@example.com"]);
+    run_real_git(
+        &real_git,
+        &source,
+        &["config", "user.email", "test@example.com"],
+    );
     std::fs::write(source.join("README.md"), "fixture\n").unwrap();
     run_real_git(&real_git, &source, &["add", "."]);
     run_real_git(&real_git, &source, &["commit", "-q", "-m", "init"]);
     run_real_git(
         &real_git,
         &source,
-        &["worktree", "add", "-q", "-b", "agent/3142", worktree.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/3142",
+            worktree.to_str().unwrap(),
+        ],
     );
     write_binding(&home, "agent-3142", "agent/3142", &worktree, &source);
 

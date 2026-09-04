@@ -341,7 +341,8 @@ fn shim_denies_agent_bypass_canonical_provisioning_2234() {
         c.arg0("git")
             .args(args)
             .current_dir(cwd)
-            .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+            .env("AGENTIC_GIT_BYPASS", "1")
+            .env("AGEND_GIT_BYPASS", "1")
             // Start at shim depth 0 (don't inherit an outer shim's depth).
             // Every removal clears BOTH the primary name and its legacy
             // (agend-terminal) fallback — an ambient legacy env (e.g. this

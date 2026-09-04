@@ -94,7 +94,14 @@ fn worktree_of(root: &Path, real_git: &Path, repo: &Path, branch: &str) -> PathB
     let wt = root.join("wt");
     setup_git(
         real_git,
-        &["worktree", "add", wt.to_str().unwrap(), "-b", branch, "main"],
+        &[
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "-b",
+            branch,
+            "main",
+        ],
         repo,
     );
     wt
@@ -168,7 +175,11 @@ fn run_shim(
 
 fn snapshot_refs(real_git: &Path, repo: &Path) -> Vec<String> {
     let out = Command::new(real_git)
-        .args(["for-each-ref", "--format=%(refname)", "refs/agentic-git/snapshots/"])
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/agentic-git/snapshots/",
+        ])
         .current_dir(repo)
         .env("AGENTIC_GIT_BYPASS", "1")
         .env("AGEND_GIT_BYPASS", "1")
@@ -216,10 +227,18 @@ fn the_test_reset_hard_is_byte_recoverable() {
         &[("AGENTIC_GIT_SNAPSHOTS", "1")],
         &["reset", "--hard"],
     );
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let refs = snapshot_refs(&real_git, &repo);
-    assert_eq!(refs.len(), 1, "exactly one snapshot ref must exist: {refs:?}");
+    assert_eq!(
+        refs.len(),
+        1,
+        "exactly one snapshot ref must exist: {refs:?}"
+    );
 
     // Post-reset: the tracked change is gone (this is what `reset --hard`
     // itself destroys — it never touches untracked files; that's `clean`'s
@@ -228,7 +247,10 @@ fn the_test_reset_hard_is_byte_recoverable() {
     // breath) so this test proves what the issue's own "THE test" asks for:
     // both categories are byte-recoverable from the ONE ref the snapshot
     // mechanism captured before the destructive op ran.
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "hello\n");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "hello\n"
+    );
     std::fs::remove_file(wt.join("untracked.txt")).unwrap();
 
     // Byte-for-byte recovery via the DOCUMENTED manual path.
@@ -268,8 +290,15 @@ fn clean_fd_variant_recovers_untracked_dir() {
         &[("AGENTIC_GIT_SNAPSHOTS", "1")],
         &["clean", "-fd"],
     );
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
-    assert!(!wt.join("untracked_dir").exists(), "clean -fd must have removed the dir");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !wt.join("untracked_dir").exists(),
+        "clean -fd must have removed the dir"
+    );
 
     let refs = snapshot_refs(&real_git, &repo);
     assert_eq!(refs.len(), 1, "{refs:?}");
@@ -303,7 +332,11 @@ fn skip_when_clean_creates_no_ref() {
         &[("AGENTIC_GIT_SNAPSHOTS", "1")],
         &["reset", "--hard"],
     );
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         snapshot_refs(&real_git, &repo).is_empty(),
         "a clean tree must create NO snapshot ref"
@@ -393,7 +426,11 @@ fn head_less_repo_snapshot_through_shim() {
         &[("AGENTIC_GIT_SNAPSHOTS", "1")],
         &["clean", "-f"],
     );
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let refs = snapshot_refs(&real_git, &repo);
     assert_eq!(refs.len(), 1, "{refs:?}");
     let parents = Command::new(&real_git)
@@ -430,10 +467,18 @@ fn snapshot_push_denied_spelling_matrix() {
     write_binding(&home, "agent-pd", "agent/pushdeny", &wt);
 
     // "origin" = the repo itself (a real remote, fetchable/pushable path).
-    setup_git(&real_git, &["remote", "add", "origin", repo.to_str().unwrap()], &wt);
+    setup_git(
+        &real_git,
+        &["remote", "add", "origin", repo.to_str().unwrap()],
+        &wt,
+    );
     setup_git(&real_git, &["fetch", "-q", "origin"], &wt);
     // Allow pushing into a non-bare repo's checked-out branch for this test.
-    setup_git(&real_git, &["config", "receive.denyCurrentBranch", "updateInstead"], &repo);
+    setup_git(
+        &real_git,
+        &["config", "receive.denyCurrentBranch", "updateInstead"],
+        &repo,
+    );
 
     // Create a real snapshot ref by running an ordinary destructive op first.
     std::fs::write(wt.join("README.md"), "dirty for snapshot\n").unwrap();
@@ -455,7 +500,10 @@ fn snapshot_push_denied_spelling_matrix() {
     let cases: &[(&str, String)] = &[
         ("full ref", format!("{snap_ref}:refs/heads/out1")),
         ("abbreviated", format!("{short_ref}:refs/heads/out2")),
-        ("wildcard", "refs/agentic-git/snapshots/*:refs/agentic-git/snapshots/*".to_string()),
+        (
+            "wildcard",
+            "refs/agentic-git/snapshots/*:refs/agentic-git/snapshots/*".to_string(),
+        ),
         ("rev-suffix ^{}", format!("{snap_ref}^{{}}:refs/heads/out3")),
         ("rev-suffix ~0", format!("{snap_ref}~0:refs/heads/out4")),
         ("laundered branch", "laundered:refs/heads/out5".to_string()),
@@ -495,7 +543,14 @@ fn snapshot_push_denied_spelling_matrix() {
     // push every local ref, protected ones included) also independently
     // denies this before our own `--mirror` check gets a chance to fire —
     // both layers are correct; only the union (denied) is the contract.
-    let mirror = run_shim(&wt, &home, "agent-pd", &real_git, &[], &["push", "--mirror", "origin"]);
+    let mirror = run_shim(
+        &wt,
+        &home,
+        "agent-pd",
+        &real_git,
+        &[],
+        &["push", "--mirror", "origin"],
+    );
     assert_eq!(mirror.status.code(), Some(1));
 
     // A normal branch push is unaffected.
@@ -538,8 +593,19 @@ fn ambient_1970_date_does_not_self_prune_or_prune_prior_snapshots() {
     // OWN test fixtures elsewhere that set GIT_COMMITTER_DATE — Δd's whole
     // point: this must NOT make the fresh snapshot look pre-expired).
     std::fs::write(wt.join("README.md"), "first dirty\n").unwrap();
-    let out1 = run_shim(&repo, &home, "agent-a70", &real_git, epoch_env, &["reset", "--hard"]);
-    assert!(out1.status.success(), "stderr={}", String::from_utf8_lossy(&out1.stderr));
+    let out1 = run_shim(
+        &repo,
+        &home,
+        "agent-a70",
+        &real_git,
+        epoch_env,
+        &["reset", "--hard"],
+    );
+    assert!(
+        out1.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
     let refs1 = snapshot_refs(&real_git, &repo);
     assert_eq!(refs1.len(), 1, "{refs1:?}");
     let ts1 = committer_epoch(&real_git, &repo, &refs1[0]);
@@ -556,8 +622,19 @@ fn ambient_1970_date_does_not_self_prune_or_prune_prior_snapshots() {
     // prune pass must NOT delete the FIRST snapshot (which would happen if
     // date-forcing had failed and the first ref's age read as ~56 years).
     std::fs::write(wt.join("README.md"), "second dirty\n").unwrap();
-    let out2 = run_shim(&repo, &home, "agent-a70", &real_git, epoch_env, &["reset", "--hard"]);
-    assert!(out2.status.success(), "stderr={}", String::from_utf8_lossy(&out2.stderr));
+    let out2 = run_shim(
+        &repo,
+        &home,
+        "agent-a70",
+        &real_git,
+        epoch_env,
+        &["reset", "--hard"],
+    );
+    assert!(
+        out2.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
     let refs2 = snapshot_refs(&real_git, &repo);
     assert_eq!(
         refs2.len(),
@@ -591,7 +668,11 @@ fn restore_staged_does_not_snapshot_but_worktree_restore_does() {
         &[("AGENTIC_GIT_SNAPSHOTS", "1")],
         &["restore", "--staged", "README.md"],
     );
-    assert!(staged.status.success(), "stderr={}", String::from_utf8_lossy(&staged.stderr));
+    assert!(
+        staged.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&staged.stderr)
+    );
     assert!(
         snapshot_refs(&real_git, &repo).is_empty(),
         "`restore --staged` must NOT create a snapshot ref"
@@ -613,7 +694,11 @@ fn restore_staged_does_not_snapshot_but_worktree_restore_does() {
         String::from_utf8_lossy(&worktree_restore.stderr)
     );
     let refs = snapshot_refs(&real_git, &repo);
-    assert_eq!(refs.len(), 1, "a worktree `restore` must snapshot: {refs:?}");
+    assert_eq!(
+        refs.len(),
+        1,
+        "a worktree `restore` must snapshot: {refs:?}"
+    );
     cleanup(&root);
 }
 
@@ -654,7 +739,10 @@ fn mid_merge_conflict_snapshot_preserves_pre_merge_content() {
     );
     // A real conflict: merge itself fails (git's own exit code), but the
     // snapshot must have been taken BEFORE it ran.
-    assert!(!merge_out.status.success(), "expected a real merge conflict");
+    assert!(
+        !merge_out.status.success(),
+        "expected a real merge conflict"
+    );
 
     let refs = snapshot_refs(&real_git, &repo);
     assert_eq!(refs.len(), 1, "{refs:?}");
@@ -687,8 +775,19 @@ fn kill_switch_default_off_in_raw_shim_no_ref_no_warning() {
 
     std::fs::write(wt.join("README.md"), "will be lost, no net\n").unwrap();
     // No AGENTIC_GIT_SNAPSHOTS at all — raw shim default.
-    let out = run_shim(&repo, &home, "agent-ks", &real_git, &[], &["reset", "--hard"]);
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let out = run_shim(
+        &repo,
+        &home,
+        "agent-ks",
+        &real_git,
+        &[],
+        &["reset", "--hard"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         snapshot_refs(&real_git, &repo).is_empty(),
         "raw shim mode (no env) must create ZERO refs by default"
@@ -800,14 +899,21 @@ fn run_session_enables_snapshots_by_default() {
         .env_remove("AGEND_GIT_SNAPSHOTS")
         .output()
         .expect("run agentic-git run");
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("snapshots:"),
         "the session summary must mention the snapshot net: {stderr}"
     );
 
-    let wt = home.join("worktrees").join("run-snap-agent").join("sess/snap");
+    let wt = home
+        .join("worktrees")
+        .join("run-snap-agent")
+        .join("sess/snap");
     let refs = snapshot_refs(&real_git, &wt);
     assert_eq!(
         refs.len(),
@@ -854,9 +960,16 @@ fn run_session_snapshots_off_respects_explicit_kill_switch() {
         .env_remove("AGEND_GIT_SNAPSHOTS")
         .output()
         .expect("run agentic-git run");
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let wt = home.join("worktrees").join("run-snap-off").join("sess/snapoff");
+    let wt = home
+        .join("worktrees")
+        .join("run-snap-off")
+        .join("sess/snapoff");
     assert!(
         snapshot_refs(&real_git, &wt).is_empty(),
         "an explicit AGENTIC_GIT_SNAPSHOTS=0 must still force-disable inside a run session"
@@ -893,12 +1006,23 @@ fn switch_discard_changes_is_recoverable_review() {
         &[("AGENTIC_GIT_SNAPSHOTS", "1")],
         &["switch", "--discard-changes", "agent/swrec"],
     );
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     // The op discarded the edit...
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "hello\n");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "hello\n"
+    );
     // ...but a snapshot captured it, byte-recoverable.
     let refs = snapshot_refs(&real_git, &repo);
-    assert_eq!(refs.len(), 1, "switch --discard-changes must snapshot: {refs:?}");
+    assert_eq!(
+        refs.len(),
+        1,
+        "switch --discard-changes must snapshot: {refs:?}"
+    );
     setup_git(&real_git, &["checkout", &refs[0], "--", "."], &wt);
     assert_eq!(
         std::fs::read_to_string(wt.join("README.md")).unwrap(),
@@ -948,10 +1072,22 @@ fn solo_opt_in_noagent_snapshots_review() {
     // (a) opted in, no agent → snapshot with who=noagent.
     dirty();
     let out = run_noagent(Some("1"));
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let refs = snapshot_refs(&real_git, &repo);
-    assert_eq!(refs.len(), 1, "solo opt-in must snapshot with no agent: {refs:?}");
-    assert!(refs[0].contains("/noagent/"), "who must be noagent: {}", refs[0]);
+    assert_eq!(
+        refs.len(),
+        1,
+        "solo opt-in must snapshot with no agent: {refs:?}"
+    );
+    assert!(
+        refs[0].contains("/noagent/"),
+        "who must be noagent: {}",
+        refs[0]
+    );
 
     // (b) default off, no agent → zero refs.
     setup_git(&real_git, &["update-ref", "-d", &refs[0]], &repo);
@@ -991,12 +1127,23 @@ fn checkout_pathspec_from_file_is_recoverable_review2() {
         &[("AGENTIC_GIT_SNAPSHOTS", "1")],
         &["checkout", "--pathspec-from-file=ps.txt"],
     );
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     // The op discarded the edit (README reverted to committed content)...
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "hello\n");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "hello\n"
+    );
     // ...but a snapshot captured it, byte-recoverable.
     let refs = snapshot_refs(&real_git, &repo);
-    assert_eq!(refs.len(), 1, "--pathspec-from-file must snapshot: {refs:?}");
+    assert_eq!(
+        refs.len(),
+        1,
+        "--pathspec-from-file must snapshot: {refs:?}"
+    );
     setup_git(&real_git, &["checkout", &refs[0], "--", "README.md"], &wt);
     assert_eq!(
         std::fs::read_to_string(wt.join("README.md")).unwrap(),
@@ -1030,12 +1177,31 @@ fn run_cli(cwd: &Path, real_git: &Path, args: &[&str]) -> std::process::Output {
 
 /// One dirty tracked change + reset --hard → exactly one snapshot. Returns the
 /// worktree so the caller can drive `snapshots restore` in it.
-fn dirty_reset_snapshot(root: &Path, real_git: &Path, repo: &Path, agent: &str, branch: &str, home: &Path, readme: &str) -> PathBuf {
+fn dirty_reset_snapshot(
+    root: &Path,
+    real_git: &Path,
+    repo: &Path,
+    agent: &str,
+    branch: &str,
+    home: &Path,
+    readme: &str,
+) -> PathBuf {
     let wt = worktree_of(root, real_git, repo, branch);
     write_binding(home, agent, branch, &wt);
     std::fs::write(wt.join("README.md"), readme).unwrap();
-    let out = run_shim(repo, home, agent, real_git, &[("AGENTIC_GIT_SNAPSHOTS", "1")], &["reset", "--hard"]);
-    assert!(out.status.success(), "seed reset --hard: {}", String::from_utf8_lossy(&out.stderr));
+    let out = run_shim(
+        repo,
+        home,
+        agent,
+        real_git,
+        &[("AGENTIC_GIT_SNAPSHOTS", "1")],
+        &["reset", "--hard"],
+    );
+    assert!(
+        out.status.success(),
+        "seed reset --hard: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     wt
 }
 
@@ -1053,31 +1219,68 @@ fn restore_cli_recovers_tracked_and_untracked_unstaged() {
 
     std::fs::write(wt.join("README.md"), "TRACKED CHANGE\n").unwrap();
     std::fs::write(wt.join("untracked.txt"), "UNTRACKED CONTENT\n").unwrap();
-    let out = run_shim(&repo, &home, "agent-rc", &real_git, &[("AGENTIC_GIT_SNAPSHOTS", "1")], &["reset", "--hard"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_shim(
+        &repo,
+        &home,
+        "agent-rc",
+        &real_git,
+        &[("AGENTIC_GIT_SNAPSHOTS", "1")],
+        &["reset", "--hard"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(snapshot_refs(&real_git, &repo).len(), 1);
 
     // Both look lost: reset reverted the tracked file; drop the untracked one.
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "hello\n");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "hello\n"
+    );
     std::fs::remove_file(wt.join("untracked.txt")).unwrap();
 
     // ONE command, no ref (exactly one snapshot), no bypass.
     let r = run_cli(&wt, &real_git, &["snapshots", "restore"]);
-    assert!(r.status.success(), "restore failed: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "TRACKED CHANGE\n");
-    assert_eq!(std::fs::read_to_string(wt.join("untracked.txt")).unwrap(), "UNTRACKED CONTENT\n");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "TRACKED CHANGE\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("untracked.txt")).unwrap(),
+        "UNTRACKED CONTENT\n"
+    );
     // Tree was clean at restore time → no pre-restore snapshot.
-    assert_eq!(snapshot_refs(&real_git, &repo).len(), 1, "clean tree → no new ref");
+    assert_eq!(
+        snapshot_refs(&real_git, &repo).len(),
+        1,
+        "clean tree → no new ref"
+    );
 
     // Recovery is UNSTAGED — nothing in the index.
     let status = setup_git(&real_git, &["status", "--porcelain"], &wt);
     let s = String::from_utf8_lossy(&status.stdout);
-    assert!(s.contains(" M README.md"), "README unstaged-modified: {s:?}");
-    assert!(s.contains("?? untracked.txt"), "recovered untracked stays untracked: {s:?}");
+    assert!(
+        s.contains(" M README.md"),
+        "README unstaged-modified: {s:?}"
+    );
+    assert!(
+        s.contains("?? untracked.txt"),
+        "recovered untracked stays untracked: {s:?}"
+    );
     for line in s.lines() {
         assert!(
-            !matches!(line.as_bytes().first(), Some(b'M' | b'A' | b'D' | b'R' | b'C')),
+            !matches!(
+                line.as_bytes().first(),
+                Some(b'M' | b'A' | b'D' | b'R' | b'C')
+            ),
             "no path may be staged: {line:?}"
         );
     }
@@ -1093,15 +1296,29 @@ fn restore_cli_staged_flag_leaves_index_staged() {
     let real_git = resolve_setup_real_git();
     init_repo(&real_git, &repo);
     let home = root.join("home");
-    let wt = dirty_reset_snapshot(&root, &real_git, &repo, "agent-rs", "agent/rstaged", &home, "STAGED WANTED\n");
+    let wt = dirty_reset_snapshot(
+        &root,
+        &real_git,
+        &repo,
+        "agent-rs",
+        "agent/rstaged",
+        &home,
+        "STAGED WANTED\n",
+    );
 
     let r = run_cli(&wt, &real_git, &["snapshots", "restore", "--staged"]);
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "STAGED WANTED\n");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "STAGED WANTED\n"
+    );
 
     let status = setup_git(&real_git, &["status", "--porcelain"], &wt);
     let s = String::from_utf8_lossy(&status.stdout);
-    assert!(s.contains("M  README.md"), "--staged must leave README staged: {s:?}");
+    assert!(
+        s.contains("M  README.md"),
+        "--staged must leave README staged: {s:?}"
+    );
     cleanup(&root);
 }
 
@@ -1120,20 +1337,43 @@ fn restore_cli_refuses_to_guess_then_yes_takes_newest() {
     // Two snapshots: V1 then V2 (V2 newest).
     for v in ["V1\n", "V2\n"] {
         std::fs::write(wt.join("README.md"), v).unwrap();
-        let out = run_shim(&repo, &home, "agent-ra", &real_git, &[("AGENTIC_GIT_SNAPSHOTS", "1")], &["reset", "--hard"]);
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = run_shim(
+            &repo,
+            &home,
+            "agent-ra",
+            &real_git,
+            &[("AGENTIC_GIT_SNAPSHOTS", "1")],
+            &["reset", "--hard"],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     assert_eq!(snapshot_refs(&real_git, &repo).len(), 2);
 
     // No ref, no --yes → refuse to guess (exit 2).
     let refuse = run_cli(&wt, &real_git, &["snapshots", "restore"]);
-    assert_eq!(refuse.status.code(), Some(2), "must refuse: {}", String::from_utf8_lossy(&refuse.stderr));
+    assert_eq!(
+        refuse.status.code(),
+        Some(2),
+        "must refuse: {}",
+        String::from_utf8_lossy(&refuse.stderr)
+    );
     assert!(String::from_utf8_lossy(&refuse.stderr).contains("refusing to guess"));
 
     // --yes → the NEWEST (V2), regardless of same-second ordering.
     let yes = run_cli(&wt, &real_git, &["snapshots", "restore", "--yes"]);
-    assert!(yes.status.success(), "{}", String::from_utf8_lossy(&yes.stderr));
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "V2\n");
+    assert!(
+        yes.status.success(),
+        "{}",
+        String::from_utf8_lossy(&yes.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "V2\n"
+    );
     cleanup(&root);
 }
 
@@ -1248,8 +1488,17 @@ fn restore_cli_rejects_non_snapshot_ref() {
     let real_git = resolve_setup_real_git();
     init_repo(&real_git, &repo);
 
-    let r = run_cli(&repo, &real_git, &["snapshots", "restore", "refs/heads/main"]);
-    assert_eq!(r.status.code(), Some(2), "bad ref must exit 2: {}", String::from_utf8_lossy(&r.stderr));
+    let r = run_cli(
+        &repo,
+        &real_git,
+        &["snapshots", "restore", "refs/heads/main"],
+    );
+    assert_eq!(
+        r.status.code(),
+        Some(2),
+        "bad ref must exit 2: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     assert!(String::from_utf8_lossy(&r.stderr).contains("not an agentic-git snapshot ref"));
     cleanup(&root);
 }
@@ -1264,7 +1513,12 @@ fn restore_cli_no_snapshots_exit_1() {
     init_repo(&real_git, &repo);
 
     let r = run_cli(&repo, &real_git, &["snapshots", "restore"]);
-    assert_eq!(r.status.code(), Some(1), "no snapshots → exit 1: {}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(
+        r.status.code(),
+        Some(1),
+        "no snapshots → exit 1: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     assert!(String::from_utf8_lossy(&r.stderr).contains("no snapshots to restore from"));
     cleanup(&root);
 }
@@ -1283,8 +1537,19 @@ fn restore_cli_is_nondestructive_and_undoable() {
 
     // Snapshot S1 captures README="OLD WORK" before reset reverts it.
     std::fs::write(wt.join("README.md"), "OLD WORK\n").unwrap();
-    let out = run_shim(&repo, &home, "agent-ru", &real_git, &[("AGENTIC_GIT_SNAPSHOTS", "1")], &["reset", "--hard"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_shim(
+        &repo,
+        &home,
+        "agent-ru",
+        &real_git,
+        &[("AGENTIC_GIT_SNAPSHOTS", "1")],
+        &["reset", "--hard"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s1: Vec<String> = snapshot_refs(&real_git, &repo);
     assert_eq!(s1.len(), 1);
 
@@ -1296,16 +1561,39 @@ fn restore_cli_is_nondestructive_and_undoable() {
     let r = run_cli(&wt, &real_git, &["snapshots", "restore"]);
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
     // Tracked recovered to S1; the file created AFTER S1 is left untouched.
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "OLD WORK\n");
-    assert_eq!(std::fs::read_to_string(wt.join("newfile.txt")).unwrap(), "NEW CURRENT\n", "non-destructive: newer file survives");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "OLD WORK\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("newfile.txt")).unwrap(),
+        "NEW CURRENT\n",
+        "non-destructive: newer file survives"
+    );
     let after: Vec<String> = snapshot_refs(&real_git, &repo);
-    assert_eq!(after.len(), 2, "dirty tree → one pre-restore snapshot added: {after:?}");
+    assert_eq!(
+        after.len(),
+        2,
+        "dirty tree → one pre-restore snapshot added: {after:?}"
+    );
 
     // Undo: restore the pre-restore snapshot (the one that isn't S1).
-    let undo_ref = after.iter().find(|r| !s1.contains(r)).expect("pre-restore ref").clone();
+    let undo_ref = after
+        .iter()
+        .find(|r| !s1.contains(r))
+        .expect("pre-restore ref")
+        .clone();
     let u = run_cli(&wt, &real_git, &["snapshots", "restore", &undo_ref]);
-    assert!(u.status.success(), "undo: {}", String::from_utf8_lossy(&u.stderr));
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "CURRENT\n", "undo brings current work back");
+    assert!(
+        u.status.success(),
+        "undo: {}",
+        String::from_utf8_lossy(&u.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "CURRENT\n",
+        "undo brings current work back"
+    );
     cleanup(&root);
 }
 
@@ -1327,23 +1615,44 @@ fn restore_cli_handles_many_long_paths_without_argv_limit() {
     let n = 5000usize;
     let pad = "x".repeat(230);
     // Total pathspec bytes must exceed a typical ARG_MAX (~1 MB on macOS).
-    assert!(n * (pad.len() + 15) > 1_100_000, "test must exceed ARG_MAX to be meaningful");
+    assert!(
+        n * (pad.len() + 15) > 1_100_000,
+        "test must exceed ARG_MAX to be meaningful"
+    );
     let bulk = wt.join("gen");
     std::fs::create_dir_all(&bulk).unwrap();
     for i in 0..n {
         std::fs::write(bulk.join(format!("f{i:05}_{pad}.txt")), b"gen\n").unwrap();
     }
 
-    let out = run_shim(&repo, &home, "agent-rbk", &real_git, &[("AGENTIC_GIT_SNAPSHOTS", "1")], &["reset", "--hard"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_shim(
+        &repo,
+        &home,
+        "agent-rbk",
+        &real_git,
+        &[("AGENTIC_GIT_SNAPSHOTS", "1")],
+        &["reset", "--hard"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(snapshot_refs(&real_git, &repo).len(), 1);
 
     // Lose the whole generated tree, then recover it in ONE command.
     std::fs::remove_dir_all(&bulk).unwrap();
     let r = run_cli(&wt, &real_git, &["snapshots", "restore"]);
-    assert!(r.status.success(), "bulk restore failed: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "bulk restore failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     let restored = std::fs::read_dir(&bulk).map(|d| d.count()).unwrap_or(0);
-    assert_eq!(restored, n, "every file in the large snapshot must be recovered");
+    assert_eq!(
+        restored, n,
+        "every file in the large snapshot must be recovered"
+    );
     cleanup(&root);
 }
 
@@ -1366,15 +1675,30 @@ fn restore_cli_recovers_pathspec_magic_filename() {
     let magic = ":(glob)literal.txt";
     std::fs::write(wt.join("README.md"), "trigger\n").unwrap(); // dirty → snapshot
     std::fs::write(wt.join(magic), "MAGIC CONTENT\n").unwrap();
-    let out = run_shim(&repo, &home, "agent-rm", &real_git, &[("AGENTIC_GIT_SNAPSHOTS", "1")], &["reset", "--hard"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_shim(
+        &repo,
+        &home,
+        "agent-rm",
+        &real_git,
+        &[("AGENTIC_GIT_SNAPSHOTS", "1")],
+        &["reset", "--hard"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(snapshot_refs(&real_git, &repo).len(), 1);
 
     std::fs::remove_file(wt.join(magic)).unwrap();
     assert!(!wt.join(magic).exists());
 
     let r = run_cli(&wt, &real_git, &["snapshots", "restore"]);
-    assert!(r.status.success(), "magic-name restore failed: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "magic-name restore failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     assert_eq!(
         std::fs::read_to_string(wt.join(magic)).unwrap(),
         "MAGIC CONTENT\n",

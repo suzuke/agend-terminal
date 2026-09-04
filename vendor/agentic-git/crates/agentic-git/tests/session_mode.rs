@@ -68,13 +68,17 @@ fn init_repo(dir: &Path) {
     assert!(real_git(&["init", "-q", "-b", "main", "."], dir)
         .status
         .success());
-    assert!(real_git(&["config", "user.name", "Test"], dir).status.success());
+    assert!(real_git(&["config", "user.name", "Test"], dir)
+        .status
+        .success());
     assert!(real_git(&["config", "user.email", "test@example.com"], dir)
         .status
         .success());
     std::fs::write(dir.join("README.md"), "hello\n").unwrap();
     assert!(real_git(&["add", "."], dir).status.success());
-    assert!(real_git(&["commit", "-q", "-m", "init"], dir).status.success());
+    assert!(real_git(&["commit", "-q", "-m", "init"], dir)
+        .status
+        .success());
 }
 
 fn git_config_get(dir: &Path, key: &str) -> Option<String> {
@@ -152,7 +156,10 @@ fn test1_run_spawns_in_worktree_with_shim_routing() {
     let printed_cwd = PathBuf::from(stdout.lines().next().unwrap_or_default().trim());
     let printed_cwd = std::fs::canonicalize(&printed_cwd).unwrap_or(printed_cwd);
     assert_eq!(printed_cwd, expected_cwd, "agent cwd must be the worktree");
-    assert!(stdout.contains("sess/t1"), "git status must show the session branch: {stdout}");
+    assert!(
+        stdout.contains("sess/t1"),
+        "git status must show the session branch: {stdout}"
+    );
     cleanup(&root);
 }
 
@@ -181,9 +188,16 @@ fn test2_child_sees_deny_on_cross_branch_checkout() {
             "git checkout main",
         ],
     );
-    assert_eq!(out.status.code(), Some(1), "the deny must propagate as the child's exit code");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the deny must propagate as the child's exit code"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("denied"), "must contain the shim's deny wording: {stderr}");
+    assert!(
+        stderr.contains("denied"),
+        "must contain the shim's deny wording: {stderr}"
+    );
     assert!(
         stderr.contains("bypass with one of") || stderr.contains("AGENTIC_GIT_BYPASS"),
         "must include the guidance block: {stderr}"
@@ -204,9 +218,15 @@ fn test3_binding_sidecar_verifies_and_tamper_is_unbound_deny() {
     let out = run_cli(
         &repo,
         &home,
-        &["run", "--agent", "agent-t3", "--branch", "sess/t3", "--", "true"],
+        &[
+            "run", "--agent", "agent-t3", "--branch", "sess/t3", "--", "true",
+        ],
     );
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let dir = home.join("runtime").join("agent-t3");
     let content = std::fs::read_to_string(dir.join("binding.json")).expect("read binding");
@@ -244,7 +264,10 @@ fn test3_binding_sidecar_verifies_and_tamper_is_unbound_deny() {
         .expect("run shim via git symlink");
     assert_eq!(out2.status.code(), Some(1));
     let stderr2 = String::from_utf8_lossy(&out2.stderr);
-    assert!(stderr2.contains("unbound"), "tampered binding must fail closed to unbound: {stderr2}");
+    assert!(
+        stderr2.contains("unbound"),
+        "tampered binding must fail closed to unbound: {stderr2}"
+    );
     cleanup(&root);
 }
 
@@ -272,7 +295,11 @@ fn test4_commit_inside_session_carries_agentic_agent_trailer() {
             "git commit --allow-empty -m committed-in-session",
         ],
     );
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let wt = worktree_path(&home, "agent-t4", "sess/t4");
     let log = real_git(&["log", "-1", "--format=%B"], &wt);
@@ -297,16 +324,40 @@ fn test5_second_run_same_branch_different_agent_fails_with_gits_own_error() {
     let out1 = run_cli(
         &repo,
         &home,
-        &["run", "--agent", "agent-t5a", "--branch", "sess/shared", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "agent-t5a",
+            "--branch",
+            "sess/shared",
+            "--",
+            "true",
+        ],
     );
-    assert!(out1.status.success(), "stderr={}", String::from_utf8_lossy(&out1.stderr));
+    assert!(
+        out1.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
 
     let out2 = run_cli(
         &repo,
         &home,
-        &["run", "--agent", "agent-t5b", "--branch", "sess/shared", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "agent-t5b",
+            "--branch",
+            "sess/shared",
+            "--",
+            "true",
+        ],
     );
-    assert_ne!(out2.status.code(), Some(0), "a second worktree for a checked-out branch must fail");
+    assert_ne!(
+        out2.status.code(),
+        Some(0),
+        "a second worktree for a checked-out branch must fail"
+    );
     let stderr2 = String::from_utf8_lossy(&out2.stderr).to_lowercase();
     assert!(
         stderr2.contains("already"),
@@ -327,9 +378,21 @@ fn test6_key_provisioned_once_0600_and_reused() {
     let out1 = run_cli(
         &repo,
         &home,
-        &["run", "--agent", "agent-t6a", "--branch", "sess/t6a", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "agent-t6a",
+            "--branch",
+            "sess/t6a",
+            "--",
+            "true",
+        ],
     );
-    assert!(out1.status.success(), "stderr={}", String::from_utf8_lossy(&out1.stderr));
+    assert!(
+        out1.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
 
     let key_path = home.join(".config-integrity-key");
     let meta1 = std::fs::metadata(&key_path).expect("key must exist");
@@ -348,11 +411,26 @@ fn test6_key_provisioned_once_0600_and_reused() {
     let out2 = run_cli(
         &repo,
         &home,
-        &["run", "--agent", "agent-t6b", "--branch", "sess/t6b", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "agent-t6b",
+            "--branch",
+            "sess/t6b",
+            "--",
+            "true",
+        ],
     );
-    assert!(out2.status.success(), "stderr={}", String::from_utf8_lossy(&out2.stderr));
+    assert!(
+        out2.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
     let key_bytes2 = std::fs::read(&key_path).unwrap();
-    assert_eq!(key_bytes1, key_bytes2, "second run must reuse the SAME key, not regenerate");
+    assert_eq!(
+        key_bytes1, key_bytes2,
+        "second run must reuse the SAME key, not regenerate"
+    );
     cleanup(&root);
 }
 
@@ -372,7 +450,11 @@ fn delta1_bare_git_name_on_path_is_shim_mode() {
     std::fs::copy(env!("CARGO_BIN_EXE_agentic-git"), fake_bin.join("git.exe")).unwrap();
 
     let real_git_path = resolve_test_real_git();
-    let path_env = std::env::join_paths([fake_bin.clone(), real_git_path.parent().unwrap().to_path_buf()]).unwrap();
+    let path_env = std::env::join_paths([
+        fake_bin.clone(),
+        real_git_path.parent().unwrap().to_path_buf(),
+    ])
+    .unwrap();
 
     let out = Command::new("git")
         .arg("--version")
@@ -390,7 +472,11 @@ fn delta1_bare_git_name_on_path_is_shim_mode() {
     // Shim mode with no agent/home passes straight through to real git —
     // `--version` must succeed (CLI mode would instead exit(2), unknown
     // subcommand, since "--version" isn't "version").
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     cleanup(&root);
 }
 
@@ -419,7 +505,11 @@ fn delta1_absolute_path_bin_git_is_shim_mode() {
         .env_remove("AGEND_REAL_GIT")
         .output()
         .expect("run absolute bin/git");
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     cleanup(&root);
 }
 
@@ -438,7 +528,10 @@ fn delta1_cli_unknown_subcommand_exits_2_with_usage_hint() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("unknown subcommand"), "{stderr}");
-    assert!(stderr.contains("bin/git"), "must hint at the shim invocation path: {stderr}");
+    assert!(
+        stderr.contains("bin/git"),
+        "must hint at the shim invocation path: {stderr}"
+    );
 }
 
 /// No subcommand at all is likewise a hard CLI error, not a silent shim.
@@ -473,20 +566,44 @@ fn delta2_concurrent_first_runs_race_key_both_bindings_verify() {
         run_cli(
             &repo1,
             &home1,
-            &["run", "--agent", "race-a", "--branch", "sess/race-a", "--", "true"],
+            &[
+                "run",
+                "--agent",
+                "race-a",
+                "--branch",
+                "sess/race-a",
+                "--",
+                "true",
+            ],
         )
     });
     let t2 = std::thread::spawn(move || {
         run_cli(
             &repo2,
             &home2,
-            &["run", "--agent", "race-b", "--branch", "sess/race-b", "--", "true"],
+            &[
+                "run",
+                "--agent",
+                "race-b",
+                "--branch",
+                "sess/race-b",
+                "--",
+                "true",
+            ],
         )
     });
     let out1 = t1.join().expect("thread 1");
     let out2 = t2.join().expect("thread 2");
-    assert!(out1.status.success(), "stderr={}", String::from_utf8_lossy(&out1.stderr));
-    assert!(out2.status.success(), "stderr={}", String::from_utf8_lossy(&out2.stderr));
+    assert!(
+        out1.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert!(
+        out2.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
 
     let key_path = home.join(".config-integrity-key");
     let meta = std::fs::metadata(&key_path).expect("key must exist after the race");
@@ -514,9 +631,11 @@ fn delta3_run_rejects_invalid_agent_names_exit_2() {
     init_repo(&repo);
     let home = root.join("home");
 
-    for (i, bad) in ["CON", "con", "Nul.log", "Agent", "agent.", "com1", "a/b", "../x", ".hidden"]
-        .iter()
-        .enumerate()
+    for (i, bad) in [
+        "CON", "con", "Nul.log", "Agent", "agent.", "com1", "a/b", "../x", ".hidden",
+    ]
+    .iter()
+    .enumerate()
     {
         let branch = format!("sess/bad{i}");
         let out = run_cli(
@@ -545,9 +664,21 @@ fn delta3_run_accepts_valid_agent_name() {
     let out = run_cli(
         &repo,
         &home,
-        &["run", "--agent", "valid-agent.1", "--branch", "sess/good", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "valid-agent.1",
+            "--branch",
+            "sess/good",
+            "--",
+            "true",
+        ],
     );
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     cleanup(&root);
 }
 
@@ -566,9 +697,21 @@ fn delta4_stale_binding_after_manual_worktree_removal_is_hard_error() {
     let out1 = run_cli(
         &repo,
         &home,
-        &["run", "--agent", "agent-stale", "--branch", "sess/stale", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "agent-stale",
+            "--branch",
+            "sess/stale",
+            "--",
+            "true",
+        ],
     );
-    assert!(out1.status.success(), "stderr={}", String::from_utf8_lossy(&out1.stderr));
+    assert!(
+        out1.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
 
     let wt = worktree_path(&home, "agent-stale", "sess/stale");
     std::fs::remove_dir_all(&wt).expect("simulate manual worktree removal");
@@ -576,7 +719,15 @@ fn delta4_stale_binding_after_manual_worktree_removal_is_hard_error() {
     let out2 = run_cli(
         &repo,
         &home,
-        &["run", "--agent", "agent-stale", "--branch", "sess/stale", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "agent-stale",
+            "--branch",
+            "sess/stale",
+            "--",
+            "true",
+        ],
     );
     assert_ne!(out2.status.code(), Some(0));
     let stderr2 = String::from_utf8_lossy(&out2.stderr);
@@ -604,16 +755,40 @@ fn delta4_cross_repo_stale_binding_is_hard_error() {
     let out1 = run_cli(
         &repo_a,
         &home,
-        &["run", "--agent", "agent-cross", "--branch", "sess/cross", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "agent-cross",
+            "--branch",
+            "sess/cross",
+            "--",
+            "true",
+        ],
     );
-    assert!(out1.status.success(), "stderr={}", String::from_utf8_lossy(&out1.stderr));
+    assert!(
+        out1.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
 
     let out2 = run_cli(
         &repo_b,
         &home,
-        &["run", "--agent", "agent-cross", "--branch", "sess/cross", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "agent-cross",
+            "--branch",
+            "sess/cross",
+            "--",
+            "true",
+        ],
     );
-    assert_ne!(out2.status.code(), Some(0), "must not silently rebind across repos");
+    assert_ne!(
+        out2.status.code(),
+        Some(0),
+        "must not silently rebind across repos"
+    );
     let stderr2 = String::from_utf8_lossy(&out2.stderr);
     assert!(
         stderr2.contains("source_repo"),
@@ -635,14 +810,34 @@ fn delta4_matching_rerun_reuses_without_error() {
     let out1 = run_cli(
         &repo,
         &home,
-        &["run", "--agent", "agent-reuse", "--branch", "sess/reuse", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "agent-reuse",
+            "--branch",
+            "sess/reuse",
+            "--",
+            "true",
+        ],
     );
-    assert!(out1.status.success(), "stderr={}", String::from_utf8_lossy(&out1.stderr));
+    assert!(
+        out1.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
 
     let out2 = run_cli(
         &repo,
         &home,
-        &["run", "--agent", "agent-reuse", "--branch", "sess/reuse", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "agent-reuse",
+            "--branch",
+            "sess/reuse",
+            "--",
+            "true",
+        ],
     );
     assert!(
         out2.status.success(),
@@ -669,9 +864,21 @@ fn hooks_are_worktree_scoped_source_checkout_keeps_its_own_hooks() {
     let out = run_cli(
         &repo,
         &home,
-        &["run", "--agent", "hook-agent", "--branch", "sess/hooks", "--", "true"],
+        &[
+            "run",
+            "--agent",
+            "hook-agent",
+            "--branch",
+            "sess/hooks",
+            "--",
+            "true",
+        ],
     );
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     assert!(
         git_config_get(&repo, "core.hooksPath").is_none(),
@@ -717,7 +924,15 @@ fn concurrent_worktree_provision_stress_all_succeed() {
                 let out = run_cli(
                     &repo,
                     &home,
-                    &["run", "--agent", agent.as_str(), "--branch", branch.as_str(), "--", "true"],
+                    &[
+                        "run",
+                        "--agent",
+                        agent.as_str(),
+                        "--branch",
+                        branch.as_str(),
+                        "--",
+                        "true",
+                    ],
                 );
                 (agent, out)
             })

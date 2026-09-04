@@ -211,6 +211,68 @@ fn sweep_does_not_reraise_a_lane_its_owner_answered_3517() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// #3517 follow-up RED 2 — the history the negative control above did not
+/// imagine.
+///
+/// Negative control 3 answers a lane's FIRST and only row, which is the
+/// simplest history rather than the normal one. Once this sweep starts raising
+/// rows, a lane accumulates generations: the merge closes row A, the first
+/// drift raises row B, the owner answers B. What closed the LAST row is the
+/// whole question — a backward search for any result-less row walks past
+/// answered B, lands on system-closed A, and re-asks an owner who has already
+/// answered.
+///
+/// With this case pinned the lane is covered for every way its last row can
+/// stand: still open (the duplicate guard above returns early), closed by an
+/// owner (here), or closed by the system (the RED at the top of this file).
+#[test]
+fn a_later_owner_answer_outranks_an_older_system_retirement_3517() {
+    let home = tmp_dir("drift-generations");
+    let repo = tmp_repo("drift-generations-repo");
+    let branch = "feat/answered-after-reraise";
+    let rs = repo.display().to_string();
+    let merged_head = make_branch(&repo, branch);
+    persist_intent(&home, &rs, branch, &merged_head, "t-origin", None, None).expect("persist");
+    let retired_row = seed_obligation(&home, &rs, branch, &merged_head, Some("agent-owner"));
+
+    // Generation 1: the merge closes A, the first drift makes the sweep raise B.
+    owner_attestation::retire_merged_lane(&home, &rs, branch);
+    commit_onto(&repo, branch, "late.txt");
+    sweep_settle_merged(&home);
+    let raised = open_lane_rows(&home, &rs, branch);
+    assert_eq!(
+        raised.len(),
+        1,
+        "precondition: the first drift raises exactly one fresh row"
+    );
+    assert_ne!(
+        raised[0].id.0, retired_row,
+        "precondition: that row is a new question, not the retired one reopened"
+    );
+
+    // The owner answers the row the sweep raised — the newest word on this lane.
+    answer(
+        &home,
+        &raised[0].id.0,
+        "agent-owner",
+        "keep: still working on it",
+    );
+
+    // Generation 2: the branch moves again.
+    commit_onto(&repo, branch, "later.txt");
+    sweep_settle_merged(&home);
+
+    assert!(
+        open_lane_rows(&home, &rs, branch).is_empty(),
+        "the owner answered the newest question on this lane, so a further \
+         drift must not reach past that answer to an older system-closed row \
+         and ask again"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// #3517 follow-up — the reachability fact the whole fix rests on, pinned rather
 /// than argued.
 ///

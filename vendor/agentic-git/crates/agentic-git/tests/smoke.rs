@@ -21,7 +21,10 @@ fn real_git() -> PathBuf {
 }
 
 fn sanitized_path(real_git: &Path) -> std::ffi::OsString {
-    let mut dirs: Vec<PathBuf> = real_git.parent().map(|p| vec![p.to_path_buf()]).unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = real_git
+        .parent()
+        .map(|p| vec![p.to_path_buf()])
+        .unwrap_or_default();
     for p in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
         let s = p.to_string_lossy();
         if !s.contains(".agend-terminal") && !s.contains(".agentic-git") {
@@ -35,7 +38,10 @@ fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
         "agentic-git-smoke-{tag}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
@@ -44,12 +50,21 @@ fn tmp(tag: &str) -> PathBuf {
 
 fn git(real_git: &Path, args: &[&str], cwd: &Path) {
     let o = Command::new(real_git)
-        .args(args).current_dir(cwd)
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
-        .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-        .output().expect("git");
-    assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        .args(args)
+        .current_dir(cwd)
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .expect("git");
+    assert!(
+        o.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
 }
 
 fn init_repo(real_git: &Path, dir: &Path) {
@@ -60,9 +75,18 @@ fn init_repo(real_git: &Path, dir: &Path) {
 }
 
 /// Invoke `agentic-git run` (argv[0] = the binary name → CLI mode, no override).
-fn run_session(repo: &Path, home: &Path, real_git: &Path, agent: &str, branch: &str, script: &str) -> std::process::Output {
+fn run_session(
+    repo: &Path,
+    home: &Path,
+    real_git: &Path,
+    agent: &str,
+    branch: &str,
+    script: &str,
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_agentic-git"))
-        .args(["run", "--agent", agent, "--branch", branch, "--", "sh", "-c", script])
+        .args([
+            "run", "--agent", agent, "--branch", branch, "--", "sh", "-c", script,
+        ])
         .current_dir(repo)
         .env("AGENTIC_GIT_HOME", home)
         .env("AGENTIC_GIT_REAL_GIT", real_git)
@@ -70,12 +94,19 @@ fn run_session(repo: &Path, home: &Path, real_git: &Path, agent: &str, branch: &
         // A CI runner has no git user config; give the whole session an identity
         // so the agent's own `git commit`s succeed (the snapshot layer forces
         // its own — see snapshot.rs).
-        .env("GIT_AUTHOR_NAME", "smoke").env("GIT_AUTHOR_EMAIL", "smoke@t")
-        .env("GIT_COMMITTER_NAME", "smoke").env("GIT_COMMITTER_EMAIL", "smoke@t")
-        .env_remove("AGEND_HOME").env_remove("AGEND_INSTANCE_NAME").env_remove("AGEND_REAL_GIT")
-        .env_remove("AGENTIC_GIT_BYPASS").env_remove("AGEND_GIT_BYPASS")
-        .env_remove("AGENTIC_GIT_SNAPSHOTS").env_remove("AGEND_GIT_SNAPSHOTS")
-        .output().expect("agentic-git run")
+        .env("GIT_AUTHOR_NAME", "smoke")
+        .env("GIT_AUTHOR_EMAIL", "smoke@t")
+        .env("GIT_COMMITTER_NAME", "smoke")
+        .env("GIT_COMMITTER_EMAIL", "smoke@t")
+        .env_remove("AGEND_HOME")
+        .env_remove("AGEND_INSTANCE_NAME")
+        .env_remove("AGEND_REAL_GIT")
+        .env_remove("AGENTIC_GIT_BYPASS")
+        .env_remove("AGEND_GIT_BYPASS")
+        .env_remove("AGENTIC_GIT_SNAPSHOTS")
+        .env_remove("AGEND_GIT_SNAPSHOTS")
+        .output()
+        .expect("agentic-git run")
 }
 
 /// THE smoke test: a real session routes to the bound branch, denies a
@@ -102,12 +133,32 @@ if git checkout main >/dev/null 2>&1; then echo CHECKOUT_MAIN=allowed; else echo
 "#;
     let out = run_session(&repo, &home, &rg, "smoke", "feat/smoke", script);
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "run failed: {}\n{}", String::from_utf8_lossy(&out.stderr), s);
-    assert!(s.contains("BRANCH=feat/smoke"), "routing to bound branch:\n{s}");
-    assert!(s.contains("TRAILER=yes"), "provenance trailer stamped:\n{s}");
-    assert!(s.contains("RESET=ran"), "destructive op still executes:\n{s}");
-    assert!(s.contains("SNAPS=1"), "reset --hard on a DIRTY tree snapshots once:\n{s}");
-    assert!(s.contains("CHECKOUT_MAIN=denied"), "cross-branch checkout denied:\n{s}");
+    assert!(
+        out.status.success(),
+        "run failed: {}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        s
+    );
+    assert!(
+        s.contains("BRANCH=feat/smoke"),
+        "routing to bound branch:\n{s}"
+    );
+    assert!(
+        s.contains("TRAILER=yes"),
+        "provenance trailer stamped:\n{s}"
+    );
+    assert!(
+        s.contains("RESET=ran"),
+        "destructive op still executes:\n{s}"
+    );
+    assert!(
+        s.contains("SNAPS=1"),
+        "reset --hard on a DIRTY tree snapshots once:\n{s}"
+    );
+    assert!(
+        s.contains("CHECKOUT_MAIN=denied"),
+        "cross-branch checkout denied:\n{s}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -130,8 +181,15 @@ echo "SNAPS=$(git for-each-ref refs/agentic-git/snapshots/ | wc -l | tr -d ' ')"
 "#;
     let out = run_session(&repo, &home, &rg, "marker", "feat/marker", script);
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(s.contains("SNAPS=0"), "marker-only tree must be clean → no snapshot:\n{s}");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        s.contains("SNAPS=0"),
+        "marker-only tree must be clean → no snapshot:\n{s}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -192,11 +250,28 @@ echo "UNTRACKED=$(cat untracked.txt 2>/dev/null || echo MISSING)"
 "#;
     let out = run_session(&repo, &home, &rg, "restore", "feat/restore", script);
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stderr), s);
-    assert!(!s.contains("SNAP=NONE"), "a snapshot must exist to restore from:\n{s}");
-    assert!(s.contains("RESTORE=ran"), "documented restore must NOT be denied by the shim:\n{s}");
-    assert!(s.contains("FTXT=DIRTY"), "tracked change recovered byte-for-byte:\n{s}");
-    assert!(s.contains("UNTRACKED=NEW"), "untracked file recovered:\n{s}");
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        s
+    );
+    assert!(
+        !s.contains("SNAP=NONE"),
+        "a snapshot must exist to restore from:\n{s}"
+    );
+    assert!(
+        s.contains("RESTORE=ran"),
+        "documented restore must NOT be denied by the shim:\n{s}"
+    );
+    assert!(
+        s.contains("FTXT=DIRTY"),
+        "tracked change recovered byte-for-byte:\n{s}"
+    );
+    assert!(
+        s.contains("UNTRACKED=NEW"),
+        "untracked file recovered:\n{s}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -216,8 +291,16 @@ fn run_session_bare_force_push_denied_wiring_2677() {
     let rg = real_git();
     init_repo(&rg, &repo);
     // bare remote + origin/main so the trust-root range (`origin/main..HEAD`) resolves.
-    git(&rg, &["init", "-q", "--bare", remote.to_str().unwrap()], &root);
-    git(&rg, &["remote", "add", "origin", remote.to_str().unwrap()], &repo);
+    git(
+        &rg,
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+        &root,
+    );
+    git(
+        &rg,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+        &repo,
+    );
     git(&rg, &["push", "-q", "origin", "main"], &repo);
     git(&rg, &["fetch", "-q", "origin"], &repo);
     let home = root.join("home");
@@ -239,9 +322,21 @@ grep -q "bare force-push denied" lease.err && echo LEASE_HIT_GATE=yes || echo LE
         "session script failed:\n{}\n{s}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(s.contains("PUSH_RC=1"), "bare force must be denied (shim exit 1):\n{s}");
-    assert!(s.contains("BARE_DENIED=yes"), "the deny must be the force-lease gate:\n{s}");
-    assert!(s.contains("LEASE_MSG=yes"), "deny must carry the --force-with-lease retry:\n{s}");
-    assert!(s.contains("LEASE_HIT_GATE=no"), "a lease force must NOT hit the bare-force gate:\n{s}");
+    assert!(
+        s.contains("PUSH_RC=1"),
+        "bare force must be denied (shim exit 1):\n{s}"
+    );
+    assert!(
+        s.contains("BARE_DENIED=yes"),
+        "the deny must be the force-lease gate:\n{s}"
+    );
+    assert!(
+        s.contains("LEASE_MSG=yes"),
+        "deny must carry the --force-with-lease retry:\n{s}"
+    );
+    assert!(
+        s.contains("LEASE_HIT_GATE=no"),
+        "a lease force must NOT hit the bare-force gate:\n{s}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

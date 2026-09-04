@@ -188,7 +188,10 @@ fn tag_to_hex(tag: &str) -> Result<&str, VerifyError> {
         if parts.len() != 3 {
             return Err(VerifyError::MalformedTag); // missing field / extra colon
         }
-        let Some(algo) = parts[0].strip_prefix('v').and_then(|n| n.parse::<u32>().ok()) else {
+        let Some(algo) = parts[0]
+            .strip_prefix('v')
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
             return Err(VerifyError::MalformedTag); // non-`v<n>` algo
         };
         if algo != HMAC_ALGO_VERSION || parts[1] != HMAC_KEY_FORMAT {
