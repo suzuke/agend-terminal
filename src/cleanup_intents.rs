@@ -954,11 +954,22 @@ mod tests {
             Some(42),
         )
         .expect("persist");
+        let obligation_id = seed_obligation(&home, &rs, "feat/settle-test", &tip, Some("owner"));
+        assert_eq!(
+            obligation(&home, &obligation_id).status,
+            crate::task_events::TaskStatus::Open,
+            "precondition: matching lane has an open retention obligation"
+        );
 
         let outcome = settle_intent(&home, &rs, "feat/settle-test", true, Some(42));
         assert!(matches!(outcome, Some(SettleOutcome::Deleted)));
         assert!(!branch_exists(&repo, "feat/settle-test"));
         assert!(!has_intent(&home, &rs, "feat/settle-test"));
+        assert_eq!(
+            obligation(&home, &obligation_id).status,
+            crate::task_events::TaskStatus::Done,
+            "a matching PR generation must reach merged-lane retirement"
+        );
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
@@ -1149,6 +1160,7 @@ mod tests {
         let tip = make_branch(&repo, "feat/gen-fc");
         let rs = repo.display().to_string();
         persist_intent(&home, &rs, "feat/gen-fc", &tip, "t-fc", None, Some(42)).expect("persist");
+        let obligation_id = seed_obligation(&home, &rs, "feat/gen-fc", &tip, Some("owner"));
 
         // Merged event with NO pr_number → intent has #42 → fail-closed
         let outcome = settle_intent(&home, &rs, "feat/gen-fc", true, None);
@@ -1158,6 +1170,11 @@ mod tests {
         );
         assert!(branch_exists(&repo, "feat/gen-fc"), "branch must survive");
         assert!(has_intent(&home, &rs, "feat/gen-fc"), "intent must survive");
+        assert_eq!(
+            obligation(&home, &obligation_id).status,
+            crate::task_events::TaskStatus::Open,
+            "missing event generation must return before merged-lane retirement"
+        );
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
@@ -1865,6 +1882,7 @@ mod tests {
                 tags: vec![
                     crate::worktree_pool::RETENTION_TAG.to_string(),
                     crate::worktree_pool::retention_key(repo, branch, head),
+                    crate::worktree_pool::retention_lane_key(repo, branch),
                 ],
                 owner: owner.map(|o| InstanceName(o.to_string())),
                 due_at: Some((chrono::Utc::now() + chrono::Duration::days(14)).to_rfc3339()),
