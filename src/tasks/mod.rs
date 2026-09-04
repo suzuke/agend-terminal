@@ -116,9 +116,17 @@ pub(crate) fn assignee_completion_guard(
         (Some("disposable_review"), Some("DaemonProvisionedReview"), Some(head)) => Some(head),
         _ => None,
     };
+    let typed_disposable_review = provisioned_head.is_some()
+        && binding["lease_kind"].as_str() == Some("review")
+        && binding["expected_head"].as_str() == provisioned_head
+        && binding["review_assignment_id"]
+            .as_str()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .is_some()
+        && crate::binding::signature_valid(home, caller);
     if binding_agent != Some(caller)
         || binding_task != Some(task_id)
-        || binding_branch != Some(branch)
+        || (binding_branch != Some(branch) && !typed_disposable_review)
         || source_repo.is_empty()
         || worktree.is_empty()
     {
@@ -136,8 +144,8 @@ pub(crate) fn assignee_completion_guard(
 
     let actual_branch = crate::git_helpers::git_cmd(worktree, &["symbolic-ref", "--short", "HEAD"])
         .map_err(|error| format!("assignee worktree branch check failed: {error}"))?;
-    if actual_branch != branch {
-        return Err("assignee worktree branch does not match the task".to_string());
+    if Some(actual_branch.as_str()) != binding_branch {
+        return Err("assignee worktree branch does not match the binding".to_string());
     }
     let disposable_review_at_provisioned_head = if let Some(expected_head) = provisioned_head {
         let actual_head = crate::git_helpers::git_cmd(worktree, &["rev-parse", "HEAD"])

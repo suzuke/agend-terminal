@@ -1742,7 +1742,7 @@ mod tests {
     }
 
     /// D4: revocation notice is deterministic and idempotent. When the
-    /// reviewer has already read the assignment inbox row, a revocation
+    /// assignment has already been delivered to the reviewer, a revocation
     /// notice is enqueued exactly once per retire cycle. A second reconcile
     /// tick (after convergence deletes the authority) enqueues no duplicate.
     #[test]
@@ -1758,13 +1758,10 @@ mod tests {
         );
         store::persist(&home, &rec).unwrap();
         store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
-        // Mark the inbox row as READ so the retire path enqueues a revocation notice.
-        mark_row_read(
-            &home,
-            "reviewer",
-            &rec.delivery_nonce,
-            "2026-07-13T00:00:30Z",
-        );
+        // Drain without acknowledging: the row is in flight (`delivering_at`
+        // set, `read_at` absent) when the head advance revokes it.
+        let delivered = crate::inbox::storage::drain(&home, "reviewer");
+        assert_eq!(delivered.len(), 1, "assignment must be delivered once");
 
         open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
 

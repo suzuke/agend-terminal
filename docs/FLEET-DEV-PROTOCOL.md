@@ -86,6 +86,14 @@ gh pr checks <PR#>
 - If any check is `pending`, wait and re-check
 - If any check is `fail`, block merge and report to implementer
 
+**GitHub review fields are not fleet authority.** Every fleet agent authenticates
+to GitHub as the shared `suzuke` account, which is also the PR author. GitHub
+therefore cannot record a distinct approving reviewer: `reviewDecision` remains
+`REVIEW_REQUIRED`, and `mergeStateStatus: BLOCKED` is expected. Do not wait for
+those fields to change. The fleet's typed review receipt and exact-head review
+threshold are the authoritative review state; GitHub receives the verdict mirror
+for human visibility.
+
 **Flake declarations require CI-log evidence.** Calling a CI failure a "flake" (to rerun instead of fix) MUST cite the real failing test name from the FAILING run's log:
 
 ```
@@ -100,6 +108,11 @@ gh run view <run-id> --log-failed
 
 ### 3.4 Re-review (r1+) Dispatch
 Every re-review dispatch must enumerate all findings from the previous round with status: fixed / deferred / withdrawn. Missing or incomplete mapping → reviewer repeats the complete original scope (`full_review`) rather than reviewing only the claimed fixes.
+
+When a reviewer rejects a test and the test is rewritten, the rewritten test
+must first exist in its own immutable RED commit and demonstrably fail against
+the unfixed implementation. Only then may the implementation fix be committed.
+The rejected test's earlier RED commit does not prove the rewritten test.
 
 ### 3.5 Multi-reviewer
 - Default: single primary reviewer

@@ -874,11 +874,11 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
                     &old.delivery_nonce,
                     &successor,
                 );
-                // Mirror the A8 revoke path: a row the reviewer had already READ is not
-                // retracted by the supersede alone — surface a durable revocation notice
-                // for the retired assignment (I21). Clock-injected via the new record's
-                // `created_at` (persist takes no separate `now`).
-                if outcome.was_read {
+                // Mirror the A8 revoke path: surface a durable revocation notice when
+                // the original assignment was already handed to the reviewer (I21).
+                // Clock-injected via the new record's `created_at` (persist takes no
+                // separate `now`).
+                if outcome.was_delivered {
                     let nonce = revocation_nonce(old.assignment_id);
                     if !revocation_nonce_present(home, &record.target, &nonce) {
                         crate::inbox::storage::enqueue(
@@ -1079,7 +1079,7 @@ fn retire_under_lock(
         &successor,
     )?;
 
-    if outcome.was_read {
+    if outcome.was_delivered {
         let nonce = revocation_nonce(expected_id);
         if !revocation_nonce_present(home, target, &nonce) {
             crate::inbox::storage::enqueue(
@@ -1217,9 +1217,9 @@ fn revoke_under_lock(
         &record.delivery_nonce,
         &successor,
     )?;
-    // A row the reviewer had already READ is not retracted by the supersede alone
-    // (it is already non-actionable) — surface an explicit revocation notice (I21).
-    if outcome.was_read {
+    // Once an assignment has been handed to the reviewer, surface an explicit
+    // revocation notice even if that delivery has not yet been acknowledged (I21).
+    if outcome.was_delivered {
         crate::inbox::storage::enqueue(
             home,
             target,

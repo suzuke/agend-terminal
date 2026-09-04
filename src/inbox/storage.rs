@@ -644,10 +644,13 @@ pub fn nonce_present_not_superseded(home: &Path, target: &str, nonce: &str) -> b
 pub struct NonceSupersedeOutcome {
     /// A row carrying the nonce was found (any state).
     pub found: bool,
-    /// That row had already been READ (`read_at` set) when we looked — the
-    /// revoke path (A8) enqueues a revocation notice only in this case, since a
-    /// still-unread row is retracted silently by the supersede itself.
+    /// That row had already been acknowledged (`read_at` set). Retained as the
+    /// narrower state signal for callers that distinguish ack from delivery.
     pub was_read: bool,
+    /// That row had already been delivered (`delivering_at` or `read_at` set)
+    /// when we looked. The revoke path (A8) enqueues a revocation notice in
+    /// this case; a never-delivered row is retracted silently.
+    pub was_delivered: bool,
 }
 
 /// t-…-17 reviewer-assignment outbox: mark the inbox row for `target` carrying
@@ -661,8 +664,9 @@ pub struct NonceSupersedeOutcome {
 /// one) and by revoke/transfer (A8/A9: retract the current row). Only an UNREAD,
 /// not-already-superseded row is rewritten (an already-read row is left verbatim —
 /// it is already non-actionable), but the returned [`NonceSupersedeOutcome`]
-/// reports `was_read` so revoke can surface a revocation notice for a row the
-/// reviewer had already seen (invariant I21).
+/// reports `was_delivered` so revoke can surface a revocation notice for a row
+/// handed to the reviewer, including an in-flight unacknowledged delivery
+/// (invariant I21).
 pub fn supersede_by_nonce(
     home: &Path,
     target: &str,
@@ -717,6 +721,9 @@ fn supersede_by_nonce_inner(
                         outcome.found = true;
                         if msg.read_at.is_some() {
                             outcome.was_read = true;
+                        }
+                        if msg.read_at.is_some() || msg.delivering_at.is_some() {
+                            outcome.was_delivered = true;
                         }
                         if msg.read_at.is_none() && msg.superseded_by.is_none() {
                             msg.superseded_by = Some(successor.to_string());

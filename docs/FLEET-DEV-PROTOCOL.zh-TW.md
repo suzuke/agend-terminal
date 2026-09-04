@@ -88,6 +88,13 @@ gh pr checks <PR#>
 - 若任何檢查為 `pending`，請等待並重新檢查
 - 若任何檢查為 `fail`，阻止合併並回報實作者
 
+**GitHub 審查欄位不是 fleet 權威。** 每個 fleet agent 都以共用的
+`suzuke` 帳號向 GitHub 驗證，而該帳號同時也是 PR 作者。因此 GitHub 無法記錄
+不同身分的核准者：`reviewDecision` 會一直是 `REVIEW_REQUIRED`，且
+`mergeStateStatus: BLOCKED` 是預期狀態。不得等待這些欄位改變。Fleet 的 typed
+review receipt 與 exact-head review threshold 才是審查狀態的權威；GitHub 上的
+判定同步只供人類查看。
+
 **不穩定測試宣告需要 CI 紀錄證據。** 將 CI 失敗稱為「不穩定測試」（以便重新執行而非修正）MUST 引用發生失敗之執行紀錄中的真實失敗測試名稱：
 
 ```
@@ -102,6 +109,10 @@ gh run view <run-id> --log-failed
 
 ### 3.4 再次審查（r1+）派發
 每次再次審查的派發都必須列舉上一輪的所有發現事項及其狀態：已修正／已延後／已撤回。對照關係缺漏或不完整 → 審查者重做完整的原始範圍（`full_review`），而非僅審查聲稱已修正的部分。
+
+若 reviewer 拒絕某項測試，而該測試隨後被重寫，重寫後的測試必須先形成自己的
+immutable RED commit，並證明它在尚未修正的實作上會失敗；之後才能提交實作修正。
+先前遭拒測試的 RED commit 不能證明重寫後的測試。
 
 ### 3.5 多位審查者
 - 預設：單一主要審查者

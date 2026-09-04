@@ -3378,6 +3378,11 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
     let remote = home.join("remote.git");
     std::fs::create_dir_all(&repo).expect("repo");
     let branch = "fix/s1-control";
+    let task_branch = if mode == "review-branch-drift" {
+        "fix/review-subject"
+    } else {
+        branch
+    };
     let git = |args: &[&str]| {
         assert!(
             std::process::Command::new("git")
@@ -3415,12 +3420,18 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
             | "review-mismatch"
             | "review-malformed"
             | "review-unpushed"
+            | "review-branch-drift"
     ) {
         git(&["-C", r, "commit", "--allow-empty", "-qm", "feature"]);
     }
     if matches!(
         mode,
-        "pushed" | "review" | "review-dirty" | "review-mismatch" | "review-malformed"
+        "pushed"
+            | "review"
+            | "review-dirty"
+            | "review-mismatch"
+            | "review-malformed"
+            | "review-branch-drift"
     ) {
         git(&["-C", r, "push", "-q", "-u", "origin", branch]);
     }
@@ -3444,7 +3455,7 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
     let created = handle(
         &home,
         "test:operator",
-        &serde_json::json!({"action":"create","title":"S1","assignee":"dev-agent","branch":branch}),
+        &serde_json::json!({"action":"create","title":"S1","assignee":"dev-agent","branch":task_branch}),
     );
     let id = created["id"].as_str().expect("task id").to_string();
     let claimed = handle(
@@ -3456,7 +3467,9 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
     let provisioned_head =
         crate::git_helpers::git_cmd(&repo, &["rev-parse", "HEAD"]).expect("provisioned head");
     let review_provenance = match mode {
-        "review" | "review-dirty" | "review-unpushed" => Some(provisioned_head.clone()),
+        "review" | "review-dirty" | "review-unpushed" | "review-branch-drift" => {
+            Some(provisioned_head.clone())
+        }
         "review-mismatch" => Some(
             crate::git_helpers::git_cmd(&repo, &["rev-parse", "origin/main"])
                 .expect("mismatched provisioned head"),
@@ -3476,6 +3489,16 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
             Some(crate::binding::BindingProvenance::DaemonProvisionedReview { provisioned_head }),
         )
         .expect("binding");
+        if mode == "review-branch-drift" {
+            crate::binding::augment_binding_with_lease(
+                &home,
+                "dev-agent",
+                "review",
+                &uuid::Uuid::new_v4().to_string(),
+                provisioned_head,
+            )
+            .expect("typed review lease");
+        }
     } else {
         crate::binding::bind_full(&home, "dev-agent", &id, branch, &repo, &repo, false)
             .expect("binding");
@@ -3487,6 +3510,40 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
         std::fs::rename(repo.join(".git"), repo.join(".git-hidden")).expect("Git error fixture");
     }
     (home, id, repo, branch.to_string())
+}
+
+#[test]
+fn task_done_allows_owned_disposable_review_branch_but_denies_third_party() {
+    let (home, id, _repo, _branch) = s1_fixture("s1-review-branch-drift", "review-branch-drift");
+
+    let denied = handle(
+        &home,
+        "other-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    assert!(
+        denied.get("error").is_some(),
+        "third party must not settle the review task: {denied}"
+    );
+    assert_eq!(
+        read_task_record(&home, &id).expect("task").status,
+        crate::task_events::TaskStatus::Claimed
+    );
+
+    let done = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "the assigned reviewer must be able to settle its own disposable review task: {done}"
+    );
+    assert_eq!(
+        read_task_record(&home, &id).expect("task").status,
+        crate::task_events::TaskStatus::Done
+    );
+    std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
