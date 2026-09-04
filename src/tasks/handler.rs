@@ -683,27 +683,6 @@ fn handle_get(home: &Path, _caller: &str, args: &Value) -> Value {
     serde_json::json!({ "task": v })
 }
 
-/// #2117 P3a (FM5 / board isolation): per-board mutation authority. A task
-/// mutation resolves its board from the task_id, so a caller can name a task that
-/// lives on ANOTHER project's board. Deny unless the caller acts in that board's
-/// project — `super::acl::can_mutate_on_board` (system identities bypass; a hard
-/// fleet read failure fail-closes). Single-project → caller project == task board project (both DEFAULT)
-/// → allow → byte-identical (no new denial). Returns `Some(error)` when denied.
-// #2760: `board_project` is the caller's ALREADY-resolved authoritative board
-// (from `super::load_routed`), so the mutation routes ONCE and this gate never
-// re-resolves (nor silently defaults). `None` = allowed.
-fn cross_board_denied(home: &Path, caller: &str, id: &str, board_project: &str) -> Option<Value> {
-    if super::acl::can_mutate_on_board(home, caller, board_project) {
-        return None;
-    }
-    Some(serde_json::json!({
-        "error": format!(
-            "cross-board mutation denied: task '{id}' lives on the '{board_project}' project \
-             board but caller '{caller}' acts in a different project (board isolation, #2117 P3a)"
-        )
-    }))
-}
-
 fn handle_claim(
     home: &Path,
     instance_name: &str,
@@ -735,7 +714,12 @@ fn handle_claim(
     // #2117 P3a: board-isolation gate — a caller may only claim tasks on its own
     // project's board (claim has no `force`/owner-ACL — an open task is claimable
     // by anyone, but only within the board). Single-project → allow.
-    if let Some(deny) = cross_board_denied(home, &iname, &id, routed.board().project()) {
+    // #3511 passes `None`: claim is the one gated action with NO owner-ACL behind
+    // it, so the boundary is its only authority — an exception here would REMOVE
+    // the gate rather than defer it. Settlement needs no prior claim.
+    if let Some(deny) =
+        super::acl::cross_board_denied(home, &iname, &id, routed.board().project(), None)
+    {
         return deny;
     }
     // #t-21: validate + append in ONE critical section to close the
@@ -879,7 +863,15 @@ fn handle_done(
     let board = routed.board().path().to_path_buf();
     let record = routed.record().clone();
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project()) {
+    // #3511: a row's own assignee settles it across boards; the owner-ACL below
+    // is still the authority on WHO may do it.
+    if let Some(deny) = super::acl::cross_board_denied(
+        home,
+        &caller,
+        &id,
+        routed.board().project(),
+        record.owner.as_ref().map(|o| o.0.as_str()),
+    ) {
         return deny;
     }
     if !can_mutate_record(home, &caller, &record) {
@@ -1248,7 +1240,15 @@ fn handle_update(
     let board = routed.board().path().to_path_buf();
     let record = routed.record().clone();
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project()) {
+    // #3511: `update` carries cancellation (no separate `cancel` action), so a
+    // row's own assignee reaches it across boards; the owner-ACL still gates WHO.
+    if let Some(deny) = super::acl::cross_board_denied(
+        home,
+        &caller,
+        &id,
+        routed.board().project(),
+        record.owner.as_ref().map(|o| o.0.as_str()),
+    ) {
         return deny;
     }
     if !can_mutate_record(home, &caller, &record) {
@@ -1899,7 +1899,11 @@ fn handle_metadata_set(
     let record = routed.record().clone();
     // #2117 P3a: board-isolation gate (no force on metadata_set — mirror its
     // unconditional owner-ACL below).
-    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project()) {
+    // #3511 passes `None`: metadata is not settlement — the deadlock is a row
+    // nobody can CLOSE, and arbitrary metadata writes are more than that needs.
+    if let Some(deny) =
+        super::acl::cross_board_denied(home, instance_name, id, routed.board().project(), None)
+    {
         return deny;
     }
     // #2760 R2 (root+independent REJECT of a542517b): evaluate the plan-governance /
@@ -2144,7 +2148,11 @@ fn handle_ack_plan(
         }
     };
     let record = routed.record().clone();
-    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project()) {
+    // #3511 passes `None`: `ack_plan` records a NON-assignee's ack by definition,
+    // so an owner exception could never fire here.
+    if let Some(deny) =
+        super::acl::cross_board_denied(home, instance_name, id, routed.board().project(), None)
+    {
         return deny;
     }
     if record.owner.as_ref().map(|o| o.0.as_str()) == Some(instance_name) {

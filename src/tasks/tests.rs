@@ -3367,6 +3367,55 @@ teams:
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3511 fail-closed pin. `can_mutate_on_board` returns `false` for two very
+/// different states: a resolved cross-board mismatch, and a HARD fleet.yaml read
+/// failure where the caller's authority is simply unknown (#2133's deliberate
+/// fail-CLOSED hardening). The owner exception may override the first and must
+/// never override the second. The caller here is the row's OWN assignee — the
+/// exact identity the exception serves — so this is the sharpest place it could
+/// leak. `fleet_read_failure_denies_mutation_fail_closed_2117_p3a` also covers
+/// this incidentally; this one says so by name, so nobody unpins it by editing
+/// that test for #2133 reasons.
+#[test]
+fn owner_exception_does_not_bypass_fail_closed_3511() {
+    let home = tmp_home("3511-fail-closed-pin");
+    write_fleet_yaml(&home, &["dev"]);
+    let t = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "create", "title": "t", "assignee": "dev"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // File PRESENT but unparseable → `try_load_fleet` = Err, not the missing-file
+    // Ok(default) path, so the caller's project cannot be resolved at all.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "{{{ not: : valid yaml ][",
+    )
+    .unwrap();
+
+    for action in ["done", "update"] {
+        let denied = handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": action, "id": &t, "status": "cancelled"}),
+        );
+        assert!(
+            denied["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cross-board mutation denied"),
+            "the #3511 owner exception must not fire while the fleet is unreadable \
+             ({action}): {denied}"
+        );
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_claim_unknown_instance_rejected() {
     let home = tmp_home("claim-unknown");
