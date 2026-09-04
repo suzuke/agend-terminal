@@ -210,3 +210,143 @@ fn sweep_does_not_reraise_a_lane_its_owner_answered_3517() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// #3517 follow-up — the reachability fact the whole fix rests on, pinned rather
+/// than argued.
+///
+/// `merged_pr_number` matches a merged PR only when the local tip IS the merged
+/// head or is an ANCESTOR of it (`branch_sweep::local_sha_matches_merged_head`).
+/// A drifted branch is neither — it is one commit AHEAD — so the moment the
+/// window this fix exists for opens, the merge stops being observable and the
+/// sweep routes to `settle_by_owner_attestation` instead of `settle_intent`.
+///
+/// Two things follow, and both matter:
+///   1. `retire_merged_lane` cannot run a second time on a drifted lane, so it
+///      cannot close the obligation this fix raises. (I reported the opposite
+///      before measuring it; this test is the correction, kept so nobody has to
+///      re-derive it.)
+///   2. The other tests here reach `settle_by_owner_attestation` because their
+///      fixture repo has no remote — the SAME branch production takes for a
+///      drifted lane, for a different reason. The seam does not send the tests
+///      down a path production would not take.
+#[test]
+fn a_drifted_lane_is_no_longer_merge_observable_3517() {
+    let repo = tmp_repo("drift-observability");
+    let branch = "feat/observability";
+    let merged_head = make_branch(&repo, branch);
+    git_in(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+
+    // At the merged head the merge IS observable — otherwise this test could
+    // pass because the mock never fires, which would prove nothing.
+    let guard = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
+        crate::scm::MockPrList::MergedHead {
+            base: "main".to_string(),
+            head_oid: merged_head.clone(),
+        },
+    ));
+    assert!(
+        crate::branch_sweep::merged_pr_number(&repo, "main", branch).is_some(),
+        "control: a branch still at its merged head must resolve its merged PR"
+    );
+    drop(guard);
+
+    // One post-merge commit, and the same lookup goes dark.
+    let drifted = commit_onto(&repo, branch, "late.txt");
+    assert_ne!(drifted, merged_head);
+    let _guard = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
+        crate::scm::MockPrList::MergedHead {
+            base: "main".to_string(),
+            head_oid: merged_head.clone(),
+        },
+    ));
+    assert!(
+        crate::branch_sweep::merged_pr_number(&repo, "main", branch).is_none(),
+        "a drifted branch is AHEAD of the merged head, so it matches neither \
+         equality nor the is-ancestor arm — the merge is no longer observable, \
+         which is exactly why nothing retires the obligation raised for it"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #3517 follow-up — the ONE reachable trigger of the head-blind retirement
+/// filter, and why leaving that filter alone is right.
+///
+/// `retire_merged_lane` closes every open row on the lane tag without looking at
+/// which head the row is about. That looks over-broad, and the first version of
+/// this work proposed narrowing it. It cannot be reached by drift — a drifted tip
+/// is AHEAD of the merged head, so the merge stops being observable (see
+/// `a_drifted_lane_is_no_longer_merge_observable_3517`) and retirement never runs
+/// again. It CAN be reached by rewinding the tip back to the merged head, with a
+/// force-push or a reset, after a later-head row was raised.
+///
+/// And that is precisely the case where closing the row is the RIGHT answer: the
+/// post-merge commits no longer exist, so there is nothing left for the owner to
+/// attest to. The branch is deleted and the question is retired — asking it would
+/// be asking about work that is gone. So the only way to reach the head-blind
+/// filter is a case where today's behaviour is correct, which is a stronger
+/// reason to leave `retire_merged_lane` untouched than "you cannot reach it".
+#[test]
+fn rewinding_to_the_merged_head_correctly_retires_the_later_head_row_3517() {
+    let home = tmp_dir("drift-rewind");
+    let repo = tmp_repo("drift-rewind-repo");
+    let branch = "feat/rewound";
+    let rs = repo.display().to_string();
+    let merged_head = make_branch(&repo, branch);
+    git_in(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    persist_intent(&home, &rs, branch, &merged_head, "t-origin", None, None).expect("persist");
+
+    // A row about a LATER head — the shape the narrowing was meant to protect.
+    let later_head = commit_onto(&repo, branch, "late.txt");
+    let later_row = seed_obligation(&home, &rs, branch, &later_head, Some("agent-owner"));
+    assert_eq!(
+        open_lane_rows(&home, &rs, branch).len(),
+        1,
+        "precondition: the later-head row is open"
+    );
+
+    // The rewind: the post-merge commits are discarded and the tip is the merged
+    // head again, so the merge becomes observable once more.
+    git_in(&repo, &["branch", "-f", branch, &merged_head]);
+    let _guard = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
+        crate::scm::MockPrList::MergedHead {
+            base: "main".to_string(),
+            head_oid: merged_head.clone(),
+        },
+    ));
+
+    sweep_settle_merged(&home);
+
+    assert!(
+        obligation(&home, &later_row).status.is_terminal(),
+        "the later-head row must be retired — the work it was about no longer exists"
+    );
+    assert!(
+        !branch_exists(&repo, branch),
+        "and the lane settles for real: tip back at the merged head passes the CAS \
+         and the branch is deleted"
+    );
+    assert!(
+        open_lane_rows(&home, &rs, branch).is_empty(),
+        "nothing is left open to ask about"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
