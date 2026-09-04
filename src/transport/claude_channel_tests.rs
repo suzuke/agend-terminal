@@ -2164,5 +2164,86 @@ fn event_worker_switches_to_a_restarted_bridge_locator() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// #3515 follow-up (RED): shutdown must not pay the stop-observation latency
+/// once PER INSTANCE.
+///
+/// `stop_instance_state` sets an events worker's stop flag and then joins it,
+/// but the worker only observes that flag when its current SSE read returns —
+/// bounded by `SSE_READ_TIMEOUT` (20s). `cleanup_managed_transports` walks the
+/// instances one at a time, so before the fix each instance's wait started only
+/// after the previous one finished: N stuck workers cost N × 20s. #3515 is what
+/// put that loop on the `agend-terminal stop` path.
+///
+/// The worker here stands in for that shape: it notices its flag only when its
+/// current "read" returns, `OBSERVE_DELAY` later. If the flags are set one at a
+/// time the run costs N × OBSERVE_DELAY; if they are all set up front the waits
+/// overlap and it costs about one.
+///
+/// The threshold is deliberately half of the sequential cost, not a hair under
+/// it: the fixed shape lands near 1 × OBSERVE_DELAY, so this discriminates by a
+/// factor of ~4 either way rather than by a race (the #3514 lesson).
+#[test]
+fn shutdown_signals_every_event_worker_before_joining_3515() {
+    use std::time::{Duration, Instant};
+
+    const WORKERS: usize = 8;
+    const OBSERVE_DELAY: Duration = Duration::from_millis(400);
+
+    let home = home("shutdown-batch-stop");
+    let instances: Vec<String> = (0..WORKERS).map(|i| format!("claude-agent-{i}")).collect();
+
+    for instance in &instances {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        // Stands in for `stream.next()` blocking on a socket whose read timeout
+        // is SSE_READ_TIMEOUT: the flag is only seen once the read returns.
+        let join = std::thread::Builder::new()
+            .name(format!("test-sse-{instance}"))
+            .spawn(move || loop {
+                std::thread::sleep(OBSERVE_DELAY);
+                if thread_stop.load(Ordering::Acquire) {
+                    return;
+                }
+            })
+            .expect("spawn stand-in worker");
+        event_workers().lock().insert(
+            worker_key(&home, instance),
+            EventWorker {
+                stop,
+                join: Some(join),
+                locator: SessionLocator::claude(
+                    "http://127.0.0.1:43123".to_string(),
+                    format!("session-{instance}"),
+                    "test-token".to_string(),
+                ),
+            },
+        );
+    }
+
+    let started = Instant::now();
+    crate::daemon::shutdown_cleanup::cleanup_managed_transports(&home, &instances);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < OBSERVE_DELAY * (WORKERS as u32) / 2,
+        "shutdown paid the stop-observation latency once per instance: {elapsed:?} for \
+         {WORKERS} workers at {OBSERVE_DELAY:?} each — the stop flags must all be set \
+         before any worker is joined so the waits overlap (#3515 follow-up)"
+    );
+
+    // Speed must not cost completeness: every worker is stopped and gone.
+    for instance in &instances {
+        assert!(
+            event_workers()
+                .lock()
+                .get(&worker_key(&home, instance))
+                .is_none(),
+            "cleanup must still remove every event worker ({instance})"
+        );
+    }
+
+    let _ = fs::remove_dir_all(home);
+}
+
 #[path = "claude_channel/tests/self_kick_tests.rs"]
 mod self_kick_tests;
