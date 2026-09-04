@@ -95,7 +95,7 @@ pub(crate) fn retention_lane_key(repo: &str, branch: &str) -> String {
 /// (empty live set — daemon unreachable) is treated as "owner is live": the
 /// operator's rule makes the branch opener accountable, and reassigning on
 /// ignorance would silently move that accountability.
-fn record_retention_obligation(
+pub(crate) fn record_retention_obligation(
     home: &Path,
     repo: &str,
     branch: &str,

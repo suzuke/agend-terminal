@@ -13,7 +13,9 @@ use legacy_release::{
 
 mod branch_cleanup;
 use branch_cleanup::resolve_branch_cleanup;
-pub(crate) use branch_cleanup::{retention_key, retention_lane_key, RETENTION_TAG};
+pub(crate) use branch_cleanup::{
+    record_retention_obligation, retention_key, retention_lane_key, RETENTION_TAG,
+};
 
 pub(crate) struct NestedDirtDiscard<'a> {
     pub expected_digest: &'a str,

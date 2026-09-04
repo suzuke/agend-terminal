@@ -320,6 +320,11 @@ pub(crate) fn sweep_settle_merged(home: &Path) {
         if !repo_path.is_dir() {
             continue;
         }
+        // #3517 follow-up: re-evaluate the residue BEFORE asking the merge
+        // ledger anything. A lane the merge already retired can have moved on
+        // since, and that question is answerable from the branch and the board
+        // alone — it must not depend on the merge still being observable.
+        owner_attestation::reraise_drifted_merged_lane(home, &intent);
         let default = crate::git_helpers::default_branch(repo_path);
         // Independently observe the merged PR number — never echo the
         // intent's own pr_number as the event generation.
@@ -2434,6 +2439,7 @@ mod tests {
              evidence is absent — if this fails, the second authority was unwired"
         );
     }
+
     #[path = "head_drift_reraise_3517_tests.rs"]
     mod head_drift_reraise_3517;
 }
