@@ -7013,3 +7013,138 @@ fn the_accountable_owner_can_answer_the_retention_obligation_after_release() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// GAP 1 (#3503 mutation-kill): a clean pre-merge release on an OPEN-PR
+/// branch must still persist the release intent — merge is what settles it
+/// later — even though (as the sibling test above already pins) no
+/// retention row is raised. `persist_release_intent` sits above the
+/// open-PR guard in `branch_cleanup.rs`; a mutation that pulls it inside
+/// the guard would silently break merge-driven cleanup on exactly the
+/// lanes this ticket is about, yet leave every other assertion green.
+#[test]
+fn open_pr_branch_release_creates_no_retention_obligation_but_persists_intent() {
+    let home = tmp_home("retention-openpr-intent");
+    let repo = tmp_repo("retention-openpr-intent-repo");
+    crate::git_helpers::git_bypass(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/repo.git",
+        ],
+    )
+    .expect("add origin");
+    let provider =
+        crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Branches(vec![
+            "feat/openpr-intent".to_string(),
+        ]));
+    let _provider_guard = crate::scm::set_test_scm_provider(provider);
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/openpr-intent");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+    assert!(
+        !outcome.branch_deleted,
+        "pre: a branch carrying real work must be preserved, not reaped"
+    );
+
+    assert!(
+        crate::cleanup_intents::has_intent(
+            &home,
+            &repo.display().to_string(),
+            "feat/openpr-intent"
+        ),
+        "an open-PR lane must still persist its release intent — merge settles it later"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// GAP 2 (#3503 mutation-kill): retirement must correlate by the LANE key
+/// (repo, branch) rather than the exact (repo, branch, head) key, because
+/// the head recorded at release time can drift from the head at merge
+/// time. A retention row is raised at head A; the branch then advances to
+/// a different head B before the merge-settle chokepoint runs — the row
+/// must still be found and closed.
+#[test]
+fn merged_branch_retires_retention_obligation_despite_head_drift() {
+    let home = tmp_home("retention-lanekey-drift");
+    let repo = tmp_repo("retention-lanekey-drift-repo");
+    // No origin remote: NotOpen at release time raises the row, exactly
+    // like the negative control.
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/willdrift");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "setup: exactly one open retention obligation must exist before merge, got {}",
+        obligations.len()
+    );
+    let head_a = crate::git_helpers::git_cmd(&repo, &["rev-parse", "feat/willdrift"])
+        .expect("head A")
+        .trim()
+        .to_string();
+    assert!(
+        obligations[0]
+            .tags
+            .contains(&crate::worktree_pool::retention_key(
+                &repo.display().to_string(),
+                "feat/willdrift",
+                &head_a,
+            )),
+        "setup: the obligation must carry the exact key for head A"
+    );
+
+    // Advance the branch to a different head B — no second release, just
+    // more work landing on the same lane before the merge is observed.
+    let lease2 = lease_bound(&home, &repo, "agent-own", "feat/willdrift");
+    commit_work(&lease2.path, "w2.txt");
+    let head_b = crate::git_helpers::git_cmd(&repo, &["rev-parse", "feat/willdrift"])
+        .expect("head B")
+        .trim()
+        .to_string();
+    assert_ne!(
+        head_a, head_b,
+        "setup: the branch must actually have advanced"
+    );
+
+    // The branch's PR merges at head B — drive the merged-settle chokepoint
+    // directly, as both `sweep_settle_merged` and the CI-watch event path do.
+    let repo_str = repo.display().to_string();
+    crate::cleanup_intents::settle_intent(&home, &repo_str, "feat/willdrift", true, None);
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "the row must still exist, now terminal"
+    );
+    assert!(
+        obligations[0].status.is_terminal(),
+        "merge must retire the retention row despite head drift, correlating by lane not exact head; got status {:?}",
+        obligations[0].status
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
