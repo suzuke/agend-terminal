@@ -3378,7 +3378,8 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
     let remote = home.join("remote.git");
     std::fs::create_dir_all(&repo).expect("repo");
     let branch = "fix/s1-control";
-    let task_branch = if mode == "review-branch-drift" {
+    let review_branch_drift = mode.starts_with("review-branch-drift");
+    let task_branch = if review_branch_drift {
         "fix/review-subject"
     } else {
         branch
@@ -3420,19 +3421,15 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
             | "review-mismatch"
             | "review-malformed"
             | "review-unpushed"
-            | "review-branch-drift"
-    ) {
+    ) || review_branch_drift
+    {
         git(&["-C", r, "commit", "--allow-empty", "-qm", "feature"]);
     }
     if matches!(
         mode,
-        "pushed"
-            | "review"
-            | "review-dirty"
-            | "review-mismatch"
-            | "review-malformed"
-            | "review-branch-drift"
-    ) {
+        "pushed" | "review" | "review-dirty" | "review-mismatch" | "review-malformed"
+    ) || review_branch_drift
+    {
         git(&["-C", r, "push", "-q", "-u", "origin", branch]);
     }
     if matches!(mode, "dirty" | "review-dirty") {
@@ -3467,14 +3464,13 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
     let provisioned_head =
         crate::git_helpers::git_cmd(&repo, &["rev-parse", "HEAD"]).expect("provisioned head");
     let review_provenance = match mode {
-        "review" | "review-dirty" | "review-unpushed" | "review-branch-drift" => {
-            Some(provisioned_head.clone())
-        }
+        "review" | "review-dirty" | "review-unpushed" => Some(provisioned_head.clone()),
         "review-mismatch" => Some(
             crate::git_helpers::git_cmd(&repo, &["rev-parse", "origin/main"])
                 .expect("mismatched provisioned head"),
         ),
         "review-malformed" => Some("not-a-commit".to_string()),
+        _ if review_branch_drift => Some(provisioned_head.clone()),
         _ => None,
     };
     if let Some(provisioned_head) = review_provenance.as_deref() {
@@ -3489,15 +3485,40 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
             Some(crate::binding::BindingProvenance::DaemonProvisionedReview { provisioned_head }),
         )
         .expect("binding");
-        if mode == "review-branch-drift" {
+        if review_branch_drift {
+            let lease_kind = if mode == "review-branch-drift-wrong-kind" {
+                "implementation"
+            } else {
+                "review"
+            };
+            let assignment_id = if mode == "review-branch-drift-bad-id" {
+                "not-a-uuid".to_string()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            let expected_head = if mode == "review-branch-drift-wrong-head" {
+                crate::git_helpers::git_cmd(&repo, &["rev-parse", "origin/main"])
+                    .expect("wrong expected head")
+            } else {
+                provisioned_head.to_string()
+            };
             crate::binding::augment_binding_with_lease(
                 &home,
                 "dev-agent",
-                "review",
-                &uuid::Uuid::new_v4().to_string(),
-                provisioned_head,
+                lease_kind,
+                &assignment_id,
+                &expected_head,
             )
             .expect("typed review lease");
+            if mode == "review-branch-drift-bad-signature" {
+                std::fs::write(
+                    crate::paths::runtime_dir(&home)
+                        .join("dev-agent")
+                        .join("binding.json.sig"),
+                    "invalid-signature",
+                )
+                .expect("invalidate binding signature");
+            }
         }
     } else {
         crate::binding::bind_full(&home, "dev-agent", &id, branch, &repo, &repo, false)
@@ -3544,6 +3565,33 @@ fn task_done_allows_owned_disposable_review_branch_but_denies_third_party() {
         crate::task_events::TaskStatus::Done
     );
     std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn task_done_denies_disposable_review_branch_drift_without_every_typed_lease_proof() {
+    for mode in [
+        "review-branch-drift-wrong-kind",
+        "review-branch-drift-bad-id",
+        "review-branch-drift-wrong-head",
+        "review-branch-drift-bad-signature",
+    ] {
+        let (home, id, _repo, _branch) = s1_fixture(mode, mode);
+        let denied = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({"action":"done","id":id}),
+        );
+        assert!(
+            denied.get("error").is_some(),
+            "branch drift without every typed lease proof must be denied for {mode}: {denied}"
+        );
+        assert_eq!(
+            read_task_record(&home, &id).expect("task").status,
+            crate::task_events::TaskStatus::Claimed,
+            "denied task must remain claimed for {mode}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 #[test]

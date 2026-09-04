@@ -1762,6 +1762,11 @@ mod tests {
         // set, `read_at` absent) when the head advance revokes it.
         let delivered = crate::inbox::storage::drain(&home, "reviewer");
         assert_eq!(delivered.len(), 1, "assignment must be delivered once");
+        assert_eq!(
+            crate::inbox::storage::requeue_delivering_for_session_reset(&home, "reviewer"),
+            1,
+            "fresh restart must requeue the unacknowledged assignment"
+        );
 
         open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
 
