@@ -341,6 +341,84 @@ fn a_touch_on_a_closed_row_does_not_make_it_the_lanes_latest_3517() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// The live-agent registry `record_retention_obligation` consults, in the same
+/// shape `worktree_pool::tests::plant_live_agents` writes it.
+fn plant_live_agents(home: &Path, agents: &[&str]) {
+    let run = home.join("run").join(std::process::id().to_string());
+    std::fs::create_dir_all(&run).expect("run dir");
+    std::fs::write(run.join(".daemon"), format!("{}:0", std::process::id())).expect(".daemon");
+    for a in agents {
+        std::fs::write(run.join(format!("{a}.port")), "1234").expect("port file");
+    }
+}
+
+/// #3517 follow-up RED 4 — the ownerless lane, which is the subset where this
+/// whole fix matters MOST and where it did the least.
+///
+/// A retention row is not always owned. `record_retention_obligation` takes a
+/// non-empty owner string and then PROJECTS it away: a dead owner escheats to
+/// the originating task's `created_by`, and when that orchestrator is gone too
+/// the row is raised with `owner: None` and tagged `branch-retention-orphan`
+/// (`retention_obligation_is_orphan_tagged_when_neither_owner_nor_orchestrator_live`
+/// pins it). Reading the parameter and concluding "production has no ownerless
+/// row" is how this case got missed twice.
+///
+/// So the drift path must not read the owner off the retired row and give up
+/// when it finds none. Nobody is watching an orphan lane by definition — the
+/// board row IS the watching — and the merge just closed the only one there
+/// was.
+#[test]
+fn an_orphan_lane_is_reraised_when_it_drifts_3517() {
+    let home = tmp_dir("drift-orphan");
+    let repo = tmp_repo("drift-orphan-repo");
+    let branch = "feat/orphaned-then-drifted";
+    let rs = repo.display().to_string();
+    // Someone unrelated is live; neither the owner nor the seeding instance is.
+    plant_live_agents(&home, &["someone-else"]);
+    let merged_head = make_branch(&repo, branch);
+    persist_intent(&home, &rs, branch, &merged_head, "t-origin", None, None).expect("persist");
+    let orphan_row = seed_obligation(&home, &rs, branch, &merged_head, None);
+    assert!(
+        obligation(&home, &orphan_row).owner.is_none(),
+        "precondition: the lane's row is ownerless, the shape branch_cleanup \
+         projects when neither owner nor orchestrator is live"
+    );
+
+    owner_attestation::retire_merged_lane(&home, &rs, branch);
+    let drifted_head = commit_onto(&repo, branch, "late.txt");
+
+    sweep_settle_merged(&home);
+
+    let rows = open_lane_rows(&home, &rs, branch);
+    assert_eq!(
+        rows.len(),
+        1,
+        "an ownerless lane still gets a fresh obligation — its row is the only \
+         thing watching it, and the merge closed that one"
+    );
+    assert!(
+        rows[0].owner.is_none()
+            && rows[0]
+                .tags
+                .iter()
+                .any(|tag| tag == "branch-retention-orphan"),
+        "and it is raised the way branch_cleanup raises an unowned row: no \
+         owner, tagged orphan, so board hygiene picks it up instead of an \
+         agent who is not there"
+    );
+    assert!(
+        rows[0].tags.contains(&crate::worktree_pool::retention_key(
+            &rs,
+            branch,
+            &drifted_head
+        )),
+        "keyed at the drifted head, like every other re-raise"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// #3517 follow-up — the reachability fact the whole fix rests on, pinned rather
 /// than argued.
 ///
