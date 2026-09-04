@@ -273,6 +273,74 @@ fn a_later_owner_answer_outranks_an_older_system_retirement_3517() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// #3517 follow-up RED 3 — "the lane's last row" means the last one RAISED,
+/// not the last one TOUCHED.
+///
+/// Ordering by `updated_at` answers a different question: which row was
+/// written to most recently. Any write counts — `task action=metadata_set` on
+/// the old system-closed row is a public tool call, and it is enough to sort
+/// that row above the answer that superseded it, putting the sweep straight
+/// back into re-asking a settled lane. The generations of a lane are fixed
+/// when its rows are CREATED, and nothing done to a closed row afterwards
+/// changes which question came last.
+#[test]
+fn a_touch_on_a_closed_row_does_not_make_it_the_lanes_latest_3517() {
+    let home = tmp_dir("drift-touched");
+    let repo = tmp_repo("drift-touched-repo");
+    let branch = "feat/touched-after-answer";
+    let rs = repo.display().to_string();
+    let merged_head = make_branch(&repo, branch);
+    persist_intent(&home, &rs, branch, &merged_head, "t-origin", None, None).expect("persist");
+    let retired_row = seed_obligation(&home, &rs, branch, &merged_head, Some("agent-owner"));
+
+    owner_attestation::retire_merged_lane(&home, &rs, branch);
+    commit_onto(&repo, branch, "late.txt");
+    sweep_settle_merged(&home);
+    let raised = open_lane_rows(&home, &rs, branch);
+    assert_eq!(
+        raised.len(),
+        1,
+        "precondition: the first drift raises a row"
+    );
+    answer(
+        &home,
+        &raised[0].id.0,
+        "agent-owner",
+        "keep: still working on it",
+    );
+
+    // The touch: metadata on the row the merge closed, changing nothing about
+    // the lane except when that row was last written.
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName::from("operator"),
+        crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(retired_row.clone()),
+            by: crate::task_events::InstanceName::from("operator"),
+            key: "note".into(),
+            value: serde_json::json!("board hygiene"),
+        },
+    )
+    .expect("touch the retired row");
+    assert!(
+        obligation(&home, &retired_row).updated_at > obligation(&home, &raised[0].id.0).updated_at,
+        "precondition: the touch really does make the closed row the most \
+         recently written one"
+    );
+
+    commit_onto(&repo, branch, "later.txt");
+    sweep_settle_merged(&home);
+
+    assert!(
+        open_lane_rows(&home, &rs, branch).is_empty(),
+        "the owner's answer is still the last word on this lane — writing to an \
+         older closed row must not promote it back into being the question"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// #3517 follow-up — the reachability fact the whole fix rests on, pinned rather
 /// than argued.
 ///
