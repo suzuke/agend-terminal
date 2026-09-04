@@ -199,11 +199,7 @@ pub(super) fn reraise_drifted_merged_lane(home: &Path, intent: &CleanupIntent) {
     // result-less row walks past a newer owner answer into an older
     // system-closed one and re-asks a question that has been answered
     // (`a_later_owner_answer_outranks_an_older_system_retirement_3517`).
-    let Some(owner) = lane_rows
-        .last()
-        .filter(|task| task.result.is_none())
-        .and_then(|task| task.owner.clone())
-    else {
+    let Some(last) = lane_rows.last().filter(|task| task.result.is_none()) else {
         return;
     };
 
@@ -217,7 +213,12 @@ pub(super) fn reraise_drifted_merged_lane(home: &Path, intent: &CleanupIntent) {
         branch,
         &tip,
         &intent.task_id,
-        &owner.0,
+        // Not the owner of ANY row — the owner of the LAST one, which is
+        // `None` for an orphan lane. Passing that through lets the one
+        // liveness projection in `record_retention_obligation` decide again,
+        // exactly as the release path does: escheat to the origin's creator if
+        // they are live, orphan-tag if nobody is.
+        last.owner.as_ref().map(|owner| owner.0.as_str()),
     );
 }
 

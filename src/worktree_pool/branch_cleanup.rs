@@ -101,9 +101,13 @@ pub(crate) fn record_retention_obligation(
     branch: &str,
     head: &str,
     origin_task_id: &str,
-    owner: &str,
+    owner: Option<&str>,
 ) {
-    if owner.is_empty() || head.is_empty() {
+    // `Some("")` keeps the release path's contract — a binding that names
+    // nobody raises nothing. `None` is a different statement: the caller knows
+    // the lane's row is ownerless, and an unowned lane still has to be asked
+    // about (`an_orphan_lane_is_reraised_when_it_drifts_3517`).
+    if owner == Some("") || head.is_empty() {
         return;
     }
     let key_tag = retention_key(repo, branch, head);
@@ -132,10 +136,9 @@ pub(crate) fn record_retention_obligation(
     let live = crate::runtime::list_agents_with_fallback(home);
     let is_live = |name: &str| live.is_empty() || live.iter().any(|a| a == name);
     let created_by = routed_origin.map(|routed| routed.task.created_by);
-    let assignee = if is_live(owner) {
-        Some(owner.to_string())
-    } else {
-        created_by.filter(|orchestrator| is_live(orchestrator))
+    let assignee = match owner {
+        Some(owner) if is_live(owner) => Some(owner.to_string()),
+        _ => created_by.filter(|orchestrator| is_live(orchestrator)),
     };
 
     let mut tags = vec![RETENTION_TAG.to_string(), lane_tag.clone(), key_tag.clone()];
@@ -387,7 +390,7 @@ pub(super) fn resolve_branch_cleanup(
                     branch,
                     &head,
                     task_id,
-                    binding["agent"].as_str().unwrap_or(""),
+                    Some(binding["agent"].as_str().unwrap_or("")),
                 );
             } else {
                 tracing::info!(
