@@ -6367,6 +6367,200 @@ fn release_records_one_owner_assigned_branch_retention_obligation() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// Write a file and commit it in `wt` — the shared "release survives with
+/// real unmerged work" fixture step used by the open-PR-guard tests below.
+fn commit_work(wt: &Path, name: &str) {
+    std::fs::write(wt.join(name), "work\n").expect("write");
+    for args in [
+        vec!["add", name],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(wt)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+}
+
+// ── #3503: an open PR on the lane means merge — not the owner — will settle
+// the intent, so no retention row should be raised; and when that PR merges,
+// any row raised in the meantime must be retired automatically. ──
+
+/// RED (a): a clean pre-merge release on a branch with an OPEN PR must create
+/// no retention row — merge will settle the intent minutes later.
+#[test]
+fn open_pr_branch_release_creates_no_retention_obligation() {
+    let home = tmp_home("retention-openpr-a");
+    let repo = tmp_repo("retention-openpr-a-repo");
+    crate::git_helpers::git_bypass(
+        &repo,
+        &["remote", "add", "origin", "https://github.com/example/repo.git"],
+    )
+    .expect("add origin");
+    let provider = crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Branches(
+        vec!["feat/openpr".to_string()],
+    ));
+    let _provider_guard = crate::scm::set_test_scm_provider(provider);
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/openpr");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+    assert!(
+        !outcome.branch_deleted,
+        "pre: a branch carrying real work must be preserved, not reaped"
+    );
+
+    let obligations = retention_tasks(&home);
+    assert!(
+        obligations.is_empty(),
+        "an open-PR lane must raise NO retention obligation — merge will settle it; got {}",
+        obligations.len()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Fourth (cheap) test pinning the fail-closed half of the same idiom: a
+/// non-GitHub remote makes `open_pr_status` return `Unknown`, which must be
+/// treated like `Open` — no row is created either.
+#[test]
+fn unknown_pr_status_branch_release_creates_no_retention_obligation() {
+    let home = tmp_home("retention-openpr-unknown");
+    let repo = tmp_repo("retention-openpr-unknown-repo");
+    crate::git_helpers::git_bypass(
+        &repo,
+        &["remote", "add", "origin", "https://example.com/not-github.git"],
+    )
+    .expect("add origin");
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/unknownpr");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+
+    let obligations = retention_tasks(&home);
+    assert!(
+        obligations.is_empty(),
+        "Unknown open-PR status must fail closed the same as Open — no row; got {}",
+        obligations.len()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// NEGATIVE CONTROL — the most important test in the ticket: a genuine
+/// local-only lane (no `origin` remote at all, so `open_pr_status` is
+/// deterministically `NotOpen`) must STILL get its retention row. A fix that
+/// makes this fail has destroyed the feature, not fixed it.
+#[test]
+fn local_only_branch_release_still_creates_retention_obligation() {
+    let home = tmp_home("retention-openpr-negctrl");
+    let repo = tmp_repo("retention-openpr-negctrl-repo");
+    // Deliberately no `origin` remote — a genuine local-only lane.
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/localonly");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+    assert!(
+        !outcome.branch_deleted,
+        "pre: a branch carrying real work must be preserved, not reaped"
+    );
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "a genuine local-only lane must still raise exactly one retention obligation, got {}",
+        obligations.len()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED (b): an existing OPEN retention row whose branch's PR merges must be
+/// terminated by the merged-settle path (`cleanup_intents::settle_intent`,
+/// the chokepoint both the CI-watch event and the periodic sweep funnel
+/// through once `merged` is authoritative).
+#[test]
+fn merged_branch_retires_open_retention_obligation() {
+    let home = tmp_home("retention-openpr-b");
+    let repo = tmp_repo("retention-openpr-b-repo");
+    // No origin remote: NotOpen at release time raises the row exactly like
+    // the negative control — the row exists to be retired by the merge below.
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/willmerge");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "setup: exactly one open retention obligation must exist before merge, got {}",
+        obligations.len()
+    );
+    assert!(
+        !obligations[0].status.is_terminal(),
+        "setup: the obligation must be open before merge"
+    );
+
+    // The branch's PR merges — drive the merged-settle chokepoint directly,
+    // as both `sweep_settle_merged` and the CI-watch event path do.
+    let repo_str = repo.display().to_string();
+    crate::cleanup_intents::settle_intent(&home, &repo_str, "feat/willmerge", true, None);
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(obligations.len(), 1, "the row must still exist, now terminal");
+    assert!(
+        obligations[0].status.is_terminal(),
+        "merge must retire the open retention row, got status {:?}",
+        obligations[0].status
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// RED B1 idempotency: while an open obligation exists for (repo, branch), a
 /// later release at a new head must be a no-op rather than creating another row.
 #[test]
