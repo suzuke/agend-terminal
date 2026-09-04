@@ -117,10 +117,21 @@ fn agendharness_users_are_in_the_flake_gate_filter() {
 /// ## The direct-boot shape
 /// Two ways a test can cause a REAL daemon to exist outside `AgendHarness`:
 ///
-///   1. `.arg("start")` and `.arg("--foreground")` (or one `.args([...])` with
-///      both) on the SAME file's Command-building calls — the literal
-///      `daemon_spawn.rs` invocation shape (see `restart_smoke.rs`,
-///      `attached_path_mcp_invariants.rs`).
+///   1. `.arg("start")` (or `.args([...])` carrying it) on the SAME file's
+///      Command-building calls, in a file that also CONSTRUCTS the
+///      `agend-terminal` crate binary — via `cargo_bin("agend-terminal")` in
+///      any of its call-path spellings (`cargo_bin(...)`,
+///      `Command::cargo_bin(...)`, `assert_cmd::cargo::cargo_bin(...)`), or
+///      via `env!("CARGO_BIN_EXE_agend-terminal")`. `start` ALONE (no
+///      `--foreground` requirement — the CLI is free to detach the daemon
+///      itself, which is exactly `cli_smoke.rs`'s shape) is enough once the
+///      binary-construction requirement is in place: a file that merely
+///      passes the literal `"start"` to some unrelated helper, or never
+///      builds the binary at all (`e2e_workflow.rs`, `migrated_scripts.rs`,
+///      `p0a_capability_auth.rs`, `teardown_completeness_regression.rs`,
+///      `integration.rs`, `issue_548_phase2_invariants.rs`), cannot
+///      direct-boot and is excluded by that requirement rather than by
+///      `--foreground`.
 ///   2. `.arg("app")` in a file that also calls `openpty` — `app_singleton_
 ///      fail_closed.rs`'s exact technique: a plain-pipe `.arg("app")` (as in
 ///      `cli_smoke.rs`'s `app_without_tty_errors_cleanly_not_panic`, which
@@ -128,10 +139,16 @@ fn agendharness_users_are_in_the_flake_gate_filter() {
 ///      path that spawns agents, so it is deliberately NOT flagged; wiring a
 ///      real pty is what gets `app` far enough to actually boot one.
 ///
-/// A file matching either shape must also reference `FixtureHome` (imported,
-/// constructed, whatever — the scan only checks that the name occurs
-/// somewhere in the AST, which is enough to prove intent to use the guard
-/// without caring how it is wired).
+/// A file matching either shape must also reference `FixtureHome`,
+/// `AgendHarness`, or `TestDaemon` (imported, constructed, whatever — the
+/// scan only checks that the name occurs somewhere in the AST, which is
+/// enough to prove intent to use the guard without caring how it is wired).
+/// All three genuinely reap: `FixtureHome` (`tests/common/daemon_reaper.rs`),
+/// `AgendHarness::drop` (`tests/common/harness.rs`) SIGTERMs then SIGKILLs
+/// the process group and waits (or closes the kill-on-close Windows job
+/// handle), and `TestDaemon::drop` (`tests/integration.rs`) kills and waits
+/// the child. `tool_cli_phase0a_real_red.rs` boots via `AgendHarness` and
+/// carries no `FixtureHome`; it is guarded, not exempt.
 ///
 /// ## Known pre-existing debt (not this invariant's to fix)
 /// `restart_smoke.rs`, `self_respawn_handoff.rs`, `self_respawn_handoff_windows.rs`,
@@ -180,13 +197,19 @@ const KNOWN_UNGUARDED_DIRECT_BOOT_DEBT: &[&str] = &[
 ];
 
 /// String literals actually passed as arguments to a call named `arg`/`args`,
-/// plus whether `openpty` or `FixtureHome` occurs anywhere in the file (as an
-/// identifier — a call, a `use`, a type, doesn't matter which).
+/// plus whether `openpty` or a reaping guard occurs anywhere in the file (as
+/// an identifier — a call, a `use`, a type, doesn't matter which), plus
+/// whether the file constructs the `agend-terminal` crate binary at all
+/// (`cargo_bin("agend-terminal")` in any of its call-path spellings, or
+/// `env!("CARGO_BIN_EXE_agend-terminal")`).
 #[derive(Default)]
 struct DirectBootScan {
     arg_literals: BTreeSet<String>,
     uses_openpty: bool,
     uses_fixture_home: bool,
+    uses_agend_harness: bool,
+    uses_test_daemon: bool,
+    builds_crate_binary: bool,
 }
 
 impl DirectBootScan {
@@ -197,13 +220,31 @@ impl DirectBootScan {
         Ok(scan)
     }
 
-    /// Shape 1: `start` + `--foreground` both passed as `.arg`/`.args`
-    /// literals somewhere in the file. Shape 2: `app` passed the same way,
-    /// AND the file wires a real pty (`openpty`) — the one thing that gets
-    /// `app` past its TTY check and into the boot path.
+    /// Shape 1: `start` passed as an `.arg`/`.args` literal in a file that
+    /// also constructs the `agend-terminal` crate binary — a file that
+    /// merely passes the literal "start" to something else (a helper, an
+    /// unrelated command, a template-string check) cannot direct-boot, so
+    /// requiring the binary construction is what excludes those. The old
+    /// shape additionally required `--foreground`; that is subsumed here
+    /// because every file in this suite that passes `--foreground` also
+    /// constructs the binary (confirmed against the current tree — see the
+    /// PR #3512-follow-up report), so dropping it only WIDENS detection.
+    /// Shape 2: `app` passed the same way, AND the file wires a real pty
+    /// (`openpty`) — the one thing that gets `app` past its TTY check and
+    /// into the boot path.
     fn direct_boots(&self) -> bool {
-        (self.arg_literals.contains("start") && self.arg_literals.contains("--foreground"))
+        (self.arg_literals.contains("start") && self.builds_crate_binary)
             || (self.arg_literals.contains("app") && self.uses_openpty)
+    }
+
+    /// A file counts as guarded if it holds ANY of the three reaping
+    /// mechanisms proven (by reading their `Drop` impls) to actually kill
+    /// and wait the daemon: `FixtureHome` (`tests/common/daemon_reaper.rs`),
+    /// `AgendHarness` (`tests/common/harness.rs` — SIGTERM/SIGKILL the
+    /// process group, or close the Windows job handle), or `TestDaemon`
+    /// (`tests/integration.rs` — kill + wait the child).
+    fn is_guarded(&self) -> bool {
+        self.uses_fixture_home || self.uses_agend_harness || self.uses_test_daemon
     }
 }
 
@@ -233,6 +274,14 @@ fn collect_string_literals(expr: &syn::Expr, out: &mut BTreeSet<String>) {
     }
 }
 
+/// True iff `path`'s LAST segment is `cargo_bin` — matches `cargo_bin(...)`,
+/// `Command::cargo_bin(...)` and `assert_cmd::cargo::cargo_bin(...)` alike,
+/// since a call's callee path always ends in the function/method name
+/// regardless of how many qualifying segments precede it.
+fn is_cargo_bin_path(path: &syn::Path) -> bool {
+    path.segments.last().is_some_and(|s| s.ident == "cargo_bin")
+}
+
 impl<'ast> syn::visit::Visit<'ast> for DirectBootScan {
     fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
         let name = c.method.to_string();
@@ -241,7 +290,51 @@ impl<'ast> syn::visit::Visit<'ast> for DirectBootScan {
                 collect_string_literals(arg, &mut self.arg_literals);
             }
         }
+        if name == "cargo_bin" {
+            // `Command::cargo_bin("agend-terminal")` — a method-call form
+            // (as opposed to the free-function/associated-function-call
+            // forms `visit_expr_call` below handles).
+            let mut lits = BTreeSet::new();
+            for arg in &c.args {
+                collect_string_literals(arg, &mut lits);
+            }
+            if lits.contains("agend-terminal") {
+                self.builds_crate_binary = true;
+            }
+        }
         syn::visit::visit_expr_method_call(self, c);
+    }
+
+    fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+        // `cargo_bin("agend-terminal")` and
+        // `assert_cmd::cargo::cargo_bin("agend-terminal")` — the callee is a
+        // bare/qualified path ending in `cargo_bin`, called as a function
+        // rather than a method.
+        if let syn::Expr::Path(p) = &*c.func {
+            if is_cargo_bin_path(&p.path) {
+                let mut lits = BTreeSet::new();
+                for arg in &c.args {
+                    collect_string_literals(arg, &mut lits);
+                }
+                if lits.contains("agend-terminal") {
+                    self.builds_crate_binary = true;
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, c);
+    }
+
+    fn visit_expr_macro(&mut self, m: &'ast syn::ExprMacro) {
+        // `env!("CARGO_BIN_EXE_agend-terminal")` — the crate-binary env var
+        // `cargo` sets for an integration test's own workspace binaries.
+        if m.mac.path.is_ident("env") {
+            if let Ok(lit) = m.mac.parse_body::<syn::LitStr>() {
+                if lit.value() == "CARGO_BIN_EXE_agend-terminal" {
+                    self.builds_crate_binary = true;
+                }
+            }
+        }
+        syn::visit::visit_expr_macro(self, m);
     }
 
     fn visit_path(&mut self, p: &'ast syn::Path) {
@@ -252,6 +345,12 @@ impl<'ast> syn::visit::Visit<'ast> for DirectBootScan {
             }
             if ident == "FixtureHome" {
                 self.uses_fixture_home = true;
+            }
+            if ident == "AgendHarness" {
+                self.uses_agend_harness = true;
+            }
+            if ident == "TestDaemon" {
+                self.uses_test_daemon = true;
             }
         }
         syn::visit::visit_path(self, p);
@@ -264,7 +363,7 @@ impl<'ast> syn::visit::Visit<'ast> for DirectBootScan {
 /// something about the actual detector, not a reimplementation of it.
 fn is_unguarded_direct_boot(src: &str) -> bool {
     match DirectBootScan::scan(src) {
-        Ok(scan) => scan.direct_boots() && !scan.uses_fixture_home,
+        Ok(scan) => scan.direct_boots() && !scan.is_guarded(),
         // An unparseable file can't be reasoned about; fail closed by NOT
         // flagging it here — `cargo test`/`cargo build` will already refuse
         // to compile a genuinely broken test file, so this branch only ever
@@ -347,12 +446,13 @@ fn direct_boot_tests_use_the_reaping_guard() {
 #[test]
 fn direct_boot_detector_fires_on_unguarded_shapes_and_only_those() {
     // True positive, shape 1: `start` + `--foreground` via `.args([...])`,
-    // no `FixtureHome` in sight.
+    // binary built via `cargo_bin`, no guard in sight.
     const UNGUARDED_START_FOREGROUND: &str = r#"
         mod common;
-        use std::process::Command;
+        use assert_cmd::Command;
         fn boot() {
-            Command::new("agend-terminal")
+            Command::cargo_bin("agend-terminal")
+                .unwrap()
                 .args(["start", "--foreground"])
                 .spawn()
                 .unwrap();
@@ -367,9 +467,9 @@ fn direct_boot_detector_fires_on_unguarded_shapes_and_only_those() {
     // separate chained `.arg(...)` calls rather than one `.args([...])` —
     // proves the scan does not depend on a single call carrying both.
     const UNGUARDED_CHAINED_ARGS: &str = r#"
-        use std::process::Command;
+        use assert_cmd::Command;
         fn boot() {
-            let mut cmd = Command::new("agend-terminal");
+            let mut cmd = Command::cargo_bin("agend-terminal").unwrap();
             cmd.arg("start").arg("--foreground");
             cmd.spawn().unwrap();
         }
@@ -379,7 +479,9 @@ fn direct_boot_detector_fires_on_unguarded_shapes_and_only_those() {
         "detector must flag `start`/`--foreground` split across chained .arg() calls"
     );
 
-    // True positive, shape 2: `app` under a real pty, no guard.
+    // True positive, shape 2: `app` under a real pty, no guard. Shape 2 does
+    // not require binary construction (it keys off `openpty` instead), so a
+    // plain `Command::new` is fine here.
     const UNGUARDED_APP_UNDER_PTY: &str = r#"
         use std::process::Command;
         fn boot_under_pty() {
@@ -406,10 +508,11 @@ fn direct_boot_detector_fires_on_unguarded_shapes_and_only_those() {
     const GUARDED_START_FOREGROUND: &str = r#"
         mod common;
         use common::daemon_reaper::FixtureHome;
-        use std::process::Command;
+        use assert_cmd::Command;
         fn boot() {
             let _home = FixtureHome::new("x");
-            Command::new("agend-terminal")
+            Command::cargo_bin("agend-terminal")
+                .unwrap()
                 .args(["start", "--foreground"])
                 .spawn()
                 .unwrap();
@@ -462,5 +565,92 @@ fn direct_boot_detector_fires_on_unguarded_shapes_and_only_those() {
     assert!(
         !is_unguarded_direct_boot(DOC_COMMENT_MENTION),
         "detector false-matched literals appearing only in a doc comment"
+    );
+
+    // True positive, the shape #3512's predicate MISSED: `start` alone (no
+    // `--foreground` — the CLI detaches the daemon itself), in a file that
+    // builds the crate binary, with no guard at all. This is `cli_smoke.rs`'s
+    // exact shape.
+    const UNGUARDED_START_NO_FOREGROUND: &str = r#"
+        use assert_cmd::Command;
+        fn boot() {
+            Command::cargo_bin("agend-terminal")
+                .unwrap()
+                .arg("start")
+                .spawn()
+                .unwrap();
+        }
+    "#;
+    assert!(
+        is_unguarded_direct_boot(UNGUARDED_START_NO_FOREGROUND),
+        "detector must flag a bare `start` (no --foreground) boot that builds the crate binary \
+         and holds no guard — this is the #3512 predicate hole (cli_smoke.rs's shape)"
+    );
+
+    // Negative control: the same bare-`start` shape, guarded by `AgendHarness`
+    // instead of `FixtureHome` — must NOT fire. `AgendHarness::drop` SIGTERMs
+    // then SIGKILLs the process group and waits, so it is a genuine reaping
+    // guard even though it isn't `FixtureHome`.
+    const GUARDED_BY_AGENDHARNESS: &str = r#"
+        mod common;
+        use common::harness::AgendHarness;
+        use assert_cmd::Command;
+        fn boot() {
+            let _harness: &AgendHarness = todo!();
+            Command::cargo_bin("agend-terminal")
+                .unwrap()
+                .arg("start")
+                .spawn()
+                .unwrap();
+        }
+    "#;
+    assert!(
+        !is_unguarded_direct_boot(GUARDED_BY_AGENDHARNESS),
+        "detector false-fired on a file guarded by AgendHarness (a genuine reaping guard, not \
+         just FixtureHome) — tool_cli_phase0a_real_red.rs's shape"
+    );
+
+    // Negative control: the same bare-`start` shape, guarded by `TestDaemon`
+    // instead — must NOT fire. `TestDaemon::drop` kills and waits the child.
+    const GUARDED_BY_TESTDAEMON: &str = r#"
+        struct TestDaemon;
+        use assert_cmd::Command;
+        fn boot() {
+            let _daemon = TestDaemon;
+            Command::cargo_bin("agend-terminal")
+                .unwrap()
+                .arg("start")
+                .spawn()
+                .unwrap();
+        }
+    "#;
+    assert!(
+        !is_unguarded_direct_boot(GUARDED_BY_TESTDAEMON),
+        "detector false-fired on a file guarded by TestDaemon (a genuine reaping guard) — \
+         integration.rs's shape"
+    );
+
+    // Negative control: a file that passes the literal `"start"` to `.arg`
+    // but NEVER constructs the `agend-terminal` crate binary — cannot
+    // direct-boot, must not fire. This is `integration.rs`'s actual shape
+    // (it resolves its binary path via `current_exe()`, not `cargo_bin`/
+    // `env!("CARGO_BIN_EXE_...")`) as well as the other five files named in
+    // the module doc above.
+    const START_WITHOUT_BUILDING_BINARY: &str = r#"
+        use std::process::Command;
+        fn binary() -> std::path::PathBuf {
+            let mut p = std::env::current_exe().unwrap();
+            p.pop();
+            p.push("agend-terminal");
+            p
+        }
+        fn boot() {
+            Command::new(binary()).arg("start").spawn().unwrap();
+        }
+    "#;
+    assert!(
+        !is_unguarded_direct_boot(START_WITHOUT_BUILDING_BINARY),
+        "detector false-fired on a file passing `start` to a binary it never actually \
+         constructs via cargo_bin/env!(CARGO_BIN_EXE_...) — cannot direct-boot"
     );
 }
