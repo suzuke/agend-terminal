@@ -39,18 +39,11 @@ fn sign_binding_emits_byte_identical_bare_hex() {
 
     let sig = sign_binding(&home, CONTENT).expect("sign_binding");
     assert_eq!(sig, GOLDEN, "sign_binding must be byte-identical bare hex");
-    assert!(
-        !sig.contains(':'),
-        "default emit must be BARE hex, not the envelope"
-    );
+    assert!(!sig.contains(':'), "default emit must be BARE hex, not the envelope");
     assert_eq!(sig.len(), 64, "HMAC-SHA256 hex is 64 chars");
     // the low-level signer agrees, and the legacy verify path accepts it.
     assert_eq!(sign(&home, CONTENT), sig, "sign_binding == low-level sign");
-    assert_eq!(
-        verify(&home, CONTENT, &sig),
-        Ok(()),
-        "legacy bare-hex verify accepts"
-    );
+    assert_eq!(verify(&home, CONTENT, &sig), Ok(()), "legacy bare-hex verify accepts");
 
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -62,11 +55,7 @@ fn sign_binding_provisions_then_signs_no_panic() {
     let home = tmp_home("provision");
     assert!(read_key(&home).is_none(), "fresh home has no key");
     let sig = sign_binding(&home, b"body").expect("sign_binding must provision + sign");
-    assert_eq!(
-        read_key(&home).map(|k| k.len()),
-        Some(32),
-        "key now provisioned"
-    );
+    assert_eq!(read_key(&home).map(|k| k.len()), Some(32), "key now provisioned");
     assert_eq!(verify(&home, b"body", &sig), Ok(()));
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -83,11 +72,7 @@ fn verify_accepts_bare_hex_legacy_and_v1_envelope_roundtrip() {
     // the envelope capability round-trips: `envelope_tag` output verifies too.
     let env = envelope_tag(&hex);
     assert_eq!(env, format!("ag-hmac-sha256:v1:raw:{hex}"));
-    assert_eq!(
-        verify(&home, b"payload", &env),
-        Ok(()),
-        "v1 envelope must verify"
-    );
+    assert_eq!(verify(&home, b"payload", &env), Ok(()), "v1 envelope must verify");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -110,10 +95,7 @@ fn verify_malformed_prefixed_tag_never_falls_to_legacy() {
     ];
     for c in cases {
         let r = verify(&home, b"data", &c);
-        assert!(
-            r.is_err(),
-            "malformed prefixed tag must fail closed: {c:?} -> {r:?}"
-        );
+        assert!(r.is_err(), "malformed prefixed tag must fail closed: {c:?} -> {r:?}");
         assert_ne!(r, Ok(()), "must NEVER authenticate: {c:?}");
     }
     // unknown key-format is a recognized-but-unsupported scheme.
@@ -145,10 +127,7 @@ fn verify_unsupported_newer_scheme_and_tamper_never_ok() {
     let mut bytes = hex::decode(&hex).unwrap();
     bytes[0] ^= 0x01;
     let flipped = hex::encode(&bytes);
-    assert_eq!(
-        verify(&home, b"msg", &flipped),
-        Err(VerifyError::MacMismatch)
-    );
+    assert_eq!(verify(&home, b"msg", &flipped), Err(VerifyError::MacMismatch));
     assert_eq!(
         verify(&home, b"msg", &envelope_tag(&flipped)),
         Err(VerifyError::MacMismatch),
@@ -162,10 +141,7 @@ fn verify_unsupported_newer_scheme_and_tamper_never_ok() {
 #[test]
 fn verify_missing_key_is_typed() {
     let home = tmp_home("nokey");
-    assert_eq!(
-        verify(&home, b"x", "deadbeef"),
-        Err(VerifyError::MissingKey)
-    );
+    assert_eq!(verify(&home, b"x", "deadbeef"), Err(VerifyError::MissingKey));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -186,10 +162,7 @@ fn ensure_key_concurrent_threads_one_key_survives() {
             .map(|j| j.join().unwrap())
             .collect()
     });
-    assert!(
-        results.iter().all(|r| r.is_ok()),
-        "every racer succeeds: {results:?}"
-    );
+    assert!(results.iter().all(|r| r.is_ok()), "every racer succeeds: {results:?}");
     // exactly ONE 32-byte key survives, and it reads back cleanly.
     let key = read_key(&home).expect("a key must exist after the race");
     assert_eq!(key.len(), 32);
@@ -228,9 +201,6 @@ fn key_tmp_file_is_0600_at_creation() {
     let f = open_new_0600(&p).expect("create");
     let mode = f.metadata().unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "temp key must be born 0600, got {mode:o}");
-    assert!(
-        open_new_0600(&p).is_err(),
-        "create_new must refuse existing path"
-    );
+    assert!(open_new_0600(&p).is_err(), "create_new must refuse existing path");
     let _ = std::fs::remove_dir_all(&home);
 }

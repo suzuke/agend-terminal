@@ -18,7 +18,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    env_compat, resolve_real_git, subcommand_index, submodule_op_is_write, write_git_event_typed,
+    env_compat, resolve_real_git, subcommand_index, submodule_op_is_write,
+    write_git_event_typed,
 };
 
 /// Amortized + manual prune default TTL (Δd: committer-date based).
@@ -31,8 +32,7 @@ fn git_bypass(git: &str) -> Command {
     // Mirrors the existing pattern (`cleanup_init_pile_pre_push` et al.): all
     // child git calls use the resolved real git + BOTH bypass env twins so
     // they never re-enter this shim.
-    cmd.env("AGENTIC_GIT_BYPASS", "1")
-        .env("AGEND_GIT_BYPASS", "1");
+    cmd.env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1");
     cmd
 }
 
@@ -84,10 +84,7 @@ fn clean_is_forced(rest: &[String]) -> bool {
 /// `stash drop|clear` — the destructive stash forms (drops working-tree-
 /// recoverable state); `push`/`pop`/`list`/`show`/apply are not.
 fn stash_is_destructive(rest: &[String]) -> bool {
-    matches!(
-        rest.first().map(String::as_str),
-        Some("drop") | Some("clear")
-    )
+    matches!(rest.first().map(String::as_str), Some("drop") | Some("clear"))
 }
 
 /// `checkout` has a large worktree-overwriting surface (`-- <paths>`, `-f`,
@@ -107,10 +104,7 @@ fn checkout_is_destructive(rest: &[String]) -> bool {
     if rest.is_empty() {
         return false;
     }
-    if rest
-        .iter()
-        .any(|a| a == "--" || a == "-f" || a == "--force")
-    {
+    if rest.iter().any(|a| a == "--" || a == "-f" || a == "--force") {
         return true;
     }
     // Pure branch creation does not discard worktree content (a dirty tree is
@@ -352,9 +346,7 @@ fn create_snapshot_inner(
             String::from_utf8_lossy(&commit_out.stderr).trim()
         ));
     }
-    let commit_sha = String::from_utf8_lossy(&commit_out.stdout)
-        .trim()
-        .to_string();
+    let commit_sha = String::from_utf8_lossy(&commit_out.stdout).trim().to_string();
     if commit_sha.is_empty() {
         return Err("`commit-tree` produced no commit SHA".to_string());
     }
@@ -406,13 +398,7 @@ fn ref_exists(git: &str, dir: &Path, refname: &str) -> bool {
 /// overlap in time can both see the same seq free and both take it, whatever
 /// `who` they run as. That is unchanged from the probe-then-write it replaces,
 /// and serialising allocation is deliberately out of scope here.
-fn unique_ref_name(
-    git: &str,
-    dir: &Path,
-    who: &str,
-    utc_ts: &str,
-    op_slug: &str,
-) -> Option<String> {
+fn unique_ref_name(git: &str, dir: &Path, who: &str, utc_ts: &str, op_slug: &str) -> Option<String> {
     let listed = git_bypass(git)
         .arg("-C")
         .arg(dir)
@@ -667,10 +653,7 @@ pub(crate) fn restore_snapshot(
     let pre_restore_ref = if is_clean(git, dir) {
         None
     } else {
-        Some(
-            create_snapshot(git, dir, opts.agent, "restore")
-                .map_err(RestoreError::PreRestoreFailed)?,
-        )
+        Some(create_snapshot(git, dir, opts.agent, "restore").map_err(RestoreError::PreRestoreFailed)?)
     };
 
     let pathspec = join_nul(&changed);
@@ -696,11 +679,7 @@ pub(crate) fn restore_snapshot(
     })
 }
 
-fn resolve_restore_target(
-    git: &str,
-    dir: &Path,
-    opts: &RestoreOpts,
-) -> Result<String, RestoreError> {
+fn resolve_restore_target(git: &str, dir: &Path, opts: &RestoreOpts) -> Result<String, RestoreError> {
     if let Some(r) = opts.target_ref {
         if !r.starts_with(SNAPSHOT_REF_PREFIX) {
             return Err(RestoreError::NotOurRef(r.to_string()));
@@ -738,11 +717,7 @@ fn ref_committerdate(git: &str, dir: &Path, refname: &str) -> String {
     git_bypass(git)
         .arg("-C")
         .arg(dir)
-        .args([
-            "for-each-ref",
-            "--format=%(committerdate:iso-strict)",
-            refname,
-        ])
+        .args(["for-each-ref", "--format=%(committerdate:iso-strict)", refname])
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -761,15 +736,7 @@ fn restore_changed_paths(git: &str, dir: &Path, refname: &str) -> Result<Vec<Vec
     let out = git_bypass(git)
         .arg("-C")
         .arg(dir)
-        .args([
-            "diff",
-            "--name-status",
-            "--no-renames",
-            "-z",
-            refname,
-            "--",
-            ".",
-        ])
+        .args(["diff", "--name-status", "--no-renames", "-z", refname, "--", "."])
         .output()
         .map_err(|e| format!("spawn `diff`: {e}"))?;
     if !out.status.success() {

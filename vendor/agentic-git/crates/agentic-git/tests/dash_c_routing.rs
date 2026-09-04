@@ -169,12 +169,7 @@ fn explicit_dash_c_add_and_commit_mutate_foreign_repo_only() {
     let add = run_shim(
         &worktree,
         &home,
-        &[
-            "-C",
-            foreign.to_str().unwrap(),
-            "add",
-            file.to_str().unwrap(),
-        ],
+        &["-C", foreign.to_str().unwrap(), "add", file.to_str().unwrap()],
     );
     assert!(
         add.status.success(),
@@ -204,15 +199,12 @@ fn explicit_dash_c_add_and_commit_mutate_foreign_repo_only() {
     );
 
     assert_eq!(commit_count(&foreign), "2", "foreign repo gets the commit");
-    assert_eq!(
-        commit_count(&worktree),
-        "1",
-        "bound worktree stays untouched"
-    );
+    assert_eq!(commit_count(&worktree), "1", "bound worktree stays untouched");
     let status = real_git(&worktree, &["status", "--porcelain"]);
     assert!(status.status.success());
     assert_eq!(
-        status.stdout, bound_status_before.stdout,
+        status.stdout,
+        bound_status_before.stdout,
         "bound worktree state must remain unchanged"
     );
 

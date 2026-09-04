@@ -226,12 +226,7 @@ fn parse_restore_args(args: &[String]) -> Result<(PathBuf, Option<String>, bool,
         }
         i += 1;
     }
-    Ok((
-        repo.unwrap_or_else(|| PathBuf::from(".")),
-        target,
-        assume_yes,
-        staged,
-    ))
+    Ok((repo.unwrap_or_else(|| PathBuf::from(".")), target, assume_yes, staged))
 }
 
 fn snapshots_restore_cmd(args: &[String]) -> ! {
@@ -272,15 +267,9 @@ fn print_restore_outcome(o: &super::snapshot::RestoreOutcome) {
     } else {
         "left unstaged (working tree only)"
     };
-    println!(
-        "Restored {} path(s) from {}",
-        o.paths_written, o.restored_from
-    );
+    println!("Restored {} path(s) from {}", o.paths_written, o.restored_from);
     if !o.when.is_empty() {
-        println!(
-            "  snapshot taken {} (before a `{}` operation)",
-            o.when, o.op
-        );
+        println!("  snapshot taken {} (before a `{}` operation)", o.when, o.op);
     }
     println!("  files created after the snapshot were left untouched; changes {staging}");
     if let Some(pre) = &o.pre_restore_ref {
@@ -359,7 +348,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--agent" => {
                 i += 1;
-                out.agent = Some(args.get(i).ok_or("`--agent` requires a value")?.to_string());
+                out.agent = Some(
+                    args.get(i)
+                        .ok_or("`--agent` requires a value")?
+                        .to_string(),
+                );
             }
             "--branch" => {
                 i += 1;
@@ -443,7 +436,10 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 fn default_branch(agent: &str) -> String {
-    format!("agent/{agent}/{}", chrono::Utc::now().format("%Y%m%d-%H%M"))
+    format!(
+        "agent/{agent}/{}",
+        chrono::Utc::now().format("%Y%m%d-%H%M")
+    )
 }
 
 // ── Home provisioning ───────────────────────────────────────────────────
@@ -476,8 +472,7 @@ fn provision_home(home: &Path) -> Result<(), String> {
 
 fn git_bypass_cmd(git: &str) -> Command {
     let mut cmd = Command::new(git);
-    cmd.env("AGENTIC_GIT_BYPASS", "1")
-        .env("AGEND_GIT_BYPASS", "1");
+    cmd.env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1");
     cmd
 }
 
@@ -649,7 +644,8 @@ fn check_reuse(
 const HOOK_PREPARE_COMMIT_MSG: &str = include_str!("../assets/hooks/prepare-commit-msg");
 const HOOK_REFERENCE_TRANSACTION: &str = include_str!("../assets/hooks/reference-transaction");
 #[cfg(windows)]
-const HOOK_PREPARE_COMMIT_MSG_PS1: &str = include_str!("../assets/hooks/prepare-commit-msg.ps1");
+const HOOK_PREPARE_COMMIT_MSG_PS1: &str =
+    include_str!("../assets/hooks/prepare-commit-msg.ps1");
 
 fn write_hook(path: &Path, content: &str) -> Result<(), String> {
     std::fs::write(path, content).map_err(|e| format!("write hook {}: {e}", path.display()))?;
@@ -889,10 +885,7 @@ fn run_cmd(raw_args: &[String]) -> ! {
     }
 
     // Step 4: worktree (branch/base defaults + Δ4 reuse-or-fresh decision).
-    let branch = parsed
-        .branch
-        .clone()
-        .unwrap_or_else(|| default_branch(&agent));
+    let branch = parsed.branch.clone().unwrap_or_else(|| default_branch(&agent));
     let base = parsed.base.clone().unwrap_or_else(|| "HEAD".to_string());
     let wt_path = home.join("worktrees").join(&agent).join(&branch);
 

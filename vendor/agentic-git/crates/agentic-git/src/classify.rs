@@ -1300,7 +1300,8 @@ pub(crate) fn detect_cross_agent_sibling_target(
     binding: &Binding,
     target_dir: &Path,
 ) -> Option<String> {
-    let canonical = std::fs::canonicalize(target_dir).unwrap_or_else(|_| target_dir.to_path_buf());
+    let canonical = std::fs::canonicalize(target_dir)
+        .unwrap_or_else(|_| target_dir.to_path_buf());
     let (target_agent, _managed_root) = resolve_managed_marker(&canonical)?;
     if target_agent == agent {
         return None;

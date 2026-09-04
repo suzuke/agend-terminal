@@ -13,10 +13,7 @@ fn reset_only_destructive_with_hard_merge_keep() {
     assert_eq!(destructive_op_slug(&s(&["reset", "--soft"])), None);
     assert_eq!(destructive_op_slug(&s(&["reset", "HEAD~1"])), None);
     assert_eq!(destructive_op_slug(&s(&["reset", "--hard"])), Some("reset"));
-    assert_eq!(
-        destructive_op_slug(&s(&["reset", "--merge"])),
-        Some("reset")
-    );
+    assert_eq!(destructive_op_slug(&s(&["reset", "--merge"])), Some("reset"));
     assert_eq!(destructive_op_slug(&s(&["reset", "--keep"])), Some("reset"));
     assert_eq!(
         destructive_op_slug(&s(&["reset", "--hard", "HEAD~1"])),
@@ -58,10 +55,7 @@ fn checkout_only_destructive_for_pathspec_or_force() {
     // is denied upstream, never reaching here) is far cheaper than missing a
     // real `checkout <path>` that discards work. See the full matrix in
     // `checkout_destructive_matrix_covers_pathspec_restore`.
-    assert_eq!(
-        destructive_op_slug(&s(&["checkout", "main"])),
-        Some("checkout")
-    );
+    assert_eq!(destructive_op_slug(&s(&["checkout", "main"])), Some("checkout"));
     assert_eq!(destructive_op_slug(&s(&["checkout", "-b", "x"])), None);
     assert_eq!(
         destructive_op_slug(&s(&["checkout", "--", "file.txt"])),
@@ -115,18 +109,18 @@ fn checkout_destructive_matrix_covers_pathspec_restore() {
     // Destructive — worktree overwrite (fail-safe default catches every
     // reachable spelling incl. flag-forms with no positional):
     for argv in [
-        vec!["checkout", "--", "f.txt"],             // explicit pathspec sep
-        vec!["checkout", "-f", "feat/x"],            // force
-        vec!["checkout", "--force"],                 // force, no arg
-        vec!["checkout", "f.txt"],                   // bare pathspec
-        vec!["checkout", "HEAD", "f.txt"],           // tree-ish + pathspec
-        vec!["checkout", "abc123", "src/"],          // sha + pathspec
-        vec!["checkout", "-p", "f.txt"],             // patch mode
-        vec!["checkout", "--ours", "f.txt"],         // conflict side restore
-        vec!["checkout", "--theirs", "f.txt"],       // conflict side restore
-        vec!["checkout", "--pathspec-from-file=ps"], // review-2 repro: NO positional
-        vec!["checkout", "--pathspec-from-file", "ps"], // space-separated form
-        vec!["checkout", "main"],                    // ambiguous 1-arg → bias to snapshot
+        vec!["checkout", "--", "f.txt"],                 // explicit pathspec sep
+        vec!["checkout", "-f", "feat/x"],                // force
+        vec!["checkout", "--force"],                     // force, no arg
+        vec!["checkout", "f.txt"],                       // bare pathspec
+        vec!["checkout", "HEAD", "f.txt"],               // tree-ish + pathspec
+        vec!["checkout", "abc123", "src/"],              // sha + pathspec
+        vec!["checkout", "-p", "f.txt"],                 // patch mode
+        vec!["checkout", "--ours", "f.txt"],             // conflict side restore
+        vec!["checkout", "--theirs", "f.txt"],           // conflict side restore
+        vec!["checkout", "--pathspec-from-file=ps"],     // review-2 repro: NO positional
+        vec!["checkout", "--pathspec-from-file", "ps"],  // space-separated form
+        vec!["checkout", "main"],                        // ambiguous 1-arg → bias to snapshot
     ] {
         assert_eq!(
             destructive_op_slug(&s(&argv)),
@@ -136,10 +130,10 @@ fn checkout_destructive_matrix_covers_pathspec_restore() {
     }
     // NOT destructive — pure branch create, or a no-op empty invocation:
     for argv in [
-        vec!["checkout", "-b", "feat/x"],         // create branch
-        vec!["checkout", "-B", "feat/x"],         // create/reset branch ref
-        vec!["checkout", "--orphan", "gh-pages"], // orphan branch
-        vec!["checkout"],                         // no args → git errors, no-op
+        vec!["checkout", "-b", "feat/x"],           // create branch
+        vec!["checkout", "-B", "feat/x"],           // create/reset branch ref
+        vec!["checkout", "--orphan", "gh-pages"],   // orphan branch
+        vec!["checkout"],                           // no args → git errors, no-op
     ] {
         assert_eq!(
             destructive_op_slug(&s(&argv)),
@@ -251,10 +245,7 @@ fn snapshot_ref_name_is_ref_name_safe_and_roundtrips() {
     );
     // No characters git disallows in a ref component.
     for bad in ['~', '^', ':', '?', '*', '[', '\\', ' '] {
-        assert!(
-            !refname.contains(bad),
-            "{refname:?} must not contain {bad:?}"
-        );
+        assert!(!refname.contains(bad), "{refname:?} must not contain {bad:?}");
     }
     let (who, op) = parse_snapshot_ref(&refname).expect("must parse own format");
     assert_eq!(who, "agent-x");
@@ -280,7 +271,11 @@ fn push_guard_text_layer_catches_every_documented_spelling() {
             "origin",
             "refs/agentic-git/snapshots/*:refs/agentic-git/snapshots/*",
         ],
-        vec!["push", "origin", "+agentic-git/snapshots/x:refs/heads/y"],
+        vec![
+            "push",
+            "origin",
+            "+agentic-git/snapshots/x:refs/heads/y",
+        ],
     ] {
         let violation = snapshot_push_violation(&s(&argv), wt);
         assert!(
@@ -313,10 +308,7 @@ fn push_guard_normal_push_never_denied_by_text_layer() {
         // a nonexistent worktree path it can never match, so any denial here
         // would have to come from the (over-eager) text layer.
         let violation = snapshot_push_violation(&s(&argv), wt);
-        assert!(
-            violation.is_none(),
-            "{argv:?} must not be denied: {violation:?}"
-        );
+        assert!(violation.is_none(), "{argv:?} must not be denied: {violation:?}");
     }
 }
 
@@ -405,7 +397,10 @@ fn create_snapshot_head_less_omits_parent_and_captures_content() {
 
     // Content-level capture: both tracked-to-be and untracked files present.
     let show_a = git_real(&git, &["show", &format!("{refname}:a.txt")], &dir);
-    assert_eq!(String::from_utf8_lossy(&show_a.stdout), "tracked-to-be\n");
+    assert_eq!(
+        String::from_utf8_lossy(&show_a.stdout),
+        "tracked-to-be\n"
+    );
     let show_u = git_real(&git, &["show", &format!("{refname}:untracked.txt")], &dir);
     assert_eq!(
         String::from_utf8_lossy(&show_u.stdout),
@@ -445,16 +440,17 @@ fn create_snapshot_commit_date_is_now_not_epoch() {
     init_repo(&git, &dir, true);
     std::fs::write(dir.join("README.md"), "dirty\n").unwrap();
     let refname = create_snapshot(&git, &dir, "agent-d", "reset").expect("must succeed");
-    let out = git_real(&git, &["log", "-1", "--format=%ct", &refname], &dir);
+    let out = git_real(
+        &git,
+        &["log", "-1", "--format=%ct", &refname],
+        &dir,
+    );
     let ts: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    assert!(
-        (now - ts).abs() < 120,
-        "snapshot committer date must be ~now, got {ts}, now={now}"
-    );
+    assert!((now - ts).abs() < 120, "snapshot committer date must be ~now, got {ts}, now={now}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -467,31 +463,20 @@ fn prune_refs_removes_only_expired_and_never_the_excluded_ref() {
 
     let make_ref_at = |refname: &str, committer_date: &str| {
         let out = Command::new(&git)
-            .args([
-                "-C",
-                dir.to_str().unwrap(),
-                "commit-tree",
-                &format!("{head}^{{tree}}"),
-                "-p",
-                &head,
-                "-m",
-                "snap",
-            ])
+            .args(["-C", dir.to_str().unwrap(), "commit-tree", &format!("{head}^{{tree}}"), "-p", &head, "-m", "snap"])
             .env("AGENTIC_GIT_BYPASS", "1")
             .env("AGEND_GIT_BYPASS", "1")
             .env("GIT_AUTHOR_DATE", committer_date)
             .env("GIT_COMMITTER_DATE", committer_date)
             .output()
             .expect("commit-tree");
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        assert!(git_real(&git, &["update-ref", refname, &sha], &dir)
-            .status
-            .success());
+        assert!(
+            git_real(&git, &["update-ref", refname, &sha], &dir)
+                .status
+                .success()
+        );
     };
 
     let now_secs = SystemTime::now()
@@ -512,17 +497,9 @@ fn prune_refs_removes_only_expired_and_never_the_excluded_ref() {
     // created" — Δd's belt-and-suspenders self-prune immunity).
     make_ref_at(&just_created_ref, &thirty_days_ago);
 
-    let pruned = prune_refs(
-        &git,
-        &dir,
-        DEFAULT_TTL_SECS,
-        Some(just_created_ref.as_str()),
-    )
-    .expect("prune must succeed");
-    assert!(
-        pruned.contains(&old_ref),
-        "expired ref must be pruned: {pruned:?}"
-    );
+    let pruned = prune_refs(&git, &dir, DEFAULT_TTL_SECS, Some(just_created_ref.as_str()))
+        .expect("prune must succeed");
+    assert!(pruned.contains(&old_ref), "expired ref must be pruned: {pruned:?}");
     assert!(
         !pruned.contains(&fresh_ref),
         "fresh ref must NOT be pruned: {pruned:?}"
@@ -553,13 +530,13 @@ fn push_guard_commit_layer_catches_rev_suffix_and_laundered_branch() {
     );
     let snap_sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let snap_ref = format!("{SNAPSHOT_REF_PREFIX}me/x-0-reset");
-    assert!(git_real(&git, &["update-ref", &snap_ref, &snap_sha], &dir)
-        .status
-        .success());
+    assert!(git_real(&git, &["update-ref", &snap_ref, &snap_sha], &dir).status.success());
     // Launder into a branch pointed straight at the snapshot tip.
-    assert!(git_real(&git, &["branch", "laundered", &snap_sha], &dir)
-        .status
-        .success());
+    assert!(
+        git_real(&git, &["branch", "laundered", &snap_sha], &dir)
+            .status
+            .success()
+    );
 
     let wt = dir.to_str().unwrap();
     for src in [
@@ -577,10 +554,7 @@ fn push_guard_commit_layer_catches_rev_suffix_and_laundered_branch() {
 
     // A normal branch (tip is the ORIGINAL head, not a snapshot) is allowed.
     let allowed = snapshot_push_violation(&s(&["push", "origin", "main:refs/heads/main2"]), wt);
-    assert!(
-        allowed.is_none(),
-        "a non-snapshot branch push must be allowed: {allowed:?}"
-    );
+    assert!(allowed.is_none(), "a non-snapshot branch push must be allowed: {allowed:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

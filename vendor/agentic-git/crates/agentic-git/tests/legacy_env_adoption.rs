@@ -230,11 +230,7 @@ fn legacy_only_env_exercises_route_deny_bypass() {
         false,
         &["checkout", "main"],
     );
-    assert_eq!(
-        deny.status.code(),
-        Some(1),
-        "cross-branch checkout must be denied"
-    );
+    assert_eq!(deny.status.code(), Some(1), "cross-branch checkout must be denied");
     assert!(
         String::from_utf8_lossy(&deny.stderr).contains("denied"),
         "deny must fire under legacy-only env: {}",

@@ -66,15 +66,7 @@ fn default_agent_name_is_always_valid() {
 #[test]
 fn parse_run_args_full_form() {
     let args: Vec<String> = [
-        "--agent",
-        "foo",
-        "--branch",
-        "feat/x",
-        "--base",
-        "origin/main",
-        "--",
-        "claude",
-        "-x",
+        "--agent", "foo", "--branch", "feat/x", "--base", "origin/main", "--", "claude", "-x",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -101,10 +93,7 @@ fn parse_run_args_minimal_form() {
 
 #[test]
 fn parse_run_args_missing_separator_errors() {
-    let args: Vec<String> = ["--branch", "feat/x"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let args: Vec<String> = ["--branch", "feat/x"].iter().map(|s| s.to_string()).collect();
     assert!(parse_run_args(&args).is_err());
 }
 
@@ -212,10 +201,7 @@ fn check_reuse_branch_mismatch_is_hard_error() {
         "git",
     );
     match result {
-        Some(Err(reason)) => assert!(
-            reason.contains("branch"),
-            "reason should mention branch mismatch: {reason}"
-        ),
+        Some(Err(reason)) => assert!(reason.contains("branch"), "reason should mention branch mismatch: {reason}"),
         other => panic!("expected Some(Err(..)) branch mismatch, got {other:?}"),
     }
     std::fs::remove_dir_all(&home).ok();

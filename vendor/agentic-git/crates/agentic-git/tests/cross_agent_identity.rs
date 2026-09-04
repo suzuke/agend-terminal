@@ -12,11 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn real_git_path() -> PathBuf {
-    for cand in [
-        "/usr/bin/git",
-        "/opt/homebrew/bin/git",
-        "/usr/local/bin/git",
-    ] {
+    for cand in ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"] {
         if Path::new(cand).exists() {
             return PathBuf::from(cand);
         }
@@ -69,13 +65,7 @@ fn fixture_home(tag: &str) -> PathBuf {
     d
 }
 
-fn write_signed_binding(
-    home: &Path,
-    agent: &str,
-    branch: &str,
-    worktree: &Path,
-    source_repo: &Path,
-) {
+fn write_signed_binding(home: &Path, agent: &str, branch: &str, worktree: &Path, source_repo: &Path) {
     let dir = home.join("runtime").join(agent);
     std::fs::create_dir_all(&dir).unwrap();
     let body = serde_json::json!({
@@ -99,27 +89,12 @@ fn two_agent_fixture(home: &Path) -> (PathBuf, PathBuf, PathBuf) {
     setup_git(&src, &["init", "-b", "main"]);
     setup_git(
         &src,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "init",
-        ],
+        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "init"],
     );
     let wt_a = home.join("wt-a");
     let wt_b = home.join("wt-b");
-    setup_git(
-        &src,
-        &["worktree", "add", wt_a.to_str().unwrap(), "-b", "feat/a"],
-    );
-    setup_git(
-        &src,
-        &["worktree", "add", wt_b.to_str().unwrap(), "-b", "feat/b"],
-    );
+    setup_git(&src, &["worktree", "add", wt_a.to_str().unwrap(), "-b", "feat/a"]);
+    setup_git(&src, &["worktree", "add", wt_b.to_str().unwrap(), "-b", "feat/b"]);
 
     for (agent, wt, branch) in [("agent-a", &wt_a, "feat/a"), ("agent-b", &wt_b, "feat/b")] {
         std::fs::write(
@@ -135,7 +110,12 @@ fn two_agent_fixture(home: &Path) -> (PathBuf, PathBuf, PathBuf) {
     (src, wt_a, wt_b)
 }
 
-fn run_shim(cwd: &Path, home: &Path, agent: &str, args: &[&str]) -> std::process::Output {
+fn run_shim(
+    cwd: &Path,
+    home: &Path,
+    agent: &str,
+    args: &[&str],
+) -> std::process::Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_agentic-git"));
     c.arg0("git")
         .args(args)
@@ -199,13 +179,7 @@ fn cross_agent_dash_c_read_denied_with_identity() {
         &neutral,
         &home,
         "agent-a",
-        &[
-            "-C",
-            wt_b.to_str().unwrap(),
-            "rev-parse",
-            "--abbrev-ref",
-            "HEAD",
-        ],
+        &["-C", wt_b.to_str().unwrap(), "rev-parse", "--abbrev-ref", "HEAD"],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -266,13 +240,7 @@ fn cross_agent_nested_dash_c_read_denied_with_identity() {
         &neutral,
         &home,
         "agent-a",
-        &[
-            "-C",
-            nested.to_str().unwrap(),
-            "rev-parse",
-            "--abbrev-ref",
-            "HEAD",
-        ],
+        &["-C", nested.to_str().unwrap(), "rev-parse", "--abbrev-ref", "HEAD"],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -319,16 +287,7 @@ fn unmanaged_scratch_read_passes() {
     setup_git(&scratch, &["init", "-b", "scratch-main"]);
     setup_git(
         &scratch,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "s",
-        ],
+        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "s"],
     );
 
     let out = run_shim(&scratch, &home, "agent-a", &["status", "--porcelain"]);
@@ -355,16 +314,7 @@ fn cross_agent_write_isolation() {
         &wt_b,
         &home,
         "agent-a",
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "x",
-        ],
+        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "x"],
     );
     let head_after = Command::new(real_git_path())
         .args(["rev-parse", "HEAD"])
@@ -446,16 +396,7 @@ fn scratch_nested_under_sibling_passes() {
     setup_git(&scratch, &["init", "-b", "scratch-main"]);
     setup_git(
         &scratch,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "s",
-        ],
+        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "s"],
     );
 
     let out = run_shim(&scratch, &home, "agent-a", &["status", "--porcelain"]);
