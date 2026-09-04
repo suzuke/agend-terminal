@@ -2434,4 +2434,6 @@ mod tests {
              evidence is absent — if this fails, the second authority was unwired"
         );
     }
+    #[path = "head_drift_reraise_3517_tests.rs"]
+    mod head_drift_reraise_3517;
 }
