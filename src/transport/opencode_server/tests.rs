@@ -1782,3 +1782,64 @@ mod fresh_restart_resident_session_3414 {
         std::fs::remove_dir_all(&home).ok();
     }
 }
+
+/// #3515 follow-up: the cross-transport claim, tested on the OpenCode production
+/// path rather than asserted.
+///
+/// The batching fix works by pre-signalling every instance's resident workers
+/// before any of them is joined, and `transport::signal_instance_transport_stop`
+/// is the entry the shutdown loop calls. Review r1 accepted the scope split (the
+/// linearity is cross-transport; bounding OpenCode's own join needs its own
+/// lifecycle design) but noted the OpenCode half had no regression of its own —
+/// the only batching test injects Claude `event_workers`.
+///
+/// This pins both halves of what that entry must do here: the flag is SET, and
+/// the worker is still REGISTERED. Signalling must not double as removal —
+/// `stop_instance_server` still owns removing and joining it, which is what
+/// keeps the speed-up from turning into skipped cleanup.
+#[test]
+fn signal_instance_transport_stop_signals_opencode_resident_worker_3515() {
+    let home = std::env::temp_dir().join(format!("agend-opencode-signal-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&home).expect("home");
+    let instance = "opencode-agent";
+    let stop = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&stop);
+    let thread_stop = Arc::clone(&stop);
+    let join = std::thread::Builder::new()
+        .name("test-opencode-resident".to_string())
+        .spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+        .expect("spawn stand-in resident worker");
+    resident_workers().lock().insert(
+        resident_key(&home, instance),
+        ResidentWorker {
+            adapter: Arc::new(parking_lot::Mutex::new(OpenCodeNativeShared::new(
+                &home, instance,
+            ))),
+            stop,
+            join: Some(join),
+        },
+    );
+
+    crate::transport::signal_instance_transport_stop(&home, instance);
+
+    assert!(
+        observed.load(Ordering::Acquire),
+        "the shutdown pre-signal must reach an OpenCode resident worker, not only \
+         the Claude channel one (#3515 follow-up: a mixed fleet keeps the linearity \
+         otherwise)"
+    );
+    assert!(
+        resident_workers()
+            .lock()
+            .contains_key(&resident_key(&home, instance)),
+        "pre-signalling must not double as removal — `stop_instance_server` still \
+         owns removing and joining the worker"
+    );
+
+    stop_instance_server(&home, instance);
+    let _ = std::fs::remove_dir_all(&home);
+}

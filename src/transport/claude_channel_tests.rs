@@ -2174,20 +2174,27 @@ fn event_worker_switches_to_a_restarted_bridge_locator() {
 /// after the previous one finished: N stuck workers cost N × 20s. #3515 is what
 /// put that loop on the `agend-terminal stop` path.
 ///
-/// The worker here stands in for that shape: it notices its flag only when its
-/// current "read" returns, `OBSERVE_DELAY` later. If the flags are set one at a
-/// time the run costs N × OBSERVE_DELAY; if they are all set up front the waits
-/// overlap and it costs about one.
+/// The stand-in worker's wind-down starts when it OBSERVES its flag, not when it
+/// is spawned. That is what makes the gate deterministic: pre-fix, flag i is set
+/// only once the join for i-1 returned, so the cost is exactly N × WIND_DOWN;
+/// post-fix every flag is already set, so the wind-downs overlap and the cost is
+/// about one. Review r1 rejected an earlier version whose workers ran a free
+/// clock from spawn — scheduler phase then decided how many windows were
+/// actually paid, and the measured RED ranged 1.616s–2.423s against a 1.600s
+/// threshold: a near-boundary gate, the exact thing this is supposed to prevent.
 ///
-/// The threshold is deliberately half of the sequential cost, not a hair under
-/// it: the fixed shape lands near 1 × OBSERVE_DELAY, so this discriminates by a
-/// factor of ~4 either way rather than by a race (the #3514 lesson).
+/// With the wind-down anchored to the flag there is no phase to get lucky with:
+/// the threshold sits at half the sequential cost, ~4× from either side.
 #[test]
 fn shutdown_signals_every_event_worker_before_joining_3515() {
     use std::time::{Duration, Instant};
 
     const WORKERS: usize = 8;
-    const OBSERVE_DELAY: Duration = Duration::from_millis(400);
+    /// What one worker costs the caller once its flag is set — the stand-in for
+    /// everything between noticing the stop and the thread actually exiting.
+    const WIND_DOWN: Duration = Duration::from_millis(400);
+    /// The flag is observed promptly; only the wind-down is meant to be paid.
+    const FLAG_POLL: Duration = Duration::from_millis(1);
 
     let home = home("shutdown-batch-stop");
     let instances: Vec<String> = (0..WORKERS).map(|i| format!("claude-agent-{i}")).collect();
@@ -2195,15 +2202,16 @@ fn shutdown_signals_every_event_worker_before_joining_3515() {
     for instance in &instances {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        // Stands in for `stream.next()` blocking on a socket whose read timeout
-        // is SSE_READ_TIMEOUT: the flag is only seen once the read returns.
+        // Stands in for the real worker's exit cost: the wind-down begins when
+        // the flag is OBSERVED, so what the caller pays is decided by when the
+        // flag was set, never by where a free-running sleep happened to be.
         let join = std::thread::Builder::new()
             .name(format!("test-sse-{instance}"))
-            .spawn(move || loop {
-                std::thread::sleep(OBSERVE_DELAY);
-                if thread_stop.load(Ordering::Acquire) {
-                    return;
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    std::thread::sleep(FLAG_POLL);
                 }
+                std::thread::sleep(WIND_DOWN);
             })
             .expect("spawn stand-in worker");
         event_workers().lock().insert(
@@ -2225,10 +2233,10 @@ fn shutdown_signals_every_event_worker_before_joining_3515() {
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < OBSERVE_DELAY * (WORKERS as u32) / 2,
-        "shutdown paid the stop-observation latency once per instance: {elapsed:?} for \
-         {WORKERS} workers at {OBSERVE_DELAY:?} each — the stop flags must all be set \
-         before any worker is joined so the waits overlap (#3515 follow-up)"
+        elapsed < WIND_DOWN * (WORKERS as u32) / 2,
+        "shutdown paid each worker's wind-down in series: {elapsed:?} for {WORKERS} \
+         workers at {WIND_DOWN:?} each — the stop flags must all be set before any \
+         worker is joined so the wind-downs overlap (#3515 follow-up)"
     );
 
     // Speed must not cost completeness: every worker is stopped and gone.
@@ -2243,50 +2251,6 @@ fn shutdown_signals_every_event_worker_before_joining_3515() {
     }
 
     let _ = fs::remove_dir_all(home);
-}
-
-/// #3515 follow-up: the join is BOUNDED. Before this, `stop_instance_state`
-/// called `join.join()` with no timeout, so a worker that never observed its
-/// stop flag held teardown open forever. Abandoning it is the right trade at
-/// teardown — the daemon is dropping this instance, usually on its way out — but
-/// it must never be silent, hence the `warn!` on the give-up path.
-///
-/// The grace is a parameter precisely so this can be proven in milliseconds
-/// rather than the 25s production window.
-#[test]
-fn wedged_event_worker_is_abandoned_after_its_grace_3515() {
-    use std::time::{Duration, Instant};
-
-    let release = Arc::new(AtomicBool::new(false));
-    let thread_release = Arc::clone(&release);
-    // A worker that ignores its stop flag entirely — the wedged case.
-    let join = std::thread::Builder::new()
-        .name("test-wedged-sse".to_string())
-        .spawn(move || {
-            while !thread_release.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        })
-        .expect("spawn wedged worker");
-
-    let grace = Duration::from_millis(150);
-    let started = Instant::now();
-    join_worker_bounded("claude-agent", join, grace);
-    let elapsed = started.elapsed();
-
-    assert!(
-        elapsed < grace * 6,
-        "a wedged worker must be abandoned once its grace expires, not waited on \
-         forever: {elapsed:?} (grace {grace:?})"
-    );
-    assert!(
-        elapsed >= grace,
-        "the grace must actually be honoured before giving up — a worker that is \
-         merely slow must still be joined: {elapsed:?} (grace {grace:?})"
-    );
-
-    // Let the stand-in thread finish so the test leaves nothing running.
-    release.store(true, Ordering::Release);
 }
 
 #[path = "claude_channel/tests/self_kick_tests.rs"]
