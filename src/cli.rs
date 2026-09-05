@@ -252,6 +252,33 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
         println!("    (none)");
     }
 
+    // #3505 P0(c) r2 B1: surface Live-registry vs *.port drift. The drift
+    // source MUST be the Live registry (`list_live_agents`), not the
+    // fallback-merged `agents` above — when the daemon is down the merged
+    // list IS the port glob, and diffing it against itself would hide
+    // every drift. A file-direct edit (or a refused/partial teardown)
+    // leaves one source stale while the other still names the agents —
+    // without this the TUI just loops `attach failed` warns with no
+    // actionable pointer.
+    match crate::runtime::list_live_agents(home) {
+        Some(live) => {
+            let ports: Vec<String> = run
+                .as_ref()
+                .map(|r| crate::ipc::list_agent_ports(r))
+                .unwrap_or_default();
+            let drift = crate::runtime::detect_registry_port_drift(&live, &ports);
+            if !drift.is_empty() {
+                println!("\n  Registry/port drift ({}):", drift.len());
+                for line in &drift {
+                    println!("    ⚠ {line}");
+                }
+            }
+        }
+        None => {
+            println!("\n  Registry/port drift: daemon unreachable — cannot compare Live registry against *.port files");
+        }
+    }
+
     println!("\n  Thread census:");
     let census = crate::thread_census::snapshot();
     if census.is_empty() {

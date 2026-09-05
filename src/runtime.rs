@@ -40,6 +40,48 @@ pub fn list_live_agents(home: &Path) -> Option<HashSet<String>> {
     })
 }
 
+/// #3505 P0(c): detect drift between the Live daemon-registry truth and
+/// the on-disk `*.port` files. Returns one actionable line per drifted
+/// name, sorted; empty when consistent.
+///
+/// - registry-only (`ghost-in-registry`): the daemon still lists an agent
+///   whose port shell is gone — teardown left the registry stale, or the
+///   agent died without cleanup. Hint: daemon restart.
+/// - port-only (`stale-on-disk`): a `.port` shell with no registry entry —
+///   file-direct edits or a crashed delete left a husk that keeps the TUI
+///   retrying attaches. Hint: port cleanup.
+///
+/// Pure over the two name sets so unit tests + doctor pin it without a
+/// live daemon; production callers feed `list_live_agents` +
+/// `ipc::list_agent_ports`.
+pub fn detect_registry_port_drift(live: &HashSet<String>, ports: &[String]) -> Vec<String> {
+    let port_set: HashSet<&str> = ports.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    let mut registry_only: Vec<&str> = live
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !port_set.contains(n))
+        .collect();
+    registry_only.sort_unstable();
+    for name in registry_only {
+        out.push(format!(
+            "{name}: in Live registry but no *.port file — stale registry entry? (daemon restart reconciles)"
+        ));
+    }
+    let mut port_only: Vec<&str> = ports
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !live.contains(*n))
+        .collect();
+    port_only.sort_unstable();
+    for name in port_only {
+        out.push(format!(
+            "{name}: *.port file with no Live registry entry — stale port shell? (remove the .port file)"
+        ));
+    }
+    out
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // #910 PR1 of 4: list_agents_with_fallback foundation helper
 //
@@ -646,6 +688,44 @@ mod tests {
         assert_eq!(
             AgentListMode::FallbackDaemonAbsent.as_str(),
             "fallback_daemon_absent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod drift_detect_3505_tests {
+    use std::collections::HashSet;
+
+    /// #3505 P0(c) RED: drift between the Live registry truth and the
+    /// on-disk `*.port` files must be detectable — names present in one
+    /// source but missing from the other are reported with an actionable
+    /// hint (daemon restart / port cleanup), not silently retried.
+    #[test]
+    fn detect_registry_port_drift_reports_both_directions_3505() {
+        let live: HashSet<String> =
+            HashSet::from(["alive".to_string(), "ghost-in-registry".to_string()]);
+        let ports = vec!["alive".to_string(), "stale-on-disk".to_string()];
+        let drift = super::detect_registry_port_drift(&live, &ports);
+        assert!(
+            drift.iter().any(|d| d.contains("ghost-in-registry")),
+            "registry-only names must surface: {drift:?}"
+        );
+        assert!(
+            drift.iter().any(|d| d.contains("stale-on-disk")),
+            "port-only names must surface: {drift:?}"
+        );
+    }
+
+    /// #3505 r2 B1 false-positive guard: a name present in BOTH sources is
+    /// consistent and must yield empty drift — no line, no hint.
+    #[test]
+    fn detect_registry_port_drift_empty_when_sources_agree_3505() {
+        let live: HashSet<String> = HashSet::from(["alive-a".to_string(), "alive-b".to_string()]);
+        let ports = vec!["alive-a".to_string(), "alive-b".to_string()];
+        let drift = super::detect_registry_port_drift(&live, &ports);
+        assert!(
+            drift.is_empty(),
+            "agreeing sources must yield empty drift: {drift:?}"
         );
     }
 }

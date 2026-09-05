@@ -316,15 +316,11 @@ pub enum DeleteOutcome {
 /// Perform the daemon-side portion of DELETE once, preserving the exact API
 /// semantics for managed and external agents. Runtime callers use the live
 /// registries directly; transport fallback belongs to the MCP routing layer.
-pub fn delete_instance(
-    home: &Path,
-    name: &str,
-    context: &DeleteContext<'_>,
-    skip_exit_wait: bool,
-) -> DeleteOutcome {
-    delete_instance_with_exit_status(home, name, context, skip_exit_wait).0
-}
-
+///
+/// #3505: merged into `delete_instance_with_exit_status` — the sole
+/// production caller (`deployments::teardown_with_runtime`) needs the
+/// exit-observation bit to name refused instances, and no other caller
+/// remains. Callers that ignore the bit take `.0`.
 pub(crate) fn delete_instance_with_exit_status(
     home: &Path,
     name: &str,
@@ -1649,7 +1645,8 @@ mod tests {
                 externals: &delete_externals,
                 notifier: None,
             };
-            let outcome = delete_instance(&delete_home, &delete_agent, &context, false);
+            let outcome =
+                delete_instance_with_exit_status(&delete_home, &delete_agent, &context, false).0;
             if send_outcome {
                 delete_tx.send(outcome).expect("delete outcome observer");
             }
