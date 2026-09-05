@@ -9,12 +9,16 @@
 ```bash
 cargo build                          # debug build
 cargo build --release                # release (strip + LTO, matches CI)
-cargo test                           # unit + integration + MCP round-trip
-cargo test --bin agend-terminal      # unit tests only
-cargo test --test integration        # integration tests (Unix-only for now)
+cargo nextest run --features tray    # 唯一的本地測試 gate：unit tests + 每一個 tests/*.rs invariant——與 CI 相同的 runner 與選取範圍
+cargo nextest run --features tray <filter>   # 同一個 gate 加過濾；仍會編譯每一個 tests/ target
+cargo test --tests --features tray   # 沒有 nextest 時的同選取範圍替代；同一個 binary 的測試會共用一個 process、可能互相干擾——CI 從不跑這種形式
+cargo test                           # unit + integration + MCP round-trip（+ doc-tests，預設 features）
+cargo test --test integration        # 只有一個 integration target（tests/integration.rs；目前僅 Unix）
 scripts/fmt-owned.sh --check         # 唯一的 owned-source fmt surface（排除 vendor/）；不帶參數即直接格式化
 cargo clippy -- -D warnings          # 快速檢查；scripts/preflight.sh 會跑 CI 完整的 owned-target 集合
 ```
+
+**`cargo test --bin agend-terminal` 不是 gate——絕不要用它回報「tests green」。** `--bin` 只編譯 binary 自己的 `#[cfg(test)]` 模組，永遠不會建置 `tests/` 底下的 target，而所有跨切面 invariant 都放在那裡（temp-fixture prefix 隔離、env 變更序列化、`task_events` scope、檔案大小上限、spawn rationale、文件雙語）。因此 `--bin` 綠燈對 CI 檢查的內容毫無說明力：曾有兩個互不相關的 PR 在同一晚都紅在 `temp_fixture_shapes_do_not_prefix_overlap`，其中一個還是在四次以該指令為據的「全綠」回報之後。迭代時用 `cargo nextest run --features tray <filter>`（任何過濾都可以，`tests/` 仍會編譯），宣稱綠燈前先跑 `scripts/preflight.sh --quick`。
 
 `cargo clippy` 會強制 `unwrap_used = "deny"`（參見 `Cargo.toml`）。請用 `?` / `anyhow::Result` 來處理錯誤。
 
@@ -38,7 +42,7 @@ CI 會在 Ubuntu + macOS + Windows 上複製這些步驟（`.github/workflows/ci
 scripts/preflight.sh          # full matrix; --quick skips the Windows cross-check
 ```
 
-它執行與 CI `check` job 相同的 fmt/clippy 介面——`scripts/fmt-owned.sh --check`（owned `*.rs`，排除 `vendor/`）與 owned-target 的 `cargo clippy`——外加 `cargo test --tests --features tray`，以及一個 **Windows cross-check**（`x86_64-pc-windows-msvc`），用來抓出 unix 開發機原本會漏掉的 Windows-only 編譯錯誤。（注意：CI 是用 `nextest` 而非 `cargo test` 跑測試，且浮動的 stable toolchain 並非長期逐位元組一致——preflight 是強力的預先檢查，而非與 CI 逐位元組一致的保證。）Windows 這一步優先採用 [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin)（`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`），因為有一個傳遞性 C 依賴（`ring`）在沒有 MSVC toolchain 的情況下無法在 macOS/Linux 上交叉編譯；若未安裝，這一步會 SKIP 並附上提示，而不是誤判為失敗。
+它執行與 CI `check` job 相同的 fmt/clippy 介面——`scripts/fmt-owned.sh --check`（owned `*.rs`，排除 `vendor/`）與 owned-target 的 `cargo clippy`——外加測試 gate（`cargo nextest run --features tray`，也就是 CI 用的 runner；只有在沒安裝 cargo-nextest 時才退回 `cargo test --tests --features tray`），以及一個 **Windows cross-check**（`x86_64-pc-windows-msvc`），用來抓出 unix 開發機原本會漏掉的 Windows-only 編譯錯誤。（浮動的 stable toolchain 並非長期逐位元組一致——preflight 是強力的預先檢查，而非與 CI 逐位元組一致的保證。）Windows 這一步優先採用 [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin)（`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`），因為有一個傳遞性 C 依賴（`ring`）在沒有 MSVC toolchain 的情況下無法在 macOS/Linux 上交叉編譯；若未安裝，這一步會 SKIP 並附上提示，而不是誤判為失敗。
 
 ### 跨平台 lint 模式
 
@@ -213,7 +217,7 @@ Fleet agent 在這個 clone 的 linked worktree 裡 commit,會自動繼承同一
 
 5. **commit + PR**：
    - Stage `tests/fixtures/state-replay/<scenario-name>.raw` + `tests/fixtures/state-replay/MANIFEST.yaml`
-   - 跑 `cargo test --bin agend-terminal corpus_measurement_smoke_f9_marker_signals` 確認煙霧測試 harness 的分類與 `--scenario-kind` 相符
+   - 跑 `cargo nextest run --features tray corpus_measurement_smoke_f9_marker_signals` 確認煙霧測試 harness 的分類與 `--scenario-kind` 相符
    - 在 PR 內文中註明擷取所用的分支與錄製條件,讓未來的操作員在漂移逼得重新擷取時可以重播
 
 ### 隱私與儲存

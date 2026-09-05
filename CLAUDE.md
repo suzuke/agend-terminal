@@ -23,7 +23,9 @@ scripts/preflight.sh          # full matrix; --quick skips the Windows check
 This is the one-shot mirror of CI's `check` job and the best way to avoid a
 local-green → CI-red round trip. It runs `cargo fmt --check`,
 `cargo clippy --all-targets --features tray -- -D warnings`,
-`cargo test --tests --features tray` (unit + integration + invariants), and a
+`cargo nextest run --features tray` (unit + integration + invariants — CI's
+runner; `cargo test --tests --features tray` only when cargo-nextest is
+missing), and a
 **Windows cross-check** (`x86_64-pc-windows-msvc`) — the keystone, since
 Windows-only code (`libc::getppid`, `/bin/sh` spawns, `UnixStream`) compiles
 fine on a unix dev box but breaks CI's `windows-latest` runner.
@@ -38,6 +40,14 @@ cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc
 Without `cargo-xwin` the Windows step SKIPs with a hint (never false-fails);
 CI's `windows-latest` runner stays the backstop. The preflight is intentionally
 *not* a git hook — the full matrix takes a few minutes; run it manually.
+
+**Filtered test runs must still build `tests/`.** Iterate with
+`cargo nextest run --features tray <filter>`, never
+`cargo test --bin agend-terminal <filter>`: `--bin` compiles only the binary's
+own `#[cfg(test)]` modules and skips every `tests/*.rs` invariant (temp-fixture
+prefix isolation, env-mutation serialisation, spawn rationale, file-size
+ceilings, docs bilingual), so a green `--bin` run is not evidence for CI. Say
+"tests green" only after that gate (or `scripts/preflight.sh --quick`).
 
 **Which hooks actually fire depends on `core.hooksPath`, and there are two
 regimes.** In a daemon-managed worktree — and in any clone whose
@@ -61,7 +71,7 @@ The pre-push hook (`scripts/hooks/pre-push`) runs **two gates**:
 1. **CI-parity** (#t-ci-parity-prepush-guard) — on a push whose range touches
    `src/` / `tests/` / `Cargo.*` / `build.rs`, it runs `scripts/preflight.sh
    --quick` (the exact CI `check` commands: `cargo fmt --check`, `cargo clippy
-   --all-targets --features tray -- -D warnings`, `cargo test --tests --features
+   --all-targets --features tray -- -D warnings`, `cargo nextest run --features
    tray`) and **blocks the push if they fail**. This closes the recurring miss
    where an agent ran only `cargo test --bin` — which SKIPS the `tests/`
    integration targets — declared CI-ready, and CI then rejected it

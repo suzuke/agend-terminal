@@ -19,7 +19,7 @@ CI 會在 `ci.yml` 的前兩個步驟執行這些命令。本機略過它們，�
 scripts/preflight.sh          # 完整 matrix；--quick 會略過 Windows 檢查
 ```
 
-這是 CI `check` job 的一次性鏡像，也是避免 local-green → CI-red 往返的最佳方法。它會執行 `cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo test --tests --features tray`（unit + integration + invariant），以及關鍵的 **Windows cross-check**（`x86_64-pc-windows-msvc`）。Windows-only 程式碼（`libc::getppid`、`/bin/sh` spawn、`UnixStream`）在 Unix 開發機上可以順利編譯，卻會讓 CI 的 `windows-latest` runner 失敗。
+這是 CI `check` job 的一次性鏡像，也是避免 local-green → CI-red 往返的最佳方法。它會執行 `cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo nextest run --features tray`（unit + integration + invariant——CI 用的 runner；只有沒安裝 cargo-nextest 時才用 `cargo test --tests --features tray`），以及關鍵的 **Windows cross-check**（`x86_64-pc-windows-msvc`）。Windows-only 程式碼（`libc::getppid`、`/bin/sh` spawn、`UnixStream`）在 Unix 開發機上可以順利編譯，卻會讓 CI 的 `windows-latest` runner 失敗。
 
 Windows 步驟需要 MSVC C toolchain，因為 transitive C dependency（`ring`）在 macOS/Linux 上缺少它就無法 cross-compile。只需安裝一次：
 
@@ -29,13 +29,15 @@ cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc
 
 若沒有 `cargo-xwin`，Windows 步驟會附提示並 SKIP（絕不 false-fail）；CI 的 `windows-latest` runner 仍是後援。Preflight 刻意*不是* git hook——完整 matrix 需要幾分鐘，請手動執行。
 
+**加了過濾的測試也必須建置 `tests/`。** 迭代時用 `cargo nextest run --features tray <filter>`，絕不要用 `cargo test --bin agend-terminal <filter>`：`--bin` 只編譯 binary 自己的 `#[cfg(test)]` 模組，會跳過每一個 `tests/*.rs` invariant（temp-fixture prefix 隔離、env 變更序列化、spawn rationale、檔案大小上限、文件雙語），所以 `--bin` 綠燈不能當作 CI 的證據。只有跑過這個 gate（或 `scripts/preflight.sh --quick`）之後才能說「tests green」。
+
 **哪些 hook 真的會觸發取決於 `core.hooksPath`，而且有兩種 regime。** 在 daemon-managed worktree——以及任何 `core.hooksPath` 指向 `$AGEND_HOME/hooks` 的 clone——中，實際生效的是 daemon 寫在該目錄的自有 hook：`prepare-commit-msg`（以及 `prepare-commit-msg.ps1`）與 `reference-transaction`。下文描述的 tracked `scripts/hooks` 資產（`pre-commit`、`pre-push`、`post-merge`）在該 regime **並未生效**，且 `.git/hooks/*` 會被 `core.hooksPath` 整個遮蔽。以下描述適用於另一種 regime：`core.hooksPath` 指向 `scripts/hooks` 的 clone，也就是 `scripts/install-hooks.sh` 會把 clone 切換過去的那一種。用 `git config --get core.hooksPath` 確認目前屬於哪一種。
 
 在 `scripts/hooks` regime 下，pre-commit hook（`scripts/hooks/pre-commit`）會自動格式化 staged `.rs` 檔並重新 stage。它不會執行 clippy——clippy 對 pre-commit 路徑而言太慢。`git push` 前請自行執行 clippy。
 
 Pre-push hook（`scripts/hooks/pre-push`）會執行**兩道 gate**：
 
-1. **CI-parity**（#t-ci-parity-prepush-guard）——若 push range 觸及 `src/` / `tests/` / `Cargo.*` / `build.rs`，便執行 `scripts/preflight.sh --quick`（與 CI `check` 完全相同的命令：`cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo test --tests --features tray`），並在失敗時**阻擋 push**。這可防止一再發生的遺漏：agent 只執行 `cargo test --bin`——會略過 `tests/` integration target——便宣稱 CI-ready，接著被 CI 拒絕（#1734 stale-string integration test、#1735 block_on invariant）。Docs-only push 會略過 build。`--quick` 不執行 Windows cross-check（由 CI 的 `windows-latest` 後援）。
+1. **CI-parity**（#t-ci-parity-prepush-guard）——若 push range 觸及 `src/` / `tests/` / `Cargo.*` / `build.rs`，便執行 `scripts/preflight.sh --quick`（與 CI `check` 完全相同的命令：`cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo nextest run --features tray`），並在失敗時**阻擋 push**。這可防止一再發生的遺漏：agent 只執行 `cargo test --bin`——會略過 `tests/` integration target——便宣稱 CI-ready，接著被 CI 拒絕（#1734 stale-string integration test、#1735 block_on invariant）。Docs-only push 會略過 build。`--quick` 不執行 Windows cross-check（由 CI 的 `windows-latest` 後援）。
 2. **claim-verify**——依實際 diff 驗證 `Claim:` trailer。
 
 緊急情況可用 `git push --no-verify` 覆寫任一 gate（daemon-side gate 與 CI 仍會套用，所以 `--no-verify` 不是免死金牌）。

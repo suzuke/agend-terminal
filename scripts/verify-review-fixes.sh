@@ -221,8 +221,8 @@ info "cargo build"
 cargo build --quiet 2>&1 | tail -5
 green "  ok"
 
-info "cargo test --bin agend-terminal"
-cargo test --bin agend-terminal --quiet 2>&1 | tail -3
+info "cargo nextest run --features tray (unit + every tests/*.rs target; --bin alone skips tests/)"
+cargo nextest run --features tray 2>&1 | tail -3
 green "  ok"
 
 echo

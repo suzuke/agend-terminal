@@ -9,12 +9,16 @@ Thanks for considering a contribution. This is a Rust CLI + daemon; the workflow
 ```bash
 cargo build                          # debug build
 cargo build --release                # release (strip + LTO, matches CI)
-cargo test                           # unit + integration + MCP round-trip
-cargo test --bin agend-terminal      # unit tests only
-cargo test --test integration        # integration tests (Unix-only for now)
+cargo nextest run --features tray    # THE local test gate: unit tests + every tests/*.rs invariant — CI's runner and selection
+cargo nextest run --features tray <filter>   # same gate, filtered; still compiles every tests/ target
+cargo test --tests --features tray   # same selection without nextest; a binary's tests then share one process and can race — CI never runs this form
+cargo test                           # unit + integration + MCP round-trip (+ doc-tests, default features)
+cargo test --test integration        # ONE integration target (tests/integration.rs; Unix-only for now)
 scripts/fmt-owned.sh --check         # THE owned-source fmt surface (excludes vendor/); no arg = format
 cargo clippy -- -D warnings          # quick check; scripts/preflight.sh runs CI's exact owned-target set
 ```
+
+**`cargo test --bin agend-terminal` is NOT a gate — never report "tests green" from it.** `--bin` compiles only the binary's own `#[cfg(test)]` modules; it never builds the `tests/` targets, and those hold every cross-cutting invariant (temp-fixture prefix isolation, env-mutation serialisation, `task_events` scope, file-size ceilings, spawn rationale, docs bilingual). A green `--bin` run therefore says nothing about what CI checks: two independent PRs went CI-red on `temp_fixture_shapes_do_not_prefix_overlap` in one night, one of them after four "all green" reports built on that command. Iterate with `cargo nextest run --features tray <filter>` (any filter; `tests/` still compiles), and run `scripts/preflight.sh --quick` before claiming green.
 
 `cargo clippy` enforces `unwrap_used = "deny"` (see `Cargo.toml`). Handle errors with `?` / `anyhow::Result`.
 
@@ -39,7 +43,7 @@ Run the one-shot CI-parity preflight to catch failures locally instead of after 
 scripts/preflight.sh          # full matrix; --quick skips the Windows cross-check
 ```
 
-It runs the same fmt/clippy surface CI's `check` job runs — `scripts/fmt-owned.sh --check` (owned `*.rs`, `vendor/` excluded) and the owned-target `cargo clippy` — plus `cargo test --tests --features tray` and a **Windows cross-check** (`x86_64-pc-windows-msvc`) that catches windows-only compile errors a unix dev box would otherwise miss. (CI runs the tests via `nextest`, not `cargo test`, and a floating stable toolchain is not byte-exact over time — so preflight is a strong pre-check, not a byte-exact CI guarantee.) The Windows step prefers [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) (`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`) since a transitive C dependency (`ring`) won't cross-compile on macOS/Linux without the MSVC toolchain; if it's not installed the step SKIPs with a hint rather than false-failing.
+It runs the same fmt/clippy surface CI's `check` job runs — `scripts/fmt-owned.sh --check` (owned `*.rs`, `vendor/` excluded) and the owned-target `cargo clippy` — plus the test gate (`cargo nextest run --features tray`, the runner CI uses; it falls back to `cargo test --tests --features tray` only when cargo-nextest is not installed) and a **Windows cross-check** (`x86_64-pc-windows-msvc`) that catches windows-only compile errors a unix dev box would otherwise miss. (A floating stable toolchain is not byte-exact over time — so preflight is a strong pre-check, not a byte-exact CI guarantee.) The Windows step prefers [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) (`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`) since a transitive C dependency (`ring`) won't cross-compile on macOS/Linux without the MSVC toolchain; if it's not installed the step SKIPs with a hint rather than false-failing.
 
 ### Cross-platform lint patterns
 
@@ -224,7 +228,7 @@ Real-PTY captures grow the regression corpus in `tests/fixtures/state-replay/` a
 
 5. **Commit + PR**:
    - Stage `tests/fixtures/state-replay/<scenario-name>.raw` + `tests/fixtures/state-replay/MANIFEST.yaml`
-   - Run `cargo test --bin agend-terminal corpus_measurement_smoke_f9_marker_signals` to confirm the smoke harness classification matches `--scenario-kind`
+   - Run `cargo nextest run --features tray corpus_measurement_smoke_f9_marker_signals` to confirm the smoke harness classification matches `--scenario-kind`
    - Reference the capturing branch + recording conditions in the PR body so future operators can replay if drift forces a recapture
 
 ### Privacy + storage
