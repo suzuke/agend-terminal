@@ -1027,6 +1027,7 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
         bytes: Arc::clone(&fixture.written),
         entered: Arc::clone(&writer_entered),
         release: Arc::clone(&writer_release),
+        post_release_stall: SELF_KICK_ARM_PATH_STALL,
     })));
     fixture.target.pty_writer = Arc::clone(&blocking_writer);
     fixture
@@ -3837,10 +3838,20 @@ impl std::io::Write for RecordingWriter {
     }
 }
 
+/// Simulates a starved CI runner for `self_kick_legacy_arm_precedes_delete_lane_acquisition`:
+/// once the test releases the blocked PTY write, the bootstrap's arm path is
+/// held back this long before it can arm. It deliberately exceeds the 1s
+/// wall-clock budget the test used to wait on, so a bounded wait for the arm
+/// fails deterministically here instead of flaking only on a loaded runner.
+/// It stays well inside `PTY_WRITE_TIMEOUT` (5s), which bounds the whole
+/// blocked write from the bootstrap's side.
+const SELF_KICK_ARM_PATH_STALL: std::time::Duration = std::time::Duration::from_millis(1500);
+
 struct BlockingWriter {
     bytes: Arc<Mutex<Vec<u8>>>,
     entered: Arc<std::sync::atomic::AtomicBool>,
     release: Arc<std::sync::atomic::AtomicBool>,
+    post_release_stall: std::time::Duration,
 }
 
 impl std::io::Write for BlockingWriter {
@@ -3864,6 +3875,7 @@ impl std::io::Write for BlockingWriter {
                     "BlockingWriter release deadline exceeded",
                 ));
             }
+            std::thread::sleep(self.post_release_stall);
         }
         Ok(buf.len())
     }
