@@ -2965,6 +2965,63 @@ fn claude_fable5_plain_quoted_limit_is_not_usage_limit() {
     );
 }
 
+/// Live capture (2026-09-05, instance `claude-0d9720`): the model-tier quota
+/// wall renders WITHOUT the version number — `Fable limit`, not `Fable 5
+/// limit` — and carries no `· resets` stamp. The pattern pinned the exact
+/// model string, so nothing latched: the pane sat dead for 82 minutes while
+/// `usage_limit_notify.json` still said `active: false`. Key on the banner's
+/// SHAPE (box-draw chrome + `/usage-credits` remedy), never the model name,
+/// which changes on every model rename.
+#[test]
+fn claude_model_tier_limit_banner_latches_regardless_of_model_name() {
+    for banner in [
+        // Verbatim from the live pane that motivated this test.
+        "⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.",
+        // The older wording the pre-fix pattern was written against.
+        "⎿  You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.",
+        // Any future rename must land the same way.
+        "⎿  You've reached your Opus 5 limit. Run /usage-credits to continue or switch models with /model.",
+    ] {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed(banner);
+        assert_eq!(
+            t.get_state(),
+            AgentState::UsageLimit,
+            "{banner} must latch UsageLimit"
+        );
+    }
+}
+
+/// The widened model-name arm must not widen the prose-FP surface: without the
+/// `⎿` banner chrome it is an agent quoting the wall, not hitting it.
+#[test]
+fn claude_model_tier_limit_prose_without_banner_chrome_is_not_usage_limit() {
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    let prose = "⏺ RCA: the pane said You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.";
+    t.feed(prose);
+    assert_ne!(
+        t.get_state(),
+        AgentState::UsageLimit,
+        "a bare quoted model-tier sentence must not latch UsageLimit"
+    );
+    assert_eq!(
+        super::classify_pty_output(&Backend::ClaudeCode, prose),
+        None,
+        "a bare quoted model-tier sentence must not produce QuotaExceeded"
+    );
+}
+
+/// A stuck model-tier wall is a STATIC pane: the hash-dedup gate
+/// ([`super::StateTracker::apply_hash_dedup_gate`]) only lets re-detection
+/// through when the screen carries a throttle hint, so the hint token list
+/// must cover this banner's `reached your` wording too.
+#[test]
+fn model_tier_limit_banner_carries_a_throttle_hint() {
+    assert!(super::screen_has_throttle_hint(
+        "⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model."
+    ));
+}
+
 /// **CRITICAL**: discussion prose containing rate_limit / rate-limit /
 /// overloaded substrings must NOT trigger RateLimit across any backend.
 /// Root cause of #841 nudge spam; post-#848 narrowed patterns fix this.

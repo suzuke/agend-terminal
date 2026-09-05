@@ -628,8 +628,17 @@ fn claudecode_profile() -> BackendProfile {
                 r"API Error: Request rejected \(429\)|rate_limit_error|hit a rate limit",
             ),
             (
+                // The model-tier wall names whatever model is active, and that
+                // name drifts on every rename: the live 2026-09-05 banner read
+                // "your Fable limit" while this arm still pinned "Fable 5", so
+                // nothing latched and the agent idled 82 minutes undetected.
+                // Key on the banner SHAPE — box-draw chrome (the prose-FP guard,
+                // see `claude_model_tier_limit_prose_without_banner_chrome_is_not_usage_limit`)
+                // plus the `/usage-credits` remedy — and leave the model name
+                // free. The trailing "to continue or switch models…" clause is
+                // dropped for the same drift reason.
                 AgentState::UsageLimit,
-                r"⎿[ \t]+You've reached your Fable 5 limit\. Run /usage-credits to continue or switch models with /model\.|You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low|credit_balance_too_low",
+                r"⎿[ \t]+You've reached your [^.\n]{0,32} limit\. Run /usage-credits|You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low|credit_balance_too_low",
             ),
             (
                 // #2090 P2: the broad `context.*(full|limit)` arm is replaced by a
