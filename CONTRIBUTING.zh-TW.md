@@ -20,6 +20,17 @@ cargo clippy -- -D warnings          # 快速檢查；scripts/preflight.sh 會�
 
 **`cargo test --bin agend-terminal` 不是 gate——絕不要用它回報「tests green」。** `--bin` 只編譯 binary 自己的 `#[cfg(test)]` 模組，永遠不會建置 `tests/` 底下的 target，而所有跨切面 invariant 都放在那裡（temp-fixture prefix 隔離、env 變更序列化、`task_events` scope、檔案大小上限、spawn rationale、文件雙語）。因此 `--bin` 綠燈對 CI 檢查的內容毫無說明力：曾有兩個互不相關的 PR 在同一晚都紅在 `temp_fixture_shapes_do_not_prefix_overlap`，其中一個還是在四次以該指令為據的「全綠」回報之後。迭代時用 `cargo nextest run --features tray <filter>`（任何過濾都可以，`tests/` 仍會編譯），宣稱綠燈前先跑 `scripts/preflight.sh --quick`。在 daemon 管理的 agent shell 裡請先 `export AGENTIC_GIT_HOME="$AGEND_HOME"`（preflight 會自己做）：否則把 `AGEND_HOME` 限定到暫存目錄再 spawn `git` 的測試會撞上 agentic-git shim 的遞迴防護——約 40 個必定失敗的測試，而 CI（PATH 上沒有 shim）永遠看不到。
 
+### agent worktree 內哪些本地結果可以信
+
+在 daemon 管理的 agent shell 裡（git shim 在 PATH 最前、`AGEND_INSTANCE_NAME` 已設）跑 `cargo nextest run --features tray`——或包著它的 `scripts/preflight.sh --quick`——會得到三種結果：
+
+- **直接可信。** 下面沒點名的全部：每一個 `tests/*.rs` invariant（文件雙語、temp-fixture 隔離、spawn rationale、檔案大小上限、env 普查）、真 git 模組（`worktree*`、`branch_sweep`、`cleanup_intents`、`dispatch_hook`、`ci`），以及過去必定失敗的三個叢集（`instructions::tests`、`usage_limit_takeover_tests`、`agent_resolve::tests`）——前提是 `AGENTIC_GIT_HOME` 已釘住：帶有 spawn 時注入的 daemon、或 `scripts/preflight.sh`、或上面那一行 export。沒釘住時，那些叢集紅的是 shim 遞迴（#1504），不是你的改動。
+- **單跑一次確認後才可信。** 有固定 5 秒 sentinel 預算的真實行程 spawn 測試——`api::handlers::instance::tests::{handle_spawn_*, set_model_*}`、`transport::{codex_app_server, opencode_server}` 的 socket 探針、以及 `attached_path_mcp_invariants::bridge_tools_list_no_silent_empty_when_daemon_unreachable`。在這台共用主機上以 16 路平行整套跑時，它們會差幾百毫秒超過預算（一個下午兩次各紅 8 個，5.2–5.6 秒），單跑則不到一秒就過；活的 daemon 不是變因。這裡的紅只有在 `cargo nextest run --features tray -E 'test(=<name>)'` 單跑再次失敗時才算證據。
+- **只在 CI 有意義。** `worktree_cleanup::windows_cleanup_diagnostics_tests::real_sweep_remove_failure_preserves_final_status_and_stderr_2830_red` 會把自己的 stub 目錄接到 PATH 最前，在任何 agent shell 裡都會於 `fetch --prune` 觸發 shim 的遞迴防護；它在本地變紅不帶任何資訊。
+- **永遠不是證據。** `cargo test --bin agend-terminal <filter>`（永遠不會建置 `tests/`，對任何住在那裡的 filter 都印出 `ok` 但零測試），以及在高負載主機上整套跑 `cargo test --tests`（每個 binary 一個 process、執行緒平行：本機 7367 個 unit tests 紅了 657 個，抽樣單跑全過）。
+
+回報用語：「tests green」指的是在 bound worktree 裡 `scripts/preflight.sh --quick` 以 0 結束，或它的 nextest 步驟只有「單跑確認」那一類失敗且每一個單跑都通過——要點名。
+
 `cargo clippy` 會強制 `unwrap_used = "deny"`（參見 `Cargo.toml`）。請用 `?` / `anyhow::Result` 來處理錯誤。
 
 CI 會在 Ubuntu + macOS + Windows 上複製這些步驟（`.github/workflows/ci.yml`）。

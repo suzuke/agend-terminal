@@ -51,7 +51,10 @@ ceilings, docs bilingual), so a green `--bin` run is not evidence for CI. Say
 daemon-managed agent shell `export AGENTIC_GIT_HOME="$AGEND_HOME"` first
 (preflight does it itself): tests that scope `AGEND_HOME` and spawn `git`
 otherwise trip the agentic-git shim's recursion guard (#1504) — about 40
-deterministic failures CI never sees, because CI has no shim on PATH.
+deterministic failures CI never sees, because CI has no shim on PATH. Which
+of the remaining results you may trust from an agent shell, and which need a
+solo re-run first, is defined in CONTRIBUTING.md under "Which local results
+an agent worktree can trust".
 
 **Which hooks actually fire depends on `core.hooksPath`, and there are two
 regimes.** In a daemon-managed worktree — and in any clone whose
