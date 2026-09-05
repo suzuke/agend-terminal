@@ -931,8 +931,13 @@ fn build_command(
         // and then spawn `git` otherwise make the shim resolve to itself and trip
         // its recursion guard. Pin the PRIMARY name to the daemon home so the shim
         // keeps knowing where its own binary lives whatever the crate's home is
-        // scoped to. Same deny-list class as AGEND_HOME, so a fleet.yaml / template
-        // env cannot redirect it (the caller-env loop below skips sensitive keys).
+        // scoped to. Same deny-list class as AGEND_HOME, and nothing can redirect
+        // it: `resolve_child_env` drops sensitive keys when it builds the isolation
+        // plan, so the `env_clear` + injected loop above never carries one in; this
+        // pin is written after that loop, so by ordering it wins over anything the
+        // plan injected; and the per-instance fleet.yaml `env:` loop further down
+        // skips sensitive keys unless they are the backend's own credential keys
+        // (#2106), which this is not.
         cmd.env("AGENTIC_GIT_HOME", h);
     }
 
