@@ -80,6 +80,48 @@ pub(crate) fn settle_completion_receipt(
     }
 }
 
+/// F6: the lease's `review_assignment_id` must still name a LIVE assignment that
+/// authorizes this caller for this task. Parsing it as a UUID says only that the
+/// id is well-formed, and a revoked assignment keeps its shape after its row is
+/// gone — `assignment_authority::revoke_under_lock` ends in
+/// `remove_if_assignment_matches_strict`, so the id outlives the authority.
+///
+/// This mirrors the sibling revalidation in `daemon::pr_state::record_validated_receipt`
+/// in intent rather than in mechanism. That path calls
+/// `review_receipt::assignment_still_authorizes`, which needs a `ReviewReceiptSummary`
+/// — reviewer instance id, PR number, reviewed head, class and slot — that a
+/// completion caller does not have and cannot honestly synthesize. What the binding
+/// does carry is the assignment id, the caller and the task, so those are what get
+/// checked here, against the same store and the same receipt-capability predicate.
+///
+/// No assignment lock is taken, deliberately. The sibling holds the assignment
+/// branch lock across its check→PR-state mutation; the documented order is
+/// assignment-OUTER / pr_state-INNER, and this runs underneath the task-board
+/// path, so taking it here would invert that order rather than extend it. The
+/// residual window — a revoke landing between this lookup and the Done event — is
+/// closed next door instead: `revoke` cancels the review task before removing the
+/// row, and a cancelled task cannot transition to Done.
+/// `revoke_cancels_the_review_task_before_removing_the_row` pins that reason so it
+/// is not just an assertion in a comment.
+fn lease_assignment_still_authorizes(
+    home: &Path,
+    binding: &serde_json::Value,
+    caller: &str,
+    task_id: &str,
+) -> bool {
+    binding["review_assignment_id"]
+        .as_str()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .and_then(|id| {
+            crate::daemon::assignment_authority::lookup_by_assignment_id_strict(home, id).ok()
+        })
+        .is_some_and(|assignment| {
+            assignment.is_receipt_capable()
+                && assignment.target == caller
+                && assignment.task_id == task_id
+        })
+}
+
 /// Gate completion by the assignee's bound branch state. Non-assignees (the
 /// orchestrator/system paths) and branchless tasks retain their existing ACL.
 pub(crate) fn assignee_completion_guard(
@@ -119,10 +161,7 @@ pub(crate) fn assignee_completion_guard(
     let typed_disposable_review = provisioned_head.is_some()
         && binding["lease_kind"].as_str() == Some("review")
         && binding["expected_head"].as_str() == provisioned_head
-        && binding["review_assignment_id"]
-            .as_str()
-            .and_then(|id| uuid::Uuid::parse_str(id).ok())
-            .is_some()
+        && lease_assignment_still_authorizes(home, &binding, caller, task_id)
         && crate::binding::signature_valid(home, caller);
     if binding_agent != Some(caller)
         || binding_task != Some(task_id)

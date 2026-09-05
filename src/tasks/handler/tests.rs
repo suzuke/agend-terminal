@@ -3510,6 +3510,39 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
                 &expected_head,
             )
             .expect("typed review lease");
+            // The lease names an assignment; until #F6 nothing checked that the
+            // assignment existed, so this fixture never planted one. It has to
+            // now, or the legitimate reviewer is refused for the same reason the
+            // dead-assignment case is — which would make the allow-test pass on
+            // a lie. `-dead-assignment` deliberately keeps the old shape: a
+            // well-formed id with no row behind it.
+            if mode != "review-branch-drift-dead-assignment" {
+                if let Ok(parsed) = uuid::Uuid::parse_str(&assignment_id) {
+                    let mut assignment =
+                        crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+                            "owner/repo",
+                            branch,
+                            "dev-agent",
+                            crate::types::InstanceId::new(),
+                            1,
+                            provisioned_head,
+                            crate::review_receipt::ReviewSlot::Primary,
+                            "test:operator",
+                            &id,
+                            crate::daemon::pr_state::ReviewClass::Single,
+                            crate::mcp::handlers::comms_gates::ReviewAuthor::External(
+                                "external-author".into(),
+                            ),
+                            "s1 fixture typed review assignment",
+                            None,
+                            None,
+                            "2026-09-05T00:00:00Z",
+                        );
+                    assignment.assignment_id = parsed;
+                    crate::daemon::assignment_authority::persist(&home, &assignment)
+                        .expect("plant the assignment the lease names");
+                }
+            }
             if mode == "review-branch-drift-bad-signature" {
                 std::fs::write(
                     crate::paths::runtime_dir(&home)
@@ -3852,6 +3885,65 @@ fn task_done_refuses_a_disposable_review_lease_whose_assignment_is_not_live() {
         read_task_record(&home, &id).expect("task").status,
         crate::task_events::TaskStatus::Claimed,
         "and the task must stay open"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Pins the reason `lease_assignment_still_authorizes` takes no assignment lock.
+///
+/// The sibling path holds the assignment branch lock across check→PR-state
+/// mutation. The completion path cannot: it runs underneath the task board, and
+/// the documented order is assignment-OUTER / pr_state-INNER, so acquiring the
+/// assignment lock here would invert it. That leaves a window — a revoke landing
+/// between the liveness lookup and the Done event — and this test shows what
+/// closes it: revoke CANCELS the review task before the row disappears, and a
+/// cancelled task cannot transition to Done. The containment is real, it just
+/// lives next door, and this pins it so the next reader does not have to take
+/// the comment's word for it.
+#[test]
+fn revoke_cancels_the_review_task_before_removing_the_row() {
+    let (home, id, _repo, branch) = s1_fixture("s1-revoke-cancels", "review-branch-drift");
+    let binding = crate::binding::read(&home, "dev-agent").expect("binding");
+    let parsed = uuid::Uuid::parse_str(
+        binding["review_assignment_id"]
+            .as_str()
+            .expect("assignment id"),
+    )
+    .expect("uuid");
+    assert!(
+        crate::daemon::assignment_authority::lookup_by_assignment_id_strict(&home, parsed).is_ok(),
+        "precondition: the assignment the lease names is live"
+    );
+
+    let revoked = crate::daemon::assignment_authority::revoke(
+        &home,
+        "owner/repo",
+        &branch,
+        "dev-agent",
+        "2026-09-05T01:00:00Z",
+    )
+    .expect("revoke");
+    assert!(revoked, "the live assignment must be revoked");
+
+    assert!(
+        crate::daemon::assignment_authority::lookup_by_assignment_id_strict(&home, parsed).is_err(),
+        "revoke removes the row, so the id keeps its shape but loses its authority"
+    );
+    let status = read_task_record(&home, &id).expect("task").status;
+    assert!(
+        status.is_terminal(),
+        "revoke cancels the review task before the row goes — that is what closes \
+         the unlocked window, not the guard: {status:?}"
+    );
+
+    let done = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    assert!(
+        done.get("error").is_some(),
+        "and a settle after revoke is refused: {done}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
