@@ -794,6 +794,10 @@ const THROTTLE_HINT_TOKENS: &[&str] = &[
     // limit" / ServiceQuotaExceeded), and the credit-balance forms.
     "hit your",
     "reached the limit",
+    // The model-tier wall says "reached your <model> limit" — neither of the
+    // two tokens above covers it, so a stuck model-tier pane (static screen,
+    // unchanged hash) never got re-detected.
+    "reached your",
     "ServiceQuotaExceeded",
     "Credit balance",
     "credit_balance_too_low",
