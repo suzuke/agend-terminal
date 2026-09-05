@@ -76,6 +76,19 @@ fi
 # Run from repo root so cargo finds the manifest regardless of CWD.
 cd "$(dirname "$0")/.." || exit 2
 
+# Daemon-managed agent shells: tests that scope AGEND_HOME to a temp dir and
+# then spawn `git` reach the agentic-git shim on PATH. The shim derives its own
+# directory from AGENTIC_GIT_HOME (legacy fallback: AGEND_HOME) to exclude
+# itself from the PATH it hands the real git; under the scoped value it resolves
+# git to itself and trips its recursion guard (#1504) — ~40 deterministic
+# failures in instructions / usage_limit_takeover / agent_resolve that CI (no
+# shim on PATH) never sees. Pinning the PRIMARY name to the real home keeps the
+# shim fully in force (same agent identity, same policy) while the tests scope
+# only the crate's own home. No-op outside a daemon-managed shell.
+if [[ -z "${AGENTIC_GIT_HOME:-}" && -n "${AGEND_HOME:-}" ]]; then
+    export AGENTIC_GIT_HOME="$AGEND_HOME"
+fi
+
 passed=()
 failed=()
 skipped=()

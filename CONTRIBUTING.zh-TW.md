@@ -18,7 +18,7 @@ scripts/fmt-owned.sh --check         # 唯一的 owned-source fmt surface（排�
 cargo clippy -- -D warnings          # 快速檢查；scripts/preflight.sh 會跑 CI 完整的 owned-target 集合
 ```
 
-**`cargo test --bin agend-terminal` 不是 gate——絕不要用它回報「tests green」。** `--bin` 只編譯 binary 自己的 `#[cfg(test)]` 模組，永遠不會建置 `tests/` 底下的 target，而所有跨切面 invariant 都放在那裡（temp-fixture prefix 隔離、env 變更序列化、`task_events` scope、檔案大小上限、spawn rationale、文件雙語）。因此 `--bin` 綠燈對 CI 檢查的內容毫無說明力：曾有兩個互不相關的 PR 在同一晚都紅在 `temp_fixture_shapes_do_not_prefix_overlap`，其中一個還是在四次以該指令為據的「全綠」回報之後。迭代時用 `cargo nextest run --features tray <filter>`（任何過濾都可以，`tests/` 仍會編譯），宣稱綠燈前先跑 `scripts/preflight.sh --quick`。
+**`cargo test --bin agend-terminal` 不是 gate——絕不要用它回報「tests green」。** `--bin` 只編譯 binary 自己的 `#[cfg(test)]` 模組，永遠不會建置 `tests/` 底下的 target，而所有跨切面 invariant 都放在那裡（temp-fixture prefix 隔離、env 變更序列化、`task_events` scope、檔案大小上限、spawn rationale、文件雙語）。因此 `--bin` 綠燈對 CI 檢查的內容毫無說明力：曾有兩個互不相關的 PR 在同一晚都紅在 `temp_fixture_shapes_do_not_prefix_overlap`，其中一個還是在四次以該指令為據的「全綠」回報之後。迭代時用 `cargo nextest run --features tray <filter>`（任何過濾都可以，`tests/` 仍會編譯），宣稱綠燈前先跑 `scripts/preflight.sh --quick`。在 daemon 管理的 agent shell 裡請先 `export AGENTIC_GIT_HOME="$AGEND_HOME"`（preflight 會自己做）：否則把 `AGEND_HOME` 限定到暫存目錄再 spawn `git` 的測試會撞上 agentic-git shim 的遞迴防護——約 40 個必定失敗的測試，而 CI（PATH 上沒有 shim）永遠看不到。
 
 `cargo clippy` 會強制 `unwrap_used = "deny"`（參見 `Cargo.toml`）。請用 `?` / `anyhow::Result` 來處理錯誤。
 
