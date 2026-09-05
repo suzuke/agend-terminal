@@ -590,8 +590,7 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
     let now_secs = chrono::Utc::now().timestamp();
 
     let mut out: Vec<Value> = Vec::new();
-    // t-…-67: watches on the requested repo/branch filter that exist but the
-    // caller is not subscribed to. Counted, not shown — see the scope note below.
+    // t-…-67: watches on the requested filter the caller cannot see (`status_scope`).
     let mut hidden_watches: usize = 0;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -722,32 +721,15 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             })
         })
         .collect();
-    // t-…-67: say what this view IS. A named caller sees only the watches it
-    // subscribes to, so `watches: []` never means "no watch exists" — four such
-    // readings in two days (#3524, #3521, #3526, #3527) were made by a
-    // non-subscriber and each ended in a needless manual re-arm of a live watch.
-    // The response therefore names its scope and counts what it hid on the
-    // requested filter. The hint states the one thing a re-arm actually does:
-    // an explicit `review_class` reconciles the PR gate and recomputes readiness
-    // (see `handle_watch_ci`); a bare `ci watch` only adds a subscriber.
-    let scope = if instance_name.is_empty() {
-        "all".to_string()
-    } else {
-        format!("subscriber:{instance_name}")
-    };
+    // t-…-67: the view names its scope and what it hid — see `status_scope`.
     let mut resp = json!({
         "watches": out,
         "pending_handoffs": pending_handoffs,
-        "scope": scope,
+        "scope": super::status_scope::scope_label(instance_name),
         "hidden_watches": hidden_watches,
     });
     if hidden_watches > 0 {
-        resp["hint"] = json!(format!(
-            "{hidden_watches} watch(es) exist on the requested repo/branch that you are not \
-             subscribed to; `ci status` is subscriber-scoped. `ci watch repository=<owner/repo> \
-             branch=<branch> review_class=single|dual` adds you as a subscriber and forces a \
-             readiness recompute; a bare `ci watch` only subscribes."
-        ));
+        resp["hint"] = json!(super::status_scope::hidden_hint(hidden_watches));
     }
     if let Some(w) = crate::daemon::ci_watch::github_token_warning_from_env() {
         resp["setup_warning"] = json!(w);

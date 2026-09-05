@@ -41,6 +41,7 @@ mod cleanup;
 mod handoff_ack;
 mod merge;
 mod release;
+mod status_scope;
 pub(super) mod unwatch;
 mod watch;
 
