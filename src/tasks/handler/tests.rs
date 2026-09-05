@@ -3804,3 +3804,54 @@ fn task_done_assignee_completion_controls_s1() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// F6 RED: the guard checks that `review_assignment_id` PARSES, never that the
+/// assignment it names is still live (src/tasks/mod.rs:122-125). A binding can
+/// therefore carry an id whose assignment row is gone — revoked, retired, or
+/// never persisted — and the typed disposable-review lease still settles the
+/// task.
+///
+/// Containment today is a neighbour, not this predicate: `revoke` and `retire`
+/// both call `cancel_review_assignment_task` first, so the task is already
+/// terminal by the time the id goes stale, and `transfer` — the one path that
+/// keeps the task alive — has no callers in src/. This test puts the predicate
+/// in exactly the state those neighbours happen to prevent: assignment absent,
+/// task live. It is deliberately NOT written by calling `revoke`, because that
+/// cancels the task and the settle would then fail for the neighbour's reason
+/// rather than the guard's.
+///
+/// The sibling path does revalidate rather than assume — pr_state/mod.rs:1740-1762
+/// re-checks under the assignment branch lock "so revoke/transfer cannot cross
+/// the final check→PR-state mutation boundary".
+#[test]
+fn task_done_refuses_a_disposable_review_lease_whose_assignment_is_not_live() {
+    let (home, id, _repo, _branch) =
+        s1_fixture("s1-dead-assignment", "review-branch-drift-dead-assignment");
+
+    let binding = crate::binding::read(&home, "dev-agent").expect("binding");
+    let assignment_id = binding["review_assignment_id"]
+        .as_str()
+        .expect("the typed lease carries an assignment id");
+    let parsed = uuid::Uuid::parse_str(assignment_id).expect("id parses — all the guard checks");
+    assert!(
+        crate::daemon::assignment_authority::lookup_by_assignment_id_strict(&home, parsed).is_err(),
+        "precondition: no assignment row answers to the id this lease carries"
+    );
+
+    let done = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+
+    assert!(
+        done.get("error").is_some(),
+        "a lease naming an assignment that is not live must not settle the task: {done}"
+    );
+    assert_eq!(
+        read_task_record(&home, &id).expect("task").status,
+        crate::task_events::TaskStatus::Claimed,
+        "and the task must stay open"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
