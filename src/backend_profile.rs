@@ -642,7 +642,7 @@ fn claudecode_profile() -> BackendProfile {
                 // trailing "to continue or switch models…" clause is dropped
                 // for the same drift reason.
                 AgentState::UsageLimit,
-                r"⎿[ \t]+You've reached your [^\n]{0,32}? limit\. Run /usage-credits|You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low|credit_balance_too_low",
+                r"⎿[ \t]+You've reached your [^\n]{0,32}? limit\.[ \t]+Run /usage-credits|You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low|credit_balance_too_low",
             ),
             (
                 // #2090 P2: the broad `context.*(full|limit)` arm is replaced by a
