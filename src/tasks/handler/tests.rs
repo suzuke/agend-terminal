@@ -3947,3 +3947,108 @@ fn revoke_cancels_the_review_task_before_removing_the_row() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// Where a non-assignee's authority to settle actually comes from.
+///
+/// `CompletionGate::NotApplicable(NotTheAssignee)` is not a permit — it says the
+/// guard had no opinion. The permission is granted upstream by
+/// `can_mutate_record`, which admits `is_orchestrator_of` and the owner's team
+/// orchestrator. This pins that the ACL is the decider, so anyone reading the
+/// guard and concluding "only the assignee can settle a branch-carrying task"
+/// is corrected by a test rather than by an incident.
+///
+/// This is deliberately NOT a proposal to change the permission. The fleet uses
+/// it: an orchestrator closes a review task for a reviewer who cannot settle its
+/// own. Whether it SHOULD survive is a separate question, deferred on the ticket.
+#[test]
+fn a_team_orchestrator_settles_a_non_owned_branch_task_by_the_acl_not_the_guard() {
+    let home = tmp_home("acl-decides-not-the-guard");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "teams:\n  dev:\n    members: [dev-lead, dev-impl-2]\n    \
+         orchestrator: dev-lead\n    created_at: \"2026-04-27T00:00:00Z\"\n",
+    )
+    .expect("write fleet.yaml");
+    let created = handle(
+        &home,
+        "dev-lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "branch-carrying work",
+            "assignee": "dev-impl-2",
+            "branch": "feat/owned-by-someone-else",
+        }),
+    );
+    let id = created["id"].as_str().expect("task id").to_string();
+    handle(
+        &home,
+        "dev-impl-2",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+
+    // dev-lead holds no binding for this task and is not its assignee. The guard
+    // returns NotApplicable(NotTheAssignee); the ACL is what lets this through.
+    let done = handle(
+        &home,
+        "dev-lead",
+        &serde_json::json!({"action": "done", "id": id, "result": "settled by the orchestrator"}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "the team orchestrator settles by the ACL, with no binding of its own: {done}"
+    );
+    assert_eq!(
+        read_task_record(&home, &id).expect("task").status,
+        crate::task_events::TaskStatus::Done
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The ownerless row, pinned as it behaves today rather than as it reads.
+///
+/// A branch-retention obligation is raised with `owner: None` whenever neither
+/// the branch opener nor the origin task's creator is live
+/// (`worktree_pool::branch_cleanup`, pinned by
+/// `retention_obligation_is_orphan_tagged_when_neither_owner_nor_orchestrator_live`).
+/// Any caller can complete such a row, and the reason is upstream of this guard:
+/// `can_mutate_record` returns `true` for `owner: None` before the guard is ever
+/// consulted (acl.rs), and the guard itself only reaches
+/// `NotApplicable(Branchless)` because retention rows are deliberately branchless.
+///
+/// This is current behaviour, deliberately unchanged here: tightening it means
+/// changing `can_mutate_record`'s membership, which is out of this ticket's
+/// scope and is deferred as its own permission question. The test exists so the
+/// next reader finds the fact stated instead of inferring containment.
+#[test]
+fn an_ownerless_row_is_completable_by_any_caller_because_the_acl_admits_everyone() {
+    let home = tmp_home("ownerless-row-any-caller");
+    let created = handle(
+        &home,
+        "system:branch-retention",
+        &serde_json::json!({
+            "action": "create",
+            "title": "branch-retention: confirm 'feat/orphaned' is still needed",
+        }),
+    );
+    let id = created["id"].as_str().expect("task id").to_string();
+    let record = read_task_record(&home, &id).expect("task");
+    assert!(
+        record.owner.is_none(),
+        "precondition: the row is ownerless, the shape branch_cleanup projects"
+    );
+    assert!(
+        record.branch.is_none(),
+        "precondition: retention rows are branchless by design"
+    );
+
+    let done = handle(
+        &home,
+        "an-unrelated-agent",
+        &serde_json::json!({"action": "done", "id": id, "result": "delete: not mine"}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "current behaviour: an unrelated caller completes an ownerless row: {done}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

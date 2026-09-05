@@ -124,19 +124,68 @@ fn lease_assignment_still_authorizes(
 
 /// Gate completion by the assignee's bound branch state. Non-assignees (the
 /// orchestrator/system paths) and branchless tasks retain their existing ACL.
+/// What [`assignee_completion_guard`] actually decided.
+///
+/// It used to return `Result<Option<MergeReceipt>, String>`, where `Ok(None)`
+/// said two unrelated things: "this guard has no opinion about this call" and
+/// "the assignee's binding checked out and there is no receipt to carry". Both
+/// call sites read it as permit, which is how the predicate came to look like a
+/// containment boundary it is not. Splitting the two apart does not move a
+/// single permission — it forces each caller to say WHY it proceeds.
+pub(crate) enum CompletionGate {
+    /// The guard has no opinion; upstream authority is the only authority that
+    /// ran. It is NOT a statement that the caller is allowed.
+    NotApplicable(GateInapplicable),
+    /// The assignee's binding, or an unconsumed merge receipt, checked out.
+    Permit(Option<crate::merge_receipt::MergeReceipt>),
+    /// The assignee failed the binding check.
+    Deny(String),
+}
+
+/// Why the guard had no opinion. The two reasons reach different callers and
+/// mean different things, so they are not collapsed into one variant.
+pub(crate) enum GateInapplicable {
+    /// The task carries no branch, so there is no binding to check.
+    Branchless,
+    /// The caller is not the task's assignee. `can_mutate_record` upstream is
+    /// then the only gate that ran, and it admits system identities,
+    /// `is_orchestrator_of`, and the owner's team orchestrator (see
+    /// [`crate::tasks::acl`]) — so this variant must never be read as
+    /// owner-only containment.
+    NotTheAssignee,
+}
+
 pub(crate) fn assignee_completion_guard(
     home: &Path,
     task_id: &str,
     caller: &str,
     record: &crate::task_events::TaskRecord,
-) -> Result<Option<crate::merge_receipt::MergeReceipt>, String> {
+) -> CompletionGate {
     let Some(branch) = record.branch.as_deref() else {
-        return Ok(None);
+        return CompletionGate::NotApplicable(GateInapplicable::Branchless);
     };
     if record.owner.as_ref().map(|owner| owner.0.as_str()) != Some(caller) {
-        return Ok(None);
+        return CompletionGate::NotApplicable(GateInapplicable::NotTheAssignee);
     }
 
+    match assignee_binding_check(home, task_id, caller, branch) {
+        Ok(receipt) => CompletionGate::Permit(receipt),
+        Err(reason) => CompletionGate::Deny(reason),
+    }
+}
+
+/// The half of the guard that actually CHECKS something: the caller is the
+/// assignee of a branch-carrying task, and this decides whether their binding
+/// (or an unconsumed merge receipt) backs the completion. Kept as a `Result` so
+/// the failure paths stay a plain `?`; the caller-facing three-state answer is
+/// assembled by [`assignee_completion_guard`], which is also where the two
+/// "no opinion" cases are decided — before any of this runs.
+fn assignee_binding_check(
+    home: &Path,
+    task_id: &str,
+    caller: &str,
+    branch: &str,
+) -> Result<Option<crate::merge_receipt::MergeReceipt>, String> {
     let Some(binding) = crate::binding::read(home, caller) else {
         return crate::merge_receipt::find_for_task_completion(home, task_id, caller)
             .map(Some)

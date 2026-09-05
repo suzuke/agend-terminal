@@ -101,8 +101,23 @@ fn auto_close_on_report_with_mode(
         None
     } else {
         match super::assignee_completion_guard(home, correlation_id, reporter, record) {
-            Ok(receipt) => receipt,
-            Err(reason) => return Err(anyhow::anyhow!(reason)),
+            super::CompletionGate::Permit(receipt) => receipt,
+            super::CompletionGate::Deny(reason) => return Err(anyhow::anyhow!(reason)),
+            // This caller does NOT share handler.rs's reading, and the
+            // difference is deliberate rather than an oversight to resolve.
+            // `NotTheAssignee` is unreachable here: the assignee check at the
+            // top of this function returned before the guard was ever called,
+            // so no non-assignee reaches this line. `Branchless` is reachable
+            // and is a permit — a task with no branch has no binding to prove,
+            // and refusing it would break auto-close for every branchless task.
+            super::CompletionGate::NotApplicable(super::GateInapplicable::Branchless) => None,
+            super::CompletionGate::NotApplicable(super::GateInapplicable::NotTheAssignee) => {
+                debug_assert!(
+                    false,
+                    "auto_close refuses non-assignees before calling the guard"
+                );
+                return Ok(false);
+            }
         }
     };
     let summary = if report_text.chars().count() > 200 {

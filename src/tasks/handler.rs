@@ -883,13 +883,22 @@ fn handle_done(
         });
     }
     let completion_receipt = match super::assignee_completion_guard(home, &id, &caller, &record) {
-        Ok(receipt) => receipt,
-        Err(reason) => {
+        super::CompletionGate::Permit(receipt) => receipt,
+        super::CompletionGate::Deny(reason) => {
             return serde_json::json!({
                 "error": reason,
                 "code": "assignee_completion_blocked",
             })
         }
+        // NOT a permit — the guard had no opinion, and the only authority that
+        // ran for this caller is `can_mutate_record` above. That ACL admits
+        // system identities, `is_orchestrator_of` and the owner's team
+        // orchestrator, so a non-assignee arriving here was authorized THERE.
+        // Whether it should be is a separate question about who may settle;
+        // this arm only makes it visible that the guard is not what decided.
+        super::CompletionGate::NotApplicable(
+            super::GateInapplicable::Branchless | super::GateInapplicable::NotTheAssignee,
+        ) => None,
     };
     // #1265: transition enforcement for done action.
     if !record
