@@ -925,6 +925,15 @@ fn build_command(
     // after the clear, exactly like AGEND_INSTANCE_NAME above.
     if let Some(h) = *home {
         cmd.env("AGEND_HOME", h);
+        // #1504 family (t-…-65): the agentic-git shim on the agent's PATH derives
+        // its own self-exclusion dir from AGENTIC_GIT_HOME, falling back to
+        // AGEND_HOME. Tests that scope AGEND_HOME to a temp dir (ScopedAgendHome)
+        // and then spawn `git` otherwise make the shim resolve to itself and trip
+        // its recursion guard. Pin the PRIMARY name to the daemon home so the shim
+        // keeps knowing where its own binary lives whatever the crate's home is
+        // scoped to. Same deny-list class as AGEND_HOME, so a fleet.yaml / template
+        // env cannot redirect it (the caller-env loop below skips sensitive keys).
+        cmd.env("AGENTIC_GIT_HOME", h);
     }
 
     // #2413 Shadow Observer — LOCAL plane (default-ON; `AGEND_SHADOW_OBSERVER=0` disables).

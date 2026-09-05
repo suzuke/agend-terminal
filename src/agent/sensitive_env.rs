@@ -45,4 +45,8 @@ pub(super) const SENSITIVE_ENV_KEYS: &[&str] = &[
     // the spawned agent to a different home / break MCP config discovery
     "AGEND_HOME",
     "AGEND_INSTANCE_NAME",
+    // #1504 family: the git shim's own home (primary name; AGEND_HOME is its
+    // legacy fallback). Redirecting it moves the shim's self-exclusion dir and
+    // audit log — the daemon pins it at spawn, nothing else may set it.
+    "AGENTIC_GIT_HOME",
 ];

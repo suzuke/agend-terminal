@@ -99,6 +99,7 @@ Stage 1 閘門是**以值判定**（必須等於 `"1"`）；關閉時它會以
 | `AGEND_GIT_BYPASS_UNTIL` | Layer-3 有時限的豁免：在 now < 指定 epoch 之前 bypass。 | 無時間豁免。 | **Unix epoch 秒數**（`u64`，非 ISO）。 | `src/bin/agend-git.rs:188` | ⚠️ 過期／無法解析 → 不 bypass。 |
 | `AGEND_GIT_SHIM_DEPTH` | 遞迴防護，會傳遞到 spawn 出來的 git；在 `MAX_SHIM_DEPTH = 3` 時 hard-fail。 | `0`。 | 非負 `u32`；無法解析 → 0。 | `src/bin/agend-git.rs:33`（讀取）；於 `:1279`、`:1310` 設定 | 內部 sentinel；正常情況下不由使用者設定。`>= 3` 時 exit 70（#1504）。 |
 | `AGEND_REAL_GIT` | escape hatch，存放真實 git 二進位檔的路徑，讓 shim 能 exec git 而不遞迴。Daemon 在 agent spawn 時注入。 | Shim：未設定 → 退回字面 `"git"`，再走 PATH-exclude 解析。Daemon：只在尚未設定時注入。 | 指向 git 可執行檔的絕對路徑；只有檔案存在時才接受。 | `src/bin/agend-git.rs:1338`（讀取）；於 `src/agent/mod.rs:835` 注入 | ⚠️ Correctness-sensitive：錯誤／缺漏的值有遞迴 spawn 風暴的風險（#1504）。 |
+| `AGENTIC_GIT_HOME` | agentic-git shim 自己的 home（主名；`AGEND_HOME` 是它的舊名 fallback）：shim 會把這個目錄的 `bin/` 從交給真實 git 的 PATH 中排除，並把稽核紀錄寫在這裡。Daemon 在 agent spawn 時把它釘在 daemon home（#1504 家族）。 | Shim：未設定 → 退回 `AGEND_HOME`。Daemon：只要知道 home 就會注入。 | 絕對目錄路徑，等於注入的 `AGEND_HOME`。 | `src/agent/mod.rs:936`（`build_command`，緊鄰 `AGEND_HOME`）；由 `vendor/agentic-git/crates/agentic-git/src/lib.rs:36` 讀取 | ⚠️ 列於 `SENSITIVE_ENV_KEYS`：fleet.yaml／template env 無法改寫它。沒有這個釘住值時，把 `AGEND_HOME` 限定到暫存目錄（`ScopedAgendHome`）再 spawn `git` 的測試會讓 shim 解析到自己並觸發遞迴防護（agent shell 內約 40 個必定失敗；CI 的 PATH 上沒有 shim）。 |
 
 ---
 
