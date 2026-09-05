@@ -4,10 +4,21 @@
 //! so `watches: []` never means "no watch exists" — four such readings in two
 //! days (#3524, #3521, #3526, #3527) were made by a non-subscriber and each
 //! ended in a needless manual re-arm of a live watch. The response therefore
-//! names its scope and counts what it hid on the requested repo/branch filter.
-//! The hint states the one thing a re-arm actually does: an explicit
-//! `review_class` reconciles the PR gate and recomputes readiness (see
-//! `handle_watch_ci`); a bare `ci watch` only adds a subscriber.
+//! names its scope and counts what it hid — after the caller's repo/branch
+//! filter, or across all watches when none was given.
+//!
+//! The hint says exactly what a re-arm does (t-…-110, #3531 R1 F1/F2 — every
+//! clause below was checked against `handle_watch_ci` and
+//! `watch_start_check_mergeable`, not against a description of them):
+//! - `ci watch … review_class=single|dual` subscribes the caller AND reconciles
+//!   the PR gate with a readiness recompute (watch.rs, the
+//!   `if let Some(requested) = requested_review_class` block).
+//! - a bare `ci watch` on an existing watch subscribes the caller and runs the
+//!   #813 on-watch-start mergeable check, which writes `last_mergeable_state` /
+//!   `last_mergeable_check_at` into the watch file and, when the PR is
+//!   CONFLICTING, sends `[ci-conflict-detected]` to every subscriber
+//!   (poller.rs `watch_start_check_mergeable` → `emit_ci_conflict_alert`). It
+//!   does not reset `last_polled_at` and does not recompute readiness.
 //!
 //! Split out of `watch.rs` so that file stays under the handler LOC invariant.
 
@@ -20,12 +31,21 @@ pub(super) fn scope_label(instance_name: &str) -> String {
     }
 }
 
-/// The `hint` field, present only when `hidden_watches > 0`.
-pub(super) fn hidden_hint(hidden_watches: usize) -> String {
+/// The `hint` field, present only when `hidden_watches > 0`. `filtered` says
+/// whether the caller narrowed the view with `repository`/`branch`, so the
+/// count is described as what it actually is.
+pub(super) fn hidden_hint(hidden_watches: usize, filtered: bool) -> String {
+    let where_counted = if filtered {
+        "matching your repo/branch filter"
+    } else {
+        "across all watches (no filter given)"
+    };
     format!(
-        "{hidden_watches} watch(es) exist on the requested repo/branch that you are not \
-         subscribed to; `ci status` is subscriber-scoped. `ci watch repository=<owner/repo> \
-         branch=<branch> review_class=single|dual` adds you as a subscriber and forces a \
-         readiness recompute; a bare `ci watch` only subscribes."
+        "{hidden_watches} watch(es) exist {where_counted} that you are not subscribed to; \
+         `ci status` is subscriber-scoped. `ci watch repository=<owner/repo> branch=<branch> \
+         review_class=single|dual` adds you as a subscriber and forces a readiness recompute; \
+         a bare `ci watch` subscribes you and runs the on-watch mergeable check (writes \
+         last_mergeable_state; may send `[ci-conflict-detected]` to every subscriber) but \
+         does not recompute readiness."
     )
 }
