@@ -2981,6 +2981,9 @@ fn claude_model_tier_limit_banner_latches_regardless_of_model_name() {
         "⎿  You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.",
         // Any future rename must land the same way.
         "⎿  You've reached your Opus 5 limit. Run /usage-credits to continue or switch models with /model.",
+        // A DOTTED point release is the live shape — the statusline of the
+        // pane that motivated this test reads `Model: Fable 5.1`.
+        "⎿  You've reached your Fable 5.1 limit. Run /usage-credits to continue or switch models with /model.",
     ] {
         let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
         t.feed(banner);
