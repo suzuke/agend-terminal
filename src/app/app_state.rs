@@ -1030,23 +1030,125 @@ impl AppState {
             });
         let mut to_add: Vec<String> = names.to_add.into_iter().collect();
         to_add.sort();
-        for name in &to_add {
+        let mut pane_builder = |name: &str, layout: &mut Layout| {
             let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
-            match pane_factory::create_remote_pane(
+            pane_factory::create_remote_pane(
                 name,
                 home,
                 fleet_path,
-                &mut self.ui.layout,
+                layout,
                 dc.saturating_sub(2),
                 dr.saturating_sub(4),
                 wakeup_tx,
-            ) {
+            )
+        };
+        self.place_remote_team_grouped(&to_add, home, &mut pane_builder);
+        let mut gone: Vec<String> = names.gone.into_iter().collect();
+        gone.sort();
+        for name in &gone {
+            tracing::warn!(
+                agent = %name,
+                "daemon-side agent gone; pane retained with stale output",
+            );
+            self.known_remote_agents.remove(name);
+        }
+    }
+
+    // #3501: team-grouped placement for hot-reload — mirrors
+    // session::place_agents_team_grouped. `to_add` is already sorted.
+    fn place_remote_team_grouped(
+        &mut self,
+        to_add: &[String],
+        home: &std::path::Path,
+        pane_builder: &mut dyn FnMut(&str, &mut Layout) -> anyhow::Result<Pane>,
+    ) {
+        let teams = crate::teams::list_all(home);
+        let mut team_members: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut standalone: Vec<String> = Vec::new();
+        for name in to_add {
+            if let Some(team) = teams.iter().find(|t| t.members.contains(name)) {
+                team_members
+                    .entry(team.name.clone())
+                    .or_default()
+                    .push(name.clone());
+            } else {
+                standalone.push(name.clone());
+            }
+        }
+        // Team-grouped: each team shares one tab named after the team. Hot
+        // reload deliberately searches all tabs (rather than only the active
+        // tab) so a late member joins an already-open team tab. Team and
+        // standalone names share the tab-name namespace, so callers should
+        // avoid assigning the same name to both.
+        for (team_name, members) in &team_members {
+            let team = teams.iter().find(|t| t.name == *team_name);
+            let orchestrator = team.and_then(|t| t.orchestrator.as_deref());
+            let mut sorted = members.clone();
+            sorted.sort_by(|a, b| {
+                let a_is_orch = orchestrator == Some(a.as_str());
+                let b_is_orch = orchestrator == Some(b.as_str());
+                b_is_orch.cmp(&a_is_orch).then(a.cmp(b))
+            });
+            for name in &sorted {
+                // #3501: if the agent already has a retained pane (disconnected
+                // but not removed), reconnect in place to avoid duplicating the
+                // leaf — preserves the existing team tab/split.
+                let already_has_pane = self.ui.layout.find_agent_pane(name).is_some();
+                match pane_builder(name, &mut self.ui.layout) {
+                    Ok(pane) => {
+                        let tab_name = pane.agent_name.clone();
+                        self.known_remote_agents.insert(tab_name.to_string());
+                        if already_has_pane {
+                            // Reuse retained pane (same as standalone's reconnect).
+                            self.ui
+                                .layout
+                                .reconnect_or_append_agent_pane(&tab_name, pane);
+                            tracing::info!(
+                                agent = %name,
+                                team = %team_name,
+                                "reused retained team pane for re-appeared remote agent"
+                            );
+                        } else if let Some(idx) = self
+                            .ui
+                            .layout
+                            .tabs
+                            .iter()
+                            .position(|tab| tab.name == *team_name)
+                        {
+                            let tab = &mut self.ui.layout.tabs[idx];
+                            tab.split_focused(crate::layout::SplitDir::Horizontal, pane);
+                            tracing::info!(
+                                agent = %name,
+                                team = %team_name,
+                                "added team member pane via split"
+                            );
+                        } else {
+                            // First new member of this team batch — create team tab.
+                            let tab = crate::layout::Tab::new(team_name.clone(), pane);
+                            self.ui.layout.add_tab(tab);
+                            tracing::info!(
+                                agent = %name,
+                                team = %team_name,
+                                "opened team tab for newly-appeared remote agent"
+                            );
+                        }
+                        self.needs_resize = true;
+                    }
+                    Err(e) => tracing::warn!(
+                        agent = %name,
+                        error = %e,
+                        "remote pane attach failed during sync",
+                    ),
+                }
+            }
+        }
+        // Standalone: per-agent tabs as before.
+        for name in &standalone {
+            match pane_builder(name, &mut self.ui.layout) {
                 Ok(pane) => {
                     let tab_name = pane.agent_name.clone();
                     self.known_remote_agents.insert(tab_name.to_string());
-                    // This sync is add-only: a gone agent's pane is retained
-                    // for scrollback. Reconnect that leaf in place when the
-                    // agent reappears, including inside an operator split.
                     if self
                         .ui
                         .layout
@@ -1070,15 +1172,6 @@ impl AppState {
                     "remote pane attach failed during sync",
                 ),
             }
-        }
-        let mut gone: Vec<String> = names.gone.into_iter().collect();
-        gone.sort();
-        for name in &gone {
-            tracing::warn!(
-                agent = %name,
-                "daemon-side agent gone; pane retained with stale output",
-            );
-            self.known_remote_agents.remove(name);
         }
     }
 
@@ -1131,6 +1224,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::PaneSource;
     use std::collections::HashSet;
 
     fn closed_before_attach_registry_survives(unmanaged: bool) -> bool {
@@ -1199,6 +1293,30 @@ mod tests {
         }
         std::fs::remove_dir_all(home).ok();
         survives
+    }
+
+    fn test_remote_pane(layout: &mut Layout, agent: &str) -> anyhow::Result<Pane> {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        Ok(Pane {
+            agent_name: agent.into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: crate::vterm::VTerm::new(10, 10),
+            rx,
+            id: layout.next_pane_id(),
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: Some(agent.into()),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        })
     }
 
     #[test]
@@ -1284,5 +1402,87 @@ mod tests {
     #[test]
     fn closed_before_attach_preserves_managed_agent() {
         assert!(closed_before_attach_registry_survives(false));
+    }
+
+    #[test]
+    fn hot_reload_team_grouped_places_team_in_one_tab() {
+        // Simulate a team svc with members svc-a, svc-b and orchestrator svc-a,
+        // plus a standalone solo. to_add = [svc-a, svc-b, solo] should yield
+        // 2 tabs: svc (with svc-a, svc-b) and solo.
+        let home = std::env::temp_dir().join(format!(
+            "agend-test-hot-reload-team-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        // Create fleet entries first so team create can merge into fleet.yaml
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  svc-a:\n    backend: shell\n  svc-b:\n    backend: shell\n  svc-c:\n    backend: shell\n  solo:\n    backend: shell\n",
+        )
+        .expect("write fleet.yaml");
+        // Create a team svc with svc-a, svc-b, orchestrator svc-a
+        let res = crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "svc", "members": ["svc-a", "svc-b", "svc-c"], "orchestrator": "svc-a"}),
+        );
+        assert_eq!(
+            res["status"],
+            serde_json::Value::String("created".to_string()),
+            "create team failed: {res}"
+        );
+
+        // Use the real production placement path with only pane construction
+        // replaced, so this test fails if grouping or ordering is disabled.
+        let to_add = vec!["svc-a".to_string(), "svc-b".to_string(), "solo".to_string()];
+        let mut state = AppState::new();
+        let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
+        state.place_remote_team_grouped(&to_add, &home, &mut pane_builder);
+
+        let team_tab = state
+            .ui
+            .layout
+            .tabs
+            .iter()
+            .find(|tab| tab.name == "svc")
+            .expect("team tab named svc");
+        assert_eq!(team_tab.root().pane_count(), 2);
+        assert_eq!(
+            team_tab.root().agent_names(),
+            vec!["svc-a", "svc-b"],
+            "orchestrator must be first in the initial team tab"
+        );
+
+        // A later roster tick must find the existing team tab even though the
+        // standalone tab is active after the first batch.
+        state.ui.layout.next_tab();
+        state.place_remote_team_grouped(&["svc-c".to_string()], &home, &mut pane_builder);
+
+        assert_eq!(state.ui.layout.tabs.len(), 2, "team + standalone tab");
+        let team_tab = state
+            .ui
+            .layout
+            .tabs
+            .iter()
+            .find(|tab| tab.name == "svc")
+            .expect("team tab named svc");
+        assert_eq!(team_tab.root().pane_count(), 3);
+        let team_names = team_tab.root().agent_names();
+        assert_eq!(team_names.first().map(String::as_str), Some("svc-a"));
+        let mut non_orchestrators = team_names[1..].to_vec();
+        non_orchestrators.sort();
+        assert_eq!(non_orchestrators, vec!["svc-b", "svc-c"]);
+        let solo_tab = state
+            .ui
+            .layout
+            .tabs
+            .iter()
+            .find(|tab| tab.name == "solo")
+            .expect("standalone tab named solo");
+        assert_eq!(solo_tab.root().agent_names(), vec!["solo"]);
+        std::fs::remove_dir_all(&home).ok();
     }
 }
