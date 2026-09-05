@@ -2414,7 +2414,7 @@ fn teardown_api_calls_not_under_flock() {
         .find(&["acquire_file", "_lock"].concat())
         .expect("teardown locks the record removal");
     let delete_at = body
-        .find("delete_instance(")
+        .find("delete_instance_with_exit_status(")
         .expect("teardown invokes the typed DELETE owner");
     assert!(
         delete_at < lock_at,
@@ -2477,7 +2477,11 @@ fn deployment_runtime_dispatch_forwards_typed_capability_slice14() {
         !deployments.contains("HandlerCtx") && !deployments.contains("RuntimeContext"),
         "deployments owner must not depend on MCP HandlerCtx/RuntimeContext"
     );
-    for needle in ["spawn_instance(", "team_ops::create", "delete_instance("] {
+    for needle in [
+        "spawn_instance(",
+        "team_ops::create",
+        "delete_instance_with_exit_status(",
+    ] {
         let body = source_function_containing(deployments, needle);
         assert!(
             !body.contains("crate::api::call"),
@@ -2772,6 +2776,63 @@ templates:
     assert!(
         !reloaded.instances.contains_key("mixed-bad"),
         "the malformed instance must not be persisted to fleet.yaml"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3505 P0(a) RED: runtime-path teardown must NAME refused instances instead
+/// of reporting a clean `torn_down`. A never-exiting child forces the
+/// child-exit refusal path; the deployment record must survive and the
+/// result must carry the residual names for an actionable retry.
+#[test]
+fn teardown_runtime_path_names_refused_instances_3505() {
+    let home = deploy_single_instance_for_test("teardown-partial-3505", "svc");
+    // Plant a never-exiting child for svc-worker, wired through fleet.yaml
+    // so `resolve_uuid` hits this registry entry (mirrors
+    // `daemon::lifecycle::tests` refusal fixtures).
+    let handle = crate::daemon::lifecycle::test_support::never_exiting_handle("svc-worker");
+    let worker_id = handle.id;
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances:\n  svc-worker:\n    backend: claude\n    id: {}\n",
+            worker_id.full(),
+        ),
+    )
+    .expect("write fleet.yaml with id");
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    registry.lock().insert(worker_id, handle);
+    let configs = crate::api::ConfigRegistry::default();
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+    // Force the timeout path in ~100ms instead of the real 5s budget.
+    let _deadline = crate::daemon::lifecycle::set_child_exit_timeout_for_test(
+        std::time::Duration::from_millis(100),
+    );
+    let result = teardown_with_runtime(&home, &serde_json::json!({"name": "svc"}), Some(&runtime));
+
+    assert_ne!(
+        result.get("status").and_then(|s| s.as_str()),
+        Some("torn_down"),
+        "a refused delete must NOT report clean torn_down: {result}"
+    );
+    let residuals = result
+        .get("residuals")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        residuals.iter().any(|r| r.as_str() == Some("svc-worker")),
+        "refused instance must be named in residuals: {result}"
+    );
+    assert!(
+        load(&home).deployments.iter().any(|d| d.name == "svc"),
+        "the deployment record must survive a partial teardown so retry stays possible"
     );
     std::fs::remove_dir_all(&home).ok();
 }
