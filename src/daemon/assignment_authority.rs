@@ -43,6 +43,10 @@ pub(crate) const SCHEMA_VERSION: u32 = 2;
 /// repair, so two ticks inside one interval produce at most one repair.
 const FIXED_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Short retry lease used when an actionable-unread wake is fenced or queue-full
+/// (#3504). Bounded (5s) so a failed wake is retried quickly without flooding.
+const SHORT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Outbox row lifecycle. `Pending` = the record is persisted but no durable inbox
 /// row is confirmed yet (crash-before-enqueue window); `Persisted` = a row
 /// carrying the current nonce is durably enqueued.
@@ -480,6 +484,82 @@ fn add_interval(now: &str) -> String {
         })
         .map(|t| t.to_rfc3339())
         .unwrap_or_else(|| now.to_string())
+}
+
+/// `now + SHORT_RETRY_INTERVAL` as RFC3339. Used when a wake is fenced or
+/// queue-full (#3504) so the next reconcile retries quickly (5s) without
+/// flooding. Degrades to `now` verbatim on unparseable input.
+fn add_short_interval(now: &str) -> String {
+    parse_ts(now)
+        .and_then(|n| {
+            chrono::Duration::from_std(SHORT_RETRY_INTERVAL)
+                .ok()
+                .and_then(|d| n.checked_add_signed(d))
+        })
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| now.to_string())
+}
+
+/// Advance the FIXED-interval lease after a successful actionable-unread wake
+/// (#3504). Caller has already proven `assignment_id` still current via
+/// `repair_row`; this re-checks CAS before writing.
+pub(crate) fn advance_lease_after_wake(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+    now: &str,
+    expected_id: uuid::Uuid,
+) -> anyhow::Result<bool> {
+    let _lock = lock_branch(home, repo, branch)?;
+    let path = record_file(home, repo, branch, target);
+    if let Ok(Some(mut cur)) = read_record(&path) {
+        if cur.assignment_id == expected_id {
+            cur.next_nudge_at = add_interval(now);
+            atomic_write_json(&path, &cur)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Set a short retry lease after a fenced / queue-full wake failure (#3504).
+/// Bounded at 5s so the next reconcile retries quickly without advancing the
+/// full 60s invisibly. CAS on `assignment_id`. `reason` is the caller-known
+/// failure class (e.g. "fenced", "queue-full", "stale-teardown",
+/// "adapter-failed") and is emitted verbatim in both tracing and the durable
+/// event_log so the #3504 diagnostic record is trustworthy.
+pub(crate) fn set_short_retry_lease(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+    now: &str,
+    expected_id: uuid::Uuid,
+    reason: &str,
+) -> anyhow::Result<bool> {
+    let _lock = lock_branch(home, repo, branch)?;
+    let path = record_file(home, repo, branch, target);
+    if let Ok(Some(mut cur)) = read_record(&path) {
+        if cur.assignment_id == expected_id {
+            cur.next_nudge_at = add_short_interval(now);
+            atomic_write_json(&path, &cur)?;
+            tracing::warn!(
+                repo = %repo, branch = %branch, target = %target,
+                next_nudge_at = %cur.next_nudge_at,
+                reason = %reason,
+                "review assignment wake {reason} — short retry lease set"
+            );
+            crate::event_log::log(
+                home,
+                "review_assignment_wake_retry",
+                target,
+                &format!("wake for {repo}@{branch} {reason} at {now}; short retry lease set"),
+            );
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // ─────────────────────────── message builders ───────────────────────────
@@ -975,16 +1055,32 @@ pub(crate) fn repair_row(
     // missing or superseded row proceeds to the append-only repair below.
     // However, an actionable-unread row still needs a wake so the reviewer
     // notices the assignment; read/delivering rows do not wake.
+    //
+    // #3504 fix: for actionable-unread we MUST NOT advance `next_nudge_at`
+    // BEFORE the wake outcome is known. The old code advanced the 60s lease
+    // then swallowed the `wake_review_assignment` result — a fenced/queue-full
+    // wake left the row unread with lease advanced and ledger empty (invisible).
+    // Now `repair_row` leaves the lease untouched for actionable-unread and
+    // lets the caller advance it only after a successful wake, or set a short
+    // 5s retry on fenced/queue-full (bounded, not flooding). Read/delivering
+    // (needs_wake=false) still advances the lease here (no wake needed).
     if crate::inbox::storage::nonce_present_not_superseded(home, target, &record.delivery_nonce) {
         let needs_wake =
             crate::inbox::storage::nonce_present_actionable(home, target, &record.delivery_nonce);
-        if let Ok(Some(mut cur)) = read_record(&path) {
-            if cur.assignment_id == record.assignment_id {
-                cur.next_nudge_at = add_interval(now);
-                atomic_write_json(&path, &cur)?;
+        if !needs_wake {
+            // read/delivering — no wake, but lease still advances (bounded, no flood).
+            if let Ok(Some(mut cur)) = read_record(&path) {
+                if cur.assignment_id == record.assignment_id {
+                    cur.next_nudge_at = add_interval(now);
+                    atomic_write_json(&path, &cur)?;
+                }
             }
+            return Ok(false);
         }
-        return Ok(needs_wake);
+        // actionable-unread — leave lease untouched; the delivery worker will
+        // advance on wake success or set a short retry on failure (#3504). This keeps
+        // the row visibly due for retry instead of silently leased forward.
+        return Ok(true);
     }
     let old_nonce = record.delivery_nonce.clone();
     let new_nonce = uuid::Uuid::new_v4().to_string();

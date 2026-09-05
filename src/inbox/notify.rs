@@ -650,15 +650,31 @@ pub(crate) fn renudge_actionable_unread(
     }
 }
 
-/// t-…-17 A3: best-effort self-IPC WAKE pointer nudging `target` to drain a
-/// reviewer-assignment inbox row that the durable outbox store already enqueued
-/// (A1/A2 or an A4 repair). A pure PTY wake — OFFLOADED to the delivery worker via
-/// [`inject_with_submit`], so the caller thread never blocks — and NEVER a new inbox
-/// row (the durable row is the store's, keyed by its `delivery_nonce`). MUST be
-/// called OUTSIDE every daemon lock (dispatch A3 / reconciler A3 both collect the
-/// target set under no lock and fire here after releasing); best-effort — a full
-/// queue / absent worker is swallowed.
-pub(crate) fn wake_review_assignment(home: &Path, target: &str) {
+/// A3 wake variant carrying the assignment identity through the worker. Lease
+/// advancement is deferred until the worker has a durable adapter outcome.
+pub(crate) fn wake_review_assignment_result_for_assignment(
+    home: &Path,
+    target: &str,
+    repo: &str,
+    branch: &str,
+    assignment_id: uuid::Uuid,
+    lease_now: &str,
+) -> Result<u64, crate::daemon::delivery_worker::TransportEnqueueError> {
+    let assignment_wake = crate::daemon::delivery_worker::AssignmentWakeContext {
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        target: target.to_string(),
+        assignment_id,
+        lease_now: lease_now.to_string(),
+    };
+    wake_review_assignment_result_with_context(home, target, assignment_wake)
+}
+
+fn wake_review_assignment_result_with_context(
+    home: &Path,
+    target: &str,
+    assignment_wake: crate::daemon::delivery_worker::AssignmentWakeContext,
+) -> Result<u64, crate::daemon::delivery_worker::TransportEnqueueError> {
     let (inbox_count, _) = storage::unread_count(home, target);
     let now_field = operator_now_field();
     let pointer = build_pending_pointer(
@@ -668,8 +684,42 @@ pub(crate) fn wake_review_assignment(home: &Path, target: &str) {
         inbox_count,
         &now_field,
     );
-    if let Err(e) = inject_with_submit(home, target, &pointer) {
-        tracing::debug!(%target, error = %e, "wake_review_assignment: best-effort inject failed");
+    let admission = crate::daemon::delivery_worker::
+        enqueue_transport_delivery_with_epoch_and_origin_and_assignment(
+            home,
+            target,
+            &pointer,
+            None,
+            Some(assignment_wake),
+        );
+    match admission {
+        Ok(epoch) => {
+            // Admission succeeded — the transport worker owns the delivery from
+            // here; no durable receipt needed for the happy path.
+            Ok(epoch)
+        }
+        Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { epoch }) => {
+            let reason = "bounded transport delivery queue full; delivery was not attempted";
+            #[cfg(test)]
+            crate::daemon::delivery_worker::test_support::run_queue_full_before_record_hook(
+                home, target, epoch,
+            );
+            // Best-effort durable trace, same semantics as the generic
+            // `finish_transport_admission` path — stale generation suppresses.
+            let _ = crate::daemon::delivery_worker::record_queue_full_drop_if_current(
+                home, target, &pointer, epoch, reason,
+            );
+            tracing::debug!(%target, epoch, "wake_review_assignment: queue full (durable drop recorded)");
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { epoch })
+        }
+        Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { epoch }) => {
+            let reason = "fenced during generation transition";
+            let _ = crate::daemon::delivery_worker::record_fenced_drop_if_current(
+                home, target, &pointer, epoch, reason,
+            );
+            tracing::debug!(%target, epoch, "wake_review_assignment: fenced (durable drop recorded)");
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { epoch })
+        }
     }
 }
 
@@ -1094,9 +1144,12 @@ fn finish_transport_admission(
                 "delivery queue full — transport delivery dropped"
             ))
         }
-        Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced) => Err(anyhow::anyhow!(
-            "transport delivery fenced during teardown or generation transition"
-        )),
+        // Fencing is a lifecycle boundary for ordinary notifications. The
+        // assignment wake path records its own durable failure because it has
+        // the assignment identity needed to retain a short retry lease.
+        Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. }) => Err(
+            anyhow::anyhow!("transport delivery fenced during teardown or generation transition"),
+        ),
     }
 }
 
