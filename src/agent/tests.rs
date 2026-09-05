@@ -1021,12 +1021,12 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
     let _arm_guard = crate::daemon::inject_delivery::test_support::arm_hook_guard();
     let mut fixture = self_kick_fixture("arm-delete-order");
     crate::daemon::hook_shadow::record_event(&fixture.name, "UserPromptSubmit", None);
-    let writer_entered = Arc::new(AtomicBool::new(false));
-    let writer_release = Arc::new(AtomicBool::new(false));
+    let (writer_entered_tx, writer_entered_rx) = std::sync::mpsc::channel();
+    let (writer_release_tx, writer_release_rx) = std::sync::mpsc::channel();
     let blocking_writer: PtyWriter = Arc::new(Mutex::new(Box::new(BlockingWriter {
         bytes: Arc::clone(&fixture.written),
-        entered: Arc::clone(&writer_entered),
-        release: Arc::clone(&writer_release),
+        entered: Some(writer_entered_tx),
+        release: writer_release_rx,
         post_release_stall: SELF_KICK_ARM_PATH_STALL,
     })));
     fixture.target.pty_writer = Arc::clone(&blocking_writer);
@@ -1061,7 +1061,11 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
     let bootstrap_id = fixture.id;
     let bootstrap_name = fixture.name.clone();
     let bootstrap_home = fixture.home.clone();
-    let _ = spawn_self_kick_bootstrap(
+    // Deliberately NOT joined before the assertions: they must hold while the
+    // bootstrap is still blocked inside the captured writer, holding the
+    // transport lane. The handle is only a liveness guard for the waits below
+    // and is joined after the last assertion for deterministic teardown.
+    let bootstrap = spawn_self_kick_bootstrap(
         bootstrap_registry,
         bootstrap_id,
         bootstrap_name,
@@ -1069,14 +1073,13 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
         std::time::Duration::from_secs(2),
         BootstrapRegistrationState::AlreadyRegistered,
         None,
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while !writer_entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    assert!(
-        writer_entered.load(Ordering::SeqCst),
-        "Legacy self-kick must reach its captured writer before delete starts"
+    )
+    .expect("self-kick bootstrap thread");
+    // The writer signals from inside the lane, at the moment it blocks.
+    recv_from_self_kick_bootstrap(
+        &writer_entered_rx,
+        &bootstrap,
+        "Legacy self-kick must reach its captured writer before delete starts",
     );
 
     let (delete_started_tx, delete_started_rx) = std::sync::mpsc::channel();
@@ -1109,12 +1112,15 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
         "delete must wait for the self-kick lane while the writer is blocked"
     );
 
-    writer_release.store(true, Ordering::SeqCst);
-    let arm_after_delete = arm_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .expect("Legacy arm observer");
+    writer_release_tx
+        .send(())
+        .expect("BlockingWriter must still be blocked on release");
+    let arm_after_delete =
+        recv_from_self_kick_bootstrap(&arm_rx, &bootstrap, "Legacy arm observer");
+    // Bounded by the delete thread's own lifetime (its sender drops on exit),
+    // not by a wall-clock budget on the bootstrap releasing the lane.
     delete_done_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
+        .recv()
         .expect("delete must complete after self-kick releases the lane");
     delete.join().expect("delete thread");
     assert!(
@@ -1125,6 +1131,7 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
         !crate::daemon::inject_delivery::is_armed_for_test(&fixture.name),
         "delete's post-acquisition forget must clear the Legacy verification arm"
     );
+    bootstrap.join().expect("self-kick bootstrap");
     clear_self_kick_fixture(&fixture);
 }
 
@@ -3841,38 +3848,36 @@ impl std::io::Write for RecordingWriter {
 /// Simulates a starved CI runner for `self_kick_legacy_arm_precedes_delete_lane_acquisition`:
 /// once the test releases the blocked PTY write, the bootstrap's arm path is
 /// held back this long before it can arm. It deliberately exceeds the 1s
-/// wall-clock budget the test used to wait on, so a bounded wait for the arm
-/// fails deterministically here instead of flaking only on a loaded runner.
-/// It stays well inside `PTY_WRITE_TIMEOUT` (5s), which bounds the whole
-/// blocked write from the bootstrap's side.
+/// wall-clock budget the test used to wait on, so re-introducing any bounded
+/// wait for the arm fails deterministically here instead of flaking only on a
+/// loaded runner. It stays well inside `PTY_WRITE_TIMEOUT` (5s), which bounds
+/// the whole blocked write from the bootstrap's side.
 const SELF_KICK_ARM_PATH_STALL: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Test-only PTY writer that blocks its first write until the test releases it.
+///
+/// `inject_with_target` runs it on the bootstrap's `pty_write_timeout` helper
+/// thread while the bootstrap itself holds the transport lane, so `entered`
+/// is the explicit "lane acquired, about to block" signal the test
+/// synchronises on. `release` is a channel rather than a flag: the test
+/// releases by sending, and a test that panics first drops its sender, which
+/// unblocks the write with an error instead of leaving the detached bootstrap
+/// behind a wall-clock self-release deadline.
 struct BlockingWriter {
     bytes: Arc<Mutex<Vec<u8>>>,
-    entered: Arc<std::sync::atomic::AtomicBool>,
-    release: Arc<std::sync::atomic::AtomicBool>,
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    release: std::sync::mpsc::Receiver<()>,
     post_release_stall: std::time::Duration,
 }
 
 impl std::io::Write for BlockingWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.bytes.lock().extend_from_slice(buf);
-        if !self.entered.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while !self.release.load(std::sync::atomic::Ordering::SeqCst)
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::yield_now();
-            }
-            if !self.release.load(std::sync::atomic::Ordering::SeqCst) {
-                // A failed ordering assertion must not leave the detached
-                // bootstrap thread spinning forever; return a visible I/O
-                // failure after the bounded self-release deadline.
-                self.release
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(entered) = self.entered.take() {
+            if entered.send(()).is_err() || self.release.recv().is_err() {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "BlockingWriter release deadline exceeded",
+                    std::io::ErrorKind::BrokenPipe,
+                    "BlockingWriter: the test went away before releasing the write",
                 ));
             }
             std::thread::sleep(self.post_release_stall);
@@ -3882,6 +3887,32 @@ impl std::io::Write for BlockingWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Wait for a signal the detached self-kick bootstrap emits, without a
+/// wall-clock budget. The wait ends when the signal arrives or when the
+/// bootstrap thread has exited without sending it; the short poll period only
+/// bounds how quickly that exit is noticed, never how long the signal may take.
+fn recv_from_self_kick_bootstrap<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    bootstrap: &std::thread::JoinHandle<()>,
+    what: &str,
+) -> T {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            Ok(value) => return value,
+            Err(RecvTimeoutError::Disconnected) => panic!("{what}: signal sender dropped"),
+            Err(RecvTimeoutError::Timeout) if !bootstrap.is_finished() => {}
+            Err(RecvTimeoutError::Timeout) => {
+                // The exit was observed after this poll timed out; a send that
+                // preceded the exit is still queued, so drain once more.
+                return rx.try_recv().unwrap_or_else(|_| {
+                    panic!("{what}: self-kick bootstrap exited without signalling")
+                });
+            }
+        }
     }
 }
 
