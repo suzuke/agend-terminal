@@ -187,6 +187,24 @@ fn status_reports_scope_and_hidden_watch_count_t67() {
             && hint.contains("readiness recompute"),
         "the hint must say what is hidden and what actually changes state: {hint}"
     );
+    // t-…-110 (#3531 R1 F2): this call gave NO filter, so the hint must not
+    // speak of a "requested repo/branch" — it must say the count spans all watches.
+    assert!(
+        hint.contains("across all watches (no filter given)")
+            && !hint.contains("requested repo/branch"),
+        "an unfiltered status must describe an unfiltered count: {hint}"
+    );
+    // t-…-110 (#3531 R1 F1): a bare `ci watch` is not side-effect free — it also
+    // runs the on-watch mergeable check (handle_watch_ci → watch_start_check_mergeable:
+    // writes last_mergeable_state, may alert every subscriber). The hint must say so,
+    // and must still say the one thing it does NOT do: recompute readiness.
+    assert!(
+        hint.contains("on-watch mergeable check")
+            && hint.contains("[ci-conflict-detected]")
+            && hint.contains("does not recompute readiness")
+            && !hint.contains("only subscribes"),
+        "the bare-watch clause must match handle_watch_ci's actual side effects: {hint}"
+    );
 
     // The anonymous CLI sees everything and hides nothing.
     let all = super::watch::handle_status_ci(&home, &json!({}), "");
@@ -194,6 +212,39 @@ fn status_reports_scope_and_hidden_watch_count_t67() {
     assert_eq!(all["scope"].as_str(), Some("all"), "{all}");
     assert_eq!(all["hidden_watches"].as_u64(), Some(0), "{all}");
     assert!(all["hint"].is_null(), "nothing hidden ⟹ no hint: {all}");
+
+    // t-…-110 (#3531 R1, opus-3's extra): a second pin that `hidden_watches` counts
+    // AFTER the repo/branch filter. Add a watch on another repo; a repo filter must
+    // hide exactly the same-repo stranger (1), not that other repo's watch too (2).
+    write_sidecar(
+        &home,
+        &crate::daemon::ci_watch::watch_filename("x/y", "feat/a"),
+        &json!({
+            "repo": "x/y",
+            "branch": "feat/a",
+            "interval_secs": 60,
+            "head_sha": null,
+            "subscribers": [{"instance": "agent-b"}],
+            "expires_at": "2099-01-01T00:00:00Z",
+        }),
+    );
+    let filtered = super::watch::handle_status_ci(&home, &json!({"repository": "o/r"}), "agent-a");
+    assert_eq!(
+        filtered["watches"].as_array().map(|w| w.len()),
+        Some(1),
+        "{filtered}"
+    );
+    assert_eq!(
+        filtered["hidden_watches"].as_u64(),
+        Some(1),
+        "the x/y watch is excluded by the filter, so it is not hidden: {filtered}"
+    );
+    let unfiltered = super::watch::handle_status_ci(&home, &json!({}), "agent-a");
+    assert_eq!(
+        unfiltered["hidden_watches"].as_u64(),
+        Some(2),
+        "without a filter both strangers' watches are hidden: {unfiltered}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -233,7 +284,14 @@ fn status_hidden_count_respects_repo_branch_filter_t67() {
     let r = status(json!({"repository": "o/r", "branch": "feat/b"}));
     assert_eq!(r["watches"].as_array().map(|w| w.len()), Some(0), "{r}");
     assert_eq!(r["hidden_watches"].as_u64(), Some(1), "{r}");
-    assert!(r["hint"].is_string(), "{r}");
+    // t-…-110 (#3531 R1 F2): a filtered call's hint must say the count is filtered.
+    let hint = r["hint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("hint expected: {r}"));
+    assert!(
+        hint.contains("matching your repo/branch filter") && !hint.contains("no filter given"),
+        "a filtered status must describe a filtered count: {hint}"
+    );
 
     // Filter on the caller's own branch: visible, nothing hidden, no hint.
     let r = status(json!({"repository": "o/r", "branch": "feat/a"}));
