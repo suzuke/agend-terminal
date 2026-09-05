@@ -814,6 +814,14 @@ pub(crate) fn teardown_with_runtime(
     };
 
     // Delete all instances (full cleanup via DELETE instead of KILL — #456).
+    // #3505 P0(a): the runtime path names refused deletes instead of
+    // reporting a silent clean `torn_down`. `delete_instance` alone cannot
+    // observe the child-exit refusal (the instance stays alive, retained
+    // for retry) — `delete_instance_with_exit_status` exposes it, and the
+    // refused names are returned as `residuals` for an actionable retry.
+    // The legacy (runtime=None) transport path cannot observe refusal, so
+    // its contract is unchanged.
+    let mut residuals: Vec<String> = Vec::new();
     if let Some(runtime) = runtime {
         let delete_context = crate::agent_ops::DeleteContext {
             registry: runtime.registry,
@@ -822,27 +830,55 @@ pub(crate) fn teardown_with_runtime(
             notifier: runtime.notifier,
         };
         for inst in &deployment.instances {
-            let _ = crate::agent_ops::delete_instance(home, inst, &delete_context, false);
+            let (_outcome, observed_exit) = crate::agent_ops::delete_instance_with_exit_status(
+                home,
+                inst,
+                &delete_context,
+                false,
+            );
+            if !observed_exit {
+                residuals.push(inst.clone());
+            }
         }
     } else {
         delete_instances_legacy(home, &deployment.instances);
     }
 
+    // #3505 P0(a): partial-teardown partition. Refused instances stay fully
+    // intact (registry + fleet.yaml + team + store record) so a retry stays
+    // possible; only fully-deleted instances proceed to file cleanup.
+    let deleted: Vec<String> = deployment
+        .instances
+        .iter()
+        .filter(|i| !residuals.contains(i))
+        .cloned()
+        .collect();
+    let deleted_deployment = Deployment {
+        instances: deleted.clone(),
+        ..deployment.clone()
+    };
+
     // Smoke 2 fix: filesystem cleanup of every spawned subdir, including
     // custom-`directory` deployments that the prior inline
     // `home/workspace/<inst>` loop missed.
-    cleanup_deployment_dirs(home, &deployment);
+    // #3505: only clean what was actually deleted — a refused instance is
+    // still alive and its workspace must survive for the retry.
+    cleanup_deployment_dirs(home, &deleted_deployment);
 
     // Symmetrical with `deploy`: we wrote entries into fleet.yaml so
     // pane_factory could render identity; teardown must remove them or
     // daemon restart would resurrect dead agents via auto_start_fleet.
-    if let Err(e) = crate::fleet::remove_instances_from_yaml(home, &deployment.instances) {
+    // #3505: only remove deleted entries — refused instances stay live.
+    if let Err(e) = crate::fleet::remove_instances_from_yaml(home, &deleted) {
         tracing::warn!(error = %e, "failed to clean up fleet.yaml on teardown");
     }
 
-    // Delete team if exists
-    if let Some(ref team) = deployment.team {
-        let _ = crate::teams::delete(home, &serde_json::json!({"name": team}));
+    // Delete team if exists — but only on FULL teardown. A partial teardown
+    // still has live residual members; deleting their team would strand them.
+    if residuals.is_empty() {
+        if let Some(ref team) = deployment.team {
+            let _ = crate::teams::delete(home, &serde_json::json!({"name": team}));
+        }
     }
 
     // #1629 (C1 lost-update): flock ONLY the store record-removal load-modify-save.
@@ -852,8 +888,16 @@ pub(crate) fn teardown_with_runtime(
         Err(e) => return serde_json::json!({"error": format!("deployment lock failed: {e}")}),
     };
     let mut store = load(home);
-    // Remove from store
-    store.deployments.retain(|d| d.name != name);
+    // #3505: partial teardown NARROWS the record to the residuals (retry
+    // stays possible via the same name); full teardown removes it.
+    if residuals.is_empty() {
+        // Remove from store
+        store.deployments.retain(|d| d.name != name);
+    } else {
+        for d in store.deployments.iter_mut().filter(|d| d.name == name) {
+            d.instances = residuals.clone();
+        }
+    }
     // #bughunt2: if the record-removal save fails, the instances are already
     // gone from fleet.yaml but the stale record lingers on disk — `list` and a
     // re-`teardown` will still show it. Surface it rather than reporting a clean
@@ -868,7 +912,24 @@ pub(crate) fn teardown_with_runtime(
         });
     }
 
-    serde_json::json!({"status": "torn_down", "name": name, "instances": deployment.instances})
+    // #3505 P0(a): partial teardown surfaces the refused names instead of
+    // a silent clean `torn_down` — the operator can retry the same name
+    // once the residual exits. Full teardown keeps the exact prior shape.
+    if residuals.is_empty() {
+        serde_json::json!({"status": "torn_down", "name": name, "instances": deployment.instances})
+    } else {
+        serde_json::json!({
+            "status": "torn_down_partial",
+            "name": name,
+            "instances": deployment.instances,
+            "deleted": deleted,
+            "residuals": residuals,
+            "hint": format!(
+                "teardown refused for {} — still live, registry + port + workspace retained; retry `teardown name={name}` once they exit",
+                residuals.join(", "),
+            ),
+        })
+    }
 }
 
 fn delete_instances_legacy(home: &Path, instances: &[String]) {
