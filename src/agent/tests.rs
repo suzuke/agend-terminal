@@ -2600,6 +2600,56 @@ fn build_command_reinjects_agend_home_under_env_isolation_med5() {
     );
 }
 
+/// t-20260905025935845604-95750-65 (#1504 family): the agentic-git shim on the
+/// spawned agent's PATH derives its own self-exclusion directory from
+/// `AGENTIC_GIT_HOME`, falling back to `AGEND_HOME`. Tests that scope
+/// `AGEND_HOME` to a temp dir (`ScopedAgendHome`) and then spawn `git` therefore
+/// make the shim resolve to itself and trip its recursion guard — about 40
+/// deterministic failures in every agent shell that CI (no shim on PATH) never
+/// sees. The daemon pins the PRIMARY name to its own home at spawn, and a
+/// caller-supplied env must not be able to redirect it (same class as
+/// `AGEND_HOME`, which the deny-list already protects).
+#[test]
+fn build_command_pins_agentic_git_home_to_daemon_home_1504() {
+    let home = std::path::PathBuf::from("/tmp/agend-1504-shim-home-pin");
+    let mut caller_env = HashMap::new();
+    caller_env.insert(
+        "AGENTIC_GIT_HOME".to_string(),
+        "/tmp/agend-1504-somewhere-else".to_string(),
+    );
+    let config = SpawnConfig {
+        name: "shim-home-pin",
+        backend: None,
+        backend_command: "echo",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: Some(&caller_env),
+        working_dir: None,
+        submit_key: "\r",
+        home: Some(&home),
+        crash_tx: None,
+        shutdown: None,
+    };
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
+    let pinned = cmd
+        .get_env("AGENTIC_GIT_HOME")
+        .expect("#1504: AGENTIC_GIT_HOME must be injected at spawn");
+    assert_eq!(
+        pinned.to_string_lossy(),
+        home.to_string_lossy(),
+        "#1504: AGENTIC_GIT_HOME must equal the daemon home the agent is spawned \
+         with, never a caller-supplied redirect"
+    );
+    assert_eq!(
+        cmd.get_env("AGEND_HOME")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some(home.to_string_lossy().into_owned()),
+        "#1504: the legacy AGEND_HOME injection stays in place beside the primary name"
+    );
+}
+
 /// #1597 helper: run `build_command` for an agy backend with the given home +
 /// workspace, returning the resulting cmd and the would-be link path. fleet.yaml
 /// pins `agy_workspace_link_base` inside `home` so tests never touch the real
