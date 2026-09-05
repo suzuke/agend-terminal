@@ -590,6 +590,9 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
     let now_secs = chrono::Utc::now().timestamp();
 
     let mut out: Vec<Value> = Vec::new();
+    // t-…-67: watches on the requested repo/branch filter that exist but the
+    // caller is not subscribed to. Counted, not shown — see the scope note below.
+    let mut hidden_watches: usize = 0;
     for entry in entries.flatten() {
         let path = entry.path();
         let watch: Value = match std::fs::read_to_string(&path)
@@ -619,6 +622,7 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
         // they're a subscriber of. Anonymous calls (empty instance)
         // see everything — useful for operator triage via the CLI.
         if !instance_name.is_empty() && !subscribers.iter().any(|s| s == instance_name) {
+            hidden_watches += 1;
             continue;
         }
         let rate_limit_until = watch["rate_limit_until"].as_i64();
@@ -718,7 +722,33 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             })
         })
         .collect();
-    let mut resp = json!({"watches": out, "pending_handoffs": pending_handoffs});
+    // t-…-67: say what this view IS. A named caller sees only the watches it
+    // subscribes to, so `watches: []` never means "no watch exists" — four such
+    // readings in two days (#3524, #3521, #3526, #3527) were made by a
+    // non-subscriber and each ended in a needless manual re-arm of a live watch.
+    // The response therefore names its scope and counts what it hid on the
+    // requested filter. The hint states the one thing a re-arm actually does:
+    // an explicit `review_class` reconciles the PR gate and recomputes readiness
+    // (see `handle_watch_ci`); a bare `ci watch` only adds a subscriber.
+    let scope = if instance_name.is_empty() {
+        "all".to_string()
+    } else {
+        format!("subscriber:{instance_name}")
+    };
+    let mut resp = json!({
+        "watches": out,
+        "pending_handoffs": pending_handoffs,
+        "scope": scope,
+        "hidden_watches": hidden_watches,
+    });
+    if hidden_watches > 0 {
+        resp["hint"] = json!(format!(
+            "{hidden_watches} watch(es) exist on the requested repo/branch that you are not \
+             subscribed to; `ci status` is subscriber-scoped. `ci watch repository=<owner/repo> \
+             branch=<branch> review_class=single|dual` adds you as a subscriber and forces a \
+             readiness recompute; a bare `ci watch` only subscribes."
+        ));
+    }
     if let Some(w) = crate::daemon::ci_watch::github_token_warning_from_env() {
         resp["setup_warning"] = json!(w);
     }
