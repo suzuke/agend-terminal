@@ -729,7 +729,8 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
         "hidden_watches": hidden_watches,
     });
     if hidden_watches > 0 {
-        resp["hint"] = json!(super::status_scope::hidden_hint(hidden_watches));
+        let filtered = filter_repo.is_some() || filter_branch.is_some();
+        resp["hint"] = json!(super::status_scope::hidden_hint(hidden_watches, filtered));
     }
     if let Some(w) = crate::daemon::ci_watch::github_token_warning_from_env() {
         resp["setup_warning"] = json!(w);
