@@ -648,7 +648,13 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        upsert_system_hygiene_task(&home, "k:r:b", "residue", ev("still-here")).unwrap();
+        // R2 F4: the evidence must be UNCHANGED here. R1 F2's defect only
+        // shows when nothing changed — changed evidence writes either way, so
+        // an altered payload exercises the push gate and leaves the early
+        // return, where the defect actually lived, untested. `c-204` is the
+        // last value the loop above wrote.
+        let unchanged = ev(&format!("c-{}", OCCURRENCES_CAP + 4));
+        upsert_system_hygiene_task(&home, "k:r:b", "residue", unchanged).unwrap();
 
         let task = board_state(&home).tasks.get(&tid).cloned().unwrap();
         assert_eq!(

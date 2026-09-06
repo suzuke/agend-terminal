@@ -383,6 +383,14 @@ fn vanished_target_reason(key: &str) -> Option<String> {
 /// t-…-241: close episodes whose subject is provably gone, so they stop being
 /// re-observed forever. Measured before this ran: 335 live episodes, 59 of
 /// them pointing at a repo or branch that no longer existed.
+///
+/// Closing is safe here BECAUSE every key family below is a STATEFUL
+/// observation — the residue is still there to be seen again, so a premature
+/// close costs only counter continuity and the next sweep re-opens a fresh
+/// task (`hygiene_task::tests::done_episode_reopens_as_new_task`). A future
+/// key family that records a ONE-SHOT event would not have that property, and
+/// must not be added to `vanished_target_reason` without a different rule
+/// (R2, archfix-opus-3).
 fn close_hygiene_episodes_with_vanished_targets(home: &Path) -> usize {
     let episodes = match crate::daemon::hygiene_task::active_episodes(home) {
         Ok(episodes) => episodes,
