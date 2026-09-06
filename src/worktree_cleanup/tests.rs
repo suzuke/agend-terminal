@@ -1920,3 +1920,41 @@ fn hygiene_episode_closes_when_its_repository_is_gone_241() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// R1 F1: `Path::exists()` coerces errors to false, so a live repo behind an
+/// unreadable parent directory looked exactly like a deleted one and its
+/// episode was cancelled. `try_exists()` reports `Err` there, and only
+/// `Ok(false)` may close. Unix-only (the mode bits are the mechanism) and
+/// self-validating: if the process can still stat the path — running as root,
+/// or a filesystem that ignores mode — the premise does not hold on this
+/// machine and there is nothing to assert.
+#[cfg(unix)]
+#[test]
+fn hygiene_episode_survives_when_the_path_cannot_be_stat_ed_241() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-eacces-home");
+    let parent = tmp_home("hyg-eacces-parent");
+    let repo = parent.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let premise_holds = Path::new(&repo).try_exists().is_err();
+    if premise_holds {
+        let task = seed_episode(&home, &hygiene_key_for(&repo, "feat/unstattable"));
+        run_sweep(&home);
+        assert!(
+            episode_is_open(&home, &task),
+            "a path we could not stat proves nothing — the episode must survive"
+        );
+    }
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&parent).ok();
+    std::fs::remove_dir_all(&home).ok();
+    assert!(
+        premise_holds,
+        "setup could not produce an unstattable path (root? permissive fs?) — \
+         this machine cannot exercise the guard"
+    );
+}

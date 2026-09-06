@@ -37,10 +37,13 @@ pub const OCCURRENCES_CAPPED_META: &str = "occurrences_capped";
 pub const OCCURRENCES_CAP: u64 = 200;
 
 /// Minimum spacing between `last_seen` refreshes for an episode whose
-/// evidence has not changed. The sweep observes every ~10 minutes; at this
-/// spacing an unresolved episode costs 4 events a day instead of 288, while
+/// evidence has not changed. The sweep observes every ~10 minutes — 144 ticks
+/// a day, each of which used to append `last_seen` + `occurrences`, so 288
+/// events. At this spacing a recurring-but-unchanged episode writes at most
+/// 4 times a day (8 events while the counter is live, 4 after it caps), and
 /// `last_seen` stays accurate enough to judge staleness on a board item that
-/// has typically been open for weeks.
+/// has typically been open for weeks. (R1 F3: the earlier "4 events a day"
+/// conflated writes with events — one write appends two.)
 const LAST_SEEN_THROTTLE: chrono::Duration = chrono::Duration::hours(6);
 
 const EMITTER: &str = "system:hygiene";
@@ -348,7 +351,7 @@ pub fn upsert_system_hygiene_task(
                         chrono::Utc::now().signed_duration_since(seen.with_timezone(&chrono::Utc))
                             >= LAST_SEEN_THROTTLE
                     });
-                if !evidence_changed && (capped || !last_seen_due) {
+                if !evidence_changed && !last_seen_due {
                     // Nothing a reader would learn from — append nothing.
                     return Ok(HygieneUpsert::Updated(tid));
                 }
@@ -356,8 +359,17 @@ pub fn upsert_system_hygiene_task(
                 if evidence_changed {
                     update.push(meta(&tid, EVIDENCE_META, evidence.clone()));
                 }
-                if !capped {
+                if last_seen_due {
+                    // R1 F2: the cap freezes the COUNTER, not the clock. A
+                    // capped episode is still recurring, and `last_seen` is
+                    // the only field that answers "is this still happening?"
+                    // — freezing it too left the flag saying "capped" and no
+                    // way to tell an active episode from one that stopped at
+                    // the moment it capped. Refreshing it costs 4 events a
+                    // day against the 288 this bound removes.
                     update.push(meta(&tid, LAST_SEEN_META, now.into()));
+                }
+                if !capped {
                     update.push(meta(&tid, OCCURRENCES_META, (n + 1).into()));
                     if n + 1 == OCCURRENCES_CAP {
                         // Written exactly at the transition, so a frozen
@@ -592,6 +604,64 @@ mod tests {
             Some(true),
             "reaching the cap must be recorded once, so a reader knows the \
              counter is frozen rather than the episode having stopped"
+        );
+    }
+
+    /// R1 F2: the cap freezes the counter, not the clock. A capped episode
+    /// that is still recurring must still refresh `last_seen` — it is the
+    /// only field that distinguishes "still happening" from "stopped at the
+    /// moment it capped", and the capped flag alone cannot say which.
+    #[test]
+    fn last_seen_still_advances_after_the_counter_caps_241() {
+        let home = tmp_home("capped-last-seen");
+        for i in 0..(OCCURRENCES_CAP + 5) {
+            upsert_system_hygiene_task(&home, "k:r:b", "residue", ev(&format!("c-{i}"))).unwrap();
+        }
+        let capped_at = board_state(&home)
+            .tasks
+            .values()
+            .find(|t| t.metadata.get(ALERT_KEY_META) == Some(&"k:r:b".into()))
+            .and_then(|t| t.metadata.get(LAST_SEEN_META).cloned())
+            .unwrap();
+
+        // Backdate `last_seen` past the throttle so the next observation is
+        // due, exactly as a real episode recurring hours later would be.
+        let stale =
+            (chrono::Utc::now() - LAST_SEEN_THROTTLE - chrono::Duration::minutes(1)).to_rfc3339();
+        let tid = board_state(&home)
+            .tasks
+            .values()
+            .find(|t| t.metadata.get(ALERT_KEY_META) == Some(&"k:r:b".into()))
+            .map(|t| t.id.clone())
+            .unwrap();
+        task_events::append_batch_checked(
+            &home,
+            &InstanceName::from(EMITTER),
+            vec![TaskEvent::MetadataSet {
+                task_id: tid.clone(),
+                by: InstanceName::from(EMITTER),
+                key: LAST_SEEN_META.to_string(),
+                value: stale.clone().into(),
+            }],
+            |_| Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+
+        upsert_system_hygiene_task(&home, "k:r:b", "residue", ev("still-here")).unwrap();
+
+        let task = board_state(&home).tasks.get(&tid).cloned().unwrap();
+        assert_eq!(
+            task.metadata.get(OCCURRENCES_META).and_then(|v| v.as_u64()),
+            Some(OCCURRENCES_CAP),
+            "the counter stays frozen at the cap"
+        );
+        assert_ne!(
+            task.metadata.get(LAST_SEEN_META).and_then(|v| v.as_str()),
+            Some(stale.as_str()),
+            "`last_seen` must still advance after the cap, or a live episode \
+             is indistinguishable from one that stopped when it capped \
+             (capped_at was {capped_at:?})"
         );
     }
 

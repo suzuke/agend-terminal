@@ -337,12 +337,19 @@ const CLEANUP_INTENT_HYGIENE_AGE: chrono::Duration = chrono::Duration::hours(24)
 /// that failed. That asymmetry is the whole point: a detector that closes on
 /// "could not tell" silently retires real problems, and the fleet has already
 /// been bitten by exactly that confusion (an error swallowed by
-/// `2>/dev/null` read as "no branches"). Absence is proven only by the
-/// filesystem saying the path is not there, or by a SUCCESSFUL branch listing
+/// `2>/dev/null` read as "no branches"). Absence is proven only by
+/// `try_exists()` answering `Ok(false)`, or by a SUCCESSFUL branch listing
 /// that does not contain the branch.
+///
+/// R1 rejected `Path::exists()` here, correctly: it "coerces errors to false"
+/// (std `path.rs`), so an EACCES on a parent directory renders a live repo
+/// indistinguishable from a deleted one — this function would then have
+/// announced `repository path no longer exists` for a repo that does, and
+/// cancelled its episode. That is the very failure this module exists to
+/// stop, so the invariant is now implemented rather than merely documented.
 fn vanished_target_reason(key: &str) -> Option<String> {
     if let Some(repo) = key.strip_prefix("residue-fetch-degraded:") {
-        return (!Path::new(repo).exists())
+        return matches!(Path::new(repo).try_exists(), Ok(false))
             .then(|| format!("repository path no longer exists: {repo}"));
     }
     let rest = [
@@ -356,8 +363,11 @@ fn vanished_target_reason(key: &str) -> Option<String> {
     // A git ref name can never contain `:` (git-check-ref-format), so the
     // last colon always separates the repo path from the branch.
     let (repo, branch) = rest.rsplit_once(':')?;
-    if !Path::new(repo).exists() {
-        return Some(format!("repository path no longer exists: {repo}"));
+    match Path::new(repo).try_exists() {
+        Ok(false) => return Some(format!("repository path no longer exists: {repo}")),
+        // Could not even determine whether the path is there.
+        Err(_) => return None,
+        Ok(true) => {}
     }
     match crate::git_helpers::git_cmd(Path::new(repo), &["branch", "--format=%(refname:short)"]) {
         // Listing succeeded: absence is now a fact about the repo, not about
