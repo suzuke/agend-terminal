@@ -1847,6 +1847,35 @@ fn unmanaged_local_shell_spawns_without_fleet_entry() {
     assert_eq!(handle.name.as_str(), "shell");
 }
 
+/// #3547 P0-near Task1 RED: spawn must log the dev-modal arming fact at info
+/// (grep-able `dev_modal_armed` + `argv_has_dev_channel_flag`) so the next
+/// dismiss-miss can be answered from the log instead of guessed.
+#[test]
+#[tracing_test::traced_test]
+fn spawn_logs_dev_modal_arming_at_info_3547() {
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let cfg = SpawnConfig {
+        name: "shell",
+        backend: None,
+        backend_command: "true", // exits immediately; we only assert the spawn log
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: None, // unmanaged identity — the local-shell path
+        crash_tx: None,
+        shutdown: None,
+    };
+    let _ = spawn_agent(&cfg, &registry).expect("spawn must succeed");
+    assert!(
+        logs_contain("dev_modal_armed"),
+        "spawn must log the dev-modal arming fact at info level"
+    );
+}
+
 /// Deleted agent: reaper should not spawn shell fallback when deleted flag is set.
 /// Behavioral test: spawn a short-lived process, set deleted=true, verify
 /// no shell replacement appears in registry after exit.

@@ -4834,3 +4834,29 @@ fn recovery_notice_is_fenced_when_the_handle_is_deleted_after_the_snapshot_78207
 
     crate::channel::reset_active_channel_for_test();
 }
+
+/// #3547 P0-near Task3 RED: stalled 升級時必須把當時畫面存一份快照
+/// （best-effort：成功回 Some(path)，失敗回 None 且不拋）。
+#[test]
+fn stalled_snapshot_saves_tail_and_fails_soft_3547() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-stalled-snap-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let path = super::save_stalled_snapshot(&dir, "snap-agent", "frozen pane tail")
+        .expect("snapshot save must succeed on a writable home");
+    let body = std::fs::read_to_string(&path).expect("snapshot file must be readable");
+    assert!(
+        body.contains("frozen pane tail"),
+        "snapshot must carry the stalled tail, got: {body:?}"
+    );
+    assert!(
+        path.to_string_lossy().contains("snap-agent"),
+        "snapshot path must name the instance, got: {path:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

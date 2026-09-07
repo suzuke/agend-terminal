@@ -396,6 +396,12 @@ pub(crate) struct DevModalGate {
     deleted: Arc<std::sync::atomic::AtomicBool>,
     candidate_epoch: Arc<AtomicU64>,
     candidate: Option<Candidate>,
+    /// #3547 P0-near Task2: per-generation first-Refuse flag. Owned by the PTY
+    /// read loop like everything else here (generation-scoped BY CONSTRUCTION),
+    /// so no store keyed by agent name and no eviction. Plain bool: every
+    /// caller holds `&mut`, so no atomic is needed. Observability only — never
+    /// read by the gate decision itself.
+    first_refuse_logged: bool,
 }
 
 impl DevModalGate {
@@ -424,6 +430,19 @@ impl DevModalGate {
             deleted,
             candidate_epoch,
             candidate: None,
+            first_refuse_logged: false,
+        }
+    }
+
+    /// #3547 P0-near Task2: claim the per-generation first-Refuse log slot.
+    /// Returns true exactly once per generation; observability only, the gate
+    /// decision never consults it.
+    pub(crate) fn claim_first_refuse_log(&mut self) -> bool {
+        if self.first_refuse_logged {
+            false
+        } else {
+            self.first_refuse_logged = true;
+            true
         }
     }
 

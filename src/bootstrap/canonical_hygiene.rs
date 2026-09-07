@@ -79,6 +79,11 @@ pub(crate) struct CanonicalDirtyReport {
     /// key. "Same WIP still dirty" yields the same fingerprint; a changed dirty
     /// set yields a new one, so the throttle re-notifies immediately on change.
     pub fingerprint: u64,
+    /// #3549: fleet instances whose `source_repo` is this canonical — the
+    /// notice's routing target (they work from this repo, so they can act on
+    /// it), NOT an attribution of who dirtied it. Sorted for a deterministic
+    /// delivery order; empty when the report was built outside a fleet scan.
+    pub owners: Vec<String>,
 }
 
 impl CanonicalDirtyReport {
@@ -103,6 +108,7 @@ impl CanonicalDirtyReport {
             default_branch: default_branch.to_string(),
             porcelain_lines,
             fingerprint,
+            owners: Vec::new(),
         }
     }
 }
@@ -121,25 +127,33 @@ impl CanonicalDirtyReport {
 pub(crate) fn run_hygiene_with_dirty_report(
     config: &crate::fleet::FleetConfig,
 ) -> Vec<CanonicalDirtyReport> {
-    let mut seen = std::collections::HashSet::<std::path::PathBuf>::new();
-    let mut dirty = Vec::new();
+    // #3549: group instances by canonical path (BTreeMap → deterministic scan
+    // order) so the report can carry EVERY instance that works from the repo —
+    // pre-#3549 the loop only remembered that a path had been seen, and the
+    // notify step had nobody to route to but `general`.
+    let mut owners_by_path = std::collections::BTreeMap::<std::path::PathBuf, Vec<String>>::new();
     for (name, instance) in &config.instances {
         let Some(source_repo) = instance.source_repo.as_ref() else {
             continue;
         };
-        let path = std::path::PathBuf::from(source_repo);
-        if !seen.insert(path.clone()) {
-            continue;
-        }
+        owners_by_path
+            .entry(std::path::PathBuf::from(source_repo))
+            .or_default()
+            .push(name.clone());
+    }
+    let mut dirty = Vec::new();
+    for (path, mut owners) in owners_by_path {
         if !path.is_dir() {
             tracing::debug!(
-                instance = %name,
+                instances = ?owners,
                 source_repo = %path.display(),
                 "#852 canonical hygiene: source_repo not a directory, skipping"
             );
             continue;
         }
-        if let Some(report) = apply_to_canonical(&path) {
+        if let Some(mut report) = apply_to_canonical(&path) {
+            owners.sort();
+            report.owners = owners;
             dirty.push(report);
         }
     }
@@ -352,9 +366,11 @@ fn notify_operator_of_auto_stash(
     crate::inbox::notify_agent(&home, "general", &source, &text);
 }
 
-/// L2: notify the operator-mapped agent (`general`, per convention) that a managed
-/// canonical repo is DIRTY on the default branch, and record a structured audit
-/// event. Strict-policy wording surfaces the violation + the fix (use a worktree /
+/// L2: notify the agents that can act on a managed canonical repo being DIRTY on
+/// the default branch — the instances whose `source_repo` it is, else their
+/// team's orchestrator, else the `general` operator inbox (#3549, see
+/// [`canonical_dirty_recipients`]) — and record a structured audit event.
+/// Strict-policy wording surfaces the violation + the fix (use a worktree /
 /// move scratch out) WITHOUT attributing it to any agent — we have no provenance.
 /// The notification body is bounded (first `MAX_LINES` porcelain entries + a
 /// count); the full porcelain list goes to the event log for audit.
@@ -391,7 +407,9 @@ pub(crate) fn notify_operator_of_canonical_dirty(report: &CanonicalDirtyReport) 
     let home = crate::home_dir();
     let text = canonical_dirty_notice(report);
     let source = crate::inbox::NotifySource::System("canonical_dirty");
-    crate::inbox::notify_agent(&home, "general", &source, &text);
+    for recipient in canonical_dirty_recipients(&home, report) {
+        crate::inbox::notify_agent(&home, &recipient, &source, &text);
+    }
 
     // Structured audit trail — full (unbounded) porcelain for forensic detail.
     crate::event_log::log(
@@ -400,6 +418,56 @@ pub(crate) fn notify_operator_of_canonical_dirty(report: &CanonicalDirtyReport) 
         &report.path.display().to_string(),
         &report.porcelain_lines.join("; "),
     );
+}
+
+/// #3549: WHO receives a canonical-dirty notice. The instances whose
+/// `source_repo` is the dirty canonical can act on it (the WIP is theirs or
+/// belongs in their worktree), so they are notified; a canonical no instance
+/// claims routes to the orchestrator(s) of the team(s) whose `source_repo` it
+/// is; only a repo nobody in fleet.yaml owns falls back to the `general`
+/// operator inbox. Pre-#3549 every notice went to `general`, which received 40+
+/// of them for a repo it had no relation to and could not act on.
+fn canonical_dirty_recipients(
+    home: &std::path::Path,
+    report: &CanonicalDirtyReport,
+) -> Vec<String> {
+    if !report.owners.is_empty() {
+        return report.owners.clone();
+    }
+    let mut orchestrators: Vec<String> =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .map(|config| {
+                config
+                    .teams
+                    .values()
+                    .filter(|team| {
+                        team.source_repo
+                            .as_deref()
+                            .is_some_and(|repo| same_repo_path(repo, &report.path))
+                    })
+                    .filter_map(|team| team.orchestrator.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+    if orchestrators.is_empty() {
+        return vec!["general".to_string()];
+    }
+    orchestrators.sort();
+    orchestrators.dedup();
+    orchestrators
+}
+
+/// Path identity for the team fallback: exact match first (both sides are
+/// operator-written fleet.yaml paths), then canonicalized so a symlinked or
+/// trailing-slash spelling of the same repo still resolves to its team instead
+/// of silently degrading to `general`.
+fn same_repo_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
 }
 
 /// Pure helper: shell out to git with `AGEND_GIT_BYPASS=1` (so we
@@ -860,5 +928,163 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ----------------------------------------------------------------
+    // #3549: canonical-dirty notices route to the repo's owners, not `general`.
+    // ----------------------------------------------------------------
+
+    fn tmp_home_3549(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "agend-test-canonical-3549-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    fn report_for_3549(path: &std::path::Path, owners: &[&str]) -> CanonicalDirtyReport {
+        let mut report = CanonicalDirtyReport::from_status(path, "?? stray.md", "main");
+        report.owners = owners.iter().map(|s| s.to_string()).collect();
+        report
+    }
+
+    /// #3549 RED: the scan already resolves which instances point at each
+    /// canonical; the report must carry them (sorted, ONE report per distinct
+    /// path) instead of dropping the mapping after the dedup check.
+    #[test]
+    fn dirty_report_carries_owning_instances_3549() {
+        let home = tmp_home_3549("owners");
+        let canonical = home.join("canon");
+        std::fs::create_dir_all(&canonical).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&canonical)
+                .args(args)
+                .env("AGEND_GIT_BYPASS", "1")
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git command spawn")
+        };
+        assert!(run(&["init", "-q", "-b", "main"]).status.success());
+        std::fs::write(canonical.join("file.txt"), "initial\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success());
+        assert!(run(&["commit", "-q", "-m", "initial"]).status.success());
+        // Dirty on main: an untracked, non-ignored stray (the incident shape).
+        std::fs::write(canonical.join("stray.md"), "dirty on main\n").unwrap();
+
+        // Two instances share the canonical; declared out of order so the
+        // sorted-owners assertion is not satisfied by insertion order.
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        std::fs::write(
+            &fleet_path,
+            format!(
+                "instances:\n  zed:\n    source_repo: {c}\n  amy:\n    source_repo: {c}\n",
+                c = canonical.display()
+            ),
+        )
+        .unwrap();
+        let config = crate::fleet::FleetConfig::load(&fleet_path).expect("fleet.yaml loads");
+
+        let reports = run_hygiene_with_dirty_report(&config);
+        assert_eq!(
+            reports.len(),
+            1,
+            "two instances on one canonical must yield ONE report: {reports:?}"
+        );
+        assert_eq!(reports[0].path, canonical);
+        assert_eq!(
+            reports[0].owners,
+            vec!["amy".to_string(), "zed".to_string()],
+            "#3549: the report must carry every instance whose source_repo is this canonical, sorted"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #3549 RED: a canonical that an instance's `source_repo` points at routes
+    /// to THAT instance — `general` must not receive it (pre-fix: every notice
+    /// went to `general`, 40+ for a repo it had no relation to).
+    #[test]
+    fn canonical_dirty_recipients_prefers_owning_instances_3549() {
+        let home = tmp_home_3549("prefer-owners");
+        let report = report_for_3549(std::path::Path::new("/repo/x"), &["codex-41b2a8"]);
+        let recipients = canonical_dirty_recipients(&home, &report);
+        assert_eq!(
+            recipients,
+            vec!["codex-41b2a8".to_string()],
+            "#3549: the owning instance receives the notice, nobody else"
+        );
+        assert!(
+            !recipients.iter().any(|r| r == "general"),
+            "#3549: general must NOT receive a notice for a repo an instance owns"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #3549: no instance claims the canonical, but a team's `source_repo` does →
+    /// that team's orchestrator (a team on another repo is ignored), not `general`.
+    #[test]
+    fn canonical_dirty_recipients_falls_back_to_team_orchestrator_3549() {
+        let home = tmp_home_3549("team-orch");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n\
+             \x20 archfix:\n\
+             \x20   members: [lead, dev]\n\
+             \x20   orchestrator: lead\n\
+             \x20   source_repo: /repo/x\n\
+             \x20 other:\n\
+             \x20   members: [o]\n\
+             \x20   orchestrator: o\n\
+             \x20   source_repo: /repo/y\n",
+        )
+        .unwrap();
+        let report = report_for_3549(std::path::Path::new("/repo/x"), &[]);
+        assert_eq!(
+            canonical_dirty_recipients(&home, &report),
+            vec!["lead".to_string()],
+            "#3549: an unclaimed canonical routes to the orchestrator of the team whose source_repo it is"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #3549: nobody in fleet.yaml owns the canonical → the `general` operator
+    /// inbox, exactly the pre-#3549 behaviour (with or without a fleet.yaml).
+    #[test]
+    fn canonical_dirty_recipients_falls_back_to_general_3549() {
+        let report = report_for_3549(std::path::Path::new("/repo/x"), &[]);
+
+        let no_fleet = tmp_home_3549("general-no-fleet");
+        assert_eq!(
+            canonical_dirty_recipients(&no_fleet, &report),
+            vec!["general".to_string()],
+            "no fleet.yaml → general"
+        );
+        let _ = std::fs::remove_dir_all(&no_fleet);
+
+        let other_team = tmp_home_3549("general-other-team");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&other_team),
+            "teams:\n\
+             \x20 other:\n\
+             \x20   members: [o]\n\
+             \x20   orchestrator: o\n\
+             \x20   source_repo: /repo/y\n",
+        )
+        .unwrap();
+        assert_eq!(
+            canonical_dirty_recipients(&other_team, &report),
+            vec!["general".to_string()],
+            "no instance and no team owns the repo → general"
+        );
+        let _ = std::fs::remove_dir_all(&other_team);
     }
 }
