@@ -1434,6 +1434,177 @@ pub fn sweep_overdue_claimed(home: &Path) -> Vec<String> {
     released
 }
 
+// ── #3536: the settled-report / unsettled-task gap ────────────────────────
+//
+// `dispatch_tracking::mark_completed` DELETES the dispatch entry when a report
+// arrives — deliberately, and pinned by
+// `dispatch_tracking::tests::test_report_result_marks_dispatch_completed`
+// ("removed outright, not flipped to completed and kept"). From that moment
+// `sweep_stuck` cannot see the work again. `sweep_overdue_claimed` above only
+// looks at tasks carrying a `due_at`. A task whose assignee reported and then
+// went idle therefore falls between the two sweeps and is nagged by nobody: the
+// case that opened #3536 sat `claimed` for 40+ hours in silence.
+//
+// The trace has to live on the TASK, because the dispatch entry is gone. The
+// stamp is written at settlement time by [`note_dispatch_settled`] and consumed
+// by [`sweep_unsettled_after_report`].
+
+/// Metadata key: RFC3339 instant at which a dispatch for this task was settled
+/// by a report. Re-stamped by every later report.
+pub const DISPATCH_COMPLETED_AT: &str = "dispatch_completed_at";
+/// Metadata key: the `dispatch_completed_at` value a reminder was already sent
+/// for. The fire-once latch — a NEW report writes a new stamp, which re-arms.
+pub const DISPATCH_UNSETTLED_NOTIFIED_FOR: &str = "dispatch_unsettled_notified_for";
+/// Emitter identity for the settlement trace and its latch.
+const SETTLEMENT_EMITTER: &str = "system:dispatch_settlement";
+
+/// How long a task may sit unsettled after its assignee reported before both
+/// parties are reminded.
+///
+/// Deliberately far above `DISPATCH_WARN_MINUTES`/`DISPATCH_ASK_MINUTES` (15/30):
+/// `mark_completed` also fires for PROGRESS reports (`terminal:false`), so
+/// "a report arrived" is not "the work is done". Because every report re-stamps
+/// `DISPATCH_COMPLETED_AT`, this timer restarts on each one — an agent that keeps
+/// reporting is never reminded, while one that reported and went idle is. Two
+/// hours is well inside the 40+ hour failure that opened #3536 and matches the
+/// `eta_minutes: 120` this fleet commonly dispatches with.
+pub const UNSETTLED_AFTER_REPORT_MINUTES: i64 = 120;
+
+/// A task whose dispatch was settled by a report while the task itself was left
+/// open. Returned by [`sweep_unsettled_after_report`] for the daemon to notify.
+#[derive(Debug, Clone)]
+pub struct UnsettledAfterReport {
+    pub task_id: String,
+    /// Current owner — the assignee who can send a terminal report.
+    pub assignee: Option<String>,
+    /// Task creator — the orchestrator who can `task action=done`.
+    pub created_by: String,
+    /// Board status at detection time (`claimed` or `in_progress`).
+    pub status: String,
+    /// Minutes since the settling report.
+    pub age_minutes: i64,
+}
+
+/// Stamp the settlement trace on a task whose dispatch a report just cleared.
+///
+/// Called from `dispatch_tracking::mark_completed` and ONLY when an entry was
+/// actually removed, so an unsolicited report (no dispatch outstanding) writes
+/// nothing. Terminal tasks are skipped: they are already settled, and a stamp
+/// there would be dead weight that later replays must carry.
+///
+/// Routing matters — this fleet keeps its real work on project boards, so the
+/// stamp must land on the board that actually holds the task, never the default
+/// one. A task that cannot be routed uniquely gets no stamp (fail-closed: a
+/// missing reminder is recoverable, a stamp written to the wrong board is not).
+pub fn note_dispatch_settled(home: &Path, task_id: &str) {
+    if task_id.is_empty() {
+        return;
+    }
+    let routed = match load_routed(home, task_id) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(task_id, %e, "#3536: no unique route for the reported task; no settlement stamp");
+            return;
+        }
+    };
+    if routed.record.status.is_terminal() {
+        return;
+    }
+    let emitter = crate::task_events::InstanceName::from(SETTLEMENT_EMITTER);
+    let event = crate::task_events::TaskEvent::MetadataSet {
+        task_id: crate::task_events::TaskId(task_id.to_string()),
+        by: emitter.clone(),
+        key: DISPATCH_COMPLETED_AT.to_string(),
+        value: serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    };
+    if let Err(e) = crate::task_events::append_at(routed.board.path(), &emitter, event) {
+        tracing::warn!(task_id, error = %e, "#3536: settlement stamp failed; the task stays invisible to the unsettled sweep until the next report");
+    }
+}
+
+/// Find tasks whose dispatch a report settled but which nobody closed.
+///
+/// Scoped to `Claimed`/`InProgress` rather than "any non-terminal" on purpose:
+/// `InReview` and `Blocked` are LEGITIMATELY waiting on somebody else (a
+/// reviewer, an unblocking event) and have their own machinery — reminding them
+/// every tick would be noise, not signal.
+///
+/// Unlike [`sweep_overdue_claimed`], which reads only the default board, this
+/// walks every project board: the tasks #3536 is about live on project boards,
+/// so a default-only sweep would never see them. Marks each hit as notified
+/// (fire-once per report) before returning it.
+pub fn sweep_unsettled_after_report(home: &Path) -> Vec<UnsettledAfterReport> {
+    let now = chrono::Utc::now();
+    let emitter = crate::task_events::InstanceName::from(SETTLEMENT_EMITTER);
+    let projects = board_router::enumerate_projects(home)
+        .unwrap_or_else(|_| vec![crate::task_events::DEFAULT_PROJECT.to_string()]);
+    let mut found = Vec::new();
+
+    for project in projects {
+        let board = crate::task_events::board_root(home, &project);
+        let state = match crate::task_events::projected_state_at(&board) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(project, error = %e, "#3536: board unreadable; skipped this pass");
+                continue;
+            }
+        };
+        for (tid, record) in &state.tasks {
+            let status = match record.status {
+                crate::task_events::TaskStatus::Claimed => "claimed",
+                crate::task_events::TaskStatus::InProgress => "in_progress",
+                _ => continue,
+            };
+            let settled_at = match record
+                .metadata
+                .get(DISPATCH_COMPLETED_AT)
+                .and_then(|v| v.as_str())
+            {
+                Some(s) => s,
+                None => continue,
+            };
+            // Already reminded for THIS report; a newer report rewrites the
+            // stamp and re-arms the reminder.
+            if record
+                .metadata
+                .get(DISPATCH_UNSETTLED_NOTIFIED_FOR)
+                .and_then(|v| v.as_str())
+                == Some(settled_at)
+            {
+                continue;
+            }
+            let settled = match chrono::DateTime::parse_from_rfc3339(settled_at) {
+                Ok(dt) => dt.with_timezone(&chrono::Utc),
+                Err(_) => continue,
+            };
+            let age_minutes = now.signed_duration_since(settled).num_minutes();
+            if age_minutes < UNSETTLED_AFTER_REPORT_MINUTES {
+                continue;
+            }
+            let latch = crate::task_events::TaskEvent::MetadataSet {
+                task_id: tid.clone(),
+                by: emitter.clone(),
+                key: DISPATCH_UNSETTLED_NOTIFIED_FOR.to_string(),
+                value: serde_json::Value::String(settled_at.to_string()),
+            };
+            if let Err(e) = crate::task_events::append_at(&board, &emitter, latch) {
+                // Without the latch this would re-fire every tick, so skip the
+                // notification rather than risk nagging forever.
+                tracing::warn!(task = %tid, error = %e, "#3536: latch write failed; reminder deferred to the next pass");
+                continue;
+            }
+            found.push(UnsettledAfterReport {
+                task_id: tid.0.clone(),
+                assignee: record.owner.as_ref().map(|o| o.0.clone()),
+                created_by: record.created_by.0.clone(),
+                status: status.to_string(),
+                age_minutes,
+            });
+        }
+    }
+    found
+}
+
 /// Result of [`reconcile_stale_cross_board_claims`].
 // #2549: dead_code allowed — the per-tick `CrossBoardDepDetectiveHandler`
 // wrapper that called this was retired (d-20260703021554626467-13), but this

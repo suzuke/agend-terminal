@@ -54,6 +54,13 @@ pub fn track_dispatch(home: &Path, entry: DispatchEntry) {
 
 /// Reporter-scoped settlement: remove only the entry whose `to` matches
 /// `reporter`. Empty reporter matches nothing (fail-closed).
+///
+/// #3536: removal is the LAST moment this task is visible to `sweep_stuck` — the
+/// entry is deleted outright, never flipped to `"completed"` and kept (see
+/// `test_report_result_marks_dispatch_completed`). If the task itself is still
+/// open, nothing else would ever notice it again, so hand the task board a
+/// settlement stamp on the way out. Only a removal stamps: an unsolicited report
+/// with no dispatch outstanding leaves no trace.
 pub fn mark_completed(home: &Path, correlation_id: Option<&str>, reporter: &str) {
     let cid = match correlation_id {
         Some(c) if !c.is_empty() => c,
@@ -62,15 +69,21 @@ pub fn mark_completed(home: &Path, correlation_id: Option<&str>, reporter: &str)
     if reporter.is_empty() {
         return;
     }
+    let mut removed = false;
     persist_or_log!(
         crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            let before = store.entries.len();
             store
                 .entries
                 .retain(|e| e.task_id.as_deref() != Some(cid) || e.to != reporter);
+            removed = store.entries.len() < before;
             Ok(())
         }),
         "dispatch_mark_completed"
     );
+    if removed {
+        crate::tasks::note_dispatch_settled(home, cid);
+    }
 }
 
 /// Task-wide cleanup: remove ALL entries for a task_id regardless of
