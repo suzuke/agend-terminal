@@ -6099,11 +6099,78 @@ fn mark_completed_records_dispatch_completed_at_on_a_live_task_3536() {
         "lead",
         &serde_json::json!({"action": "get", "id": id}),
     );
-    let stamp = task["task"]["metadata"]["dispatch_completed_at"].as_str();
+    let first = task["task"]["metadata"]["dispatch_completed_at"]
+        .as_str()
+        .map(str::to_string);
     assert!(
-        stamp.is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
+        first
+            .as_deref()
+            .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
         "settling a dispatch must stamp dispatch_completed_at (RFC3339) on the \
          still-live task; got {:?}",
+        task["task"]["metadata"]
+    );
+
+    // EVERY report re-stamps, and this assertion is the only thing pinning it.
+    // The re-stamp is what keeps an actively-reporting agent from being
+    // reminded: the 120-minute timer restarts on each report, so only someone
+    // who reported and then went idle ages into a reminder. Nothing else covers
+    // it — the maintenance tests below backdate the stamp by hand, so they
+    // exercise the sweep and never this write. (R1 mutation testing on 5f15d0a2
+    // deleted the re-stamp and left all six tests green.)
+    // The sleep keeps the two stamps distinguishable whatever the clock
+    // resolution, so this can never flake into a false pass.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    settle_dispatch(&home, &id, "lead", "impl");
+    let task = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "get", "id": id}),
+    );
+    let second = task["task"]["metadata"]["dispatch_completed_at"].as_str();
+    assert!(
+        second.is_some() && second != first.as_deref(),
+        "a second report must RE-STAMP dispatch_completed_at (the timer restarts \
+         on every report); first={first:?} second={second:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A task that is already closed needs no settlement trace: it is settled. The
+/// stamp is skipped at the SOURCE rather than merely ignored later — the sweep's
+/// status filter would refuse to act on it anyway, so this pins the first of two
+/// independent guards. Without this assertion, deleting the early return costs
+/// stamp pollution that every later replay must carry, and no test notices.
+#[test]
+fn mark_completed_leaves_no_trace_on_an_already_terminal_task_3536() {
+    let home = tmp_home("3536-no-trace-terminal");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "already closed"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "done", "id": id, "result": "shipped"}),
+    );
+
+    settle_dispatch(&home, &id, "lead", "impl");
+
+    let task = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "get", "id": id}),
+    );
+    assert!(
+        task["task"]["metadata"]["dispatch_completed_at"].is_null(),
+        "a terminal task must not be stamped at all; got {:?}",
         task["task"]["metadata"]
     );
     std::fs::remove_dir_all(&home).ok();
