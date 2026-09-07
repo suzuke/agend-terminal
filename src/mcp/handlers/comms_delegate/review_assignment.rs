@@ -329,7 +329,7 @@ pub(super) fn dispatch_review_assignment_with_workspace(
 /// A1 persists the PENDING record (mint assignment_id + delivery_nonce; store the
 /// mandatory `pr_number` — the generation identity). A2 `durable_enqueue`s the
 /// reviewer's actionable inbox row (the store owns delivery — this is NOT a
-/// `deliver_delegate`/API send). A3 emits a best-effort self-IPC WAKE pointer
+/// `deliver_delegate`/API send). A3 emits a queued self-IPC WAKE pointer
 /// OUTSIDE all flocks. The public workspace path wraps this sequence with
 /// exact-head provisioning and cleans up its fresh binding on later failure.
 #[cfg(test)]
@@ -513,8 +513,37 @@ fn dispatch_review_assignment_via_store_impl(
             "code": "review_assignment_store_enqueue_failed",
         });
     }
-    // A4 — best-effort self-IPC WAKE pointer, OUTSIDE all flocks.
-    crate::inbox::notify::wake_review_assignment(home, target);
+    // A4 — self-IPC WAKE pointer, OUTSIDE all flocks. The assignment identity
+    // follows the queued job so the worker can update the lease only after the
+    // adapter reports accepted or failed; queue admission is not delivery.
+    if let Err(error) = crate::inbox::notify::wake_review_assignment_result_for_assignment(
+        home,
+        target,
+        repo_slug,
+        branch,
+        record.assignment_id,
+        &now,
+    ) {
+        let reason = match &error {
+            crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. } => "queue-full",
+            crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. } => "fenced",
+        };
+        let _ = crate::daemon::assignment_authority::set_short_retry_lease(
+            home,
+            repo_slug,
+            branch,
+            target,
+            &now,
+            record.assignment_id,
+            reason,
+        );
+        tracing::warn!(
+            target = %target,
+            error = ?error,
+            reason = %reason,
+            "review assignment wake admission failed; durable short retry retained"
+        );
+    }
     let mut result = json!({
         "target": target,
         "review_assignment": true,
