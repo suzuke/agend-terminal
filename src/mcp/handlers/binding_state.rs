@@ -56,7 +56,9 @@ use std::path::Path;
 ///   "signature_valid": true,
 ///   "ci_watches": ["repo:branch", ...],
 ///   "bind_in_flight": false,
-///   "cross_branch_holders": []
+///   "cross_branch_holders": [],
+///   "base_from_stale_view": false,
+///   "base_behind_default_by": 0
 /// }
 /// ```
 ///
@@ -80,6 +82,38 @@ use std::path::Path;
 /// (Sprint 57 lease-block recovery surface — when this is non-empty
 /// AND the queried agent has no binding, the operator can immediately
 /// see who's holding the branch).
+/// #3546: how many commits the worktree's HEAD is behind the LOCAL view of the
+/// default branch — `None` when that cannot be established.
+///
+/// Deliberately measured against `refs/remotes/<remote>/<default>` as it is on
+/// disk, with NO fetch: a health query must not do network I/O, and inventing a
+/// number would be worse than admitting we don't have one. That gives the field
+/// an asymmetric meaning worth stating plainly, because the bug this exists for
+/// is precisely a stale local view:
+///
+///   * a NON-ZERO count proves the base is behind;
+///   * ZERO does NOT prove it is current — the local ref may itself be stale.
+///
+/// The `base_from_stale_view` flag beside it is what covers the second case: it
+/// records, at provision time, that the ref could not be refreshed at all.
+fn base_behind_default_by(worktree: &Path, source_repo: &Path) -> Option<u64> {
+    let default = crate::git_helpers::default_branch(source_repo);
+    if default.is_empty() {
+        return None;
+    }
+    let range = format!("HEAD..origin/{default}");
+    let out = crate::git_helpers::git_bypass(worktree, &["rev-list", "--count", &range]).ok()?;
+    if !out.status.success() {
+        // No such ref (never fetched, renamed default, a fixture without a
+        // remote) — unknown, not zero.
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
 pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<Sender>) -> Value {
     let agent = match args["instance"].as_str() {
         Some(a) if !a.is_empty() => a,
@@ -194,6 +228,14 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "dispatched_waiting_for": dispatched_waiting_for,
             "pending_response_to": pending_response_to,
             "target_identity": target_identity,
+            // #3546: the two halves of "is this worktree standing on the right
+            // base". The flag is the provision-time fact (recorded in the signed
+            // binding); the count is measured now, against the local view.
+            "base_from_stale_view": b
+                .get("base_from_stale_view")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "base_behind_default_by": base_behind_default_by(wt_path, Path::new(source_repo)),
         })
     } else {
         json!({

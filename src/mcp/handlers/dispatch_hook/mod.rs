@@ -14,6 +14,7 @@ mod live_binding;
 mod provider_neutral_slug;
 mod rebase_dispatch;
 mod types;
+pub(crate) use branch_start_point::BranchProvision;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 pub(crate) use provider_neutral_slug::derive_repo_slug_any_forge_pub;
 pub(crate) use rebase_dispatch::dispatch_auto_bind_lease_with_source_and_chain_preheld;
@@ -642,17 +643,10 @@ fn resolve_source_repo(
 const DISPATCH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// #781 Piece 6: shared auto-create-branch helper (decision tree formerly inlined
-/// in `ci::handle_checkout_repo`, #780) — both `repo checkout bind:true` and
-/// `dispatch_auto_bind_lease` route through here (#784 / d-20260514102305998399-0).
-/// Branch exists → fetch + `update-ref` so the local ref tracks the remote PR HEAD
-/// (#869); else `git branch <branch> <from_ref>` with a fetch-then-retry on an
-/// unresolved ref. Returns `(auto_created, fetch_attempted)`.
-///
-/// BOTH the user-supplied `branch` and `from_ref` run through `validate_branch`
-/// (defense in depth, rejecting option-injection like `--upload-pack=...` at the
-/// API boundary before any git subprocess); `branch` is additionally rejected by
-/// `is_protected_ref` (E4.5). `actor` = event_log id for the fetch breadcrumb; the
-/// `from_ref`→remote split lives in [`from_ref::resolve_from_ref_remote`].
+/// Back-compat tuple view of [`ensure_branch_exists_provisioned`]: `(auto_created,
+/// fetch_attempted)`. Every caller that does not need to know HOW TRUSTWORTHY the
+/// base was keeps this shape, so #3546 adds a fact without rewriting call sites
+/// that make no claim about it.
 pub(crate) fn ensure_branch_exists(
     home: &Path,
     source: &Path,
@@ -660,6 +654,28 @@ pub(crate) fn ensure_branch_exists(
     from_ref: &str,
     actor: &str,
 ) -> Result<(bool, bool), DispatchError> {
+    ensure_branch_exists_provisioned(home, source, branch, from_ref, actor)
+        .map(|p| (p.created, p.fetch_attempted))
+}
+
+/// in `ci::handle_checkout_repo`, #780) — both `repo checkout bind:true` and
+/// `dispatch_auto_bind_lease` route through here (#784 / d-20260514102305998399-0).
+/// Branch exists → fetch + `update-ref` so the local ref tracks the remote PR HEAD
+/// (#869); else `git branch <branch> <from_ref>` with a fetch-then-retry on an
+/// unresolved ref. Returns a [`BranchProvision`].
+///
+/// BOTH the user-supplied `branch` and `from_ref` run through `validate_branch`
+/// (defense in depth, rejecting option-injection like `--upload-pack=...` at the
+/// API boundary before any git subprocess); `branch` is additionally rejected by
+/// `is_protected_ref` (E4.5). `actor` = event_log id for the fetch breadcrumb; the
+/// `from_ref`→remote split lives in [`from_ref::resolve_from_ref_remote`].
+pub(crate) fn ensure_branch_exists_provisioned(
+    home: &Path,
+    source: &Path,
+    branch: &str,
+    from_ref: &str,
+    actor: &str,
+) -> Result<BranchProvision, DispatchError> {
     // CR-2026-06-14 F1 (security): validate `branch` before it reaches
     // `git branch <branch>` as a positional (arg-injection: `--upload-pack=...`).
     if !crate::agent_ops::validate_branch(branch) {
@@ -805,7 +821,14 @@ pub(crate) fn ensure_branch_exists(
                 }
             }
         }
-        return Ok((false, fetched_ok));
+        // #3546: this path bases the branch on `origin/<branch>` (or ff-aligns
+        // to `from_ref`), and `fetched_ok` is exactly whether the fetch that
+        // refreshes it succeeded.
+        return Ok(BranchProvision {
+            created: false,
+            fetch_attempted: fetched_ok,
+            base_from_stale_view: !fetched_ok,
+        });
     }
     // Local ref absent -> create it. Prefers an existing origin/<branch>
     // over from_ref (#t-83936-5 data-loss guard); the full rationale and the

@@ -100,6 +100,9 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // `d-20260514102305998399-0` scope.
     let mut auto_created_branch = false;
     let mut fetch_attempted = false;
+    // #3546: default false — a checkout that never provisioned a branch made no
+    // claim about any base, and an absent/false flag must keep meaning that.
+    let mut base_from_stale_view = false;
     if bind {
         let src = Path::new(&source_path);
         // #2703: omitted `from_ref` follows the repo default (`origin/<default_branch>`).
@@ -110,16 +113,22 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("origin/{}", crate::git_helpers::default_branch(src)))
         });
-        match crate::mcp::handlers::dispatch_hook::ensure_branch_exists(
+        match crate::mcp::handlers::dispatch_hook::ensure_branch_exists_provisioned(
             home,
             src,
             branch,
             &creation_ref,
             instance_name,
         ) {
-            Ok((created, fetched)) => {
+            Ok(provision) => {
+                let created = provision.created;
                 auto_created_branch = created;
-                fetch_attempted = fetched;
+                fetch_attempted = provision.fetch_attempted;
+                // #3546: carry the "base came from a view we could not refresh"
+                // fact to the CALLER, at provision time. Discovering it later
+                // from `binding_state` is already too late — the dispatcher has
+                // handed the tree to someone who will start work on it.
+                base_from_stale_view = provision.base_from_stale_view;
                 if checkout_purpose == Some(CheckoutPurpose::DisposableReview) && !created {
                     return json!({
                         "error": format!("disposable review branch '{branch}' was not created by this checkout"),
@@ -570,6 +579,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     &source_canonical,
                     true, // #2158 GR1: agent self-claim (repo checkout bind:true) → notify operator
                     provenance,
+                    base_from_stale_view, // #3546
                 ) {
                     // #1310: rollback worktree on binding failure to prevent orphans
                     tracing::warn!(
@@ -647,6 +657,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 resp["bound"] = json!(true);
                 resp["ci_watch_armed"] = json!(false);
                 resp["auto_created_branch"] = json!(auto_created_branch);
+                // #3546: only present when true. A checkout that provisioned
+                // from a refreshed base says nothing, so existing readers see
+                // an unchanged response; the one case that needs attention is
+                // the one that speaks.
+                if base_from_stale_view {
+                    resp["base_from_stale_view"] = json!(true);
+                }
                 resp["fetch_attempted"] = json!(fetch_attempted);
                 if checkout_purpose == Some(CheckoutPurpose::DisposableReview) {
                     resp["checkout_purpose"] = json!("disposable_review");

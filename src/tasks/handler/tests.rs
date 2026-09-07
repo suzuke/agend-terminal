@@ -3483,6 +3483,7 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
             &repo,
             false,
             Some(crate::binding::BindingProvenance::DaemonProvisionedReview { provisioned_head }),
+            false, // #3546: this fixture makes no claim about the base's freshness
         )
         .expect("binding");
         if review_branch_drift {

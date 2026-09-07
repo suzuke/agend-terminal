@@ -4412,6 +4412,92 @@ fn ensure_branch_fail_open_when_unreachable_but_has_view_state3_83936_5() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3546 (RED): the reported symptom — a worktree provisioned from a base tens of
+/// commits behind the default branch, with every health check green. The reporter's
+/// canonical repo had `origin` pointing at an unreachable local path, which is state
+/// 3: the branch IS created (fail-open is deliberate, an offline agent must still be
+/// able to start), but it is created from a remote-tracking ref nothing in the call
+/// could refresh. Before this fix that fact was computed, written to the event log,
+/// and dropped, so the caller had no way to know.
+#[test]
+fn provisioning_from_an_unrefreshable_view_is_reported_as_stale_3546() {
+    let home = std::env::temp_dir().join(format!("agend-3546-stale-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+    let repo = workspace.join("agent");
+    std::fs::create_dir_all(&repo).ok();
+    s5_git(&["init", "-b", "main"], &repo);
+    s5_git(
+        &[
+            "remote",
+            "add",
+            "origin",
+            "file:///dev/null/unreachable-3546",
+        ],
+        &repo,
+    );
+    let sha_a = s5_commit(&repo, "A");
+    // We have synced before (a view exists) but cannot reach origin now, so BOTH
+    // fetches on the create path fail — exactly the reporter's environment.
+    s5_git(&["update-ref", "refs/remotes/origin/main", &sha_a], &repo);
+
+    let provision =
+        super::ensure_branch_exists_provisioned(&home, &repo, "feat/stale", "origin/main", "agent")
+            .expect("state 3 stays fail-OPEN: the branch must still be created");
+
+    assert!(provision.created, "state 3 still creates the branch");
+    assert!(
+        provision.base_from_stale_view,
+        "the base came from a view neither fetch could refresh — the caller must be \
+         told, or a tree tens of commits behind looks exactly like a correct one"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3546 reverse: when the base ref IS refreshed, nothing is flagged. This also pins
+/// that the #1755 pre-create fetch still runs — the fix must not turn a working
+/// refresh into a false alarm, which would train readers to ignore the flag.
+#[test]
+fn provisioning_from_a_refreshed_view_is_not_flagged_3546() {
+    let home = std::env::temp_dir().join(format!("agend-3546-fresh-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+
+    // A REACHABLE origin: a real local repo, reached by path.
+    let origin = workspace.join("origin-src");
+    std::fs::create_dir_all(&origin).ok();
+    s5_git(&["init", "-b", "main"], &origin);
+    let origin_sha = s5_commit(&origin, "O");
+
+    let repo = workspace.join("agent");
+    std::fs::create_dir_all(&repo).ok();
+    s5_git(&["init", "-b", "main"], &repo);
+    s5_git(
+        &["remote", "add", "origin", &origin.display().to_string()],
+        &repo,
+    );
+    s5_commit(&repo, "A");
+
+    let provision =
+        super::ensure_branch_exists_provisioned(&home, &repo, "feat/fresh", "origin/main", "agent")
+            .expect("a reachable origin must provision");
+
+    assert!(
+        !provision.base_from_stale_view,
+        "the fetch succeeded, so the base is current and must NOT be flagged"
+    );
+    let head = s5_git(&["rev-parse", "refs/heads/feat/fresh"], &repo);
+    assert_eq!(
+        head, origin_sha,
+        "and the base must actually be origin's tip, not the local view"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// STATE 4 (fail-CLOSED): origin is UNREACHABLE and there is NO remote-tracking
 /// view at all (never synced) → cannot rule out an existing origin/<branch> →
 /// REFUSE (Err) rather than silently orphan it. This is the guard the lead

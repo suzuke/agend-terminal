@@ -1389,6 +1389,7 @@ fn auto_close_on_report_enqueues_release_recompute() {
         Some(crate::binding::BindingProvenance::DaemonProvisionedReview {
             provisioned_head: &provisioned_head,
         }),
+        false, // #3546: this fixture makes no claim about the base's freshness
     )
     .expect("daemon-provisioned review binding");
     let seeded_tracking_ref = crate::git_helpers::git_bypass(

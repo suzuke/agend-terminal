@@ -269,6 +269,7 @@ pub fn bind_full(
         source_repo,
         is_self_claim,
         None,
+        false,
     )
 }
 
@@ -286,6 +287,13 @@ pub(crate) fn bind_full_with_provenance(
     source_repo: &std::path::Path,
     is_self_claim: bool,
     provenance: Option<BindingProvenance<'_>>,
+    // #3546: the provisioning call could not refresh the remote-tracking ref it
+    // based this branch on, so the worktree may sit tens of commits behind the
+    // default branch while every health check passes. Recorded INSIDE the signed
+    // document: a post-bind edit would invalidate the HMAC sidecar, and this fact
+    // is not recomputable later (nothing else records whether a fetch succeeded
+    // at provision time).
+    base_from_stale_view: bool,
 ) -> Result<(), String> {
     // #1888 phase-2: the agent claiming a branch is acting on any pending
     // ci-handoff for it — resolve the track (re-nudge stops). Scoped to this
@@ -378,6 +386,9 @@ pub(crate) fn bind_full_with_provenance(
     if !src_str.is_empty() {
         binding["source_repo"] = json!(src_str);
         register_managed_repo(home, &src_str);
+    }
+    if base_from_stale_view {
+        binding["base_from_stale_view"] = json!(true);
     }
     if let Some(BindingProvenance::DaemonProvisionedReview { provisioned_head }) = provenance {
         binding["checkout_purpose"] = json!("disposable_review");
