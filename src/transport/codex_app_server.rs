@@ -444,8 +444,9 @@ impl CodexNativeShared {
                 }
                 _ => {
                     return Err(anyhow::anyhow!(
-                        "Codex app-server has {} loaded threads; refusing ambiguous TUI delivery",
-                        thread_ids.len()
+                        "Codex app-server has {} loaded threads ({}); refusing ambiguous TUI delivery",
+                        thread_ids.len(),
+                        ambiguous_thread_ids_preview(&thread_ids)
                     ));
                 }
             }
@@ -828,6 +829,22 @@ fn validate_initialize_response(response: &Value) -> anyhow::Result<String> {
         }
     }
     Ok(version.to_string())
+}
+
+/// #3535: truncated preview of ambiguous loaded thread ids for the refusal
+/// diagnostic. The guard verdict (refuse when != 1) lives in
+/// `discover_loaded_tui_thread` and is untouched.
+///
+/// This only renders the ids the helper already holds, truncated to 8 chars
+/// per id so the receipt detail + event-log let the operator compare against
+/// visible TUI threads without persisting full identifiers.
+#[cfg(unix)]
+fn ambiguous_thread_ids_preview(thread_ids: &[String]) -> String {
+    thread_ids
+        .iter()
+        .map(|thread_id| thread_id.chars().take(8).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(unix)]
@@ -1556,6 +1573,13 @@ mod tests {
     }
 
     fn run_fake_codex(endpoint: &Path) -> thread::JoinHandle<()> {
+        run_fake_codex_with_loaded_threads(endpoint, vec!["thread-1".to_string()])
+    }
+
+    fn run_fake_codex_with_loaded_threads(
+        endpoint: &Path,
+        loaded_threads: Vec<String>,
+    ) -> thread::JoinHandle<()> {
         let listener = UnixListener::bind(endpoint).expect("bind fake Codex socket");
         // fire-and-forget: the fake app-server owns the socket until the client drains events.
         thread::spawn(move || {
@@ -1581,7 +1605,14 @@ mod tests {
             stream.flush().expect("flush handshake");
 
             loop {
-                let (_, body) = read_websocket_frame(&mut stream).expect("read client frame");
+                // #3535: a refused discovery never sends `turn/start`, so the
+                // client may drop the connection right after `thread/loaded/list`.
+                // Treat that EOF as a clean test shutdown, not a failure — the
+                // `turn/start` arm below still owns the happy-path `break`.
+                let (_, body) = match read_websocket_frame(&mut stream) {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                };
                 let request: Value = serde_json::from_slice(&body).expect("decode client frame");
                 let method = request
                     .get("method")
@@ -1614,9 +1645,13 @@ mod tests {
                         );
                     }
                     "thread/loaded/list" => {
+                        let data: Vec<Value> = loaded_threads
+                            .iter()
+                            .map(|thread_id| json!({"id": thread_id}))
+                            .collect();
                         write_server_frame(
                             &mut stream,
-                            json!({"id": id, "result": {"data": [{"id": "thread-1"}]}}),
+                            json!({"id": id, "result": {"data": data}}),
                         );
                     }
                     "thread/start" => {
@@ -2186,6 +2221,72 @@ mod tests {
             "platformOs": "macos"
         });
         assert!(validate_initialize_response(&null_platform).is_err());
+    }
+
+    /// #3535: the ambiguous-delivery refusal must carry truncated thread ids
+    /// (first 8 chars) so the receipt detail + event-log let the operator tell
+    /// a stale leftover from a genuine double-open. The guard verdict itself
+    /// (refuse when != 1) is unchanged — only the diagnostic payload grows.
+    #[test]
+    fn ambiguous_delivery_refusal_carries_truncated_thread_ids() {
+        let home =
+            std::env::temp_dir().join(format!("agend-codex-ambiguous-ids-{}", Uuid::new_v4()));
+        let endpoint = std::env::temp_dir().join(format!("a-{}.sock", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("home");
+        let server = run_fake_codex_with_loaded_threads(
+            &endpoint,
+            vec![
+                "thread-aaaa1111bbbb2222".to_string(),
+                "thread-bbbb3333cccc4444".to_string(),
+            ],
+        );
+        let locator = SessionLocator::codex(endpoint.clone(), None);
+        let mut adapter = CodexNativeShared::new(&home, "codex-agent");
+
+        let envelope = DeliveryEnvelope::new(
+            "codex-agent",
+            locator,
+            DeliveryKind::Prompt,
+            "hello",
+            Some("corr-ambiguous".to_string()),
+        );
+        let delivery_id = envelope.delivery_id;
+        let error = adapter
+            .deliver_blocking(envelope)
+            .expect_err("two loaded threads must stay refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("2 loaded threads"),
+            "count must survive: {message}"
+        );
+        assert!(
+            message.contains("thread-a") && message.contains("thread-b"),
+            "truncated ids must be present: {message}"
+        );
+        assert!(
+            !message.contains("aaaa1111bbbb2222") && !message.contains("bbbb3333cccc4444"),
+            "full ids must not leak: {message}"
+        );
+
+        let store = ReceiptStore::for_instance(&home, "codex-agent").expect("store");
+        let receipt = store
+            .latest(delivery_id)
+            .expect("latest receipt")
+            .expect("failed receipt");
+        assert_eq!(receipt.state, DeliveryState::Failed);
+        let detail = receipt.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("thread-a") && detail.contains("thread-b"),
+            "receipt detail must carry the truncated ids: {detail}"
+        );
+
+        // #3535: the refusal happens at discovery, so no `turn/start` ever
+        // reaches the fake server — drop the client first so its read loop
+        // sees EOF and exits instead of hanging the join.
+        drop(adapter);
+        server.join().expect("fake server");
+        let _ = std::fs::remove_file(endpoint);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
