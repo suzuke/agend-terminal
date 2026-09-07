@@ -562,11 +562,25 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
                     }
                     GateOutcome::Hold => return false,
                     GateOutcome::Refuse(reason) => {
-                        tracing::debug!(
-                            agent = name,
-                            ?reason,
-                            "startup-modal dismiss refused by the generation gate"
-                        );
+                        // #3547 P0-near Task2: the FIRST Refuse of a generation
+                        // surfaces at info with its reason (NotArmed /
+                        // NoCompleteModal / WindowExpired / Spent) so a
+                        // dismiss-miss leaves a grep-able trace; later refuses
+                        // stay at debug to avoid log flooding. Observability
+                        // only — the verdict and the early return are unchanged.
+                        if dev_gate.claim_first_refuse_log() {
+                            tracing::info!(
+                                agent = name,
+                                ?reason,
+                                "startup-modal dismiss refused by the generation gate (first of generation)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                agent = name,
+                                ?reason,
+                                "startup-modal dismiss refused by the generation gate"
+                            );
+                        }
                         return false;
                     }
                 }
