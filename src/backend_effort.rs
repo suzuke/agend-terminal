@@ -69,16 +69,35 @@ pub(crate) fn capability_for(backend: &Backend) -> Option<&'static EffortCapabil
 /// The config key Codex uses for reasoning effort (overridden via `-c`).
 pub const CODEX_EFFORT_KEY: &str = "model_reasoning_effort";
 
-/// #3543 R1 B1: the value glued onto a Codex config flag — `-c<val>` or
-/// `--config=<val>`. Returns `None` for the separate-value spellings (`-c`
-/// / `--config` alone), which the next-token branch owns, and for any other
-/// token. clap treats `-cKEY=V` and `--config=KEY=V` as the same option as
-/// `-c KEY=V`, so a hand-written effort setting hides in these too.
+/// #3543 R1 B1 / #3557 R2 B1: the value glued onto a Codex config flag.
+/// Returns `None` for the separate-value spellings (`-c` / `--config`
+/// alone), which the next-token branch owns, and for any other token.
+///
+/// codex 0.153.2 accepts FOUR spellings of the same option, verified
+/// against the real binary: `-c KEY=V`, `-cKEY=V`, `-c=KEY=V` and
+/// `--config=KEY=V` all exit 0, while a bare `-c` exits 2. The first is
+/// the next-token branch; the other three land here, so the optional `=`
+/// separator has to be stripped too — the first cut of this helper appealed
+/// to that equivalence class and then missed `-c=KEY=V`, leaving a
+/// hand-written setting invisible to the scan.
 fn glued_codex_config_value(tok: &str) -> Option<&str> {
-    if let Some(rest) = tok.strip_prefix("--config=") {
-        return Some(rest);
-    }
-    tok.strip_prefix("-c").filter(|rest| !rest.is_empty())
+    let rest = match tok.strip_prefix("--config=") {
+        Some(rest) => rest,
+        None => tok.strip_prefix("-c").filter(|rest| !rest.is_empty())?,
+    };
+    Some(rest.strip_prefix('=').unwrap_or(rest))
+}
+
+/// #3557 N6: does `rest` assign the reasoning-effort key? Compares the KEY
+/// — everything before the first `=` — exactly, so a different key that
+/// merely shares the prefix (`model_reasoning_effort_summary`) is not
+/// mistaken for one. Whitespace around the key is tolerated because that is
+/// how TOML assignments are normally written (`key = "value"`, the shape
+/// `provider_detect` itself emits); a key with no `=` at all still counts,
+/// which keeps the pre-existing conservative reading of a bare key.
+fn is_effort_assignment(rest: &str) -> bool {
+    let key = rest.split_once('=').map_or(rest, |(key, _)| key);
+    key.trim() == CODEX_EFFORT_KEY
 }
 
 /// Long flag backends with [`EffortInjectionKind::CliFlag`] use.
@@ -91,13 +110,13 @@ pub const EFFORT_LONG_FLAG: &str = "--effort";
 ///
 /// - `CliFlag` backends: `--effort` (separate value) or `--effort=<val>`
 ///   (glued value). `--effort-foo` is a different flag and must not match.
-/// - `CodexConfig`: a `-c` / `--config` token whose NEXT token starts with
-///   `model_reasoning_effort` (covers `model_reasoning_effort="low"` and
-///   bare `model_reasoning_effort=low`), OR the glued spellings clap accepts
-///   for the same option — `-c<val>` and `--config=<val>` — whose value
-///   starts with that key. A lone `-c` at end of argv with no next token is
-///   not a conflict, and a glued value for any OTHER config key is not one
-///   either (it says nothing about effort).
+/// - `CodexConfig`: a `-c` / `--config` token whose NEXT token assigns
+///   `model_reasoning_effort`, OR any of the glued spellings codex accepts
+///   for the same option (`-c<val>`, `-c=<val>`, `--config=<val>`) whose
+///   value assigns it. Both arms compare the key EXACTLY (see
+///   [`is_effort_assignment`]), so `model_reasoning_effort_summary` — a
+///   different setting that shares the prefix — is not a conflict. A lone
+///   `-c` at end of argv with no next token is not a conflict either.
 pub fn scan_effort_conflict(backend: &Backend, args: &[String]) -> Option<String> {
     let cap = capability_for(backend)?;
     match cap.injection {
@@ -127,14 +146,14 @@ pub fn scan_effort_conflict(backend: &Backend, args: &[String]) -> Option<String
                 }
                 if tok == "-c" || tok == "--config" {
                     if let Some(next) = args.get(index + 1) {
-                        if next.starts_with(CODEX_EFFORT_KEY) {
+                        if is_effort_assignment(next) {
                             return Some(next.clone());
                         }
                     }
                 } else if let Some(rest) = glued_codex_config_value(tok) {
                     // Same setting, glued: report the whole token, since that
                     // is what the operator would have to remove.
-                    if rest.trim_start().starts_with(CODEX_EFFORT_KEY) {
+                    if is_effort_assignment(rest) {
                         return Some(tok.clone());
                     }
                 }
@@ -270,6 +289,12 @@ mod tests {
         assert_eq!(
             scan_effort_conflict(&backend, &args(&["--config", "model_reasoning_effort=low"])),
             Some("model_reasoning_effort=low".to_string())
+        );
+        // TOML's normal spacing — the shape `provider_detect` writes — is
+        // the same assignment. Nothing pinned this before #3557.
+        assert_eq!(
+            scan_effort_conflict(&backend, &args(&["-c", "model_reasoning_effort = \"low\""])),
+            Some("model_reasoning_effort = \"low\"".to_string())
         );
         // Unrelated -c pair: no conflict.
         assert_eq!(

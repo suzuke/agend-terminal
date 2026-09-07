@@ -161,6 +161,56 @@ fn push_effort_arg_skips_on_glued_long_codex_config_3541() {
     );
 }
 
+/// #3557 R2 B1: `-c=KEY=V` is the third glued spelling codex accepts
+/// (verified against codex 0.153.2: `-cfoo=bar`, `-c=foo=bar` and
+/// `--config=foo=bar` all exit 0). Stripping only the flag left the `=`
+/// separator on the value, so the scan read it as "no effort set" and the
+/// fleet value was appended on top of the operator's.
+#[test]
+fn push_effort_arg_skips_on_equals_separated_codex_config_3541() {
+    let mut args = vec!["-c=model_reasoning_effort=\"low\"".to_string()];
+    Backend::push_effort_arg(&mut args, &Backend::Codex, "high");
+    assert_eq!(
+        args,
+        vec!["-c=model_reasoning_effort=\"low\""],
+        "hand-written -c=… must win — no second -c appended"
+    );
+}
+
+/// #3557 N6: a DIFFERENT codex setting that merely shares the prefix is not
+/// an effort setting, so fleet intent still applies. Prefix matching would
+/// have read both of these as a conflict and silently dropped the injection.
+#[test]
+fn push_effort_arg_injects_for_prefix_sharing_codex_key_3541() {
+    let mut args = vec![
+        "-c".to_string(),
+        "model_reasoning_effort_summary=\"auto\"".to_string(),
+    ];
+    Backend::push_effort_arg(&mut args, &Backend::Codex, "high");
+    assert_eq!(
+        args,
+        vec![
+            "-c",
+            "model_reasoning_effort_summary=\"auto\"",
+            "-c",
+            "model_reasoning_effort=\"high\""
+        ],
+        "a prefix-sharing key must not block effort injection (separate form)"
+    );
+
+    let mut args = vec!["-cmodel_reasoning_effort_summary=\"auto\"".to_string()];
+    Backend::push_effort_arg(&mut args, &Backend::Codex, "high");
+    assert_eq!(
+        args,
+        vec![
+            "-cmodel_reasoning_effort_summary=\"auto\"",
+            "-c",
+            "model_reasoning_effort=\"high\""
+        ],
+        "a prefix-sharing key must not block effort injection (glued form)"
+    );
+}
+
 /// #2744 PR-A: Shell/Raw (any command without a declared model
 /// capability) must never receive a blind `--model` injection — `bash
 /// --model X` fails to spawn, and an arbitrary executable's argv
