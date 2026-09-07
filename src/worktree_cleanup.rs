@@ -330,6 +330,91 @@ fn upsert_hygiene(home: &Path, key: String, title: String, evidence: serde_json:
 
 const CLEANUP_INTENT_HYGIENE_AGE: chrono::Duration = chrono::Duration::hours(24);
 
+/// t-…-241: is this episode's subject provably gone?
+///
+/// `None` means "unchanged" for every reason that is not proof of absence —
+/// an unknown key shape, a repo we could not interrogate, a branch listing
+/// that failed. That asymmetry is the whole point: a detector that closes on
+/// "could not tell" silently retires real problems, and the fleet has already
+/// been bitten by exactly that confusion (an error swallowed by
+/// `2>/dev/null` read as "no branches"). Absence is proven only by
+/// `try_exists()` answering `Ok(false)`, or by a SUCCESSFUL branch listing
+/// that does not contain the branch.
+///
+/// R1 rejected `Path::exists()` here, correctly: it "coerces errors to false"
+/// (std `path.rs`), so an EACCES on a parent directory renders a live repo
+/// indistinguishable from a deleted one — this function would then have
+/// announced `repository path no longer exists` for a repo that does, and
+/// cancelled its episode. That is the very failure this module exists to
+/// stop, so the invariant is now implemented rather than merely documented.
+fn vanished_target_reason(key: &str) -> Option<String> {
+    if let Some(repo) = key.strip_prefix("residue-fetch-degraded:") {
+        return matches!(Path::new(repo).try_exists(), Ok(false))
+            .then(|| format!("repository path no longer exists: {repo}"));
+    }
+    let rest = [
+        "residue-lifecycle-blocked:",
+        "residue-delete-failed:",
+        "residue-recovery-failed:",
+        "residue-remove-failed:",
+    ]
+    .iter()
+    .find_map(|prefix| key.strip_prefix(prefix))?;
+    // A git ref name can never contain `:` (git-check-ref-format), so the
+    // last colon always separates the repo path from the branch.
+    let (repo, branch) = rest.rsplit_once(':')?;
+    match Path::new(repo).try_exists() {
+        Ok(false) => return Some(format!("repository path no longer exists: {repo}")),
+        // Could not even determine whether the path is there.
+        Err(_) => return None,
+        Ok(true) => {}
+    }
+    match crate::git_helpers::git_cmd(Path::new(repo), &["branch", "--format=%(refname:short)"]) {
+        // Listing succeeded: absence is now a fact about the repo, not about
+        // our ability to ask it.
+        Ok(stdout) => (!stdout.lines().any(|b| b == branch))
+            .then(|| format!("branch no longer exists in {repo}: {branch}")),
+        // Could not ask — shim refusal, permissions, a repo mid-clone. Say
+        // nothing rather than retire a live problem.
+        Err(_) => None,
+    }
+}
+
+/// t-…-241: close episodes whose subject is provably gone, so they stop being
+/// re-observed forever. Measured before this ran: 335 live episodes, 59 of
+/// them pointing at a repo or branch that no longer existed.
+///
+/// Closing is safe here BECAUSE every key family below is a STATEFUL
+/// observation — the residue is still there to be seen again, so a premature
+/// close costs only counter continuity and the next sweep re-opens a fresh
+/// task (`hygiene_task::tests::done_episode_reopens_as_new_task`). A future
+/// key family that records a ONE-SHOT event would not have that property, and
+/// must not be added to `vanished_target_reason` without a different rule
+/// (R2, archfix-opus-3).
+fn close_hygiene_episodes_with_vanished_targets(home: &Path) -> usize {
+    let episodes = match crate::daemon::hygiene_task::active_episodes(home) {
+        Ok(episodes) => episodes,
+        Err(error) => {
+            tracing::warn!(%error, "hygiene revalidation: board unreadable, skipping this tick");
+            return 0;
+        }
+    };
+    let mut closed = 0;
+    for (task_id, key) in episodes {
+        let Some(reason) = vanished_target_reason(&key) else {
+            continue;
+        };
+        match crate::daemon::hygiene_task::close_episode(home, &task_id, &reason) {
+            Ok(()) => {
+                tracing::info!(key = %key, task = %task_id.0, %reason, "hygiene episode closed");
+                closed += 1;
+            }
+            Err(error) => tracing::warn!(key = %key, %error, "hygiene episode close failed"),
+        }
+    }
+    closed
+}
+
 fn surface_aged_preserved_review_intents(
     home: &Path,
     aged: &[crate::cleanup_intents::CleanupIntent],
@@ -411,7 +496,31 @@ pub fn sweep_from_registry(
     let review_reconcile = crate::cleanup_intents::reconcile_terminal_review_intents(home, false);
     surface_aged_preserved_review_intents(home, &aged_review_intents, &review_reconcile);
 
+    // t-…-241: revalidate BEFORE observing, so a subject that vanished since
+    // the last tick is closed in the same tick that would have re-counted it.
+    close_hygiene_episodes_with_vanished_targets(home);
+
     let mut removed = Vec::new();
+
+    // t-…-241: `managed-repos.jsonl` only ever grows — 7 of its 24 entries
+    // were temp dirs and deleted worktrees. Sweeping one makes `fetch --prune`
+    // fail every tick, which is what kept the fetch-degraded episodes alive.
+    // Skipping (rather than deleting the entry) is deliberate: the file is the
+    // only record that a repo was ever managed, deletion is irreversible, and
+    // a path that is merely unreachable right now — an unmounted volume, a
+    // detached external disk — comes back on its own with skipping and never
+    // with deletion. Retiring entries permanently is operator hygiene, and
+    // every other destructive cleanup in this codebase is dry-run + confirm.
+    let repos: HashSet<PathBuf> = repos
+        .into_iter()
+        .filter(|repo| {
+            let live = repo.exists();
+            if !live {
+                tracing::debug!(repo = %repo.display(), "sweep: skipping managed repo whose path is gone");
+            }
+            live
+        })
+        .collect();
 
     for repo in &repos {
         // #2605: fetch runs UNCONDITIONALLY as the first step of every sweep —

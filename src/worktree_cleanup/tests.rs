@@ -1794,3 +1794,167 @@ fn terminal_candidate_still_probes_freshly_3011() {
     std::fs::remove_dir_all(&repo).ok();
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------------------------------------------------------------------------
+// t-…-241: an episode is re-observed every sweep tick forever, so the sweep
+// must first ask whether its subject still exists. Measured on the fleet board
+// before this landed: 335 live episodes, 59 pointing at a repo or branch that
+// was gone, one counter at 4,411.
+// ---------------------------------------------------------------------------
+
+fn hygiene_key_for(repo: &Path, branch: &str) -> String {
+    format!("residue-lifecycle-blocked:{}:{branch}", repo.display())
+}
+
+fn seed_episode(home: &Path, key: &str) -> crate::task_events::TaskId {
+    crate::daemon::hygiene_task::upsert_system_hygiene_task(
+        home,
+        key,
+        "[hygiene] fixture",
+        serde_json::json!({"fixture": true}),
+    )
+    .unwrap()
+    .task_id()
+    .clone()
+}
+
+fn episode_is_open(home: &Path, task_id: &crate::task_events::TaskId) -> bool {
+    !crate::task_events::projected_state(home)
+        .unwrap()
+        .tasks
+        .get(task_id)
+        .expect("episode task must still be on the board")
+        .status
+        .is_terminal()
+}
+
+fn run_sweep(home: &Path) {
+    std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+    sweep_from_registry(home, &HashMap::new(), &[]);
+    std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+}
+
+/// RED: the branch is gone, so nobody can ever resolve this episode — close it
+/// instead of counting it again.
+#[test]
+fn hygiene_episode_closes_when_its_branch_is_gone_241() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-branch-gone");
+    let repo = setup_test_repo("hyg-branch-gone");
+    let task = seed_episode(&home, &hygiene_key_for(&repo, "feat/never-existed"));
+
+    run_sweep(&home);
+
+    assert!(
+        !episode_is_open(&home, &task),
+        "an episode whose branch no longer exists must be closed"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The reverse, and the one that matters most: 203 of the 250 live branch
+/// episodes on the fleet board point at a branch that DOES exist. Closing
+/// those would retire real, un-actioned problems in silence — strictly worse
+/// than the board noise this change is fixing.
+#[test]
+fn hygiene_episode_survives_when_its_branch_still_exists_241() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-branch-live");
+    let repo = setup_test_repo("hyg-branch-live");
+    std::process::Command::new("git")
+        .args(["-C", &repo.display().to_string(), "branch", "feat/live"])
+        .output()
+        .unwrap();
+    let task = seed_episode(&home, &hygiene_key_for(&repo, "feat/live"));
+
+    run_sweep(&home);
+
+    assert!(
+        episode_is_open(&home, &task),
+        "an episode whose branch still exists must NOT be closed"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// "Could not ask" is not "is not there". The path exists but is not a git
+/// repo, so the branch listing fails; the episode must survive. This is the
+/// exact confusion that produced the wrong diagnosis for this task — an error
+/// swallowed by `2>/dev/null`, and `wc -l` reporting 0 branches.
+#[test]
+fn hygiene_episode_survives_when_the_branch_listing_fails_241() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-unaskable");
+    let not_a_repo = tmp_home("hyg-not-a-repo");
+    std::fs::create_dir_all(&not_a_repo).unwrap();
+    let task = seed_episode(&home, &hygiene_key_for(&not_a_repo, "feat/unknowable"));
+
+    run_sweep(&home);
+
+    assert!(
+        episode_is_open(&home, &task),
+        "a branch listing that FAILED proves nothing about the branch — the \
+         episode must survive"
+    );
+    std::fs::remove_dir_all(&not_a_repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The fetch-degraded family: its subject is the repository itself, and 12 of
+/// the 14 live ones pointed at a deleted temp dir, each still re-counting
+/// every tick because `fetch --prune` fails on a path that is not there.
+#[test]
+fn hygiene_episode_closes_when_its_repository_is_gone_241() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-repo-gone");
+    let gone = tmp_home("hyg-repo-deleted");
+    std::fs::remove_dir_all(&gone).ok();
+    let task = seed_episode(&home, &format!("residue-fetch-degraded:{}", gone.display()));
+
+    run_sweep(&home);
+
+    assert!(
+        !episode_is_open(&home, &task),
+        "an episode whose repository path is gone must be closed"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R1 F1: `Path::exists()` coerces errors to false, so a live repo behind an
+/// unreadable parent directory looked exactly like a deleted one and its
+/// episode was cancelled. `try_exists()` reports `Err` there, and only
+/// `Ok(false)` may close. Unix-only (the mode bits are the mechanism) and
+/// self-validating: if the process can still stat the path — running as root,
+/// or a filesystem that ignores mode — the premise does not hold on this
+/// machine and there is nothing to assert.
+#[cfg(unix)]
+#[test]
+fn hygiene_episode_survives_when_the_path_cannot_be_stat_ed_241() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-eacces-home");
+    let parent = tmp_home("hyg-eacces-parent");
+    let repo = parent.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let premise_holds = Path::new(&repo).try_exists().is_err();
+    if premise_holds {
+        let task = seed_episode(&home, &hygiene_key_for(&repo, "feat/unstattable"));
+        run_sweep(&home);
+        assert!(
+            episode_is_open(&home, &task),
+            "a path we could not stat proves nothing — the episode must survive"
+        );
+    }
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&parent).ok();
+    std::fs::remove_dir_all(&home).ok();
+    assert!(
+        premise_holds,
+        "setup could not produce an unstattable path (root? permissive fs?) — \
+         this machine cannot exercise the guard"
+    );
+}
