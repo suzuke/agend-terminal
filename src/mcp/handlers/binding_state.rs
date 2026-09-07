@@ -82,37 +82,6 @@ use std::path::Path;
 /// (Sprint 57 lease-block recovery surface — when this is non-empty
 /// AND the queried agent has no binding, the operator can immediately
 /// see who's holding the branch).
-/// #3546: how many commits the worktree's HEAD is behind the LOCAL view of the
-/// default branch — `None` when that cannot be established.
-///
-/// Deliberately measured against `refs/remotes/<remote>/<default>` as it is on
-/// disk, with NO fetch: a health query must not do network I/O, and inventing a
-/// number would be worse than admitting we don't have one. That gives the field
-/// an asymmetric meaning worth stating plainly, because the bug this exists for
-/// is precisely a stale local view:
-///
-///   * a NON-ZERO count proves the base is behind;
-///   * ZERO does NOT prove it is current — the local ref may itself be stale.
-///
-/// The `base_from_stale_view` flag beside it is what covers the second case: it
-/// records, at provision time, that the ref could not be refreshed at all.
-fn base_behind_default_by(worktree: &Path, source_repo: &Path) -> Option<u64> {
-    let default = crate::git_helpers::default_branch(source_repo);
-    if default.is_empty() {
-        return None;
-    }
-    let range = format!("HEAD..origin/{default}");
-    let out = crate::git_helpers::git_bypass(worktree, &["rev-list", "--count", &range]).ok()?;
-    if !out.status.success() {
-        // No such ref (never fetched, renamed default, a fixture without a
-        // remote) — unknown, not zero.
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok()
-}
 
 pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<Sender>) -> Value {
     let agent = match args["instance"].as_str() {
@@ -228,13 +197,9 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "dispatched_waiting_for": dispatched_waiting_for,
             "pending_response_to": pending_response_to,
             "target_identity": target_identity,
-            // #3546: the two halves of "is this worktree standing on the right
-            // base". The flag is the provision-time fact (recorded in the signed
-            // binding); the count is measured now, against the local view.
-            "base_from_stale_view": b
-                .get("base_from_stale_view")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            // #3546: see `binding_state_base_freshness.rs` — each half proves a
+            // different thing, and one of them cannot prove freshness at all.
+            "base_from_stale_view": base_freshness::flag_from_binding(&b),
             "base_behind_default_by": base_behind_default_by(wt_path, Path::new(source_repo)),
         })
     } else {
@@ -255,32 +220,24 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
 // `ci_watches_detail` projection) live in a sibling module so binding_state.rs
 // stays under the MCP-handler LOC ceiling (file_size_invariant — the same reason
 // the tests are `#[path]` siblings).
+// #3546: base-freshness projection lives in a sibling file — binding_state.rs
+// was already AT the 750-LOC handler ceiling, so the fields had to arrive with
+// an extraction, not on top of one.
+#[path = "binding_state_base_freshness.rs"]
+mod base_freshness;
+use base_freshness::base_freshness_fields;
+
+// Pure move (no logic change), same ceiling reason as above.
+#[path = "binding_state_cross_branch.rs"]
+mod cross_branch;
+use cross_branch::cross_branch_holders_for;
+
 #[path = "binding_state_ci_watches.rs"]
 mod ci_watches;
 use ci_watches::{enumerate_ci_watches_detail_for_agent, enumerate_ci_watches_for_agent};
 #[path = "binding_state_target_identity.rs"]
 mod target_identity;
 
-/// Return list of agent names (other than `exclude_agent`) whose
-/// binding currently references `branch`. P0-1.5 enforces uniqueness
-/// at bind time — this enumerator surfaces any violation so it's
-/// immediately visible via `binding_state`.
-fn cross_branch_holders_for(home: &Path, branch: &str, exclude_agent: &str) -> Vec<String> {
-    if branch.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for (other, v) in crate::binding::binding_scan_all(home) {
-        if other == exclude_agent {
-            continue;
-        }
-        if v["branch"].as_str() == Some(branch) {
-            out.push(other);
-        }
-    }
-    out.sort();
-    out
-}
 
 // #t-…83936-4 protection ① liveness tests (worktree_resolves / invalid_reason)
 // live in a sibling file loaded via `#[path]` so binding_state.rs stays under
