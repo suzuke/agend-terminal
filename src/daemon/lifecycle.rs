@@ -645,9 +645,12 @@ mod tests {
             !was_deleting,
             "marker must clear before transport finalization"
         );
-        assert_eq!(
-            late_result,
-            Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced),
+        assert!(
+            late_result.is_err()
+                && matches!(
+                    late_result,
+                    Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. })
+                ),
             "same-key enqueue must remain stale while transport finalization is active"
         );
 
