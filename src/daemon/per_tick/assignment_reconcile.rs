@@ -8,7 +8,7 @@
 //!     crash-gap and old-generation replays — I18/I19).
 //!   - **A2** row recovery: `durable_enqueue` any `Pending` record (idempotent).
 //!   - **A3/A4** nudge + repair: a record classifying `Unengaged` whose FIXED-
-//!     interval lease is due gets an append-only row repair (A4) and a best-effort
+//!     interval lease is due gets an append-only row repair (A4) and a queued
 //!     self-IPC WAKE pointer (A3), emitted OUTSIDE all flocks. `Satisfied` /
 //!     `EngagedUnsatisfied` is a TRUE stop — never nudged. Generic correlated
 //!     ACK state is not code-review evidence.
@@ -103,11 +103,45 @@ fn log_legacy_cutover_census(home: &Path) {
 }
 
 /// Reconcile every active branch, then fire the collected A3 WAKE pointers OUTSIDE
-/// all flocks (self-IPC nudge; best-effort). Production entry.
+/// all flocks through the delivery worker. Production entry.
+///
+/// #3504 fix: wakes for actionable-unread are now observable — a fenced or
+/// queue-full admission writes a durable `Failed` receipt (via
+/// `wake_review_assignment_result`) and the lease is shortened to 5s instead of
+/// silently advancing 60s with ledger empty.
 pub(crate) fn reconcile_all(home: &Path, now: &str) {
     let wakes = reconcile_all_collect_wakes(home, now);
-    for target in wakes.assignment_targets {
-        crate::inbox::notify::wake_review_assignment(home, &target);
+    for detail in &wakes.assignment_wake_details {
+        let result = crate::inbox::notify::wake_review_assignment_result_for_assignment(
+            home,
+            &detail.target,
+            &detail.repo,
+            &detail.branch,
+            detail.assignment_id,
+            now,
+        );
+        let reason = match &result {
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. }) => {
+                Some("queue-full")
+            }
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. }) => {
+                Some("fenced")
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            // Admission failure is known synchronously; retain the row and let
+            // the bounded retry make the failure visible to the next tick.
+            let _ = store::set_short_retry_lease(
+                home,
+                &detail.repo,
+                &detail.branch,
+                &detail.target,
+                now,
+                detail.assignment_id,
+                reason,
+            );
+        }
     }
     for wake in wakes.continuations {
         if let Err(error) = crate::inbox::wake_persisted_pointer(
@@ -127,17 +161,30 @@ pub(crate) fn reconcile_all(home: &Path, now: &str) {
 }
 
 /// Deterministic tested core: reconcile every active branch and RETURN the set of
-/// targets to WAKE (A3), so the caller emits the self-IPC pointers lock-free. Takes
-/// `now` injected — no unmockable clock inside.
+/// targets to WAKE (A3), so the production caller emits the self-IPC pointers
+/// lock-free and owns their transport outcome. Takes `now` injected — no
+/// unmockable clock inside.
 #[cfg(test)]
 pub(crate) fn reconcile_all_collect(home: &Path, now: &str) -> Vec<String> {
-    reconcile_all_collect_wakes(home, now).assignment_targets
+    let wakes = reconcile_all_collect_wakes(home, now);
+    // This collector intentionally does not apply the wake outcome. The
+    // production entry point owns transport admission and lease advancement;
+    // tests that assert that contract must drive `reconcile_all` itself.
+    wakes.assignment_targets
 }
 
 #[derive(Default)]
 struct ReconcileWakes {
     assignment_targets: Vec<String>,
+    assignment_wake_details: Vec<AssignmentWakeInfo>,
     continuations: Vec<ContinuationWake>,
+}
+
+struct AssignmentWakeInfo {
+    target: String,
+    repo: String,
+    branch: String,
+    assignment_id: uuid::Uuid,
 }
 
 struct ContinuationWake {
@@ -210,6 +257,9 @@ fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
         wakes
             .assignment_targets
             .extend(branch_wakes.assignment_targets);
+        wakes
+            .assignment_wake_details
+            .extend(branch_wakes.assignment_wake_details);
         wakes.continuations.extend(branch_wakes.continuations);
     }
     wakes
@@ -306,10 +356,25 @@ fn reconcile_branch(
         // the FIXED-interval lease (returns false when not due) and advances it, so
         // two ticks in one interval fire at most once (I12). Wake fires on an
         // actionable-unread row (pure wake) or a missing/superseded row (repair).
+        //
+        // #3504: for actionable-unread `repair_row` no longer advances the lease
+        // before the wake outcome is known — the reconciler advances on success
+        // or sets a 5s short retry on fenced/queue-full (bounded). Missing/
+        // superseded repair already created a durable row and advanced 60s.
         if store::classify_assignment(&record, prstate) == store::AssignmentEvidence::Unengaged
             && store::repair_row(home, repo, branch, &record.target, now).unwrap_or(false)
         {
+            // Both healthy actionable rows and append-only repaired rows use
+            // the typed worker path. For a repaired row, `repair_row` has
+            // already set the normal lease; a worker failure still replaces
+            // it with the bounded short retry.
             wakes.assignment_targets.push(record.target.clone());
+            wakes.assignment_wake_details.push(AssignmentWakeInfo {
+                target: record.target.clone(),
+                repo: repo.to_string(),
+                branch: branch.to_string(),
+                assignment_id: record.assignment_id,
+            });
         }
     }
 
@@ -446,6 +511,9 @@ mod tests {
     use crate::mcp::handlers::comms_gates::ReviewAuthor;
     use crate::task_events::{InstanceName, TaskEvent, TaskId};
     use std::path::{Path, PathBuf};
+
+    #[path = "assignment_reconcile_3504.rs"]
+    mod issue_3504_tests;
 
     fn tmp_home(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -857,10 +925,12 @@ mod tests {
             vec!["reviewer".to_string()],
             "actionable-unread row triggers pure wake (no rotation)"
         );
-        // The lease still advanced (a full interval away) so the guard is bounded.
-        assert_ne!(
+        // The collector does not own transport admission, so it must not mutate
+        // the lease. The production `reconcile_all` advances it after the wake
+        // outcome is known.
+        assert_eq!(
             after.next_nudge_at, rec.next_nudge_at,
-            "next_nudge_at advanced past created_at even though no repair fired"
+            "collector must not advance the lease before transport admission"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -2214,9 +2284,15 @@ mod tests {
             .delivery_nonce;
         assert_eq!(nonce_0, nonce_1, "pure wake: nonce not rotated");
 
-        // Second tick within 60s → lease not due → no wake.
+        // The collector intentionally does not apply transport admission, so it
+        // has no lease outcome to apply; production `reconcile_all` owns that
+        // post-admission transition.
         let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:30Z");
-        assert!(wakes.is_empty(), "second tick within lease ⇒ no wake");
+        assert_eq!(
+            wakes,
+            vec!["reviewer".to_string()],
+            "collector must not pretend the wake succeeded"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }

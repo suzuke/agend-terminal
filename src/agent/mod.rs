@@ -1561,6 +1561,16 @@ pub(crate) fn spawn_agent_with_capture_home(
     // #3314 B1: arming is a PURE function of the provenance captured from the
     // command that was actually built and spawned — never a post-spawn re-read.
     let dev_modal_armed = dev_modal::armed_for_spawn(&spawn_provenance);
+    // #3547 P0-near Task1: log the arming fact at info (grep-able field names)
+    // so the next dismiss-miss can be answered from the log: was this
+    // generation even armed, and did its argv carry the dev-channel flag?
+    // Observability only — the value flows unchanged into `ctx` below.
+    tracing::info!(
+        agent = name,
+        dev_modal_armed,
+        argv_has_dev_channel_flag = spawn_provenance.argv_has_dev_channel_flag,
+        "dev-modal dismiss armed for spawn"
+    );
     let shutdown_for_reaper = shutdown.clone();
     let deleted_for_reaper = {
         let reg = lock_registry(registry);

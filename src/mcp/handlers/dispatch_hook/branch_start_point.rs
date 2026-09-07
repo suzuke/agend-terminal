@@ -7,11 +7,44 @@
 use super::{DispatchError, ErrorCode, Stage, DISPATCH_FETCH_TIMEOUT};
 use std::path::Path;
 
+/// What provisioning did, and whether the base it used could be trusted.
+///
+/// #3546: `base_from_stale_view` is the fact this module always KNEW and threw
+/// away — every fetch result was computed, logged, and dropped. When the base
+/// ref is a remote-tracking view we could not refresh in this call, the branch
+/// is created from whatever that view last saw: `git branch` succeeds, the
+/// worktree lands, and every binding health check passes, so a base tens of
+/// commits behind the default branch is indistinguishable from a correct one.
+/// The reported instance had `origin` pointing at an unreachable local path,
+/// which fails BOTH fetches on the create path — 60 and 61 commits behind, all
+/// green. State 3 of the table below stays fail-OPEN by design (an offline
+/// agent must still be able to start work); this flag is what makes it visible
+/// instead of silent.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BranchProvision {
+    /// This call authored the local ref (vs. observing a pre-existing one).
+    pub created: bool,
+    /// A fetch ran AND succeeded (the pre-#3546 second tuple element).
+    pub fetch_attempted: bool,
+    /// The base came from a remote-tracking ref this call could not refresh.
+    pub base_from_stale_view: bool,
+}
+
+impl BranchProvision {
+    fn fresh(created: bool, fetch_attempted: bool) -> Self {
+        Self {
+            created,
+            fetch_attempted,
+            base_from_stale_view: false,
+        }
+    }
+}
+
 /// Create the local `refs/heads/<branch>` when it does not yet exist. Prefers an
 /// existing `origin/<branch>` (the #t-83936-5 data-loss guard), fails CLOSED only
 /// when totally blind (no remote-tracking view AND origin unreachable), and
 /// otherwise creates from `from_ref` (the #1755 refresh-then-create path). Returns
-/// `(n_branch, fetch_attempted)`. `remote` / `from_ref_branch` are the base ref's
+/// a [`BranchProvision`]. `remote` / `from_ref_branch` are the base ref's
 /// resolved remote (`resolve_from_ref_remote`), computed once by the caller.
 pub(super) fn create_new_branch(
     home: &Path,
@@ -21,7 +54,7 @@ pub(super) fn create_new_branch(
     actor: &str,
     remote: &str,
     from_ref_branch: Option<&str>,
-) -> Result<(bool, bool), DispatchError> {
+) -> Result<BranchProvision, DispatchError> {
     // Step 1.5 (#t-83936-5 data-loss, incident-followup — lead-vetted hybrid):
     // the LOCAL ref is absent, but the branch may ALREADY EXIST on the remote — the
     // fresh-canonical-clone / pruned-after-release re-bind scenario (exactly
@@ -89,12 +122,19 @@ pub(super) fn create_new_branch(
                 );
                 // n_branch=false: the branch pre-existed on the remote; we only
                 // materialized the local ref (consistent with the EXISTS path).
-                return Ok((false, work_fetch_ok));
+                // #3546: this base IS `refs/remotes/origin/<branch>`, and the
+                // only thing that refreshes it here is the work fetch above.
+                return Ok(BranchProvision {
+                    created: false,
+                    fetch_attempted: work_fetch_ok,
+                    base_from_stale_view: !work_fetch_ok,
+                });
             }
             Ok(o) if String::from_utf8_lossy(&o.stderr).contains("already exists") => {
                 // Race: a concurrent caller authored the local ref between our
                 // rev-parse gate and here. Idempotent — observed, not created.
-                return Ok((false, work_fetch_ok));
+                // Someone else chose the base, so this call cannot characterise it.
+                return Ok(BranchProvision::fresh(false, work_fetch_ok));
             }
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr).to_string();
@@ -208,8 +248,31 @@ pub(super) fn create_new_branch(
             ),
         );
     }
+    // #3546: is the ref we are about to branch from a remote-tracking view that
+    // nothing in this call refreshed? A bare local `from_ref` is not a view at
+    // all (nothing to be stale against). For a view, the refresh could come from
+    // the #1755 fetch just above, or — only when the base lives on `origin` —
+    // from the full `git fetch origin` at the top of this function.
+    let base_ref_refreshed = if remote == "origin" {
+        work_fetch_ok || create_fetched
+    } else {
+        create_fetched
+    };
+    let base_from_stale_view = from_ref_branch.is_some() && !base_ref_refreshed;
+    if base_from_stale_view {
+        crate::event_log::log(
+            home,
+            "ensure_branch_stale_view",
+            actor,
+            &format!("branch={branch} from_ref={from_ref} remote={remote}: created from an UNREFRESHED remote-tracking view (both fetches failed) — base may be behind the default branch (#3546)"),
+        );
+    }
     match crate::git_helpers::git_bypass(source, &["branch", branch, from_ref]) {
-        Ok(o) if o.status.success() => Ok((true, create_fetched)),
+        Ok(o) if o.status.success() => Ok(BranchProvision {
+            created: true,
+            fetch_attempted: create_fetched,
+            base_from_stale_view,
+        }),
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr).to_string();
             if stderr.contains("already exists") {
@@ -217,7 +280,7 @@ pub(super) fn create_new_branch(
                 // rev-parse and branch. Idempotent fall-through —
                 // auto_created stays false so callers can distinguish
                 // "I created it" vs "I observed it pre-existing".
-                Ok((false, false))
+                Ok(BranchProvision::fresh(false, false))
             } else if stderr.contains("not a valid object name")
                 || stderr.contains("not a valid ref")
             {
@@ -244,11 +307,11 @@ pub(super) fn create_new_branch(
                     Ok(fo) if fo.status.success() => {
                         match crate::git_helpers::git_bypass(source, &["branch", branch, from_ref])
                         {
-                            Ok(ro) if ro.status.success() => Ok((true, true)),
+                            Ok(ro) if ro.status.success() => Ok(BranchProvision::fresh(true, true)),
                             Ok(ro) => {
                                 let rstderr = String::from_utf8_lossy(&ro.stderr).to_string();
                                 if rstderr.contains("already exists") {
-                                    Ok((false, true))
+                                    Ok(BranchProvision::fresh(false, true))
                                 } else {
                                     tracing::warn!(
                                         target: "dispatch_hook",

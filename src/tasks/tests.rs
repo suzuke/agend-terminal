@@ -6022,3 +6022,385 @@ fn list_filter_aliases_2037() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #3536: a report settles the dispatch entry but not the task ──
+//
+// `dispatch_tracking::mark_completed` DELETES the entry (deliberately —
+// `test_report_result_marks_dispatch_completed` pins "removed outright, not
+// flipped to completed and kept"), so `sweep_stuck` can never see the task
+// again. `sweep_overdue_claimed` only looks at tasks carrying a `due_at`.
+// Between the two, a task whose assignee reported and went idle is invisible
+// to every sweep: the real case sat `claimed` for 40+ hours with zero
+// reminders. These tests pin the trace (`dispatch_completed_at`) and the
+// reminder built on it.
+
+/// Seed a settled dispatch: the entry existed and the assignee reported it.
+fn settle_dispatch(home: &std::path::Path, task_id: &str, from: &str, to: &str) {
+    crate::dispatch_tracking::track_dispatch(
+        home,
+        crate::dispatch_tracking::DispatchEntry {
+            task_id: Some(task_id.to_string()),
+            from: from.to_string(),
+            to: to.to_string(),
+            from_id: None,
+            to_id: None,
+            delegated_at: chrono::Utc::now().to_rfc3339(),
+            status: "pending".into(),
+        },
+    );
+    crate::dispatch_tracking::mark_completed(home, Some(task_id), to);
+}
+
+/// Backdate the settlement trace so the sweep sees it as aged.
+///
+/// Must run as the ASSIGNEE: `can_mutate_task` only admits the owner or an
+/// orchestrator of the owner's team, and these tests configure no team — a
+/// creator-issued write is refused SILENTLY, which would leave the stamp at
+/// "now" and quietly turn every assertion below into a vacuous pass. The
+/// assert is the guard against exactly that.
+fn backdate_settlement(home: &std::path::Path, assignee: &str, id: &str, minutes: i64) {
+    let past = (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+    let r = handle(
+        home,
+        assignee,
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "dispatch_completed_at", "metadata_value": past
+        }),
+    );
+    assert_eq!(
+        r["event"], "metadata_set",
+        "backdating must actually land, or the test proves nothing: {r}"
+    );
+}
+
+/// The trace itself: settling a dispatch for a still-live task must leave a
+/// durable, inspectable mark ON THE TASK — the dispatch store cannot hold it
+/// because the entry is gone by design.
+#[test]
+fn mark_completed_records_dispatch_completed_at_on_a_live_task_3536() {
+    let home = tmp_home("3536-trace");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "discuss the thing"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+
+    settle_dispatch(&home, &id, "lead", "impl");
+
+    let task = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "get", "id": id}),
+    );
+    let first = task["task"]["metadata"]["dispatch_completed_at"]
+        .as_str()
+        .map(str::to_string);
+    assert!(
+        first
+            .as_deref()
+            .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
+        "settling a dispatch must stamp dispatch_completed_at (RFC3339) on the \
+         still-live task; got {:?}",
+        task["task"]["metadata"]
+    );
+
+    // EVERY report re-stamps, and this assertion is the only thing pinning it.
+    // The re-stamp is what keeps an actively-reporting agent from being
+    // reminded: the 120-minute timer restarts on each report, so only someone
+    // who reported and then went idle ages into a reminder. Nothing else covers
+    // it — the maintenance tests below backdate the stamp by hand, so they
+    // exercise the sweep and never this write. (R1 mutation testing on 5f15d0a2
+    // deleted the re-stamp and left all six tests green.)
+    // The sleep keeps the two stamps distinguishable whatever the clock
+    // resolution, so this can never flake into a false pass.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    settle_dispatch(&home, &id, "lead", "impl");
+    let task = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "get", "id": id}),
+    );
+    let second = task["task"]["metadata"]["dispatch_completed_at"].as_str();
+    assert!(
+        second.is_some() && second != first.as_deref(),
+        "a second report must RE-STAMP dispatch_completed_at (the timer restarts \
+         on every report); first={first:?} second={second:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A task that is already closed needs no settlement trace: it is settled. The
+/// stamp is skipped at the SOURCE rather than merely ignored later — the sweep's
+/// status filter would refuse to act on it anyway, so this pins the first of two
+/// independent guards. Without this assertion, deleting the early return costs
+/// stamp pollution that every later replay must carry, and no test notices.
+#[test]
+fn mark_completed_leaves_no_trace_on_an_already_terminal_task_3536() {
+    let home = tmp_home("3536-no-trace-terminal");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "already closed"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "done", "id": id, "result": "shipped"}),
+    );
+
+    settle_dispatch(&home, &id, "lead", "impl");
+
+    let task = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "get", "id": id}),
+    );
+    assert!(
+        task["task"]["metadata"]["dispatch_completed_at"].is_null(),
+        "a terminal task must not be stamped at all; got {:?}",
+        task["task"]["metadata"]
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The gap #3536 is about: report in, task still `claimed`, no `due_at` —
+/// every existing sweep is blind to it. Both parties who can resolve it must
+/// be told, and the text must name the two exits (assignee sends a terminal
+/// report / orchestrator closes it), not merely say "stuck".
+#[test]
+fn run_task_maintenance_reminds_when_a_settled_report_left_the_task_unsettled_3536() {
+    let home = tmp_home("3536-remind");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "unsettled after report"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    settle_dispatch(&home, &id, "lead", "impl");
+    backdate_settlement(&home, "impl", &id, 121);
+
+    crate::daemon::run_task_maintenance(&home);
+
+    let to_assignee = crate::inbox::drain(&home, "impl");
+    let assignee_text = to_assignee
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        assignee_text.contains(&id),
+        "assignee must be reminded about the unsettled task: {to_assignee:?}"
+    );
+    assert!(
+        assignee_text.contains("terminal"),
+        "the reminder must name the assignee's exit (a terminal report), not just \
+         say stuck: {assignee_text}"
+    );
+
+    let to_creator = crate::inbox::drain(&home, "lead");
+    let creator_text = to_creator
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        creator_text.contains(&id),
+        "the orchestrator who created the task must be reminded too: {to_creator:?}"
+    );
+    assert!(
+        creator_text.contains("done"),
+        "the reminder must name the orchestrator's exit (task action=done): \
+         {creator_text}"
+    );
+
+    let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+    assert!(
+        log.contains("task_unsettled_after_report"),
+        "the reminder must be auditable in the event log"
+    );
+
+    // The task itself is NEVER auto-closed — the #3526 completion guard owns
+    // settlement; this sweep only reminds.
+    let after = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "get", "id": id}),
+    );
+    assert_eq!(
+        after["task"]["status"], "claimed",
+        "the sweep must not settle or release the task, only remind"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Negative: the assignee reported AND the task was closed. Nothing is
+/// pending, so nobody may be nagged.
+#[test]
+fn run_task_maintenance_stays_silent_for_a_terminal_task_after_report_3536() {
+    let home = tmp_home("3536-terminal");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "settled properly"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    settle_dispatch(&home, &id, "lead", "impl");
+    backdate_settlement(&home, "impl", &id, 121);
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "done", "id": id, "result": "shipped"}),
+    );
+
+    crate::daemon::run_task_maintenance(&home);
+
+    for who in ["impl", "lead"] {
+        let msgs = crate::inbox::drain(&home, who);
+        assert!(
+            !msgs.iter().any(|m| m.text.contains(&id)),
+            "a done task must not be reminded about ({who}): {msgs:?}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Negative, and the reason the predicate is `claimed`/`in_progress` rather
+/// than "any non-terminal": `in_review` is LEGITIMATELY waiting on someone
+/// else. Field evidence — t-…-110 on this very fleet sat `in_review` for 43
+/// hours waiting for a re-review after its head moved; nagging that every
+/// maintenance tick would be pure noise.
+#[test]
+fn run_task_maintenance_stays_silent_for_in_review_after_report_3536() {
+    let home = tmp_home("3536-in-review");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "awaiting review"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    settle_dispatch(&home, &id, "lead", "impl");
+    backdate_settlement(&home, "impl", &id, 600);
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_review"}),
+    );
+
+    crate::daemon::run_task_maintenance(&home);
+
+    for who in ["impl", "lead"] {
+        let msgs = crate::inbox::drain(&home, who);
+        assert!(
+            !msgs.iter().any(|m| m.text.contains(&id)),
+            "in_review is waiting on a reviewer, not stalled ({who}): {msgs:?}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// One reminder per report, not one per maintenance tick. A fresh report
+/// re-stamps the trace and makes the task eligible again.
+#[test]
+fn run_task_maintenance_reminds_once_per_report_3536() {
+    let home = tmp_home("3536-once");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "nag once"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    settle_dispatch(&home, &id, "lead", "impl");
+    backdate_settlement(&home, "impl", &id, 121);
+
+    crate::daemon::run_task_maintenance(&home);
+    let first = crate::inbox::drain(&home, "impl");
+    assert!(
+        first.iter().any(|m| m.text.contains(&id)),
+        "first tick must remind: {first:?}"
+    );
+
+    crate::daemon::run_task_maintenance(&home);
+    let second = crate::inbox::drain(&home, "impl");
+    assert!(
+        !second.iter().any(|m| m.text.contains(&id)),
+        "the same report must not be nagged twice: {second:?}"
+    );
+
+    // A NEW report re-stamps the trace → eligible again.
+    settle_dispatch(&home, &id, "lead", "impl");
+    backdate_settlement(&home, "impl", &id, 121);
+    crate::daemon::run_task_maintenance(&home);
+    let third = crate::inbox::drain(&home, "impl");
+    assert!(
+        third.iter().any(|m| m.text.contains(&id)),
+        "a fresh report that is again left unsettled must remind again: {third:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Negative control on the pre-existing path: a `due_at` task with no
+/// settlement trace still gets RELEASED by `sweep_overdue_claimed`, and the
+/// new sweep adds no reminder of its own.
+#[test]
+fn run_task_maintenance_leaves_the_due_at_release_path_unchanged_3536() {
+    let home = tmp_home("3536-due-at");
+    let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "overdue", "due_at": past}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+
+    crate::daemon::run_task_maintenance(&home);
+
+    let listed = handle(&home, "lead", &serde_json::json!({"action": "list"}));
+    assert_eq!(
+        listed["tasks"][0]["status"], "open",
+        "the overdue release path must be untouched"
+    );
+    let msgs = crate::inbox::drain(&home, "impl");
+    assert!(
+        !msgs.iter().any(|m| m.text.contains("task_unsettled")),
+        "no settlement reminder is owed when no report ever settled a dispatch: {msgs:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

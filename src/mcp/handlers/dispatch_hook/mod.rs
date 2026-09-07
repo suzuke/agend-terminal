@@ -14,6 +14,7 @@ mod live_binding;
 mod provider_neutral_slug;
 mod rebase_dispatch;
 mod types;
+pub(crate) use branch_start_point::BranchProvision;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 pub(crate) use provider_neutral_slug::derive_repo_slug_any_forge_pub;
 pub(crate) use rebase_dispatch::dispatch_auto_bind_lease_with_source_and_chain_preheld;
@@ -378,8 +379,17 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         .as_ref()
         .filter(|_| !reused)
         .and_then(|_| exact_head::branch_tip(&source_repo, branch));
-    let (auto_created_branch, fetch_attempted) = if reused {
-        (false, false)
+    // #3546 R1 blocker 1: take the PROVISIONED view, not the back-compat tuple.
+    // This is the path every `send kind=task` with a branch travels, and it hits
+    // the same state-3 fail-open as `repo checkout` — an offline agent still gets
+    // a tree, provisioned from a remote-tracking ref nothing could refresh. The
+    // tuple wrapper drops that fact on the floor, so the binding was written with
+    // the flag hardcoded false and `binding_state` then asserted, positively,
+    // that the base was fresh. Carrying it here is what makes the two entry
+    // points agree.
+    let (auto_created_branch, fetch_attempted, base_from_stale_view) = if reused {
+        // A reused live worktree provisioned nothing, so it claims nothing.
+        (false, false, false)
     } else {
         // #2703: qualify the bare default branch with the push remote so both
         // branch creation and the pre-create fetch use the same remote.
@@ -388,7 +398,12 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             crate::git_helpers::default_branch(&source_repo)
         );
         let base = expected_head.as_deref().unwrap_or(&default_base);
-        ensure_branch_exists(home, &source_repo, branch, base, target)?
+        let provision = ensure_branch_exists_provisioned(home, &source_repo, branch, base, target)?;
+        (
+            provision.created,
+            provision.fetch_attempted,
+            provision.base_from_stale_view,
+        )
     };
 
     // #2234 cure-(B): under the flag the agent's WORKSPACE dir IS its worktree
@@ -455,7 +470,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         if let Some(reason) = bind_test_seam::hit() {
             Err(reason)
         } else {
-            crate::binding::bind_full(
+            crate::binding::bind_full_with_provenance(
                 home,
                 target,
                 task_id,
@@ -463,11 +478,13 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 &wt_path,
                 &source_repo,
                 !arm_ci_watch,
+                None,
+                base_from_stale_view,
             )
         }
         #[cfg(not(test))]
         {
-            crate::binding::bind_full(
+            crate::binding::bind_full_with_provenance(
                 home,
                 target,
                 task_id,
@@ -475,6 +492,8 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 &wt_path,
                 &source_repo,
                 !arm_ci_watch,
+                None,
+                base_from_stale_view,
             )
         }
     };
@@ -642,17 +661,16 @@ fn resolve_source_repo(
 const DISPATCH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// #781 Piece 6: shared auto-create-branch helper (decision tree formerly inlined
-/// in `ci::handle_checkout_repo`, #780) — both `repo checkout bind:true` and
-/// `dispatch_auto_bind_lease` route through here (#784 / d-20260514102305998399-0).
-/// Branch exists → fetch + `update-ref` so the local ref tracks the remote PR HEAD
-/// (#869); else `git branch <branch> <from_ref>` with a fetch-then-retry on an
-/// unresolved ref. Returns `(auto_created, fetch_attempted)`.
-///
-/// BOTH the user-supplied `branch` and `from_ref` run through `validate_branch`
-/// (defense in depth, rejecting option-injection like `--upload-pack=...` at the
-/// API boundary before any git subprocess); `branch` is additionally rejected by
-/// `is_protected_ref` (E4.5). `actor` = event_log id for the fetch breadcrumb; the
-/// `from_ref`→remote split lives in [`from_ref::resolve_from_ref_remote`].
+/// Back-compat tuple view of [`ensure_branch_exists_provisioned`]: `(auto_created,
+/// fetch_attempted)`. Every caller that does not need to know HOW TRUSTWORTHY the
+/// base was keeps this shape, so #3546 adds a fact without rewriting call sites
+/// that make no claim about it.
+// #3546: the last PRODUCTION caller (`dispatch_auto_bind_lease_with_source_and_chain`)
+// moved to the provisioned view, because it does make a claim about the base. The
+// tuple view stays as the documented back-compat surface — ~15 tests exercise this
+// exact shape, and rewriting them to unpack a struct would churn coverage that has
+// nothing to do with this fix.
+#[allow(dead_code)]
 pub(crate) fn ensure_branch_exists(
     home: &Path,
     source: &Path,
@@ -660,6 +678,28 @@ pub(crate) fn ensure_branch_exists(
     from_ref: &str,
     actor: &str,
 ) -> Result<(bool, bool), DispatchError> {
+    ensure_branch_exists_provisioned(home, source, branch, from_ref, actor)
+        .map(|p| (p.created, p.fetch_attempted))
+}
+
+/// in `ci::handle_checkout_repo`, #780) — both `repo checkout bind:true` and
+/// `dispatch_auto_bind_lease` route through here (#784 / d-20260514102305998399-0).
+/// Branch exists → fetch + `update-ref` so the local ref tracks the remote PR HEAD
+/// (#869); else `git branch <branch> <from_ref>` with a fetch-then-retry on an
+/// unresolved ref. Returns a [`BranchProvision`].
+///
+/// BOTH the user-supplied `branch` and `from_ref` run through `validate_branch`
+/// (defense in depth, rejecting option-injection like `--upload-pack=...` at the
+/// API boundary before any git subprocess); `branch` is additionally rejected by
+/// `is_protected_ref` (E4.5). `actor` = event_log id for the fetch breadcrumb; the
+/// `from_ref`→remote split lives in [`from_ref::resolve_from_ref_remote`].
+pub(crate) fn ensure_branch_exists_provisioned(
+    home: &Path,
+    source: &Path,
+    branch: &str,
+    from_ref: &str,
+    actor: &str,
+) -> Result<BranchProvision, DispatchError> {
     // CR-2026-06-14 F1 (security): validate `branch` before it reaches
     // `git branch <branch>` as a positional (arg-injection: `--upload-pack=...`).
     if !crate::agent_ops::validate_branch(branch) {
@@ -749,7 +789,13 @@ pub(crate) fn ensure_branch_exists(
             crate::git_helpers::git_bypass(source, &["rev-parse", "--verify", &remote_branch_ref])
                 .map(|o| o.status.success())
                 .unwrap_or(false);
+        // #3546 R1 blocker 2: which fetch proves this branch's base is fresh
+        // depends on WHERE the base comes from, so the flag is decided per arm.
+        let base_from_stale_view;
         if remote_exists {
+            // Base = `origin/<branch>`, refreshed by the #869 fetch above, so
+            // that fetch's result is exactly the right evidence here.
+            base_from_stale_view = !fetched_ok;
             let _ = crate::git_helpers::git_bypass(
                 source,
                 &["update-ref", &branch_ref, &remote_branch_ref],
@@ -776,12 +822,19 @@ pub(crate) fn ensure_branch_exists(
             // fetch) so the re-align lands on the current base, not a stale local
             // copy. All steps best-effort; the returned `fetched_ok` stays the
             // #869 working-branch fetch result (this from_ref fetch is internal).
+            // #3546: this is the fetch that refreshes the base actually used on
+            // this arm, so its result — not the #869 one — is what the staleness
+            // flag must be read from. It used to be discarded with `let _`.
+            // `true` when there is no remote branch to refresh (`from_ref` is a
+            // raw SHA): a literal commit cannot be a stale view of anything.
+            let mut from_ref_refreshed = true;
             if let Some(rb) = from_ref_branch.as_deref() {
-                let _ = crate::git_helpers::git_bypass_timeout(
+                let out = crate::git_helpers::git_bypass_timeout(
                     source,
                     &["fetch", &remote, rb, "--quiet"],
                     DISPATCH_FETCH_TIMEOUT,
                 );
+                from_ref_refreshed = matches!(&out, Ok(o) if o.status.success());
             }
             let ff_safe = crate::git_helpers::git_bypass(
                 source,
@@ -804,8 +857,25 @@ pub(crate) fn ensure_branch_exists(
                     }
                 }
             }
+            // Claim staleness ONLY when this call actually re-based the branch
+            // off a ref it could not refresh. Without `ff_safe` the branch keeps
+            // the tip it already had — this call chose no base, so it asserts
+            // nothing, which is what a false flag means.
+            //
+            // This is the arm that produced the reviewer's P1 false positive: a
+            // branch that was never pushed makes `git fetch origin <branch>`
+            // fail no matter how reachable origin is, and the old
+            // `base_from_stale_view: !fetched_ok` turned that into a permanent
+            // "your base is stale" for every unpushed branch.
+            base_from_stale_view = ff_safe && !from_ref_refreshed;
         }
-        return Ok((false, fetched_ok));
+        return Ok(BranchProvision {
+            created: false,
+            // Unchanged: the pre-#3546 second tuple element is still the #869
+            // working-branch fetch result.
+            fetch_attempted: fetched_ok,
+            base_from_stale_view,
+        });
     }
     // Local ref absent -> create it. Prefers an existing origin/<branch>
     // over from_ref (#t-83936-5 data-loss guard); the full rationale and the

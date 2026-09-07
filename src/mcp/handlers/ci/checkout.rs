@@ -4,7 +4,9 @@ use serde_json::{json, Value};
 use std::path::Path;
 // #2755 R3: response-mapping + marker-durability helpers live in a sibling module to
 // keep this handler under the LOC ceiling (call sites below are unchanged).
-use super::checkout_helpers::{rollback_response, sync_marker_contents, validate_expected_head};
+use super::checkout_helpers::{
+    acquire_bind_lifecycle_permit, rollback_response, sync_marker_contents, validate_expected_head,
+};
 
 use super::checkout_disposable::CheckoutPurpose;
 pub(crate) use super::checkout_helpers::checkout_source;
@@ -37,26 +39,9 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         Ok(purpose) => purpose,
         Err(error) => return error,
     };
-    // The bind transaction owns the per-agent lifecycle authority before any
-    // provisioning preflight. Keep this permit through branch locking,
-    // bind_full, commit, and exact rollback so checkout cannot race release or
-    // rebase at the release→bind gap.
-    let lifecycle_permit = if bind {
-        match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
-            home,
-            instance_name,
-            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Bind,
-        ) {
-            Ok(permit) => Some(permit),
-            Err(error) => {
-                return json!({
-                    "error": format!("checkout bind refused: {error}"),
-                    "code": "lifecycle_conflict",
-                });
-            }
-        }
-    } else {
-        None
+    let lifecycle_permit = match acquire_bind_lifecycle_permit(home, instance_name, bind) {
+        Ok(permit) => permit,
+        Err(error) => return error,
     };
     if bind {
         if let Err(e) = crate::agent_ops::ensure_not_protected_json(branch) {
@@ -100,6 +85,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // `d-20260514102305998399-0` scope.
     let mut auto_created_branch = false;
     let mut fetch_attempted = false;
+    // #3546: false ⟺ this checkout made no claim about any base.
+    let mut base_from_stale_view = false;
     if bind {
         let src = Path::new(&source_path);
         // #2703: omitted `from_ref` follows the repo default (`origin/<default_branch>`).
@@ -110,16 +97,20 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("origin/{}", crate::git_helpers::default_branch(src)))
         });
-        match crate::mcp::handlers::dispatch_hook::ensure_branch_exists(
+        match crate::mcp::handlers::dispatch_hook::ensure_branch_exists_provisioned(
             home,
             src,
             branch,
             &creation_ref,
             instance_name,
         ) {
-            Ok((created, fetched)) => {
+            Ok(provision) => {
+                let created = provision.created;
                 auto_created_branch = created;
-                fetch_attempted = fetched;
+                fetch_attempted = provision.fetch_attempted;
+                // #3546: the caller must learn this HERE — by the time it shows
+                // up in binding_state the tree is already in someone's hands.
+                base_from_stale_view = provision.base_from_stale_view;
                 if checkout_purpose == Some(CheckoutPurpose::DisposableReview) && !created {
                     return json!({
                         "error": format!("disposable review branch '{branch}' was not created by this checkout"),
@@ -570,6 +561,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     &source_canonical,
                     true, // #2158 GR1: agent self-claim (repo checkout bind:true) → notify operator
                     provenance,
+                    base_from_stale_view, // #3546
                 ) {
                     // #1310: rollback worktree on binding failure to prevent orphans
                     tracing::warn!(
@@ -647,6 +639,11 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 resp["bound"] = json!(true);
                 resp["ci_watch_armed"] = json!(false);
                 resp["auto_created_branch"] = json!(auto_created_branch);
+                // #3546: present only when true — a healthy provision leaves the
+                // response byte-identical for existing readers.
+                if base_from_stale_view {
+                    resp["base_from_stale_view"] = json!(true);
+                }
                 resp["fetch_attempted"] = json!(fetch_attempted);
                 if checkout_purpose == Some(CheckoutPurpose::DisposableReview) {
                     resp["checkout_purpose"] = json!("disposable_review");

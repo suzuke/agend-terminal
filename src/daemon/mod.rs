@@ -1758,8 +1758,62 @@ pub fn run_task_maintenance(home: &Path) {
         })
         .collect();
     crate::event_log::log_many(home, &orphan_events);
+    // #3536: the sweeps above are both blind to a task whose dispatch a report
+    // already settled — the entry is gone, and `sweep_overdue_claimed` only
+    // covers tasks with a `due_at`. Remind BOTH parties who can close the loop,
+    // because the two exits belong to different roles.
+    notify_unsettled_after_report(home);
     // M3: 30-day TTL cleanup for terminal dispatch entries
     crate::dispatch_tracking::gc_old_entries(home);
+}
+
+/// #3536: tell the assignee and the orchestrator that a reported task is still
+/// sitting open, and name both exits. The task is NEVER auto-closed here — the
+/// #3526 completion guard owns settlement and its three-state semantics are
+/// deliberate; this only ends the silence.
+fn notify_unsettled_after_report(home: &Path) {
+    for task in crate::tasks::sweep_unsettled_after_report(home) {
+        let assignee = task.assignee.as_deref().unwrap_or("(unassigned)");
+        crate::event_log::log(
+            home,
+            "task_unsettled_after_report",
+            assignee,
+            &format!(
+                "task_id={} status={} reported {}min ago, still unsettled",
+                task.task_id, task.status, task.age_minutes
+            ),
+        );
+        // One text for both recipients: each needs to know the OTHER exit exists,
+        // otherwise both wait for the other to act — which is how the 40-hour
+        // stall in #3536 happened.
+        let text = format!(
+            "task not settled: a report for task_id={} landed {}min ago but the task is still `{}` on the board. \
+             Close the loop — assignee: send the report again with `terminal: true` (correlation_id={}); \
+             orchestrator: `task action=done id={}`. \
+             Still working? Ignore this; the next report resets the timer.",
+            task.task_id, task.age_minutes, task.status, task.task_id, task.task_id
+        );
+        // `update`, not `query`: the message says "ignore this if you are still
+        // working", so it must not read as a question owed an answer.
+        let mut targets = Vec::new();
+        if let Some(a) = task.assignee.as_deref() {
+            targets.push(a.to_string());
+        }
+        if !targets.iter().any(|t| t == &task.created_by) {
+            targets.push(task.created_by.clone());
+        }
+        for target in targets {
+            persist_or_log!(
+                crate::inbox::enqueue_with_idle_hint(
+                    home,
+                    &target,
+                    crate::inbox::InboxMessage::new_system("system:task", "update", text.clone()),
+                ),
+                "task_unsettled_after_report",
+                target
+            );
+        }
+    }
 }
 
 fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {

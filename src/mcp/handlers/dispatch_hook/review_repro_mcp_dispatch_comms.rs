@@ -146,7 +146,13 @@ fn ensure_branch_exists_body() -> String {
     let mod_rs =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp/handlers/dispatch_hook/mod.rs");
     let text = std::fs::read_to_string(&mod_rs).expect("read dispatch_hook/mod.rs");
-    extract_fn_body(&text, "fn ensure_branch_exists")
+    // #3546: `ensure_branch_exists` is now a thin tuple-returning wrapper, and the
+    // body these scans are about — the validation and the bounded fetch — lives in
+    // `ensure_branch_exists_provisioned`. The anchor follows the body rather than
+    // the name: scanning the wrapper would report "no validate_branch call" while
+    // the guard is present and running one call away, which is a weaker invariant
+    // wearing a green light.
+    extract_fn_body(&text, "fn ensure_branch_exists_provisioned")
 }
 
 /// Extract the `{ ... }` body of the first function whose signature line
