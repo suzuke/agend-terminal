@@ -419,6 +419,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// #3543 R1 B1: the glued Codex config spelling carries a hand-written
+    /// effort setting just like `-c <val>`, so an effort set_model must
+    /// REJECT instead of persisting an intent that argv would override.
+    #[test]
+    fn set_model_rejects_glued_codex_effort_args_conflict_3541() {
+        let home = test_home("glued-effort");
+        write_fleet(
+            &home,
+            "instances:\n  seat:\n    backend: codex\n    args:\n      - -cmodel_reasoning_effort=low\n",
+        );
+        let r = handle_set_model(&home, &json!({"instance": "seat", "effort": "high"}), &None);
+        assert_eq!(r["code"], "args_conflict_confirmed", "got {r}");
+        assert!(
+            r["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("-cmodel_reasoning_effort=low")),
+            "error must name the glued token the operator has to remove, got {r}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// T4 ambiguous conflict: a glued `-mVAL` token on a `-m`-declaring
     /// backend rejects with the AMBIGUOUS class and a disambiguation hint
     /// (move payload after `--`).

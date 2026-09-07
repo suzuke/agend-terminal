@@ -69,6 +69,18 @@ pub(crate) fn capability_for(backend: &Backend) -> Option<&'static EffortCapabil
 /// The config key Codex uses for reasoning effort (overridden via `-c`).
 pub const CODEX_EFFORT_KEY: &str = "model_reasoning_effort";
 
+/// #3543 R1 B1: the value glued onto a Codex config flag — `-c<val>` or
+/// `--config=<val>`. Returns `None` for the separate-value spellings (`-c`
+/// / `--config` alone), which the next-token branch owns, and for any other
+/// token. clap treats `-cKEY=V` and `--config=KEY=V` as the same option as
+/// `-c KEY=V`, so a hand-written effort setting hides in these too.
+fn glued_codex_config_value(tok: &str) -> Option<&str> {
+    if let Some(rest) = tok.strip_prefix("--config=") {
+        return Some(rest);
+    }
+    tok.strip_prefix("-c").filter(|rest| !rest.is_empty())
+}
+
 /// Long flag backends with [`EffortInjectionKind::CliFlag`] use.
 pub const EFFORT_LONG_FLAG: &str = "--effort";
 
@@ -81,8 +93,11 @@ pub const EFFORT_LONG_FLAG: &str = "--effort";
 ///   (glued value). `--effort-foo` is a different flag and must not match.
 /// - `CodexConfig`: a `-c` / `--config` token whose NEXT token starts with
 ///   `model_reasoning_effort` (covers `model_reasoning_effort="low"` and
-///   bare `model_reasoning_effort=low`). A lone `-c` at end of argv with no
-///   next token is not a conflict.
+///   bare `model_reasoning_effort=low`), OR the glued spellings clap accepts
+///   for the same option — `-c<val>` and `--config=<val>` — whose value
+///   starts with that key. A lone `-c` at end of argv with no next token is
+///   not a conflict, and a glued value for any OTHER config key is not one
+///   either (it says nothing about effort).
 pub fn scan_effort_conflict(backend: &Backend, args: &[String]) -> Option<String> {
     let cap = capability_for(backend)?;
     match cap.injection {
@@ -115,6 +130,12 @@ pub fn scan_effort_conflict(backend: &Backend, args: &[String]) -> Option<String
                         if next.starts_with(CODEX_EFFORT_KEY) {
                             return Some(next.clone());
                         }
+                    }
+                } else if let Some(rest) = glued_codex_config_value(tok) {
+                    // Same setting, glued: report the whole token, since that
+                    // is what the operator would have to remove.
+                    if rest.trim_start().starts_with(CODEX_EFFORT_KEY) {
+                        return Some(tok.clone());
                     }
                 }
                 index += 1;

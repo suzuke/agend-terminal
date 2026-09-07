@@ -121,6 +121,46 @@ fn push_effort_arg_skips_on_hand_written_conflict_3541() {
     assert_eq!(args, vec!["-c", "model_reasoning_effort=\"low\""]);
 }
 
+/// #3543 R1 B1: clap also accepts the config value GLUED to the short flag
+/// (`-c<val>`). That is the same hand-written setting as `-c <val>`, so
+/// fleet effort must not append a second `-c model_reasoning_effort=…`:
+/// Codex applies `-c` overrides in order, the later one wins, and the fleet
+/// value would silently override what the operator typed.
+#[test]
+fn push_effort_arg_skips_on_glued_short_codex_config_3541() {
+    let mut args = vec!["-cmodel_reasoning_effort=\"low\"".to_string()];
+    Backend::push_effort_arg(&mut args, &Backend::Codex, "high");
+    assert_eq!(
+        args,
+        vec!["-cmodel_reasoning_effort=\"low\""],
+        "hand-written glued -c must win — no second -c appended"
+    );
+
+    // A glued value for a DIFFERENT key says nothing about effort, so fleet
+    // intent still applies. (Guards against over-blocking the whole spelling.)
+    let mut args = vec!["-cmodel=\"o3\"".to_string()];
+    Backend::push_effort_arg(&mut args, &Backend::Codex, "high");
+    assert_eq!(
+        args,
+        vec!["-cmodel=\"o3\"", "-c", "model_reasoning_effort=\"high\""],
+        "an unrelated glued config key must not block effort injection"
+    );
+}
+
+/// #3543 R1 B1: the long glued spelling `--config=<val>` is the same
+/// setting again — see the short-flag test above for why a second `-c`
+/// would reverse the documented "caller args > fleet intent" order.
+#[test]
+fn push_effort_arg_skips_on_glued_long_codex_config_3541() {
+    let mut args = vec!["--config=model_reasoning_effort=\"low\"".to_string()];
+    Backend::push_effort_arg(&mut args, &Backend::Codex, "high");
+    assert_eq!(
+        args,
+        vec!["--config=model_reasoning_effort=\"low\""],
+        "hand-written --config=… must win — no second -c appended"
+    );
+}
+
 /// #2744 PR-A: Shell/Raw (any command without a declared model
 /// capability) must never receive a blind `--model` injection — `bash
 /// --model X` fails to spawn, and an arbitrary executable's argv
