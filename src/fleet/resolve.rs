@@ -112,6 +112,20 @@ fn resolve_model(
         .and_then(|tier| resolve_tier_model(fleet, name, tier))
 }
 
+/// #3541: resolve the effective reasoning-effort level. Precedence:
+/// instance `effort:` > `defaults.effort` > `None`. Empty strings normalize
+/// to `None` (so `effort: ""` in YAML and "never set" behave identically —
+/// no injection either way). Value-range validation is intentionally NOT
+/// done here: `push_effort_arg` fail-soft-drops out-of-range values per
+/// backend at spawn time, so a fleet-wide default never crashes a narrower
+/// backend.
+fn resolve_effort(fleet: &super::FleetConfig, inst: &super::InstanceConfig) -> Option<String> {
+    inst.effort
+        .clone()
+        .filter(|e| !e.is_empty())
+        .or_else(|| fleet.defaults.effort.clone().filter(|e| !e.is_empty()))
+}
+
 pub(super) fn resolve_instance(
     fleet: &super::FleetConfig,
     name: &str,
@@ -164,6 +178,7 @@ pub(super) fn resolve_instance(
             .or(inst.topic_id),
         git_branch: inst.git_branch.clone(),
         model: resolve_model(fleet, inst, name),
+        effort: resolve_effort(fleet, inst),
         worktree: inst.worktree,
         instructions: inst
             .instructions

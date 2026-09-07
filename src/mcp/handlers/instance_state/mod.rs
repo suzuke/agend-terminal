@@ -1,4 +1,6 @@
 pub(crate) mod set_model;
+#[cfg(test)]
+mod set_model_tests;
 
 use serde_json::{json, Value};
 use std::path::Path;

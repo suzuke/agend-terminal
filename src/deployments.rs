@@ -325,6 +325,7 @@ fn create_instance_entries(
                 args: template_args,
                 model: yaml_str(inst_val, "model"),
                 model_tier: yaml_str(inst_val, "model_tier"),
+                effort: yaml_str(inst_val, "effort"),
                 env: template_env,
                 ready_pattern: yaml_str(inst_val, "ready_pattern"),
                 command: yaml_str(inst_val, "command"),

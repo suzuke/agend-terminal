@@ -74,6 +74,26 @@ pub(crate) fn build_member_entries(
         .collect()
 }
 
+/// #3541: build a team member's spawn argv from its fleet-resolved entry —
+/// model and effort intents both route through the `Backend::push_*`
+/// chokepoints on the DECLARED identity. Pure (no I/O) so the team-member
+/// path is unit-testable without a live registry/spawn.
+pub(crate) fn member_spawn_args(
+    resolved: Option<&crate::fleet::ResolvedInstance>,
+    declared_backend: &crate::backend::Backend,
+    mut member_args: Vec<String>,
+) -> Vec<String> {
+    if let Some(model) = resolved.and_then(|r| r.model.as_deref()) {
+        crate::backend::Backend::push_model_arg(&mut member_args, declared_backend, model);
+    }
+    if let Some(effort) = resolved.and_then(|r| r.effort.as_deref()) {
+        // Same chokepoint as model above (members resolve through fleet, so
+        // defaults.effort inheritance works here too); fail-soft inside.
+        crate::backend::Backend::push_effort_arg(&mut member_args, declared_backend, effort);
+    }
+    member_args
+}
+
 /// Neutral typed CREATE_TEAM entry point.
 ///
 /// Both API and MCP adapters call this after parsing their transport-specific
@@ -158,9 +178,7 @@ pub(crate) fn create(
             .as_ref()
             .map(|r| r.backend.clone())
             .unwrap_or_else(|| crate::backend::Backend::parse_str(backend));
-        if let Some(model) = resolved.as_ref().and_then(|r| r.model.as_deref()) {
-            crate::backend::Backend::push_model_arg(&mut member_args, &declared_backend, model);
-        }
+        member_args = member_spawn_args(resolved.as_ref(), &declared_backend, member_args);
         // #3417: a team member is spawned through `spawn_one` directly rather
         // than the SPAWN service, so it needs the same config transaction — a
         // member absent from the map is invisible to the snapshot writer and

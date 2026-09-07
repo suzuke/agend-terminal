@@ -184,9 +184,10 @@ Drain 或管理 caller 的 durable inbox。
 
 ### `set_model`
 
-為 instance 持久化恰好一種 model intent（`model` 或 `tier`）；設定一方會清除另一方。`restart:true` 立即套用，否則下次 respawn 生效。
+為 instance 持久化 model 與／或推理預算 intent。`model` 與 `tier` 維持互斥（設定一方會清除另一方）；`effort` 可與任一組合或單獨設定，空字串 `effort` 則清除。`restart:true` 立即套用，否則下次 respawn 生效。
 
-- 必填：`instance`，以及 `model`／`tier` 恰好一個。
+- 必填：`instance`，以及 `model`／`tier`／`effort` 至少一個。
+- `effort` 接受 `low` / `medium` / `high` / `xhigh` / `max`（各 backend 有效範圍於啟動時套用；超出範圍的值安全丟棄並警告）。不支援 effort 的 backend 會持久化 intent 並回傳 `effort_unsupported_dropped` 警告。
 
 ### `bind_topic`
 

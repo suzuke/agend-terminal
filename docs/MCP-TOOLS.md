@@ -184,9 +184,10 @@ Restart an instance.
 
 ### `set_model`
 
-Persist exactly one model intent (`model` or `tier`) for an instance; setting one clears the other. `restart:true` applies it immediately, otherwise it takes effect on the next respawn.
+Persist model and/or reasoning-effort intent for an instance. `model` and `tier` stay mutually exclusive (setting one clears the other); `effort` composes with either or stands alone, and an empty-string `effort` clears it. `restart:true` applies it immediately, otherwise it takes effect on the next respawn.
 
-- Required: `instance` and exactly one of `model`/`tier`.
+- Required: `instance` and at least one of `model`/`tier`/`effort`.
+- `effort` accepts `low` / `medium` / `high` / `xhigh` / `max` (per-backend range applies at spawn; out-of-range values are safely dropped with a warning). On backends without effort support the intent persists with an `effort_unsupported_dropped` warning.
 
 ### `bind_topic`
 

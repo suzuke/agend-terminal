@@ -1,0 +1,17 @@
+# Provenance: captured 2026-09-06 on Darwin via `codex --help` (codex-cli 0.153.4)
+# plus the live `~/.codex/config.toml` entry `model_reasoning_effort = "medium"`.
+# Purpose: pins the effort-config grammar EffortCapability depends on (issue #3541, L2 fixture).
+# Codex has no `--effort` flag (`codex --help` / `codex exec --help` contain no
+# "effort" line); reasoning effort is a config key overridden with `-c key="value"`.
+# Minimal excerpt: only the -c/--config mechanism lines are retained.
+#
+  -c, --config <key=value>
+          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`.
+          Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed
+          as TOML. If it fails to parse as TOML, the raw string is used as a literal.
+
+          Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
+          shell_environment_policy.inherit=all`
+# Live config evidence (same machine, same date):
+#   ~/.codex/config.toml contains: model_reasoning_effort = "medium"
+# Hence the injected form: -c model_reasoning_effort="<low|medium|high>"

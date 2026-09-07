@@ -1090,19 +1090,47 @@ impl AppState {
             });
         let mut to_add: Vec<String> = names.to_add.into_iter().collect();
         to_add.sort();
-        for name in &to_add {
-            // #3505 P0(b): bound the retry storm — skip this pass when the
-            // agent is in backoff, so a Live-but-unreachable entry doesn't
-            // spam one `attach failed` warn per 2s sync forever.
-            // r1 F1: the skip RE-AGES the counter (a skip that leaves the
-            // counter frozen caps it at 3 and makes the stale hint dead
-            // code). At `STALE_HINT_AFTER` the hint fires once; past it
-            // the counter resets into the retry window so attempts resume
-            // — defer + eventual hint + recovery, never abandon.
+        let mut pane_builder = |name: &str, layout: &mut Layout| {
+            let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
+            pane_factory::create_remote_pane(
+                name,
+                home,
+                fleet_path,
+                layout,
+                dc.saturating_sub(2),
+                dr.saturating_sub(4),
+                wakeup_tx,
+            )
+        };
+        self.place_remote_team_grouped(&to_add, home, &mut pane_builder);
+        let mut gone: Vec<String> = names.gone.into_iter().collect();
+        gone.sort();
+        for name in &gone {
+            tracing::warn!(
+                agent = %name,
+                "daemon-side agent gone; pane retained with stale output",
+            );
+            self.known_remote_agents.remove(name);
+            self.remote_attach_failures.remove(name);
+        }
+    }
+
+    // #3501: team-grouped placement for hot-reload — mirrors
+    // session::place_agents_team_grouped. `to_add` is already sorted.
+    fn place_remote_team_grouped(
+        &mut self,
+        to_add: &[String],
+        home: &std::path::Path,
+        pane_builder: &mut dyn FnMut(&str, &mut Layout) -> anyhow::Result<Pane>,
+    ) {
+        // #3505 P0(b): bound the retry storm — agents in backoff skip this
+        // pass (counter re-aged via advance_deferred so the stale hint still
+        // fires and attempts resume). Merged with #3501 team grouping: the
+        // filter runs first, grouping applies to the eligible remainder.
+        let mut eligible: Vec<String> = Vec::new();
+        for name in to_add {
             let fails = self.remote_attach_failures.get(name).copied().unwrap_or(0);
             if !attach_retry_due(fails) {
-                // r2 B2: the transition lives in `advance_deferred`, shared
-                // with the tests — the branch must not carry its own copy.
                 let (next, emit_hint) = advance_deferred(fails);
                 if emit_hint {
                     tracing::warn!(
@@ -1115,16 +1143,108 @@ impl AppState {
                 self.remote_attach_failures.insert(name.clone(), next);
                 continue;
             }
-            let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
-            match pane_factory::create_remote_pane(
-                name,
-                home,
-                fleet_path,
-                &mut self.ui.layout,
-                dc.saturating_sub(2),
-                dr.saturating_sub(4),
-                wakeup_tx,
-            ) {
+            eligible.push(name.clone());
+        }
+        let to_add = &eligible;
+        let teams = crate::teams::list_all(home);
+        let mut team_members: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut standalone: Vec<String> = Vec::new();
+        for name in to_add {
+            if let Some(team) = teams.iter().find(|t| t.members.contains(name)) {
+                team_members
+                    .entry(team.name.clone())
+                    .or_default()
+                    .push(name.clone());
+            } else {
+                standalone.push(name.clone());
+            }
+        }
+        // Team-grouped: each team shares one tab named after the team. Hot
+        // reload deliberately searches all tabs (rather than only the active
+        // tab) so a late member joins an already-open team tab. Team and
+        // standalone names share the tab-name namespace, so callers should
+        // avoid assigning the same name to both.
+        for (team_name, members) in &team_members {
+            let team = teams.iter().find(|t| t.name == *team_name);
+            let orchestrator = team.and_then(|t| t.orchestrator.as_deref());
+            let mut sorted = members.clone();
+            sorted.sort_by(|a, b| {
+                let a_is_orch = orchestrator == Some(a.as_str());
+                let b_is_orch = orchestrator == Some(b.as_str());
+                b_is_orch.cmp(&a_is_orch).then(a.cmp(b))
+            });
+            for name in &sorted {
+                // #3501: if the agent already has a retained pane (disconnected
+                // but not removed), reconnect in place to avoid duplicating the
+                // leaf — preserves the existing team tab/split.
+                let already_has_pane = self.ui.layout.find_agent_pane(name).is_some();
+                match pane_builder(name, &mut self.ui.layout) {
+                    Ok(pane) => {
+                        let tab_name = pane.agent_name.clone();
+                        self.known_remote_agents.insert(tab_name.to_string());
+                        self.remote_attach_failures.remove(name);
+                        if already_has_pane {
+                            // Reuse retained pane (same as standalone's reconnect).
+                            self.ui
+                                .layout
+                                .reconnect_or_append_agent_pane(&tab_name, pane);
+                            tracing::info!(
+                                agent = %name,
+                                team = %team_name,
+                                "reused retained team pane for re-appeared remote agent"
+                            );
+                        } else if let Some(idx) = self
+                            .ui
+                            .layout
+                            .tabs
+                            .iter()
+                            .position(|tab| tab.name == *team_name)
+                        {
+                            let tab = &mut self.ui.layout.tabs[idx];
+                            tab.split_focused(crate::layout::SplitDir::Horizontal, pane);
+                            tracing::info!(
+                                agent = %name,
+                                team = %team_name,
+                                "added team member pane via split"
+                            );
+                        } else {
+                            // First new member of this team batch — create team
+                            // tab. `push_tab_preserve_focus`, never `add_tab`:
+                            // this runs on a background roster tick, and
+                            // `add_tab` switches the active tab (layout::add_tab
+                            // → switch_active), which would pull the operator off
+                            // whatever they are working on. The standalone arm
+                            // below preserves focus for exactly this reason.
+                            let tab = crate::layout::Tab::new(team_name.clone(), pane);
+                            self.ui.layout.push_tab_preserve_focus(tab);
+                            tracing::info!(
+                                agent = %name,
+                                team = %team_name,
+                                "opened team tab for newly-appeared remote agent"
+                            );
+                        }
+                        self.needs_resize = true;
+                    }
+                    // #3505 backoff accounting mirrors the standalone arm below:
+                    // without the increment a failing team member never enters
+                    // backoff and the stale hint never fires for it.
+                    Err(e) => {
+                        let fails = self.remote_attach_failures.get(name).copied().unwrap_or(0) + 1;
+                        self.remote_attach_failures.insert(name.clone(), fails);
+                        tracing::warn!(
+                            agent = %name,
+                            error = %e,
+                            fails,
+                            "remote pane attach failed during sync",
+                        );
+                    }
+                }
+            }
+        }
+        // Standalone: per-agent tabs as before.
+        for name in &standalone {
+            match pane_builder(name, &mut self.ui.layout) {
                 Ok(pane) => {
                     let tab_name = pane.agent_name.clone();
                     self.known_remote_agents.insert(tab_name.to_string());
@@ -1160,16 +1280,6 @@ impl AppState {
                     );
                 }
             }
-        }
-        let mut gone: Vec<String> = names.gone.into_iter().collect();
-        gone.sort();
-        for name in &gone {
-            tracing::warn!(
-                agent = %name,
-                "daemon-side agent gone; pane retained with stale output",
-            );
-            self.known_remote_agents.remove(name);
-            self.remote_attach_failures.remove(name);
         }
     }
 
@@ -1222,6 +1332,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::PaneSource;
     use std::collections::HashSet;
 
     fn closed_before_attach_registry_survives(unmanaged: bool) -> bool {
@@ -1290,6 +1401,30 @@ mod tests {
         }
         std::fs::remove_dir_all(home).ok();
         survives
+    }
+
+    fn test_remote_pane(layout: &mut Layout, agent: &str) -> anyhow::Result<Pane> {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        Ok(Pane {
+            agent_name: agent.into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: crate::vterm::VTerm::new(10, 10),
+            rx,
+            id: layout.next_pane_id(),
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: Some(agent.into()),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        })
     }
 
     #[test]
@@ -1375,6 +1510,242 @@ mod tests {
     #[test]
     fn closed_before_attach_preserves_managed_agent() {
         assert!(closed_before_attach_registry_survives(false));
+    }
+
+    #[test]
+    fn hot_reload_team_grouped_places_team_in_one_tab() {
+        // Simulate a team svc with members svc-a, svc-b and orchestrator svc-a,
+        // plus a standalone solo. to_add = [svc-a, svc-b, solo] should yield
+        // 2 tabs: svc (with svc-a, svc-b) and solo.
+        let home = std::env::temp_dir().join(format!(
+            "agend-test-hot-reload-team-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        // Create fleet entries first so team create can merge into fleet.yaml
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  svc-a:\n    backend: shell\n  svc-b:\n    backend: shell\n  svc-c:\n    backend: shell\n  solo:\n    backend: shell\n",
+        )
+        .expect("write fleet.yaml");
+        // Create a team svc with svc-a, svc-b, orchestrator svc-a
+        let res = crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "svc", "members": ["svc-a", "svc-b", "svc-c"], "orchestrator": "svc-a"}),
+        );
+        assert_eq!(
+            res["status"],
+            serde_json::Value::String("created".to_string()),
+            "create team failed: {res}"
+        );
+
+        // Use the real production placement path with only pane construction
+        // replaced, so this test fails if grouping or ordering is disabled.
+        let to_add = vec!["svc-a".to_string(), "svc-b".to_string(), "solo".to_string()];
+        let mut state = AppState::new();
+        let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
+        state.place_remote_team_grouped(&to_add, &home, &mut pane_builder);
+
+        let team_tab = state
+            .ui
+            .layout
+            .tabs
+            .iter()
+            .find(|tab| tab.name == "svc")
+            .expect("team tab named svc");
+        assert_eq!(team_tab.root().pane_count(), 2);
+        assert_eq!(
+            team_tab.root().agent_names(),
+            vec!["svc-a", "svc-b"],
+            "orchestrator must be first in the initial team tab"
+        );
+
+        // A later roster tick must find the existing team tab even though the
+        // standalone tab is active after the first batch.
+        state.ui.layout.next_tab();
+        let active_before = state.ui.layout.tabs[state.ui.layout.active].name.clone();
+        state.place_remote_team_grouped(&["svc-c".to_string()], &home, &mut pane_builder);
+        assert_eq!(
+            state.ui.layout.tabs[state.ui.layout.active].name, active_before,
+            "joining an EXISTING team tab must leave the operator where they were"
+        );
+
+        assert_eq!(state.ui.layout.tabs.len(), 2, "team + standalone tab");
+        let team_tab = state
+            .ui
+            .layout
+            .tabs
+            .iter()
+            .find(|tab| tab.name == "svc")
+            .expect("team tab named svc");
+        assert_eq!(team_tab.root().pane_count(), 3);
+        let team_names = team_tab.root().agent_names();
+        assert_eq!(team_names.first().map(String::as_str), Some("svc-a"));
+        let mut non_orchestrators = team_names[1..].to_vec();
+        non_orchestrators.sort();
+        assert_eq!(non_orchestrators, vec!["svc-b", "svc-c"]);
+        let solo_tab = state
+            .ui
+            .layout
+            .tabs
+            .iter()
+            .find(|tab| tab.name == "solo")
+            .expect("standalone tab named solo");
+        assert_eq!(solo_tab.root().agent_names(), vec!["solo"]);
+
+        // F1 (#3505 backoff for team members): a failing team member must
+        // increment the same failure counter as the standalone arm — without
+        // it the member never enters backoff and the stale hint never fires.
+        // svc-b already has a pane; the builder fails first so the Err arm
+        // runs before any retained-pane check.
+        let mut failing_builder = |name: &str, layout: &mut Layout| -> anyhow::Result<Pane> {
+            if name == "svc-b" {
+                Err(anyhow::anyhow!("boom"))
+            } else {
+                test_remote_pane(layout, name)
+            }
+        };
+        state.place_remote_team_grouped(&["svc-b".to_string()], &home, &mut failing_builder);
+        assert_eq!(
+            state.remote_attach_failures.get("svc-b"),
+            Some(&1),
+            "one failed team tick must record fails=1"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Fixture for the #3501 focus/reconnect pins: fleet with m1, m2, solo and
+    /// a team `svc` (members m1+m2, orchestrator m1). `solo` is in no team.
+    fn team_fixture_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "agend-test-3501-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  m1:\n    backend: shell\n  m2:\n    backend: shell\n  solo:\n    backend: shell\n",
+        )
+        .expect("write fleet.yaml");
+        let res = crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "svc", "members": ["m1", "m2"], "orchestrator": "m1"}),
+        );
+        assert_eq!(
+            res["status"],
+            serde_json::Value::String("created".to_string()),
+            "create team failed: {res}"
+        );
+        home
+    }
+
+    /// #3501 B1: opening a team tab happens on a background roster tick, so it
+    /// must NOT steal the active tab — `push_tab_preserve_focus`, not `add_tab`
+    /// (whose contract is to focus what it adds). The existing hot-reload test
+    /// only reaches the split branch, so this is the case that pins the choice.
+    #[test]
+    fn hot_reload_team_tab_creation_preserves_active_tab_3501() {
+        let home = team_fixture_home("active");
+        let mut state = AppState::new();
+        let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
+        // Standalone `solo` opens the tab the operator is working on.
+        state.place_remote_team_grouped(&["solo".to_string()], &home, &mut pane_builder);
+        let active_before = state.ui.layout.tabs[state.ui.layout.active].name.clone();
+        assert_eq!(active_before, "solo");
+        // A team member appears on a later tick: a NEW team tab is created.
+        state.place_remote_team_grouped(&["m1".to_string()], &home, &mut pane_builder);
+        assert_eq!(state.ui.layout.tabs.len(), 2, "solo + svc");
+        assert_eq!(
+            state.ui.layout.tabs[state.ui.layout.active].name, active_before,
+            "opening a team tab must not steal the active tab"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3501 B2: a retained team pane (agent gone, pane kept for scrollback)
+    /// that re-appears reconnects IN PLACE — no duplicate leaf, same team tab,
+    /// same position. Without the `already_has_pane` check the member is
+    /// appended a second time and the tab shows one agent twice.
+    #[test]
+    fn hot_reload_retained_team_pane_reconnects_in_place_3501() {
+        let home = team_fixture_home("retained");
+        let mut state = AppState::new();
+        let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
+        state.place_remote_team_grouped(
+            &["m1".to_string(), "m2".to_string()],
+            &home,
+            &mut pane_builder,
+        );
+        assert_eq!(state.ui.layout.tabs.len(), 1, "one team tab");
+        assert_eq!(
+            state.ui.layout.tabs[0].root().agent_names(),
+            vec!["m1", "m2"]
+        );
+        // m1 disappeared (pane retained) and comes back on a later tick.
+        state.place_remote_team_grouped(&["m1".to_string()], &home, &mut pane_builder);
+        assert_eq!(state.ui.layout.tabs.len(), 1, "no extra tab");
+        assert_eq!(
+            state.ui.layout.tabs[0].root().agent_names(),
+            vec!["m1", "m2"],
+            "retained team pane must reconnect in place — same tab, same position, no duplicate"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// N1 (tab-name collision, pinned): a team whose name collides with an
+    /// existing tab does NOT open a second same-named tab — members split
+    /// into the existing one. Recorded here so a future grouping change
+    /// must consciously alter this behavior, not drift into it.
+    #[test]
+    fn hot_reload_team_name_collision_reuses_existing_tab() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-test-hot-reload-collide-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  m1:\n    backend: shell\n  solo:\n    backend: shell\n",
+        )
+        .expect("write fleet.yaml");
+        let res = crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "solo", "members": ["m1"], "orchestrator": "m1"}),
+        );
+        assert_eq!(
+            res["status"],
+            serde_json::Value::String("created".to_string()),
+            "create team failed: {res}"
+        );
+
+        let mut state = AppState::new();
+        let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
+        // Standalone first: opens a tab named "solo".
+        state.place_remote_team_grouped(&["solo".to_string()], &home, &mut pane_builder);
+        assert_eq!(state.ui.layout.tabs.len(), 1);
+        // Team "solo" member arrives: must reuse, not duplicate.
+        state.place_remote_team_grouped(&["m1".to_string()], &home, &mut pane_builder);
+        assert_eq!(
+            state.ui.layout.tabs.len(),
+            1,
+            "colliding team name must not open a second tab"
+        );
+        let tab = &state.ui.layout.tabs[0];
+        assert_eq!(tab.name, "solo");
+        assert_eq!(tab.root().pane_count(), 2);
+        std::fs::remove_dir_all(&home).ok();
     }
 }
 

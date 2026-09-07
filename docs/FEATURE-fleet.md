@@ -101,6 +101,7 @@ All instances inherit settings from defaults. Individual instances can override 
 | `args` | [string] | CLI argument list |
 | `model` | string | Concrete model name (e.g., opus, sonnet). Wins over `model_tier` |
 | `model_tier` | string | Symbolic tier from `model_tiers` (e.g., cheap / strong) for role/task cost policy (#2477) |
+| `effort` | string | Reasoning-effort level (`low` / `medium` / `high` / `xhigh` / `max`; per-backend range applies at spawn). Passed as `--effort` (claude/agy) or `-c model_reasoning_effort="…"` (codex); unsupported backends skip it with a warning (#3541) |
 | `ready_pattern` | string | Regex to determine when the agent is ready |
 | `env` | map | Environment variables (key-value pairs) |
 | `cols` | int | Terminal width (default 200) |
@@ -130,6 +131,7 @@ Each key is the agent's name (must match `[a-zA-Z0-9_-]`); the value is its conf
 | `git_branch` | string | Custom worktree branch name (alias: `worktree_source`) |
 | `model` | string | Concrete model override; wins over `model_tier` |
 | `model_tier` | string | Symbolic tier from `model_tiers`. If `model` is absent, resolves to a concrete backend model and is passed as `--model` |
+| `effort` | string | Reasoning-effort override (instance wins over `defaults.effort`; empty string normalizes to unset). See the `defaults` table above for value ranges and backend behavior |
 | `env` | map | Environment variables (merged with defaults; instance takes precedence) |
 | `cols` / `rows` | int | Terminal size override |
 | `ready_pattern` | string | Readiness regex override |

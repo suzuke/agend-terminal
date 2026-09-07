@@ -165,11 +165,12 @@ pub(crate) fn def_bind_topic() -> Value {
 }
 
 pub(crate) fn def_set_model() -> Value {
-    json!({"name": "set_model", "description": "#2744: persist an instance's model intent to fleet.yaml (exactly ONE of model/tier; setting one atomically clears the other). Takes effect on the next respawn unless restart:true. Backends without a declared model capability (shell/raw/custom) are rejected; an explicit model flag already in the entry's args is a hard conflict (no automatic rewriting).",
+    json!({"name": "set_model", "description": "#2744/#3541: persist an instance's model and/or effort intent to fleet.yaml (at least ONE of model/tier/effort; model and tier stay mutually exclusive, effort composes with either; setting model clears model_tier and vice versa; empty-string effort clears it). Takes effect on the next respawn unless restart:true. Backends without a declared model capability (shell/raw/custom) are rejected for model/tier; effort on a backend without an effort capability persists with an effort_unsupported_dropped warning (spawn drops it). An explicit model/effort setting already in the entry's args is a hard conflict (no automatic rewriting).",
     "inputSchema": {"type": "object", "properties": {
         "instance": {"type": "string", "description": "Fleet instance whose entry to update"},
         "model": {"type": "string", "description": "Concrete model id/alias for the declared backend. Mutually exclusive with tier."},
         "tier": {"type": "string", "description": "Symbolic key from fleet.yaml model_tiers (e.g. cheap/strong). Mutually exclusive with model."},
+        "effort": {"type": "string", "description": "Reasoning-effort level (low|medium|high|xhigh|max; per-backend range applies at spawn). Composes with model/tier or stands alone. Empty string clears the entry."},
         "restart": {"type": "boolean", "description": "Restart the instance after persisting (default false). A restart failure never rolls back the persisted intent (persisted:true, restart_ok:false)."}
     }, "required": ["instance"]}})
 }

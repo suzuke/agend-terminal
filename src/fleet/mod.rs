@@ -438,6 +438,10 @@ pub struct InstanceDefaults {
     /// Symbolic model tier key looked up in `model_tiers` (#2477).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tier: Option<String>,
+    /// Fleet-wide default reasoning-effort level (#3541). Instance-level
+    /// `effort:` wins; empty string normalizes to `None` at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub ready_pattern: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -560,6 +564,12 @@ pub struct InstanceConfig {
     /// without hard-coding backend model IDs on every instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tier: Option<String>,
+    /// Reasoning-effort level (e.g. "low", "medium", "high"). Passed as
+    /// `--effort` (Claude/Agy) or `-c model_reasoning_effort="…"` (Codex).
+    /// Backends without a declared effort capability skip it with a warning
+    /// (#3541). Empty string normalizes to `None` at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Optional per-instance context-alert threshold override. When absent,
     /// the effective global runtime threshold applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -977,6 +987,9 @@ pub struct ResolvedInstance {
     pub topic_id: Option<i32>,
     pub git_branch: Option<String>,
     pub model: Option<String>,
+    /// #3541: resolved reasoning-effort level (instance > defaults > None;
+    /// empty string normalizes to None in `resolve.rs`).
+    pub effort: Option<String>,
     pub worktree: Option<bool>,
     pub instructions: Option<String>,
     /// Sprint 54 P1-B Bug 2 fix: resolved source repository path. See
@@ -1025,6 +1038,8 @@ pub struct InstanceYamlEntry {
     pub model: Option<String>,
     /// #2477: symbolic model tier mirror of [`InstanceConfig::model_tier`].
     pub model_tier: Option<String>,
+    /// #3541: reasoning-effort mirror of [`InstanceConfig::effort`].
+    pub effort: Option<String>,
     /// Sprint 56 Track E (#450): process env mirror of
     /// [`InstanceConfig::env`]. Same `Option` semantics as `args`:
     /// `None` = no override, `Some(empty)` = explicit empty map.

@@ -877,6 +877,10 @@ pub(super) fn run_attach(
                 // from_command inference or a blind append.
                 Backend::push_model_arg(&mut args, &resolved.backend, model);
             }
+            if let Some(ref effort) = resolved.effort {
+                // #3541: same chokepoint as model above; fail-soft inside.
+                Backend::push_effort_arg(&mut args, &resolved.backend, effort);
+            }
             let command = resolved.backend_command.clone();
             let work_dir = working_dir
                 .clone()
@@ -1115,6 +1119,10 @@ pub(super) fn create_pane_from_resolved(
         // #2744 r1: DECLARED identity + capability gate — never from_command
         // inference or a blind append.
         Backend::push_model_arg(&mut args, &resolved.backend, model);
+    }
+    if let Some(ref effort) = resolved.effort {
+        // #3541: same chokepoint as model above; fail-soft inside.
+        Backend::push_effort_arg(&mut args, &resolved.backend, effort);
     }
 
     let mut pane = create_pane_with_backend(
@@ -1409,6 +1417,7 @@ mod tests {
             topic_id: None,
             git_branch: None,
             model: model.map(String::from),
+            effort: None,
             worktree: Some(false),
             instructions: None,
             source_repo: None,

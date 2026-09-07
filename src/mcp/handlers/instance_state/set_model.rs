@@ -1,17 +1,22 @@
 //! #2744 PR-A: `set_model` — typed, fleet-scoped explicit model intent.
+//! #3541: extended with an optional `effort` (reasoning-budget) dimension.
 //!
-//! Contract (decision d-20260712101306674407-19): exactly one of
-//! `model`/`tier` (handler-enforced); persists ONLY to the target instance's
-//! fleet.yaml entry; atomically sets one field and clears the other in a
-//! single lock/write transaction; every false/skip persistence outcome is a
-//! hard tool error; default no restart (`restart:true` opts in, and a restart
-//! failure after a durable persist reports `persisted:true, restart_ok:false`
-//! — never a rollback); ACL = instance management (anonymous/operator full
-//! authority; identified caller must be the instance itself, its team
-//! orchestrator, or its creator); capability keys off the DECLARED backend
-//! (Shell/Raw/custom hard-error); pre-existing model-flag spellings in the
-//! entry's args are hard conflicts (parser-aware; no automatic argv
-//! rewriting).
+//! Contract (decision d-20260712101306674407-19, extended by #3541): at
+//! least one of `model`/`tier`/`effort` (handler-enforced); `model` and
+//! `tier` stay mutually exclusive, while `effort` composes with either (or
+//! stands alone); persists ONLY to the target instance's fleet.yaml entry;
+//! atomically sets/clears all touched fields in a single lock/write
+//! transaction; every false/skip persistence outcome is a hard tool error;
+//! default no restart (`restart:true` opts in, and a restart failure after
+//! a durable persist reports `persisted:true, restart_ok:false` — never a
+//! rollback); ACL = instance management (anonymous/operator full authority;
+//! identified caller must be the instance itself, its team orchestrator, or
+//! its creator); capability keys off the DECLARED backend (Shell/Raw/custom
+//! hard-error for model/tier; effort on a backend without an effort
+//! capability is allowed but flagged `effort_unsupported_dropped` — spawn
+//! fail-soft-drops it with a warning); pre-existing model-flag spellings in
+//! the entry's args are hard conflicts (parser-aware; no automatic argv
+//! rewriting); pre-existing effort settings in args likewise conflict.
 
 use serde_json::{json, Value};
 use std::path::Path;
@@ -55,9 +60,13 @@ pub(crate) fn handle_set_model(
 
     let model = args["model"].as_str().filter(|s| !s.is_empty());
     let tier = args["tier"].as_str().filter(|s| !s.is_empty());
-    let (set_field, set_val, clear_field) = match (model, tier) {
-        (Some(m), None) => ("model", m, "model_tier"),
-        (None, Some(t)) => ("model_tier", t, "model"),
+    // #3541: `effort` composes with model/tier (or stands alone). An
+    // explicitly-passed empty string means CLEAR. `None` = untouched.
+    let effort = args.get("effort").and_then(|v| v.as_str());
+    let (model_set, model_clear) = match (model, tier) {
+        (Some(m), None) => (Some(("model", m)), "model_tier"),
+        (None, Some(t)) => (Some(("model_tier", t)), "model"),
+        (None, None) => (None, ""),
         _ => {
             return json!({
                 "error": "set_model requires exactly one of `model` or `tier`",
@@ -65,6 +74,12 @@ pub(crate) fn handle_set_model(
             })
         }
     };
+    if model_set.is_none() && effort.is_none() {
+        return json!({
+            "error": "set_model requires at least one of `model`, `tier`, or `effort`",
+            "code": "exactly_one_required"
+        });
+    }
 
     let fleet = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
         Ok(f) => f,
@@ -84,16 +99,24 @@ pub(crate) fn handle_set_model(
         .clone()
         .or_else(|| fleet.defaults.backend.clone())
         .unwrap_or(crate::backend::Backend::ClaudeCode);
-    let Some(cap) = declared.model_capability() else {
-        return json!({
-            "error": format!(
-                "backend '{}' declares no model capability — set_model is \
-                 unsupported for it (an adapter must opt in explicitly)",
-                declared.name()
-            ),
-            "code": "no_model_capability"
-        });
+    // #3541: model/tier keep the #2744 hard gate; effort-only requests skip
+    // it (effort has its own fail-soft path below).
+    let model_cap = if model_set.is_some() {
+        let Some(cap) = declared.model_capability() else {
+            return json!({
+                "error": format!(
+                    "backend '{}' declares no model capability — set_model is \
+                     unsupported for it (an adapter must opt in explicitly)",
+                    declared.name()
+                ),
+                "code": "no_model_capability"
+            });
+        };
+        Some(cap)
+    } else {
+        None
     };
+    let effort_cap = declared.effort_capability();
 
     if let Some(t) = tier {
         if fleet.model_tiers.get(t).is_none_or(|m| m.is_empty()) {
@@ -102,6 +125,24 @@ pub(crate) fn handle_set_model(
                     "unknown model tier '{t}' — no non-empty fleet.yaml model_tiers entry"
                 ),
                 "code": "unknown_tier"
+            });
+        }
+    }
+
+    // #3541: effort gate — global value-domain guard + args conflict scan.
+    // A value outside GLOBAL_EFFORT_VALUES (typo) is a hard error: it can
+    // never be valid on any backend. A value valid globally but narrower
+    // than THIS backend's range still persists (flagged below) — spawn
+    // fail-soft-drops it, so fleet-wide defaults stay portable.
+    let mut effort_unsupported_dropped = false;
+    if let Some(e) = effort {
+        if !e.is_empty() && !crate::backend_effort::GLOBAL_EFFORT_VALUES.contains(&e) {
+            return json!({
+                "error": format!(
+                    "invalid effort value '{e}' — must be one of {}",
+                    crate::backend_effort::GLOBAL_EFFORT_VALUES.join("|")
+                ),
+                "code": "invalid_effort_value"
             });
         }
     }
@@ -116,35 +157,79 @@ pub(crate) fn handle_set_model(
     } else {
         &inst.args
     };
-    if let Some(hit) = cap.scan(scan_args).into_iter().next() {
-        return match hit {
-            crate::backend::ModelFlagHit::Confirmed(tok) => json!({
+    if let Some(cap) = model_cap {
+        if let Some(hit) = cap.scan(scan_args).into_iter().next() {
+            return match hit {
+                crate::backend::ModelFlagHit::Confirmed(tok) => json!({
+                    "error": format!(
+                        "instance '{name}' args already pin an explicit model flag ('{tok}') — \
+                         args win over fleet intent, so set_model would be a silent no-op. \
+                         Remove the flag from the entry's args, then retry."
+                    ),
+                    "code": "args_conflict_confirmed"
+                }),
+                crate::backend::ModelFlagHit::Ambiguous(tok) => json!({
+                    "error": format!(
+                        "instance '{name}' args carry an ambiguous model-flag-like token ('{tok}'). \
+                         If it is payload text, move it after a bare `--` delimiter; if it is a \
+                         model flag, remove it — then retry."
+                    ),
+                    "code": "args_conflict_ambiguous"
+                }),
+            };
+        }
+    }
+    // #3541: effort conflict scan — a hand-written effort setting wins over
+    // fleet intent, so persisting alongside it would be a silent no-op.
+    if effort.is_some_and(|e| !e.is_empty()) {
+        if let Some(tok) = crate::backend_effort::scan_effort_conflict(&declared, scan_args) {
+            return json!({
                 "error": format!(
-                    "instance '{name}' args already pin an explicit model flag ('{tok}') — \
+                    "instance '{name}' args already pin an explicit effort setting ('{tok}') — \
                      args win over fleet intent, so set_model would be a silent no-op. \
-                     Remove the flag from the entry's args, then retry."
+                     Remove the setting from the entry's args, then retry."
                 ),
                 "code": "args_conflict_confirmed"
-            }),
-            crate::backend::ModelFlagHit::Ambiguous(tok) => json!({
-                "error": format!(
-                    "instance '{name}' args carry an ambiguous model-flag-like token ('{tok}'). \
-                     If it is payload text, move it after a bare `--` delimiter; if it is a \
-                     model flag, remove it — then retry."
-                ),
-                "code": "args_conflict_ambiguous"
-            }),
-        };
+            });
+        }
+    }
+    if effort_cap.is_none() && effort.is_some_and(|e| !e.is_empty()) {
+        effort_unsupported_dropped = true;
     }
 
+    // #3541: single atomic transaction — model/tier (mutually exclusive,
+    // with the peer cleared) plus effort set-or-clear.
     let old_model = inst.model.clone();
     let old_tier = inst.model_tier.clone();
-    match crate::fleet::persist::update_instance_fields(
-        home,
-        name,
-        &[(set_field, serde_yaml_ng::Value::String(set_val.to_string()))],
-        &[clear_field],
-    ) {
+    let old_effort = inst.effort.clone();
+    let mut sets: Vec<(&str, serde_yaml_ng::Value)> = Vec::new();
+    let mut removes: Vec<&str> = Vec::new();
+    let mut set_map = serde_json::Map::new();
+    let mut cleared: Vec<&str> = Vec::new();
+    if let Some((field, val)) = model_set {
+        sets.push((field, serde_yaml_ng::Value::String(val.to_string())));
+        set_map.insert(
+            field.to_string(),
+            serde_json::Value::String(val.to_string()),
+        );
+        removes.push(model_clear);
+        cleared.push(model_clear);
+    }
+    match effort {
+        Some(e) if !e.is_empty() => {
+            sets.push(("effort", serde_yaml_ng::Value::String(e.to_string())));
+            set_map.insert(
+                "effort".to_string(),
+                serde_json::Value::String(e.to_string()),
+            );
+        }
+        Some(_) => {
+            removes.push("effort");
+            cleared.push("effort");
+        }
+        None => {}
+    }
+    match crate::fleet::persist::update_instance_fields(home, name, &sets, &removes) {
         Ok(true) => {}
         Ok(false) => {
             return json!({
@@ -159,24 +244,33 @@ pub(crate) fn handle_set_model(
     }
 
     // Durable audit — event log, not just tracing. No secrets: model ids /
-    // tier keys + actor + old→new + cleared field + source.
+    // tier keys / effort levels + actor + old→new + cleared fields + source.
     crate::event_log::log(
         home,
         "set_model",
         name,
         &format!(
-            "{set_field}={set_val} cleared={clear_field} \
-             was_model={old_model:?} was_tier={old_tier:?} by={actor} source=set_model"
+            "set={set_map:?} cleared={cleared:?} \
+             was_model={old_model:?} was_tier={old_tier:?} was_effort={old_effort:?} \
+             by={actor} source=set_model"
         ),
     );
 
     let mut resp = json!({
         "ok": true,
         "persisted": true,
-        "set": {set_field: set_val},
-        "cleared": clear_field,
+        "set": set_map,
+        "cleared": cleared,
         "note": "takes effect on the next respawn"
     });
+    if effort_unsupported_dropped {
+        resp["effort_unsupported_dropped"] = json!(true);
+        resp["warning"] = json!(format!(
+            "backend '{}' declares no effort capability — the persisted effort \
+             will be fallback-dropped at spawn (see daemon warn log)",
+            declared.name()
+        ));
+    }
     // Restart only AFTER the durable persist. A restart failure must not
     // roll back or mask the persist: persisted:true + restart_ok:false.
     if args["restart"].as_bool() == Some(true) {
@@ -187,7 +281,7 @@ pub(crate) fn handle_set_model(
         let restart_ok = r.get("error").is_none_or(Value::is_null) && r["spawned"] == json!(true);
         resp["restart_ok"] = json!(restart_ok);
         if restart_ok {
-            resp["note"] = json!("restarted — new model intent active");
+            resp["note"] = json!("restarted — new model/effort intent active");
         } else {
             resp["restart_error"] = json!(format!(
                 "restart failed ({}) — the persisted intent still applies on the next respawn",
@@ -225,23 +319,31 @@ mod tests {
     const CODEX_SEAT: &str =
         "model_tiers:\n  cheap: claude-haiku-4-5\ninstances:\n  seat:\n    backend: codex\n    model_tier: cheap\n";
 
-    /// T2: exactly one of model/tier — both or neither is a hard error.
+    /// T2: exactly one of model/tier — both together is a hard error;
+    /// neither without effort is a hard error (#3541: effort composes, so a
+    /// bare request names all three fields in its message).
     #[test]
     fn set_model_enforces_exactly_one_of_model_or_tier_2744() {
         let home = test_home("exclusive");
         write_fleet(&home, CODEX_SEAT);
-        for bad in [
-            json!({"instance": "seat", "model": "o3", "tier": "cheap"}),
-            json!({"instance": "seat"}),
-        ] {
-            let r = handle_set_model(&home, &bad, &None);
-            assert!(
-                r["error"]
-                    .as_str()
-                    .is_some_and(|e| e.contains("exactly one")),
-                "want exactly-one error, got {r}"
-            );
-        }
+        let r = handle_set_model(
+            &home,
+            &json!({"instance": "seat", "model": "o3", "tier": "cheap"}),
+            &None,
+        );
+        assert!(
+            r["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("exactly one")),
+            "model+tier together must stay exactly-one, got {r}"
+        );
+        let r = handle_set_model(&home, &json!({"instance": "seat"}), &None);
+        assert!(
+            r["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("at least one")),
+            "bare request must name all three fields, got {r}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -313,6 +415,27 @@ mod tests {
         assert!(
             r["error"].as_str().is_some_and(|e| e.contains("-m")),
             "error must name the conflicting token, got {r}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #3543 R1 B1: the glued Codex config spelling carries a hand-written
+    /// effort setting just like `-c <val>`, so an effort set_model must
+    /// REJECT instead of persisting an intent that argv would override.
+    #[test]
+    fn set_model_rejects_glued_codex_effort_args_conflict_3541() {
+        let home = test_home("glued-effort");
+        write_fleet(
+            &home,
+            "instances:\n  seat:\n    backend: codex\n    args:\n      - -cmodel_reasoning_effort=low\n",
+        );
+        let r = handle_set_model(&home, &json!({"instance": "seat", "effort": "high"}), &None);
+        assert_eq!(r["code"], "args_conflict_confirmed", "got {r}");
+        assert!(
+            r["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("-cmodel_reasoning_effort=low")),
+            "error must name the glued token the operator has to remove, got {r}"
         );
         let _ = std::fs::remove_dir_all(&home);
     }

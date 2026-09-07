@@ -2322,6 +2322,7 @@ fn mk_resolved(
         topic_id: None,
         git_branch,
         model: None,
+        effort: None,
         worktree,
         instructions: None,
         source_repo,

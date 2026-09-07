@@ -18,7 +18,11 @@ mod api_activity_probe;
 mod app;
 mod auth_cookie;
 mod backend;
+mod backend_effort;
 mod backend_harness;
+mod backend_inject;
+#[cfg(test)]
+mod backend_inject_tests;
 mod backend_model;
 mod backend_profile;
 mod backend_session;
@@ -107,6 +111,8 @@ mod task_events;
 #[cfg_attr(windows, allow(dead_code))]
 mod tasks;
 mod team_ops;
+#[cfg(test)]
+mod team_ops_tests;
 mod teams;
 mod thread_census;
 mod token_cost;

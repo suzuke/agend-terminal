@@ -153,6 +153,10 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
         // inference or a blind append.
         backend::Backend::push_model_arg(&mut args, &resolved.backend, model);
     }
+    if let Some(ref effort) = resolved.effort {
+        // #3541: same chokepoint as model above; fail-soft inside.
+        backend::Backend::push_effort_arg(&mut args, &resolved.backend, effort);
+    }
 
     Some((
         resolved.name,
@@ -654,6 +658,7 @@ mod tests {
                 topic_id: None,
                 git_branch,
                 model: None,
+                effort: None,
                 worktree,
                 instructions: None,
                 source_repo,

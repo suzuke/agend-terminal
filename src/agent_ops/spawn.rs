@@ -129,6 +129,11 @@ pub fn resolve_spawn_request(home: &Path, params: &SpawnParams<'_>) -> SpawnRequ
     {
         Backend::push_model_arg(&mut args, &declared_backend, model);
     }
+    if let Some(effort) = fleet_resolved.as_ref().and_then(|r| r.effort.as_deref()) {
+        // #3541: same DECLARED-identity + capability gate as model above;
+        // unsupported backends / out-of-range values fail-soft inside.
+        Backend::push_effort_arg(&mut args, &declared_backend, effort);
+    }
 
     SpawnRequest {
         name: params.name.to_string(),

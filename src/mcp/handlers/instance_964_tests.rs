@@ -469,7 +469,7 @@ fn create_instance_persists_args_and_model_for_restart_parity_1858() {
     // Restart parity: boot reconstructs argv = entry.args + a --model flag derived
     // from entry.model; it must EQUAL the spawn-time argv (not be "less than").
     let model_token = crate::backend::Backend::from_command("claude")
-        .map(|b| b.format_model_arg("opus"))
+        .map(|b| crate::backend_inject::format_model_arg(&b, "opus"))
         .unwrap_or_else(|| "opus".to_string());
     let mut boot_argv = cfg.args.clone();
     boot_argv.push("--model".to_string());

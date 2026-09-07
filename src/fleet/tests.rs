@@ -2501,3 +2501,77 @@ instances:
     );
     fs::remove_dir_all(&dir).ok();
 }
+
+/// #3541: `resolve_effort` precedence — instance > defaults > None, and
+/// empty strings normalize to None on both levels.
+#[test]
+fn resolve_effort_precedence_and_empty_normalization_3541() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-fleet-effort-main-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = write_fleet(
+        &dir,
+        r#"
+defaults:
+  backend: claude
+  effort: medium
+instances:
+  pinned:
+    effort: high
+  inherits:
+    backend: codex
+  cleared:
+    effort: ""
+  bare:
+    backend: claude
+"#,
+    );
+    let config = FleetConfig::load(&path).expect("load");
+
+    // Instance wins over defaults.
+    assert_eq!(
+        config.resolve_instance("pinned").expect("resolve").effort,
+        Some("high".to_string())
+    );
+    // No instance value → defaults.
+    assert_eq!(
+        config.resolve_instance("inherits").expect("resolve").effort,
+        Some("medium".to_string())
+    );
+    // Empty instance string normalizes to "unset", so resolution falls
+    // through to defaults — consistent with `set_model`'s clear semantics
+    // (which REMOVES the instance key, exposing the default again).
+    assert_eq!(
+        config.resolve_instance("cleared").expect("resolve").effort,
+        Some("medium".to_string())
+    );
+
+    // No effort anywhere → None.
+    let dir2 = std::env::temp_dir().join(format!(
+        "agend-fleet-effort-bare-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path2 = write_fleet(&dir2, "instances:\n  bare:\n    backend: claude\n");
+    let config2 = FleetConfig::load(&path2).expect("load");
+    assert_eq!(
+        config2.resolve_instance("bare").expect("resolve").effort,
+        None
+    );
+    // Struct-level parse: effort deserializes on all three config types.
+    assert_eq!(config.defaults.effort, Some("medium".to_string()));
+    assert_eq!(
+        config.instances.get("pinned").unwrap().effort,
+        Some("high".to_string())
+    );
+    fs::remove_dir_all(&dir).ok();
+    fs::remove_dir_all(&dir2).ok();
+}

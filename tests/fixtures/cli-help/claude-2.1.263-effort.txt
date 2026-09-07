@@ -1,0 +1,6 @@
+# Provenance: captured 2026-09-06 on Darwin via `claude --help` (claude 2.1.263)
+# Purpose: pins the effort-flag grammar EffortCapability depends on (issue #3541, L2 fixture)
+# Minimal excerpt: only the effort-flag-relevant help lines are retained.
+#
+  --effort <level>                      Effort level for the current session
+                                        (low, medium, high, xhigh, max)
