@@ -1209,9 +1209,15 @@ impl AppState {
                                 "added team member pane via split"
                             );
                         } else {
-                            // First new member of this team batch — create team tab.
+                            // First new member of this team batch — create team
+                            // tab. `push_tab_preserve_focus`, never `add_tab`:
+                            // this runs on a background roster tick, and
+                            // `add_tab` switches the active tab (layout::add_tab
+                            // → switch_active), which would pull the operator off
+                            // whatever they are working on. The standalone arm
+                            // below preserves focus for exactly this reason.
                             let tab = crate::layout::Tab::new(team_name.clone(), pane);
-                            self.ui.layout.add_tab(tab);
+                            self.ui.layout.push_tab_preserve_focus(tab);
                             tracing::info!(
                                 agent = %name,
                                 team = %team_name,
@@ -1561,7 +1567,12 @@ mod tests {
         // A later roster tick must find the existing team tab even though the
         // standalone tab is active after the first batch.
         state.ui.layout.next_tab();
+        let active_before = state.ui.layout.tabs[state.ui.layout.active].name.clone();
         state.place_remote_team_grouped(&["svc-c".to_string()], &home, &mut pane_builder);
+        assert_eq!(
+            state.ui.layout.tabs[state.ui.layout.active].name, active_before,
+            "joining an EXISTING team tab must leave the operator where they were"
+        );
 
         assert_eq!(state.ui.layout.tabs.len(), 2, "team + standalone tab");
         let team_tab = state
@@ -1603,6 +1614,88 @@ mod tests {
             state.remote_attach_failures.get("svc-b"),
             Some(&1),
             "one failed team tick must record fails=1"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Fixture for the #3501 focus/reconnect pins: fleet with m1, m2, solo and
+    /// a team `svc` (members m1+m2, orchestrator m1). `solo` is in no team.
+    fn team_fixture_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "agend-test-3501-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  m1:\n    backend: shell\n  m2:\n    backend: shell\n  solo:\n    backend: shell\n",
+        )
+        .expect("write fleet.yaml");
+        let res = crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "svc", "members": ["m1", "m2"], "orchestrator": "m1"}),
+        );
+        assert_eq!(
+            res["status"],
+            serde_json::Value::String("created".to_string()),
+            "create team failed: {res}"
+        );
+        home
+    }
+
+    /// #3501 B1: opening a team tab happens on a background roster tick, so it
+    /// must NOT steal the active tab — `push_tab_preserve_focus`, not `add_tab`
+    /// (whose contract is to focus what it adds). The existing hot-reload test
+    /// only reaches the split branch, so this is the case that pins the choice.
+    #[test]
+    fn hot_reload_team_tab_creation_preserves_active_tab_3501() {
+        let home = team_fixture_home("active");
+        let mut state = AppState::new();
+        let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
+        // Standalone `solo` opens the tab the operator is working on.
+        state.place_remote_team_grouped(&["solo".to_string()], &home, &mut pane_builder);
+        let active_before = state.ui.layout.tabs[state.ui.layout.active].name.clone();
+        assert_eq!(active_before, "solo");
+        // A team member appears on a later tick: a NEW team tab is created.
+        state.place_remote_team_grouped(&["m1".to_string()], &home, &mut pane_builder);
+        assert_eq!(state.ui.layout.tabs.len(), 2, "solo + svc");
+        assert_eq!(
+            state.ui.layout.tabs[state.ui.layout.active].name, active_before,
+            "opening a team tab must not steal the active tab"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3501 B2: a retained team pane (agent gone, pane kept for scrollback)
+    /// that re-appears reconnects IN PLACE — no duplicate leaf, same team tab,
+    /// same position. Without the `already_has_pane` check the member is
+    /// appended a second time and the tab shows one agent twice.
+    #[test]
+    fn hot_reload_retained_team_pane_reconnects_in_place_3501() {
+        let home = team_fixture_home("retained");
+        let mut state = AppState::new();
+        let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
+        state.place_remote_team_grouped(
+            &["m1".to_string(), "m2".to_string()],
+            &home,
+            &mut pane_builder,
+        );
+        assert_eq!(state.ui.layout.tabs.len(), 1, "one team tab");
+        assert_eq!(
+            state.ui.layout.tabs[0].root().agent_names(),
+            vec!["m1", "m2"]
+        );
+        // m1 disappeared (pane retained) and comes back on a later tick.
+        state.place_remote_team_grouped(&["m1".to_string()], &home, &mut pane_builder);
+        assert_eq!(state.ui.layout.tabs.len(), 1, "no extra tab");
+        assert_eq!(
+            state.ui.layout.tabs[0].root().agent_names(),
+            vec!["m1", "m2"],
+            "retained team pane must reconnect in place — same tab, same position, no duplicate"
         );
         std::fs::remove_dir_all(&home).ok();
     }
