@@ -1284,6 +1284,21 @@ fn tick(
         }
         match action {
             Some(NoticeAction::Stall { tail, silent_secs }) => {
+                // #3547 P0-near Task3: persist the stalled frame for post-mortem
+                // diagnosis (best-effort — a failed save warns and the notice
+                // still goes out). Runs lock-free here at the emit site, never
+                // under the core lock (CR-2026-06-14 concurrency).
+                match save_stalled_snapshot(home, &name, &tail) {
+                    Some(path) => tracing::info!(
+                        agent = %name,
+                        snapshot = %path.display(),
+                        "stalled pane snapshot saved"
+                    ),
+                    None => tracing::warn!(
+                        agent = %name,
+                        "stalled pane snapshot save failed (best-effort, notice continues)"
+                    ),
+                }
                 let msg = format_stall_notice(&name, &tail, silent_secs);
                 // Outbound info-leak gate (Sprint 21 Phase 1): `tail`
                 // carries 40 lines of PTY output — must not leak to a
@@ -2340,6 +2355,34 @@ fn format_stall_notice(name: &str, tail: &str, silent_secs: Option<u64>) -> Stri
          ────────\n\
          💬 回覆將以原始鍵盤輸入寫入 agent stdin"
     )
+}
+
+/// #3547 P0-near Task3: persist the stalled pane `tail` to
+/// `$AGEND_HOME/stalled-captures/<instance>-<epoch_ms>.log` so the next
+/// dismiss-miss can be diagnosed from a real frame instead of guessed.
+/// Best-effort: any IO failure returns None and the caller logs a warn —
+/// the snapshot must never block or break the stall notice itself.
+/// Pure w.r.t. daemon state (takes `home`/`name`/`tail` only), so it is
+/// unit-testable without a registry or a core lock.
+fn save_stalled_snapshot(
+    home: &std::path::Path,
+    name: &str,
+    tail: &str,
+) -> Option<std::path::PathBuf> {
+    let dir = home.join("stalled-captures");
+    std::fs::create_dir_all(&dir).ok()?;
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = dir.join(format!(
+        "{}-{}.log",
+        crate::transport::safe_component(name),
+        epoch_ms
+    ));
+    let body = format!("agent: {name}\ncaptured_at_ms: {epoch_ms}\n────────\n{tail}\n");
+    std::fs::write(&path, body).ok()?;
+    Some(path)
 }
 
 /// Short, silent ping emitted when an agent leaves a blocked state

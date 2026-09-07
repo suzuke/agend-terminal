@@ -1518,6 +1518,21 @@ fn refused_startup_modal_is_not_logged_as_dismissed_3314() {
     );
 }
 
+/// #3547 P0-near Task2 RED: the FIRST Refuse of a generation must surface at
+/// info with its reason; subsequent refuses stay at debug. Today the Refuse
+/// path only ever logs at debug, so a dismiss-miss leaves no trace in the log.
+#[test]
+#[tracing_test::traced_test]
+fn first_refuse_surfaces_at_info_once_per_generation_3547() {
+    let mut gen = Generation3314::new("3547-first-refuse", false);
+    assert!(!gen.frame(FRAME_LIVE_MODAL_3314));
+    assert!(!gen.frame(FRAME_LIVE_MODAL_3314));
+    assert!(
+        logs_contain("first of generation"),
+        "first Refuse must be visible at info level with its reason"
+    );
+}
+
 /// #3314: the replacement success signal is emitted only after the write
 /// has crossed the generation gate and been submitted.
 #[test]
