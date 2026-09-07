@@ -1146,7 +1146,8 @@ mod session_contract_3414_tests {
     #[test]
     fn codex_resume_available_tracks_thread_presence_3538() {
         let home = scratch_home("resume-avail");
-        // No locator file at all → unavailable.
+        // No locator file at all → `locator_for_instance` hands back a DEFAULT
+        // locator (its NotFound arm), which carries no thread → unavailable.
         assert!(
             !codex_resume_available(&home, "ghost"),
             "missing locator must not resume"
