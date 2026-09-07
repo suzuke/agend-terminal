@@ -330,3 +330,32 @@ pub(super) fn rollback_if_expected_head_drift(
     err["actual_head"] = json!(actual);
     Some(err)
 }
+
+/// #3546 LOC: the bind-lifecycle permit acquisition, moved here verbatim so
+/// `checkout.rs` stays under `MAX_LOC` while gaining the base-freshness flag.
+/// Pure move — same order, same error shape, same `code`.
+///
+/// The permit owns the per-agent lifecycle authority for the whole bind
+/// transaction (branch locking → `bind_full` → commit → exact rollback), so
+/// checkout cannot race a release or rebase at the release→bind gap. `None` is
+/// the inspection-only (`bind:false`) case, which claims nothing.
+pub(super) fn acquire_bind_lifecycle_permit(
+    home: &Path,
+    instance_name: &str,
+    bind: bool,
+) -> Result<Option<crate::mcp::handlers::dispatch_hook::LifecyclePermit>, Value> {
+    if !bind {
+        return Ok(None);
+    }
+    match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        instance_name,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Bind,
+    ) {
+        Ok(permit) => Ok(Some(permit)),
+        Err(error) => Err(json!({
+            "error": format!("checkout bind refused: {error}"),
+            "code": "lifecycle_conflict",
+        })),
+    }
+}

@@ -4,7 +4,9 @@ use serde_json::{json, Value};
 use std::path::Path;
 // #2755 R3: response-mapping + marker-durability helpers live in a sibling module to
 // keep this handler under the LOC ceiling (call sites below are unchanged).
-use super::checkout_helpers::{rollback_response, sync_marker_contents, validate_expected_head};
+use super::checkout_helpers::{
+    acquire_bind_lifecycle_permit, rollback_response, sync_marker_contents, validate_expected_head,
+};
 
 use super::checkout_disposable::CheckoutPurpose;
 pub(crate) use super::checkout_helpers::checkout_source;
@@ -37,26 +39,9 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         Ok(purpose) => purpose,
         Err(error) => return error,
     };
-    // The bind transaction owns the per-agent lifecycle authority before any
-    // provisioning preflight. Keep this permit through branch locking,
-    // bind_full, commit, and exact rollback so checkout cannot race release or
-    // rebase at the release→bind gap.
-    let lifecycle_permit = if bind {
-        match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
-            home,
-            instance_name,
-            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Bind,
-        ) {
-            Ok(permit) => Some(permit),
-            Err(error) => {
-                return json!({
-                    "error": format!("checkout bind refused: {error}"),
-                    "code": "lifecycle_conflict",
-                });
-            }
-        }
-    } else {
-        None
+    let lifecycle_permit = match acquire_bind_lifecycle_permit(home, instance_name, bind) {
+        Ok(permit) => permit,
+        Err(error) => return error,
     };
     if bind {
         if let Err(e) = crate::agent_ops::ensure_not_protected_json(branch) {
@@ -100,8 +85,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // `d-20260514102305998399-0` scope.
     let mut auto_created_branch = false;
     let mut fetch_attempted = false;
-    // #3546: default false — a checkout that never provisioned a branch made no
-    // claim about any base, and an absent/false flag must keep meaning that.
+    // #3546: false ⟺ this checkout made no claim about any base.
     let mut base_from_stale_view = false;
     if bind {
         let src = Path::new(&source_path);
@@ -124,10 +108,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 let created = provision.created;
                 auto_created_branch = created;
                 fetch_attempted = provision.fetch_attempted;
-                // #3546: carry the "base came from a view we could not refresh"
-                // fact to the CALLER, at provision time. Discovering it later
-                // from `binding_state` is already too late — the dispatcher has
-                // handed the tree to someone who will start work on it.
+                // #3546: the caller must learn this HERE — by the time it shows
+                // up in binding_state the tree is already in someone's hands.
                 base_from_stale_view = provision.base_from_stale_view;
                 if checkout_purpose == Some(CheckoutPurpose::DisposableReview) && !created {
                     return json!({
@@ -657,10 +639,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 resp["bound"] = json!(true);
                 resp["ci_watch_armed"] = json!(false);
                 resp["auto_created_branch"] = json!(auto_created_branch);
-                // #3546: only present when true. A checkout that provisioned
-                // from a refreshed base says nothing, so existing readers see
-                // an unchanged response; the one case that needs attention is
-                // the one that speaks.
+                // #3546: present only when true — a healthy provision leaves the
+                // response byte-identical for existing readers.
                 if base_from_stale_view {
                     resp["base_from_stale_view"] = json!(true);
                 }

@@ -5323,3 +5323,108 @@ fn review_assignment_repo_absent_field_fallback_fails_closed_3479() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #3546 R1 blocker 1: the DISPATCH path must write the flag too.
+///
+/// `send kind=task` with a branch is how most worktrees in this fleet are born,
+/// and it hits the same state-3 fail-open as `repo checkout`. It used to call the
+/// back-compat tuple wrapper, which drops `base_from_stale_view`, so `bind_full`
+/// hardcoded false into the signed binding — and `binding_state` then reported,
+/// positively, that the base was fresh. A reader cannot distinguish that from a
+/// genuinely refreshed base, which is worse than saying nothing.
+///
+/// `setup_test_repo` points origin at `file:///dev/null/agend-fixture`, i.e. the
+/// fixture IS state 3: the branch is created (fail-open, deliberate) from a
+/// remote-tracking ref no fetch could refresh.
+#[test]
+fn dispatch_path_records_the_stale_base_in_the_signed_binding_3546() {
+    let home = std::env::temp_dir().join(format!("agend-3546-dispatch-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "stale-dispatch-3546");
+
+    super::dispatch_auto_bind_lease(
+        &home,
+        "stale-dispatch-3546",
+        "T-3546",
+        "feat/dispatch-3546",
+        None,
+    )
+    .expect("state 3 stays fail-OPEN: dispatch must still bind a worktree");
+
+    let binding_path = crate::paths::runtime_dir(&home)
+        .join("stale-dispatch-3546")
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding_path).expect("read binding.json"))
+            .expect("parse binding.json");
+    assert_eq!(
+        v["base_from_stale_view"],
+        serde_json::json!(true),
+        "the dispatch path provisioned from an unrefreshable view and must say so \
+         in the signed binding; got {v}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3546 R1 blocker 2 (the reviewer's P1 shape): an existing local branch that was
+/// never pushed, with origin perfectly reachable, must NOT be flagged.
+///
+/// `git fetch origin <branch>` fails for such a branch no matter how healthy the
+/// network is — there is nothing on origin to fetch. Deriving the flag from that
+/// failure marked every unpushed branch as standing on a stale base, permanently,
+/// which is precisely the kind of false alarm that teaches readers to ignore the
+/// field. On this path the base actually comes from `from_ref`, refreshed by the
+/// #2107 fetch whose result used to be discarded.
+#[test]
+fn an_unpushed_existing_branch_with_a_reachable_origin_is_not_flagged_3546() {
+    let home = std::env::temp_dir().join(format!("agend-3546-unpushed-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+
+    // A REACHABLE origin, reached by path.
+    let origin = workspace.join("origin-src");
+    std::fs::create_dir_all(&origin).ok();
+    s5_git(&["init", "-b", "main"], &origin);
+    let origin_sha = s5_commit(&origin, "O");
+
+    let repo = workspace.join("agent");
+    std::fs::create_dir_all(&repo).ok();
+    s5_git(&["init", "-b", "main"], &repo);
+    s5_git(
+        &["remote", "add", "origin", &origin.display().to_string()],
+        &repo,
+    );
+    s5_commit(&repo, "A");
+    s5_git(&["fetch", "origin", "main", "--quiet"], &repo);
+    // The branch exists locally, sits exactly on origin/main, and was never
+    // pushed — so `refs/remotes/origin/feat/unpushed-3546` does not exist.
+    s5_git(
+        &["branch", "feat/unpushed-3546", "refs/remotes/origin/main"],
+        &repo,
+    );
+
+    let provision = super::ensure_branch_exists_provisioned(
+        &home,
+        &repo,
+        "feat/unpushed-3546",
+        "origin/main",
+        "agent",
+    )
+    .expect("an existing branch with a reachable origin must provision");
+
+    assert!(
+        !provision.created,
+        "fixture: the branch already exists, so this must take the EXISTS path"
+    );
+    assert!(
+        !provision.base_from_stale_view,
+        "origin is reachable and the base ref refreshed — an unpushed branch is \
+         not evidence of a stale base"
+    );
+    let head = s5_git(&["rev-parse", "refs/heads/feat/unpushed-3546"], &repo);
+    assert_eq!(head, origin_sha, "fixture: the branch sits on origin/main");
+    std::fs::remove_dir_all(&home).ok();
+}

@@ -82,7 +82,6 @@ use std::path::Path;
 /// (Sprint 57 lease-block recovery surface — when this is non-empty
 /// AND the queried agent has no binding, the operator can immediately
 /// see who's holding the branch).
-
 pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<Sender>) -> Value {
     let agent = match args["instance"].as_str() {
         Some(a) if !a.is_empty() => a,
@@ -225,7 +224,7 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
 // an extraction, not on top of one.
 #[path = "binding_state_base_freshness.rs"]
 mod base_freshness;
-use base_freshness::base_freshness_fields;
+use base_freshness::base_behind_default_by;
 
 // Pure move (no logic change), same ceiling reason as above.
 #[path = "binding_state_cross_branch.rs"]
@@ -237,7 +236,6 @@ mod ci_watches;
 use ci_watches::{enumerate_ci_watches_detail_for_agent, enumerate_ci_watches_for_agent};
 #[path = "binding_state_target_identity.rs"]
 mod target_identity;
-
 
 // #t-…83936-4 protection ① liveness tests (worktree_resolves / invalid_reason)
 // live in a sibling file loaded via `#[path]` so binding_state.rs stays under

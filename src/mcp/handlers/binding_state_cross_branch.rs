@@ -8,7 +8,11 @@ use std::path::Path;
 /// binding currently references `branch`. P0-1.5 enforces uniqueness
 /// at bind time — this enumerator surfaces any violation so it's
 /// immediately visible via `binding_state`.
-pub(super) fn cross_branch_holders_for(home: &Path, branch: &str, exclude_agent: &str) -> Vec<String> {
+pub(super) fn cross_branch_holders_for(
+    home: &Path,
+    branch: &str,
+    exclude_agent: &str,
+) -> Vec<String> {
     if branch.is_empty() {
         return Vec::new();
     }

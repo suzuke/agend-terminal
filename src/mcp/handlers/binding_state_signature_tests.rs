@@ -131,3 +131,75 @@ fn binding_state_signature_valid_true_false_missing() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// #3546: the new `base_from_stale_view` key must not break the signed-binding
+/// contract the agend-git shim depends on.
+///
+/// The flag is written INSIDE the signed document (a post-bind edit would
+/// invalidate the sidecar, and the fact is not recomputable later), so it lands
+/// in the exact bytes the HMAC covers. Three consumers must all still accept it:
+/// this daemon's `signature_valid`, the shared core verifier the shim runs, and
+/// the shim's own `BindingV1` decoder — whose fields are `#[serde(default)]`
+/// with no `deny_unknown_fields`, which is WHY an added key is safe. This test
+/// pins that reasoning so a future `deny_unknown_fields` cannot silently turn
+/// every flagged binding into a fleet-wide push denial.
+///
+/// Both shapes are checked: with the key (flagged provision) and without it
+/// (the healthy provision, byte-identical to a pre-#3546 binding).
+#[test]
+fn base_from_stale_view_key_keeps_the_signed_binding_verifiable_3546() {
+    for flagged in [true, false] {
+        let home = tmp_home(if flagged { "3546-flag" } else { "3546-noflag" });
+        let agent = "stale-flag-agent";
+        let wt = home.join("wt");
+        let src = home.join("src");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+
+        crate::binding::bind_full_with_provenance(
+            &home,
+            agent,
+            "t-3546",
+            "feat/3546",
+            &wt,
+            &src,
+            false,
+            None,
+            flagged,
+        )
+        .expect("bind_full_with_provenance must succeed for a hermetic home");
+
+        let dir = binding_dir(&home, agent);
+        let body = std::fs::read_to_string(dir.join("binding.json")).unwrap();
+        let tag = std::fs::read_to_string(dir.join("binding.json.sig")).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed.get("base_from_stale_view").is_some(),
+            flagged,
+            "the key is present only when true (flagged={flagged}): {body}"
+        );
+
+        // 1. This daemon's own reader.
+        let r = handle_binding_state(&home, &json!({"instance": agent}), &None);
+        assert_eq!(
+            r["signature_valid"].as_bool(),
+            Some(true),
+            "flagged={flagged}: the signed body must still verify: {r}"
+        );
+
+        // 2. The shared core verifier — the one the shim actually runs.
+        assert!(
+            agentic_git_core::integrity_core::verify(&home, body.as_bytes(), tag.trim()).is_ok(),
+            "flagged={flagged}: the core verifier must accept the daemon-signed body"
+        );
+
+        // 3. The shim's decoder must still parse the document.
+        assert!(
+            agentic_git_core::binding::decode(&body).is_ok(),
+            "flagged={flagged}: an added key must not break BindingV1 decode: {body}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
