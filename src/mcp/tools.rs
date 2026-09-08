@@ -241,9 +241,9 @@ pub(crate) fn def_instance() -> Value {
 }
 
 pub(crate) fn def_decision() -> Value {
-    json!({"name": "decision", "description": "Manage decisions. Actions: post, list, update, answer, archive_batch. Listing is bounded and cursor-paginated; audit_history is a separate view. archive_batch is dry-run-first and requires an actor-bound confirmation token for apply.",
+    json!({"name": "decision", "description": "Manage decisions. Actions: post, list, get, update, answer, archive_batch. `get` returns one full record by id. Listing is bounded, cursor-paginated, and terse by default; use verbose:true for full content or fields:\"minimal\" for id/title/author/status/tags/created_at only. audit_history is a separate view. archive_batch is dry-run-first and requires an actor-bound confirmation token for apply.",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["post", "list", "update", "answer", "archive_batch"]},
+            "action": {"type": "string", "enum": ["post", "list", "get", "update", "answer", "archive_batch"]},
             "title": {"type": "string"}, "content": {"type": "string", "description": "Decision body (alias: text — #2037). For a question, the prompt text."}, "text": {"type": "string", "description": "Alias of `content` (#2037)."},
             "scope": {"type": "string", "enum": ["project", "fleet"]},
             "review_class": {"type": "string", "enum": ["single", "dual"], "description": "Create-only typed review authority for tasks governed by this decision."},
@@ -260,6 +260,8 @@ pub(crate) fn def_decision() -> Value {
             "limit": {"type": "integer", "minimum": 1, "maximum": 500},
             "scan_budget": {"type": "integer", "minimum": 1, "maximum": 5000},
             "cursor": {"type": "string", "description": "Opaque cursor returned by the preceding list page."},
+            "verbose": {"type": "boolean", "description": "list: return complete content. Default false caps content at about 200 characters; get is always full."},
+            "fields": {"type": "string", "enum": ["full", "minimal"], "description": "list: minimal keeps only id, title, author, status, tags, and created_at."},
             "apply": {"type": "boolean", "description": "archive_batch only: false/omitted previews; true applies an exact confirmation."},
             "confirm_token": {"type": "string", "description": "archive_batch apply: opaque actor-bound token from dry-run."},
             "confirm_ids": {"type": "array", "items": {"type": "string"}},
@@ -1238,6 +1240,8 @@ mod tests {
             ("decision", "limit", "decisions.rs bounded list result cap"),
             ("decision", "scan_budget", "decisions.rs bounded scan cap"),
             ("decision", "cursor", "decisions.rs opaque pagination cursor"),
+            ("decision", "verbose", "decisions.rs list full-content opt-in (#3506)"),
+            ("decision", "fields", "decisions.rs list minimal projection (#3506)"),
             ("decision", "apply", "decisions.rs archive_batch preview/apply"),
             ("decision", "confirm_token", "decisions.rs actor-bound batch confirmation"),
             ("decision", "confirm_ids", "decisions.rs exact batch preview binding"),
