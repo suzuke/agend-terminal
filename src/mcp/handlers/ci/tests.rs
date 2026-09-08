@@ -2040,6 +2040,48 @@ fn p780_checkout_target(home: &Path, agent: &str, source: &Path) -> std::path::P
         ))
 }
 
+#[test]
+fn checkout_path_digest_normalizes_equivalent_source_spellings_3550() {
+    let parent = p778_tmp_home("3550-path-digest-normalization");
+    let source = parent.join("repo");
+    std::fs::create_dir_all(&source).unwrap();
+    let alias = parent.join(".").join("repo");
+
+    assert_eq!(
+        super::checkout_path::bounded_mangled("reviewer", &source.display().to_string()),
+        super::checkout_path::bounded_mangled("reviewer", &alias.display().to_string()),
+        "one repository must have one bounded checkout identity"
+    );
+    std::fs::remove_dir_all(parent).ok();
+}
+
+#[test]
+#[cfg(not(windows))]
+fn checkout_path_warn_strategy_preserves_old_raw_digest_directory_3550() {
+    let home = p778_tmp_home("3550-old-raw-digest-home");
+    let parent = p778_tmp_home("3550-old-raw-digest-source");
+    let source = parent.join("repo");
+    std::fs::create_dir_all(&source).unwrap();
+    let alias = parent.join(".").join("repo").display().to_string();
+    let raw_digest = crate::daemon::utils::sha256_hex(alias.as_bytes());
+    let old_target = home
+        .join("worktrees")
+        .join(format!("reviewer-repo-{}", &raw_digest[..32]));
+    std::fs::create_dir_all(&old_target).unwrap();
+
+    let target = super::checkout_path::resolve_worktree_target(&home, "reviewer", &alias).unwrap();
+    assert_ne!(
+        target.path, old_target,
+        "new checkouts use the canonical digest instead of perpetuating the old spelling"
+    );
+    assert!(
+        old_target.exists(),
+        "compatibility policy warns but never renames or deletes a legacy raw-digest directory"
+    );
+    std::fs::remove_dir_all(home).ok();
+    std::fs::remove_dir_all(parent).ok();
+}
+
 #[cfg(unix)]
 fn p780_branch_exists(source: &Path, branch: &str) -> bool {
     std::process::Command::new("git")
@@ -2203,6 +2245,21 @@ fn checkout_bind_cross_repo_conflict_does_not_claim_target_is_occupied_3550() {
     assert!(
         error.contains("feat/bound-cross-repo-3550"),
         "refusal must still name the existing branch: {second}"
+    );
+    assert_eq!(
+        second["current_path"].as_str(),
+        first["path"].as_str(),
+        "cross-repo refusal must retain the existing binding's path: {second}"
+    );
+    assert_eq!(
+        second["current_task_id"].as_str(),
+        Some("t-3550-cross-repo-owner"),
+        "cross-repo refusal must retain the existing binding's task: {second}"
+    );
+    assert_eq!(
+        second["hint"].as_str(),
+        Some("release_worktree first"),
+        "cross-repo refusal must not suggest reusing a branch from another repo: {second}"
     );
 
     std::fs::remove_dir_all(&home).ok();

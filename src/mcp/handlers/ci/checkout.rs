@@ -275,9 +275,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     return reuse_resp;
                 }
             }
-            // #3550: the binding itself can block this provision — a stale
-            // same-branch binding, or a DIFFERENT branch whose worktree still
-            // occupies the `(agent, repo)` path this checkout would use.
+            // #3550: the agent's global binding can block this provision —
+            // either stale on this branch or live on a different branch.
             if let Some(resp) = super::checkout_helpers::binding_mismatch_response(
                 &existing,
                 branch,

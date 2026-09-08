@@ -426,7 +426,7 @@ pub(super) fn binding_mismatch_response(
         "current_branch": bound_branch,
         "current_path": current_path.display().to_string(),
         "current_task_id": task_id,
-        "hint": "release_worktree first, or reuse the bound branch",
+        "hint": "release_worktree first",
         "auto_created_branch": auto_created_branch,
     }))
 }
