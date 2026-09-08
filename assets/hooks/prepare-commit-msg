@@ -33,6 +33,40 @@ inject_agend_trailers() {
     BRANCH=$(grep -o '"branch"[[:space:]]*:[[:space:]]*"[^"]*"' "$BINDING" | sed 's/.*"branch"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' 2>/dev/null)
     ISSUED=$(grep -o '"issued_at"[[:space:]]*:[[:space:]]*"[^"]*"' "$BINDING" | sed 's/.*"issued_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' 2>/dev/null)
 
+    # #3545: binding.json describes the branch this agent was BOUND to, which is
+    # not necessarily the branch this commit is on — a `bind:false` dispatch
+    # leaves the previous binding in place, so the trailer would name the
+    # PREVIOUS task and branch, and a squash merge freezes that into the default
+    # branch as a confident wrong answer.
+    #
+    # The actual branch is read from $GIT_DIR/HEAD, NOT from `git rev-parse`:
+    # the shim ChdirPass-redirects git reads to the bound worktree
+    # (#2234/#2481), so a subprocess would answer with the binding's own branch
+    # and the comparison could never fail — the redirection is what hid this.
+    #
+    # Reach: git sets GIT_DIR for hooks in a LINKED worktree — which is what the
+    # daemon binds an agent to — but NOT for a commit in a repository's main
+    # worktree, where it is unset and the branch-derived trailers are withheld.
+    # That is the fail-closed side and it is intended.
+    ACTUAL_BRANCH=""
+    if [ -n "${GIT_DIR:-}" ] && [ -f "$GIT_DIR/HEAD" ]; then
+        HEAD_REF=$(cat "$GIT_DIR/HEAD" 2>/dev/null)
+        case "$HEAD_REF" in
+            "ref: refs/heads/"*) ACTUAL_BRANCH=${HEAD_REF#"ref: refs/heads/"} ;;
+        esac
+    fi
+
+    # Withhold provenance we cannot verify. A detached HEAD, a missing GIT_DIR
+    # or a binding with no branch all mean "this commit's branch was never
+    # confirmed to be the bound one" — and a wrong Agend-Task/Agend-Branch is
+    # worse than none, because it is read as an authoritative answer and squash
+    # makes it permanent. `Agend-Agent` stays: it is true either way.
+    if [ -z "$ACTUAL_BRANCH" ] || [ "$ACTUAL_BRANCH" != "$BRANCH" ]; then
+        TASK=""
+        BRANCH=""
+        ISSUED=""
+    fi
+
     # Only inject if we have at least agent name.
     {
         echo ""
