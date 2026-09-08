@@ -38,6 +38,7 @@ mod channel;
 mod claim_verifier;
 mod cleanup_intents;
 mod cli;
+mod cli_stop;
 mod config_integrity;
 mod connect;
 #[cfg_attr(windows, allow(dead_code))]
@@ -441,8 +442,19 @@ enum Commands {
         #[arg(long = "app-restart-requester", hide = true)]
         app_restart_requester: Option<String>,
     },
-    /// Stop the daemon
-    Stop,
+    /// Stop the daemon. Waits (bounded) for the daemon process to exit, then
+    /// lists reparented processes that look agend-related without touching
+    /// them (#3539).
+    Stop {
+        /// Return as soon as the daemon accepts the request; do not wait for
+        /// the process to exit (the pre-#3539 behaviour).
+        #[arg(long)]
+        no_wait: bool,
+        /// Upper bound, in seconds, on the wait for the daemon to exit. Exits
+        /// non-zero if the daemon is still running at the bound.
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
     /// Kill an agent
     Kill {
         /// Agent name
@@ -1224,13 +1236,15 @@ fn main() -> anyhow::Result<()> {
                 Err(_) => daemon_not_running_hint(),
             }
         }
-        Some(Commands::Stop) => {
-            match api::call(&home, &serde_json::json!({"method": api::method::SHUTDOWN})) {
-                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-                    println!("Daemon shutdown initiated.")
-                }
-                Ok(_) => eprintln!("Shutdown request failed."),
-                Err(_) => daemon_not_running_hint(),
+        Some(Commands::Stop { no_wait, timeout }) => {
+            let opts = cli_stop::StopOptions {
+                wait: !no_wait,
+                timeout: std::time::Duration::from_secs(timeout),
+            };
+            match cli_stop::run_stop(&home, opts)? {
+                cli_stop::StopOutcome::NotRunning => daemon_not_running_hint(),
+                cli_stop::StopOutcome::TimedOut => std::process::exit(1),
+                cli_stop::StopOutcome::Initiated | cli_stop::StopOutcome::Exited => {}
             }
         }
         Some(Commands::List { json, detailed }) => {

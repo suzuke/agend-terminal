@@ -220,11 +220,15 @@ agend-terminal kill <name>
 ```
 
 ### `stop`
-停止 daemon（同時終止所有受管理的 agent）。
+停止 daemon（同時終止所有受管理的 agent）。`stop` 預設會在有上限的時間內等 daemon 行程真正退出，再印出結果，因此 `stop && start` 不會再撞上還在退出的 daemon（#3539）。
 
 ```
-agend-terminal stop
+agend-terminal stop                 # 最多等 30 秒讓 daemon 退出
+agend-terminal stop --timeout 60    # 拉長上限；到期仍在跑則以非零碼結束
+agend-terminal stop --no-wait       # 請求被接受即返回（舊行為）
 ```
+
+daemon 退出後，`stop` 會列出「看起來像 agend 相關」的已重新掛載（reparented）行程——本 crate 的 cargo 測試二進位、debug 版 daemon、cwd 在 `worktrees/` 下——以 `hint=…` 欄標示。它們不歸 daemon 所有，daemon 不會動它們；`doctor` 有同一個 hint 欄，`doctor orphans preview` 可啟動人工確認的清理。
 
 ### `agend-mcp-bridge`（獨立的二進位檔）
 

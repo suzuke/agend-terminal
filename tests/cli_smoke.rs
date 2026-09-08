@@ -568,3 +568,229 @@ fn attach_without_daemon_shows_daemon_hint() {
         "must not say 'not found' when daemon isn't running"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #3539: `stop` waits for the daemon to be gone and reports what it left behind
+// ---------------------------------------------------------------------------
+
+/// Poll `<home>/run/<pid>/` for a daemon that has published both its identity
+/// and its API port. Returns the daemon pid.
+#[cfg(unix)]
+fn wait_for_daemon_identity(home: &std::path::Path, budget: std::time::Duration) -> u32 {
+    let started = std::time::Instant::now();
+    while started.elapsed() < budget {
+        if let Ok(entries) = std::fs::read_dir(home.join("run")) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if dir.join("api.port").exists() {
+                    if let Ok(content) = std::fs::read_to_string(dir.join(".daemon")) {
+                        if let Some(pid) = content.split(':').next().and_then(|p| p.parse().ok()) {
+                            return pid;
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!(
+        "daemon under {} did not publish .daemon + api.port within {budget:?}",
+        home.display()
+    );
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 delivers nothing; it only asks whether the pid exists.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Processes planted as if a test runner had died and left them behind:
+/// `sleep` invoked through a symlink at `…/target/debug/deps/agend_terminal-<hash>`
+/// (the #3539 residue shape — `ps` reports argv[0] as invoked, and a symlink
+/// keeps the real `/bin/sleep`, which macOS would SIGKILL if copied out of its
+/// signed location) and a plain one elsewhere (the control). Both are started
+/// through a throw-away `sh` so they reparent to init, which is the only scope
+/// the V1 report looks at. `Drop` kills them — test-only authority.
+#[cfg(unix)]
+struct PlantedResidue {
+    hinted_pid: u32,
+    control_pid: u32,
+}
+
+#[cfg(unix)]
+impl PlantedResidue {
+    fn plant(home: &std::path::Path) -> Self {
+        let deps = home.join("target").join("debug").join("deps");
+        let plain = home.join("ctl");
+        std::fs::create_dir_all(&deps).expect("mkdir deps");
+        std::fs::create_dir_all(&plain).expect("mkdir ctl");
+        let hinted = deps.join("agend_terminal-deadbeef3539");
+        let control = plain.join("plain-sleeper");
+        std::os::unix::fs::symlink("/bin/sleep", &hinted).expect("link sleep as test-binary shape");
+        std::os::unix::fs::symlink("/bin/sleep", &control).expect("link sleep as control");
+        Self {
+            hinted_pid: Self::spawn_reparented(&hinted, home),
+            control_pid: Self::spawn_reparented(&control, home),
+        }
+    }
+
+    fn spawn_reparented(exe: &std::path::Path, cwd: &std::path::Path) -> u32 {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("\"$0\" 300 >/dev/null 2>&1 & echo $!")
+            .arg(exe)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn via sh");
+        let pid: u32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("sh must echo the background pid");
+        // `sh` has exited, so the child now belongs to init.
+        let started = std::time::Instant::now();
+        while pid_alive(pid) && started.elapsed() < std::time::Duration::from_secs(5) {
+            let ppid = std::process::Command::new("ps")
+                .args(["-o", "ppid=", "-p", &pid.to_string()])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if ppid == "1" {
+                return pid;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("planted pid {pid} did not reparent to init");
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PlantedResidue {
+    fn drop(&mut self) {
+        for pid in [self.hinted_pid, self.control_pid] {
+            // SAFETY: exact positive pid this fixture spawned; test-only.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            let started = std::time::Instant::now();
+            while pid_alive(pid) && started.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// #3539 (1): `stop` returns only once the daemon process is gone and says so.
+/// #3539 (2): what a dead test runner left behind is LISTED with a hint and
+/// left alone — the control process without a hint is not listed, and neither
+/// is signalled (both are still alive after `stop` returns).
+#[cfg(unix)]
+#[test]
+fn stop_waits_for_daemon_exit_and_lists_hinted_residue_untouched_3539() {
+    let stamp = std::process::id();
+    let home_guard = FixtureHome::new(&format!("agend-cli-smoke-stop-wait-{stamp}"));
+    let home = home_guard.path().to_path_buf();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+    )
+    .expect("write fleet.yaml");
+
+    cmd()
+        .env("AGEND_HOME", &home)
+        .arg("start")
+        .assert()
+        .success();
+    let daemon_pid = wait_for_daemon_identity(&home, std::time::Duration::from_secs(30));
+    assert!(pid_alive(daemon_pid), "daemon must be alive before stop");
+
+    // Declared AFTER `home_guard` so it drops FIRST: the planted binaries live
+    // under the home, and the guard's teardown asserts nothing references it.
+    let residue = PlantedResidue::plant(&home);
+
+    let output = cmd()
+        .env("AGEND_HOME", &home)
+        .arg("stop")
+        .output()
+        .expect("run stop");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stop must exit 0 once the daemon is gone: {stdout}"
+    );
+
+    // (1) synchronous: the daemon is gone by the time `stop` has returned.
+    assert!(
+        !pid_alive(daemon_pid),
+        "daemon pid {daemon_pid} must have exited before stop returned: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Daemon shutdown initiated (pid {daemon_pid}).")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Daemon (pid {daemon_pid}) exited after")),
+        "stop must report the exit, not just the accepted request: {stdout}"
+    );
+
+    // (2) residue: listed with its hint, not acted on; control not listed.
+    assert!(
+        stdout.contains(&format!(
+            "pid={} hint=test-runner-binary",
+            residue.hinted_pid
+        )),
+        "the test-runner-shaped residue must be listed with its hint: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("pid={} ", residue.control_pid)),
+        "a reparented process without a hint is not stop's business: {stdout}"
+    );
+    assert!(
+        pid_alive(residue.hinted_pid) && pid_alive(residue.control_pid),
+        "stop reports residue and never signals it (#3273 consensus)"
+    );
+    assert!(
+        !stdout.contains("SIGTERM") && !stdout.contains("SIGKILL"),
+        "the residual report must not read as an action: {stdout}"
+    );
+    drop(residue);
+}
+
+/// `--no-wait` is the pre-#3539 receipt: accepted request, no exit claim.
+#[cfg(unix)]
+#[test]
+fn stop_no_wait_returns_on_the_accepted_request_only_3539() {
+    let stamp = std::process::id();
+    let home_guard = FixtureHome::new(&format!("agend-cli-smoke-stop-nowait-{stamp}"));
+    let home = home_guard.path().to_path_buf();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+    )
+    .expect("write fleet.yaml");
+
+    cmd()
+        .env("AGEND_HOME", &home)
+        .arg("start")
+        .assert()
+        .success();
+    let daemon_pid = wait_for_daemon_identity(&home, std::time::Duration::from_secs(30));
+
+    let output = cmd()
+        .env("AGEND_HOME", &home)
+        .args(["stop", "--no-wait"])
+        .output()
+        .expect("run stop --no-wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!("Daemon shutdown initiated (pid {daemon_pid}).")),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("exited after") && !stdout.contains("Residual scan"),
+        "--no-wait must not claim anything about the exit: {stdout}"
+    );
+    // `home_guard` reaps whatever is still shutting down.
+}
