@@ -138,7 +138,7 @@ fn t122_fixture_uses_real_git_end_to_end() {
     );
 }
 
-/// (task122 RED #1) the #2770 suite (scripts/test_fmt_owned.sh) passes 10/10 through
+/// (task122 RED #1) the #2770 suite (scripts/test_fmt_owned.sh) passes 12/12 through
 /// the shell seam even when a DENY-SHIM occupies `$AGEND_HOME/bin` on the child PATH
 /// — proof the migrated shell fixture + its child git procs use REAL git.
 #[cfg(unix)]
@@ -176,8 +176,8 @@ fn t122_test_fmt_owned_passes_under_simulated_deny_shim() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.status.success() && stdout.contains("10 passed, 0 failed"),
-        "test_fmt_owned.sh must pass 10/10 via the seam under a deny-shim.\nstdout:\n{stdout}\nstderr:\n{}",
+        out.status.success() && stdout.contains("12 passed, 0 failed"),
+        "test_fmt_owned.sh must pass 12/12 via the seam under a deny-shim.\nstdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
