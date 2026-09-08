@@ -2,9 +2,9 @@
 # scripts/fmt-owned.sh — THE single repository-owned rustfmt surface (task83, decision
 # d-20260713150435301072-46).
 #
-# "Owned" = tracked *.rs EXCLUDING vendor/** — the in-tree agentic-git workspace
-# keeps its own source-format boundary. This pathspec remains the explicit
-# AgEnD-Terminal boundary. Every fmt caller —
+# "Owned" = tracked plus untracked/non-ignored *.rs EXCLUDING vendor/** — the
+# in-tree agentic-git workspace keeps its own source-format boundary. This
+# pathspec remains the explicit AgEnD-Terminal boundary. Every fmt caller —
 # GitHub CI, GitLab CI, scripts/preflight.sh (and pre-push via preflight) — invokes
 # THIS one script, so the owned-source boundary is defined in exactly one place.
 #
@@ -41,7 +41,7 @@ fi
 # Version-scope evidence (task83/d-46): record the EXACT rustfmt this run used, to
 # stderr, so a "matches CI" claim is scoped to a concrete version in the logs
 # rather than asserted as byte-exact — and without pinning a toolchain here.
-echo "fmt-owned: $(rustfmt --version 2>/dev/null) [edition 2021, owned *.rs, vendor/** excluded]" >&2
+echo "fmt-owned: $(rustfmt --version 2>/dev/null) [edition 2021, tracked + untracked/non-ignored *.rs, vendor/** excluded]" >&2
 
 # Resolve the OUTERMOST superproject working tree so enumeration + rustfmt always
 # run against the top-level owned tree, regardless of CWD. `--show-superproject-
@@ -56,15 +56,16 @@ while true; do
 done
 cd "$root"
 
-# NUL-safe: enumerate tracked owned *.rs (vendor/** excluded). A -z stream keeps
-# paths with spaces or newlines intact; the read loop preserves them exactly.
+# NUL-safe: enumerate tracked and untracked/non-ignored owned *.rs (vendor/**
+# excluded). A -z stream keeps paths with spaces or newlines intact; the read
+# loop preserves them exactly.
 files=()
 while IFS= read -r -d '' f; do
     files+=("$f")
-done < <(git ls-files -z -- '*.rs' ':!:vendor/**')
+done < <(git ls-files -z --cached --others --exclude-standard -- '*.rs' ':!:vendor/**')
 
 if [ "${#files[@]}" -eq 0 ]; then
-    echo "fmt-owned: no owned *.rs tracked under $root — nothing to do" >&2
+    echo "fmt-owned: no owned *.rs found under $root — nothing to do" >&2
     exit 0
 fi
 

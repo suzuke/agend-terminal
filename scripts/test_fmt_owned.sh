@@ -9,6 +9,8 @@
 #   - the vendored submodule's content, gitlink and status stay BYTE-IDENTICAL
 #     (recursively), and a super-tracked vendor/** file is never touched;
 #   - --check DETECTS owned drift (non-zero) and passes once clean;
+#   - an untracked, non-ignored *.rs is checked and named on failure;
+#   - a gitignored *.rs remains outside the owned surface;
 #   - a rustfmt PARSE FAILURE propagates (non-zero);
 #   - the recursive parent/submodule tree ends CLEAN.
 #
@@ -133,14 +135,35 @@ else
     bad "tree not clean recursively (super='$super_dirty' sub='$recurse_dirty')"
 fi
 
-# ── 7. rustfmt PARSE FAILURE propagates (non-zero) ────────────────────────────
+# ── 7. an untracked, non-ignored *.rs is part of the owned surface ────────────
+printf 'fn   untracked( ){  }\n' > "$super/src/untracked.rs"
+untracked_log="$work/untracked-check.log"
+if run_owned --check >"$untracked_log" 2>&1; then
+    bad "--check ignored malformed untracked src/untracked.rs"
+elif grep -q 'src/untracked\.rs' "$untracked_log"; then
+    ok "--check detects and names malformed untracked *.rs"
+else
+    bad "--check failed without naming untracked src/untracked.rs"
+fi
+rm -f "$super/src/untracked.rs"
+
+# ── 8. gitignored *.rs remains outside the owned surface ─────────────────────
+printf 'ignored.rs\n' > "$super/.gitignore"
+commit_all "$super" ignore
+printf 'fn   ignored( ){  }\n' > "$super/ignored.rs"
+[ "$(rc run_owned --check)" -eq 0 ] \
+    && ok "--check excludes gitignored untracked *.rs" \
+    || bad "gitignored untracked *.rs should stay outside the owned surface"
+rm -f "$super/ignored.rs"
+
+# ── 9. rustfmt PARSE FAILURE propagates (non-zero) ────────────────────────────
 printf 'fn broken( {\n' > "$super/src/broken.rs"   # unparseable Rust
 git_h -C "$super" add -A >/dev/null 2>&1
 [ "$(rc run_owned)" -ne 0 ] \
     && ok "rustfmt parse failure propagates (non-zero)" \
     || bad "unparseable owned file should make write mode non-zero"
 
-# ── 8. every production fmt caller invokes the shared surface ─────────────────
+# ── 10. every production fmt caller invokes the shared surface ────────────────
 # (pre-push converges transitively via preflight, so the direct callers suffice.)
 repo_root="$(cd "$script_dir/.." && pwd)"
 callers_ok=1
@@ -154,7 +177,7 @@ done
     && ok "all production fmt callers invoke scripts/fmt-owned.sh" \
     || bad "a production fmt caller does not invoke the shared surface"
 
-# ── 9. invoked from a deeply NESTED submodule CWD → resolves to the OUTERMOST
+# ── 11. invoked from a deeply NESTED submodule CWD → resolves to the OUTERMOST
 #       superproject. `--show-superproject-working-tree` climbs ONE level, so from
 #       vendor/dep/nested (the doubly-nested inner) a single call picks the IMMEDIATE
 #       superproject (vendor/dep) and would format vendored dep.rs, dirtying the
