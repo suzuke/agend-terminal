@@ -89,15 +89,21 @@ pub(crate) const MODAL_STATIC_LINES: &[&str] = &[
 /// the part that survives that, and each is static prose unique to this modal.
 ///
 /// The two lines deliberately dropped (`I am using this for local development`,
-/// `Enter to confirm`) are the interactive half. Answering without seeing them
-/// means answering without confirming the selection sits on option 1. That is a
-/// real, accepted risk: it is bounded by every other condition on the relaxed
-/// path (armed generation, inside the startup window, prompt-blocked state,
-/// [`RELAXED_AFTER_INCOMPLETE_FRAMES`] consecutive incomplete frames, the same
-/// stability window, and [`MAX_ANSWERS_PER_GENERATION`]), and the alternative it
-/// replaces is the observed harm: an agent stranded for the rest of its life
-/// because the locator its self-kick waits on is published by an MCP server the
-/// unanswered modal is holding shut.
+/// `Enter to confirm`) are the interactive half — which is precisely the half
+/// that says "there is something here you may answer with Enter".
+///
+/// **So an anchor match proves the warning TEXT is on screen. It does not prove
+/// an answerable modal is on screen.** #3561 R1 found what that gap costs: a
+/// frame whose upper half QUOTES the warning (the pattern's `[^A-Za-z\n]*`
+/// prefix class admits `> `) and whose lower half carries a different prompt
+/// actually blocking the pane satisfies the anchor, and `prompt_blocked` is true
+/// — because of that other prompt. The CR would have answered it.
+///
+/// Two further conditions close that, and both are about the FRAME rather than
+/// the text: the match must be the bottom-most thing on screen
+/// ([`ANCHOR_TAIL_MAX_LINES`]), and no other dismiss pattern may match the same
+/// frame ([`DevModalGate::set_other_prompt_on_screen`]). A live modal owns the
+/// bottom of its pane; a quotation has the rest of the transcript under it.
 pub(crate) const MODAL_ANCHOR_LINES: &[&str] = &[
     "WARNING: Loading development channels",
     "is for local channel development",
@@ -114,6 +120,20 @@ pub(crate) const MODAL_ANCHOR_LINES: &[&str] = &[
 /// child actually emits output, so a quiet pane cannot age into the relaxed path
 /// while nothing is being drawn.
 pub(crate) const RELAXED_AFTER_INCOMPLETE_FRAMES: u32 = 24;
+
+/// How many non-blank lines may follow an anchored match and still leave it the
+/// bottom-most thing on screen.
+///
+/// #3561 R1 B1, remedy (a). Derived from the modal's own shape rather than
+/// chosen: below [`MODAL_ANCHOR_LINES`]'s last entry the shipped modal renders
+/// exactly four more non-blank lines — option 1, option 2, and
+/// `Enter to confirm` (with a blank between). A pane too short to show the whole
+/// modal cuts that tail off, so the anchor ends at or near the last rendered
+/// line. A frame that QUOTES the warning has the rest of the transcript below
+/// it, which does not fit in four lines. Deliberately not "zero lines": the
+/// complete match can fail with option 1 still visible, and refusing that case
+/// would give up the recovery this whole path exists for.
+pub(crate) const ANCHOR_TAIL_MAX_LINES: usize = 4;
 
 /// Hard ceiling on answers per generation, across all fingerprints.
 ///
@@ -353,10 +373,17 @@ pub(crate) fn complete_modal_digest(screen: &str) -> Option<u64> {
 /// only the required line set is smaller. The digests cannot collide across the
 /// two: a complete match hashes a strictly longer region.
 pub(crate) fn anchored_modal_digest(screen: &str) -> Option<u64> {
-    digest_of_lines(screen, MODAL_ANCHOR_LINES)
+    let (digest, end) = digest_and_end_of_lines(screen, MODAL_ANCHOR_LINES)?;
+    anchor_reaches_bottom(screen, end).then_some(digest)
 }
 
 fn digest_of_lines(screen: &str, lines: &[&str]) -> Option<u64> {
+    digest_and_end_of_lines(screen, lines).map(|(digest, _)| digest)
+}
+
+/// As [`digest_of_lines`], but also reports the byte offset just past the last
+/// matched literal, so a caller can ask what is BELOW the match.
+fn digest_and_end_of_lines(screen: &str, lines: &[&str]) -> Option<(u64, usize)> {
     let mut cursor = 0usize;
     let mut start = None;
     let mut end = 0usize;
@@ -375,7 +402,19 @@ fn digest_of_lines(screen: &str, lines: &[&str]) -> Option<u64> {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    Some(hash)
+    Some((hash, end))
+}
+
+/// Is the anchored match the bottom-most content of the frame?
+///
+/// #3561 R1 B1 remedy (a). Counts only non-blank lines after the match, so
+/// trailing padding a terminal emits does not disarm the recovery.
+fn anchor_reaches_bottom(screen: &str, end: usize) -> bool {
+    screen[end..]
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        <= ANCHOR_TAIL_MAX_LINES
 }
 
 /// Find an ASCII literal while tolerating terminal-induced wrapping inside its
@@ -594,6 +633,12 @@ pub(crate) struct DevModalGate {
     /// the same reason `armed` is: the decision path stays a pure function of
     /// (gate state, screen, `now`) with no clock and no registry read of its own.
     prompt_blocked: bool,
+    /// #3561 R1 B1, remedy (b): does this frame carry a DIFFERENT dismissible
+    /// prompt? Injected by the read loop like `prompt_blocked`, and for the same
+    /// reason it is needed: `prompt_blocked` says only that SOMETHING is holding
+    /// the pane, never which thing. When something else on screen is answerable,
+    /// a CR aimed at a merely-quoted warning would land on that instead.
+    other_prompt_on_screen: bool,
     /// #3547: observability sink. Never read by the decision path.
     tally: Arc<RefuseTally>,
     /// #3547 P0-near Task2: per-generation first-Refuse flag. Owned by the PTY
@@ -636,6 +681,7 @@ impl DevModalGate {
             candidate: None,
             consecutive_no_complete: 0,
             prompt_blocked: false,
+            other_prompt_on_screen: false,
             tally,
             first_refuse_logged: false,
         }
@@ -646,6 +692,13 @@ impl DevModalGate {
     /// `observe` free of any state lookup of its own.
     pub(crate) fn set_prompt_blocked(&mut self, prompt_blocked: bool) {
         self.prompt_blocked = prompt_blocked;
+    }
+
+    /// #3561 R1 B1, remedy (b): record whether any OTHER dismiss pattern matches
+    /// this frame. Computed by the scan that is about to consult the gate, so
+    /// the gate still reads nothing but injected facts.
+    pub(crate) fn set_other_prompt_on_screen(&mut self, other_prompt_on_screen: bool) {
+        self.other_prompt_on_screen = other_prompt_on_screen;
     }
 
     /// #3547 P0-near Task2: claim the per-generation first-Refuse log slot.
@@ -703,6 +756,11 @@ impl DevModalGate {
     /// none of it is read off the frame beyond the anchor match itself.
     fn relaxed_digest(&self, screen: &str) -> Option<u64> {
         if !self.prompt_blocked || self.consecutive_no_complete < RELAXED_AFTER_INCOMPLETE_FRAMES {
+            return None;
+        }
+        // #3561 R1 B1 remedy (b): something else on this frame is answerable, so
+        // the pane is not blocked on OUR modal and a CR would land on that.
+        if self.other_prompt_on_screen {
             return None;
         }
         anchored_modal_digest(screen)
@@ -1042,6 +1100,102 @@ mod resilience_3547_tests {
             summary.contains("answered=1 (relaxed=0)"),
             "a strict answer must not be reported as relaxed: {summary}"
         );
+    }
+
+    /// The #3561 R1 frame: the warning QUOTED into the transcript (the pattern's
+    /// `[^A-Za-z\n]*` prefix class admits `> `), with a DIFFERENT prompt below
+    /// it actually holding the pane.
+    fn quoted_warning_then(trailing: &str) -> String {
+        let quoted: String = FRAME_LIVE_MODAL
+            .lines()
+            .take_while(|line| !line.contains("I am using this for local development"))
+            .map(|line| format!("> {line}\n"))
+            .collect();
+        format!("{quoted}{trailing}")
+    }
+
+    /// #3561 R1 B1 (reviewer probe C): a quoted warning above a prompt that is
+    /// really blocking the pane must NEVER be escalated. `prompt_blocked` is true
+    /// here — because of that OTHER prompt — which is exactly why it alone was
+    /// not enough. Before the fix this reached `Enqueue` and the CR would have
+    /// answered the tool-approval prompt.
+    #[test]
+    fn a_quoted_warning_above_a_blocking_prompt_never_escalates_3561() {
+        let screen = quoted_warning_then(
+            "  Tool use: Bash\n  kubectl delete namespace prod\n\n  Do you want to proceed?\n  \u{276f} 1. Yes\n    2. No\n",
+        );
+        assert!(
+            complete_modal_digest(&screen).is_none(),
+            "the quote is incomplete, or this frame proves nothing"
+        );
+        let mut gate = DevModalGate::new(true);
+        gate.set_prompt_blocked(true);
+        // Remedy (b) is what production would inject here; leave it false so this
+        // test isolates remedy (a) — the transcript below the quote.
+        gate.set_other_prompt_on_screen(false);
+        for frame in 0..(RELAXED_AFTER_INCOMPLETE_FRAMES * 2) {
+            assert_eq!(
+                gate.observe(&screen, LogicalMs(frame.into())),
+                GateOutcome::Refuse(Refused::NoCompleteModal),
+                "frame {frame}: a quoted warning with a transcript under it must never escalate"
+            );
+        }
+    }
+
+    /// The same shape with a SHORT trailing prompt, so the bottom-region rule
+    /// alone would admit it. Only remedy (b) — "something else on this frame is
+    /// answerable" — refuses it. Kept separate so the two guards cannot mask
+    /// each other.
+    #[test]
+    fn a_quoted_warning_above_a_short_prompt_is_refused_by_the_other_prompt_fact_3561() {
+        // Short on purpose: the remainder of the matched line and the quoted
+        // blank already consume part of the tail budget, so the trailing prompt
+        // has to be terse for this frame to reach remedy (b) at all.
+        let screen = quoted_warning_then("  Continue? [y/N]\n");
+        assert!(
+            anchored_modal_digest(&screen).is_some(),
+            "this frame must pass the bottom-region rule, or it does not isolate remedy (b)"
+        );
+        let mut gate = DevModalGate::new(true);
+        gate.set_prompt_blocked(true);
+        gate.set_other_prompt_on_screen(true);
+        for frame in 0..(RELAXED_AFTER_INCOMPLETE_FRAMES * 2) {
+            assert_eq!(
+                gate.observe(&screen, LogicalMs(frame.into())),
+                GateOutcome::Refuse(Refused::NoCompleteModal),
+                "frame {frame}: another answerable prompt on the frame must block escalation"
+            );
+        }
+    }
+
+    /// #3561 R1 reverse (reviewer probes A/B): frames that do not carry the
+    /// anchor literals at all never come close, however long they are blocked.
+    #[test]
+    fn unrelated_blocking_prompts_never_reach_the_anchor_3561() {
+        for (label, screen) in [
+            (
+                "tool-approval",
+                "  Tool use: Bash\n  rm -rf /tmp/scratch\n\n  Do you want to proceed?\n  \u{276f} 1. Yes\n    2. No\n",
+            ),
+            (
+                "model-menu",
+                "  Select model\n  \u{276f} 1. claude-opus-5\n    2. claude-sonnet-5\n    3. claude-haiku-4-5\n",
+            ),
+        ] {
+            assert!(
+                anchored_modal_digest(screen).is_none(),
+                "{label}: must not match the anchor subset"
+            );
+            let mut gate = DevModalGate::new(true);
+            gate.set_prompt_blocked(true);
+            for frame in 0..48u32 {
+                assert_eq!(
+                    gate.observe(screen, LogicalMs(frame.into())),
+                    GateOutcome::Refuse(Refused::NoCompleteModal),
+                    "{label} frame {frame}: must never escalate"
+                );
+            }
+        }
     }
 
     /// #3547 observability: the tally reports the LAST refuse, not the first.

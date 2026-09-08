@@ -552,6 +552,15 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
             #[cfg(test)]
             let mut scheduled_from_first_sighting = false;
             if pattern.dev_gated {
+                // #3561 R1 B1 remedy (b): is anything ELSE on this frame
+                // answerable? Computed here, where the prepared pattern set is
+                // already in hand, and pushed in as a fact — the gate itself
+                // still looks at nothing but the screen and what it was told.
+                dev_gate.set_other_prompt_on_screen(
+                    dismiss_patterns
+                        .iter()
+                        .any(|other| !other.dev_gated && other.regex.is_match(screen)),
+                );
                 match dev_gate.observe(screen, now) {
                     GateOutcome::Enqueue => {}
                     GateOutcome::Schedule => {
