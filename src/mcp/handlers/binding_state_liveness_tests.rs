@@ -13,6 +13,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::handle_binding_state;
+use crate::mcp::handlers::worktree::handle_release_worktree;
 use serde_json::json;
 use std::path::Path;
 
@@ -243,6 +244,63 @@ fn binding_state_exposes_base_freshness_fields_3546() {
         r["base_from_stale_view"].as_bool(),
         Some(true),
         "the provision-time fact must survive into the health view: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn binding_state_reports_release_lifecycle_in_flight() {
+    let home = tmp_home("release-in-flight");
+    let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &home,
+        "release-agent",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    )
+    .expect("release permit");
+
+    let active = handle_binding_state(&home, &json!({"instance": "release-agent"}), &None);
+    assert_eq!(active["release_in_flight"], true, "{active}");
+
+    drop(permit);
+    let complete = handle_binding_state(&home, &json!({"instance": "release-agent"}), &None);
+    assert_eq!(complete["release_in_flight"], false, "{complete}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn binding_state_after_release_reports_unbound_clean_state() {
+    let home = tmp_home("post-release");
+    let wt = home.join("wt-x");
+    write_binding_src(
+        &home,
+        "alpha",
+        "feature/x",
+        wt.to_str().unwrap(),
+        "/tmp/source-repo",
+    );
+
+    let pre = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
+    assert_eq!(pre["bound"].as_bool(), Some(true));
+    let _ = handle_release_worktree(&home, &json!({"instance": "alpha"}), &None);
+
+    let post = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
+    assert_eq!(
+        post["bound"].as_bool(),
+        Some(false),
+        "post-release must report unbound: {post}"
+    );
+    assert_eq!(
+        post["bind_in_flight"].as_bool(),
+        Some(false),
+        "in-flight guard cleared post-release: {post}"
+    );
+    assert!(
+        post["ci_watches"].as_array().unwrap().is_empty(),
+        "no leaked watches: {post}"
+    );
+    assert!(
+        post["cross_branch_holders"].as_array().unwrap().is_empty(),
+        "no cross-branch holders: {post}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

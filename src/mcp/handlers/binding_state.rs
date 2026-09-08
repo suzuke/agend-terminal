@@ -613,67 +613,6 @@ mod tests {
     }
 
     #[test]
-    fn binding_state_reports_release_lifecycle_in_flight() {
-        let home = tmp_home("release-in-flight");
-        let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
-            &home,
-            "release-agent",
-            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
-        )
-        .expect("release permit");
-
-        let active = handle_binding_state(&home, &json!({"instance": "release-agent"}), &None);
-        assert_eq!(active["release_in_flight"], true, "{active}");
-
-        drop(permit);
-        let complete = handle_binding_state(&home, &json!({"instance": "release-agent"}), &None);
-        assert_eq!(complete["release_in_flight"], false, "{complete}");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn binding_state_after_release_reports_unbound_clean_state() {
-        // Regression-proof against the Sprint 57 lease-block surface:
-        // after release_worktree, binding_state must report bound:false,
-        // bind_in_flight:false, no cross_branch_holders, and no leaked
-        // ci_watches. If any layer leaks state, this assertion fails.
-        let home = tmp_home("post-release");
-        let wt = home.join("wt-x");
-        // A stale binding whose target is already absent is a successful
-        // release path; a present removal failure now deliberately retains it.
-        write_binding(&home, "alpha", "feature/x", wt.to_str().unwrap());
-
-        // Pre-release: bound.
-        let pre = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
-        assert_eq!(pre["bound"].as_bool(), Some(true));
-
-        // Release.
-        let _ = handle_release_worktree(&home, &json!({"instance": "alpha"}), &None);
-
-        // Post-release: unbound, clean.
-        let post = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
-        assert_eq!(
-            post["bound"].as_bool(),
-            Some(false),
-            "post-release must report unbound: {post}"
-        );
-        assert_eq!(
-            post["bind_in_flight"].as_bool(),
-            Some(false),
-            "in-flight guard cleared post-release: {post}"
-        );
-        assert!(
-            post["ci_watches"].as_array().unwrap().is_empty(),
-            "no leaked watches: {post}"
-        );
-        assert!(
-            post["cross_branch_holders"].as_array().unwrap().is_empty(),
-            "no cross-branch holders: {post}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
     fn binding_state_lists_ci_watches_for_bound_agent() {
         // Defensive bonus: if the agent is subscribed to a CI watch,
         // binding_state must surface it. This pairs with
