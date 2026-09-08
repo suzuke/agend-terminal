@@ -359,3 +359,74 @@ pub(super) fn acquire_bind_lifecycle_permit(
         })),
     }
 }
+
+/// #3550: the two ways THIS agent's existing binding blocks a fresh provision,
+/// reported structurally instead of as raw `git worktree add` output.
+///
+/// - Same branch, bound worktree gone, a task still owns the binding →
+///   `stale_binding` (pre-existing behaviour, moved here so the handler stays
+///   under its LOC ceiling).
+/// - A DIFFERENT branch whose worktree is still on disk → `binding_conflict`.
+///   The worktree path key is `(agent, repo)` and carries no branch
+///   (`checkout_path::bounded_mangled`), so the fresh provision targets the very
+///   directory the current binding occupies and `git worktree add` fails with a
+///   bare `'<path>' already exists` — an error that names neither the binding
+///   nor the branch holding it, which is what issue #3550's reporter read as a
+///   daemon fault. The path-not-clobbered semantics are unchanged: this refuses
+///   EARLIER and more legibly, it never removes the occupied directory.
+///
+/// A branch auto-created by this now-refused checkout is rolled back, mirroring
+/// the `worktree_add_failed` path it replaces (arch14) — without this, moving
+/// the refusal earlier would start leaking branches that path cleans up.
+///
+/// Returns `None` when the binding does not block this checkout.
+pub(super) fn binding_mismatch_response(
+    existing: &Value,
+    branch: &str,
+    live_worktree: Option<&Path>,
+    source_path: &Path,
+    expected_head: &str,
+    auto_created_branch: bool,
+) -> Option<Value> {
+    let bound_branch = existing
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let task_id = existing
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if bound_branch == branch {
+        if live_worktree.is_none() && !task_id.is_empty() {
+            return Some(json!({
+                "error": format!(
+                    "stale binding for branch '{branch}' points at a missing worktree - release first before checkout"
+                ),
+                "code": "stale_binding",
+                "branch": branch,
+            }));
+        }
+        return None;
+    }
+    let current_path = live_worktree?;
+    if auto_created_branch {
+        super::checkout_disposable::rollback_auto_created_branch(
+            source_path,
+            branch,
+            expected_head,
+        );
+    }
+    Some(json!({
+        "error": format!(
+            "already bound to branch '{bound_branch}' in this repository, and that worktree \
+             still occupies the path a checkout of '{branch}' would use"
+        ),
+        "code": "binding_conflict",
+        "branch": branch,
+        "current_branch": bound_branch,
+        "current_path": current_path.display().to_string(),
+        "current_task_id": task_id,
+        "hint": "release_worktree first, or reuse the bound branch",
+        "auto_created_branch": auto_created_branch,
+    }))
+}

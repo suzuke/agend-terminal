@@ -240,7 +240,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 .map(std::path::PathBuf::from)
                 .filter(|p| p.exists());
             if same_branch {
-                if let Some(wt) = live_wt {
+                if let Some(wt) = live_wt.clone() {
                     // #2755: the full fail-closed reuse contract (deadlock-safe exact-path
                     // lock transfer, CAS re-read, canonical daemon-managed provenance, then
                     // sync-to-final-HEAD → strict init → gitlink verify) lives in the sibling
@@ -274,19 +274,19 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     }
                     return reuse_resp;
                 }
-                let existing_task_id = existing
-                    .get("task_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if !existing_task_id.is_empty() {
-                    return json!({
-                        "error": format!(
-                            "stale binding for branch '{branch}' points at a missing worktree - release first before checkout"
-                        ),
-                        "code": "stale_binding",
-                        "branch": branch,
-                    });
-                }
+            }
+            // #3550: the binding itself can block this provision — a stale
+            // same-branch binding, or a DIFFERENT branch whose worktree still
+            // occupies the `(agent, repo)` path this checkout would use.
+            if let Some(resp) = super::checkout_helpers::binding_mismatch_response(
+                &existing,
+                branch,
+                live_wt.as_deref(),
+                Path::new(&source_path),
+                args["expected_head"].as_str().unwrap_or(""),
+                auto_created_branch,
+            ) {
+                return resp;
             }
         }
     }

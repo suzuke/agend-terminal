@@ -2053,6 +2053,105 @@ fn p780_branch_exists(source: &Path, branch: &str) -> bool {
         .success()
 }
 
+/// #3550 RED→GREEN: the worktree path key is `(agent, repo)` and carries no
+/// branch, so an agent already bound to branch A that checks out a DIFFERENT
+/// branch B targets the very directory its own binding occupies. Before this
+/// fix the raw `git worktree add` failure surfaced as `worktree_add_failed`
+/// with a bare `'<path>' already exists`, naming neither the binding nor the
+/// branch holding it — the reporter of #3550 read it as a daemon fault. The
+/// refusal must name the current branch, path and task, and a branch this
+/// refused checkout auto-created must not survive it (arch14's rule).
+///
+/// Uses the arch14 source fixture because it stages a `refs/remotes/origin/*`
+/// view: without one the #3546 create-path guard fail-closes on branch B long
+/// before this gap, and the auto-create arm is never reached.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_reports_binding_conflict_for_other_branch_3550() {
+    let home = p778_tmp_home("3550-conflict");
+    let parent = p778_tmp_home("3550-conflict-src");
+    let source = p780_setup_source_broken_origin(&parent);
+    let agent = "agent-3550";
+
+    let first = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/bound-3550",
+            "bind": true,
+            "task_id": "t-3550-owner",
+        }),
+        agent,
+    );
+    assert!(
+        first.get("error").is_none(),
+        "first checkout must bind: {first}"
+    );
+    let bound_path = first["path"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !bound_path.is_empty(),
+        "first checkout must report its path: {first}"
+    );
+
+    let second = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/other-3550",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert_eq!(
+        second["code"].as_str(),
+        Some("binding_conflict"),
+        "{second}"
+    );
+    assert_eq!(
+        second["current_branch"].as_str(),
+        Some("feat/bound-3550"),
+        "the refusal must name the branch actually holding the path: {second}"
+    );
+    assert_eq!(
+        second["current_path"].as_str(),
+        Some(bound_path.as_str()),
+        "the refusal must name the occupied path: {second}"
+    );
+    assert_eq!(
+        second["current_task_id"].as_str(),
+        Some("t-3550-owner"),
+        "the refusal must name the task that owns the binding: {second}"
+    );
+    assert!(
+        second["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("release_worktree")),
+        "the refusal must say how to proceed: {second}"
+    );
+    // The refused checkout DID auto-create its branch, and must roll it back —
+    // the same rule the `worktree_add_failed` path follows (arch14).
+    assert_eq!(
+        second["auto_created_branch"].as_bool(),
+        Some(true),
+        "fixture must reach the auto-create arm: {second}"
+    );
+    assert!(
+        !p780_branch_exists(&source, "feat/other-3550"),
+        "a branch auto-created by the refused checkout must not survive: {second}"
+    );
+    // The existing binding is untouched by the refusal.
+    let binding = crate::binding::read(&home, agent).expect("binding survives the refusal");
+    assert_eq!(
+        binding["branch"].as_str(),
+        Some("feat/bound-3550"),
+        "{binding}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 /// Arch14 residue: a checkout that auto-created its branch must delete only that
 /// branch when the fixed worktree target is already occupied and `git worktree add`
 /// fails. The occupied target is deliberately preserved as out-of-scope state.
