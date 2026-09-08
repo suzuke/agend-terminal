@@ -41,6 +41,58 @@ pub enum StopOutcome {
     Exited,
     /// Request accepted but the daemon was still alive at the bound.
     TimedOut,
+    /// Request accepted; at the bound the pid was still alive but its start
+    /// token could not be read, so "same daemon or a recycled pid" is unknown.
+    /// Never reported as an exit (R1 N1): a false "exited" would let
+    /// `stop && start` run against a live daemon.
+    Unconfirmed,
+}
+
+/// What one liveness probe of the recorded daemon pid established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// The pid is gone, or is alive under a DIFFERENT start token (recycled pid).
+    Exited,
+    /// The pid is alive under the recorded token (or no token was recorded, so
+    /// pid liveness is all there is to go on — the legacy `.daemon` case).
+    Alive,
+    /// The pid is alive but its start token cannot be read right now
+    /// (`process_start_token` fails for a live process on macOS when
+    /// `proc_pidinfo` returns a short struct, on Linux under `hidepid`, on
+    /// Windows without the query right). Not evidence of an exit.
+    Unknown,
+}
+
+/// "Is the recorded daemon still there?" with the platform probes injected so
+/// the token comparison is testable (R1 N1: the previous inline closure was
+/// not, and dropping the comparison left every test green).
+fn daemon_liveness(
+    pid: u32,
+    recorded_token: Option<u64>,
+    alive: impl Fn(u32) -> bool,
+    read_token: impl Fn(u32) -> Option<u64>,
+) -> Liveness {
+    if !alive(pid) {
+        return Liveness::Exited;
+    }
+    let Some(recorded) = recorded_token else {
+        return Liveness::Alive;
+    };
+    match read_token(pid) {
+        Some(current) if current == recorded => Liveness::Alive,
+        Some(_) => Liveness::Exited,
+        None => Liveness::Unknown,
+    }
+}
+
+/// Result of polling [`daemon_liveness`] up to a bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    Exited(Duration),
+    /// The bound elapsed; `last` is the final probe (never `Exited`).
+    TimedOut {
+        last: Liveness,
+    },
 }
 
 const POLL: Duration = Duration::from_millis(100);
@@ -79,16 +131,16 @@ pub fn run_stop(home: &Path, opts: StopOptions) -> anyhow::Result<StopOutcome> {
         return Ok(StopOutcome::Initiated);
     };
 
-    let alive = || {
-        crate::process::is_pid_alive(pid)
-            && match token {
-                // A different start token on the same pid is a different process.
-                Some(recorded) => crate::process::process_start_token(pid) == Some(recorded),
-                None => true,
-            }
+    let probe = || {
+        daemon_liveness(
+            pid,
+            token,
+            crate::process::is_pid_alive,
+            crate::process::process_start_token,
+        )
     };
-    match wait_for_exit(alive, opts.timeout, POLL) {
-        Some(elapsed) => {
+    match wait_for_exit(probe, opts.timeout, POLL) {
+        WaitOutcome::Exited(elapsed) => {
             println!(
                 "Daemon (pid {pid}) exited after {} ms; run dir {}.",
                 elapsed.as_millis(),
@@ -101,7 +153,19 @@ pub fn run_stop(home: &Path, opts: StopOptions) -> anyhow::Result<StopOutcome> {
             report_residuals(home);
             Ok(StopOutcome::Exited)
         }
-        None => {
+        WaitOutcome::TimedOut {
+            last: Liveness::Unknown,
+        } => {
+            println!(
+                "Cannot confirm exit: pid {pid} is still alive after {} s but its start token \
+                 could not be read, so it may be the daemon or a recycled pid. \
+                 Inspect `agend-terminal doctor` and {}.",
+                opts.timeout.as_secs(),
+                home.join("daemon.log").display()
+            );
+            Ok(StopOutcome::Unconfirmed)
+        }
+        WaitOutcome::TimedOut { .. } => {
             println!(
                 "Daemon (pid {pid}) is still running after {} s; shutdown is not complete. \
                  Inspect `agend-terminal doctor` and {}.",
@@ -126,21 +190,24 @@ fn daemon_identity(run_dir: &Path) -> (Option<u32>, Option<u64>) {
     (pid, token)
 }
 
-/// Poll `alive` until it returns false or `timeout` elapses. `Some(elapsed)`
-/// when the process went away, `None` at the bound. Checked once before any
-/// sleep so a daemon that is already gone costs no wait.
+/// Poll `probe` until it reports [`Liveness::Exited`] or `timeout` elapses.
+/// Checked once before any sleep so a daemon that is already gone costs no
+/// wait. An `Unknown` probe keeps polling (a token read can fail transiently
+/// while the process is being reaped) and, if it is still `Unknown` at the
+/// bound, is reported as such — never as an exit.
 fn wait_for_exit(
-    mut alive: impl FnMut() -> bool,
+    mut probe: impl FnMut() -> Liveness,
     timeout: Duration,
     poll: Duration,
-) -> Option<Duration> {
+) -> WaitOutcome {
     let started = Instant::now();
     loop {
-        if !alive() {
-            return Some(started.elapsed());
+        let last = probe();
+        if last == Liveness::Exited {
+            return WaitOutcome::Exited(started.elapsed());
         }
         if started.elapsed() >= timeout {
-            return None;
+            return WaitOutcome::TimedOut { last };
         }
         std::thread::sleep(poll);
     }
@@ -211,23 +278,37 @@ mod tests {
     #[test]
     fn wait_for_exit_returns_as_soon_as_the_process_is_gone_3539() {
         let mut polls = 0;
-        let elapsed = wait_for_exit(
+        let outcome = wait_for_exit(
             || {
                 polls += 1;
-                polls < 3
+                if polls < 3 {
+                    Liveness::Alive
+                } else {
+                    Liveness::Exited
+                }
             },
             Duration::from_secs(5),
             Duration::from_millis(1),
         );
-        assert!(elapsed.is_some(), "must report the exit");
-        assert_eq!(polls, 3, "stops polling once alive() is false");
+        assert!(matches!(outcome, WaitOutcome::Exited(_)), "{outcome:?}");
+        assert_eq!(polls, 3, "stops polling once the probe says Exited");
     }
 
     #[test]
     fn wait_for_exit_never_outstays_its_bound_3539() {
         let started = Instant::now();
-        let elapsed = wait_for_exit(|| true, Duration::from_millis(30), Duration::from_millis(1));
-        assert_eq!(elapsed, None, "a process that never exits hits the bound");
+        let outcome = wait_for_exit(
+            || Liveness::Alive,
+            Duration::from_millis(30),
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            outcome,
+            WaitOutcome::TimedOut {
+                last: Liveness::Alive
+            },
+            "a process that never exits hits the bound"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the bound is honoured"
@@ -237,11 +318,64 @@ mod tests {
     #[test]
     fn wait_for_exit_does_not_sleep_when_already_gone_3539() {
         let started = Instant::now();
-        let elapsed = wait_for_exit(|| false, Duration::from_secs(5), Duration::from_secs(5));
-        assert!(elapsed.is_some());
+        let outcome = wait_for_exit(
+            || Liveness::Exited,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        assert!(matches!(outcome, WaitOutcome::Exited(_)));
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "no poll interval before the first check"
+        );
+    }
+
+    /// R1 N1, test 1: the recorded token no longer matches the live pid — a
+    /// recycled pid — and that IS an exit.
+    #[test]
+    fn a_changed_start_token_on_a_live_pid_is_an_exit_3539() {
+        let alive = |_pid: u32| true;
+        assert_eq!(
+            daemon_liveness(4242, Some(99), alive, |_| Some(100)),
+            Liveness::Exited
+        );
+        assert_eq!(
+            daemon_liveness(4242, Some(99), alive, |_| Some(99)),
+            Liveness::Alive,
+            "same token, same daemon"
+        );
+        assert_eq!(
+            daemon_liveness(4242, None, alive, |_| None),
+            Liveness::Alive,
+            "legacy .daemon without a token: pid liveness is all there is"
+        );
+        assert_eq!(
+            daemon_liveness(4242, Some(99), |_| false, |_| Some(99)),
+            Liveness::Exited,
+            "a dead pid is an exit regardless of any token"
+        );
+    }
+
+    /// R1 N1, test 2: alive but the token cannot be read — NOT an exit. The
+    /// waiter must carry that through to the bound instead of reporting a
+    /// clean stop, otherwise `stop && start` proceeds against a live daemon.
+    #[test]
+    fn an_unreadable_start_token_on_a_live_pid_is_never_an_exit_3539() {
+        let liveness = daemon_liveness(4242, Some(99), |_| true, |_| None);
+        assert_ne!(liveness, Liveness::Exited);
+        assert_eq!(liveness, Liveness::Unknown);
+
+        let outcome = wait_for_exit(
+            || Liveness::Unknown,
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            outcome,
+            WaitOutcome::TimedOut {
+                last: Liveness::Unknown
+            },
+            "an Unknown probe reaches the bound as Unknown, never as Exited"
         );
     }
 
