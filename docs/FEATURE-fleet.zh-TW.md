@@ -308,8 +308,17 @@ defaults:
 # 然後只在需要改名時才在 fleet.yaml 中引用：
 defaults:
   env:
-    SERVICE_KEY_ALIAS: "${MY_SERVICE_API_KEY}"
+    SERVICE_KEY_ALIAS:
+      from_env: MY_SERVICE_API_KEY
 ```
+
+`from_env` 是完整值引用；instance 解析時會從 daemon process 的環境讀取。
+若來源變數未設定或不是有效 Unicode，AgEnD 會拒絕啟動該 instance，並回報
+來源變數名稱。字面字串不會進行插值，因此 `"${NAME}"` 仍會原樣保留。
+
+敏感變數政策仍以目的鍵（上例的 `SERVICE_KEY_ALIAS`）為準，包含既有的
+backend credential 例外；來源變數名稱和值都不能繞過該政策。
+`passthrough_env` 行為不變，仍只傳遞同名鍵。
 
 **Per-instance 覆蓋：**
 

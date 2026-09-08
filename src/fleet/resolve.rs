@@ -152,8 +152,27 @@ pub(super) fn resolve_instance(
         defaults.args.clone()
     };
 
-    let mut env = defaults.env.clone();
-    env.extend(inst.env.clone());
+    let mut configured_env = defaults.env.clone();
+    configured_env.extend(inst.env.clone());
+    let mut env = std::collections::HashMap::with_capacity(configured_env.len() + 1);
+    for (key, value) in configured_env {
+        let value = match value {
+            super::FleetEnvValue::Literal(value) => value,
+            super::FleetEnvValue::FromEnv { from_env } => match std::env::var(&from_env) {
+                Ok(value) if !from_env.is_empty() => value,
+                _ => {
+                    tracing::error!(
+                        instance = name,
+                        destination = %key,
+                        source = %from_env,
+                        "fleet env source is missing or is not valid Unicode; refusing instance resolution"
+                    );
+                    return None;
+                }
+            },
+        };
+        env.insert(key, value);
+    }
     env.insert("AGEND_INSTANCE_NAME".to_string(), name.to_string());
 
     let ready_pattern = resolve_ready_pattern(inst, defaults, &preset, name)?;

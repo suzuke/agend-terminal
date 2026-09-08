@@ -427,6 +427,32 @@ fn default_discord_bot_token_env() -> String {
     "AGEND_DISCORD_BOT_TOKEN".to_string()
 }
 
+/// A fleet environment value is either stored literally or read from the
+/// daemon's environment when an instance is resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FleetEnvValue {
+    Literal(String),
+    FromEnv { from_env: String },
+}
+
+impl FleetEnvValue {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Literal(value) => value,
+            Self::FromEnv { from_env } => from_env,
+        }
+    }
+}
+
+impl std::ops::Deref for FleetEnvValue {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceDefaults {
     /// Backend preset name (e.g., "claude", "kiro-cli").
@@ -444,7 +470,7 @@ pub struct InstanceDefaults {
     pub effort: Option<String>,
     pub ready_pattern: Option<String>,
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub env: HashMap<String, FleetEnvValue>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub instructions: Option<String>,
@@ -539,7 +565,7 @@ pub struct InstanceConfig {
     pub repo: Option<String>,
     pub ready_pattern: Option<String>,
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub env: HashMap<String, FleetEnvValue>,
     /// #1440: per-instance env keys to pass through under `AGEND_ENV_ISOLATION`
     /// (additive with fleet-level [`FleetConfig::passthrough_env`]). Still
     /// `is_sensitive_env_key`-gated.
