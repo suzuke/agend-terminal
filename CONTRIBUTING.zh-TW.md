@@ -146,6 +146,11 @@ git config user.email "1557604+suzuke@users.noreply.github.com"
 這是 `.git/config` 的 local 設定、**不進版控**,所以全新 `git clone` 後要重設一次。
 Fleet agent 在這個 clone 的 linked worktree 裡 commit,會自動繼承同一個身份。
 
+Fleet provenance trailer 會先驗證 branch。在 repository 的 main worktree 中，Git
+不會把 `GIT_DIR` 匯出給 hook，因此會保留 `Agend-Agent`，但不寫入 `Agend-Task`
+與 `Agend-Branch`。Agent binding 使用 linked worktree；Git 在那裡會匯出
+`GIT_DIR`，所以 branch 相符時仍會保留 task 與 branch provenance。
+
 ## Review 流程
 
 以下是你開 issue 或 PR 之後可以預期的狀況——目標是快速、具體的回饋，而不是繁文縟節。

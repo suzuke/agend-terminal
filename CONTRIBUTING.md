@@ -151,6 +151,11 @@ This is local to `.git/config` and is **not** version-controlled, so re-run it a
 fresh `git clone`. Fleet agents commit in linked worktrees of this clone and inherit
 the same identity automatically.
 
+Fleet provenance trailers are branch-verified. In a repository's main worktree Git
+does not export `GIT_DIR` to the hook, so `Agend-Task` and `Agend-Branch` are withheld
+and only `Agend-Agent` is kept. Agent bindings use linked worktrees, where Git does
+export `GIT_DIR`, so matching task and branch provenance is retained.
+
 ## Review Process
 
 Here's what to expect once you open an issue or PR — the aim is fast, concrete feedback, not ceremony.
