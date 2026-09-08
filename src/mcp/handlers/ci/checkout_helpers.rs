@@ -3,6 +3,7 @@
 //! the post-rollback response mapping and the marker content-durability fsync.
 
 use super::checkout_txn::RollbackOutcome;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -49,6 +50,75 @@ pub(super) fn rollback_auto_created_branch_if_needed(
     if should_rollback {
         super::checkout_disposable::rollback_auto_created_branch(source, branch, expected_head);
     }
+}
+
+/// Replay a crashed checkout transaction before classifying any preserved
+/// marker-bearing directory at the same target.
+pub(super) fn recover_stale_checkout_txn(
+    home: &Path,
+    journal_key: &str,
+    target: &Path,
+    source: &Path,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let target_display = target.display().to_string();
+    super::checkout_txn::recover_stale(
+        home,
+        journal_key,
+        target,
+        &source.display().to_string(),
+        now,
+        || {
+            crate::git_helpers::git_bypass(
+                source,
+                &["worktree", "remove", "--force", &target_display],
+            )
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        },
+    )
+}
+
+/// Classify a marker-bearing, unbound checkout target before invoking Git.
+/// This is preserved evidence from an interrupted daemon release, so callers
+/// get the guarded recovery route instead of raw `worktree add` stderr.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stale_worktree_dir_response(
+    home: &Path,
+    target: &Path,
+    source: &Path,
+    agent: &str,
+    branch: &str,
+    expected_head: &str,
+    auto_created_branch: bool,
+) -> Option<Value> {
+    let target_is_directory =
+        std::fs::symlink_metadata(target).is_ok_and(|metadata| metadata.file_type().is_dir());
+    if crate::binding::read(home, agent).is_some() || !target_is_directory {
+        return None;
+    }
+    let marker_path = target.join(crate::worktree_pool::MANAGED_MARKER);
+    if !std::fs::symlink_metadata(&marker_path).is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+    let marker = std::fs::read_to_string(marker_path).ok()?;
+    rollback_auto_created_branch_if_needed(source, branch, expected_head, auto_created_branch);
+    Some(json!({
+        "error": format!(
+            "stale daemon-managed worktree directory remains at {}; force-release it before checkout",
+            target.display()
+        ),
+        "code": "stale_worktree_dir",
+        "stage": "preflight",
+        "path": target.display().to_string(),
+        "marker": marker,
+        "hint": format!(
+            "call release_worktree with instance='{agent}', branch='{branch}', force=true, and repository_path='{}'",
+            source.display()
+        ),
+        "auto_created_branch": auto_created_branch,
+    }))
 }
 
 #[cfg(all(test, unix))]

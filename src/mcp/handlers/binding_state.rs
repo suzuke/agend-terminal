@@ -91,6 +91,14 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
 
     let binding = crate::binding::read(home, agent);
     let bind_in_flight = crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent);
+    let release_progress = crate::mcp::handlers::dispatch_hook::lifecycle_active_operation(
+        home, agent,
+    )
+    .and_then(|(operation, stage)| {
+        (operation == crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release)
+            .then_some(stage)
+    });
+    let release_in_flight = release_progress.is_some();
     let ci_watches = enumerate_ci_watches_for_agent(home, agent);
     // PR2 L3 visibility: surface pending dispatch metadata alongside
     // binding state so operators investigating a stuck binding can see
@@ -192,6 +200,8 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "ci_watches": ci_watches,
             "ci_watches_detail": enumerate_ci_watches_detail_for_agent(home, agent, &current_repo, branch),
             "bind_in_flight": bind_in_flight,
+            "release_in_flight": release_in_flight,
+            "release_progress": release_progress,
             "cross_branch_holders": cross_branch_holders,
             "dispatched_waiting_for": dispatched_waiting_for,
             "pending_response_to": pending_response_to,
@@ -206,6 +216,8 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "agent": agent,
             "bound": false,
             "bind_in_flight": bind_in_flight,
+            "release_in_flight": release_in_flight,
+            "release_progress": release_progress,
             "ci_watches": ci_watches,
             "ci_watches_detail": enumerate_ci_watches_detail_for_agent(home, agent, "", ""),
             "cross_branch_holders": Vec::<String>::new(),
@@ -610,19 +622,11 @@ mod tests {
         )
         .expect("release permit");
 
-        let active = handle_binding_state(
-            &home,
-            &json!({"instance": "release-agent"}),
-            &None,
-        );
+        let active = handle_binding_state(&home, &json!({"instance": "release-agent"}), &None);
         assert_eq!(active["release_in_flight"], true, "{active}");
 
         drop(permit);
-        let complete = handle_binding_state(
-            &home,
-            &json!({"instance": "release-agent"}),
-            &None,
-        );
+        let complete = handle_binding_state(&home, &json!({"instance": "release-agent"}), &None);
         assert_eq!(complete["release_in_flight"], false, "{complete}");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -635,8 +639,8 @@ mod tests {
         // ci_watches. If any layer leaks state, this assertion fails.
         let home = tmp_home("post-release");
         let wt = home.join("wt-x");
-        std::fs::create_dir_all(&wt).unwrap();
-        std::fs::write(wt.join(".agend-managed"), "agent=alpha\n").unwrap();
+        // A stale binding whose target is already absent is a successful
+        // release path; a present removal failure now deliberately retains it.
         write_binding(&home, "alpha", "feature/x", wt.to_str().unwrap());
 
         // Pre-release: bound.

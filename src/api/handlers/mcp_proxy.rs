@@ -135,6 +135,15 @@ fn timeout_response(
         }
     );
     if side_effect {
+        if tool == "release_worktree" {
+            return json!({
+                "ok": true,
+                "status": "accepted_in_progress",
+                "accepted": true,
+                "release_in_flight": true,
+                "note": "release_worktree is still running in the daemon; do not retry. Inspect binding_state for progress."
+            });
+        }
         json!({
             "ok": true,
             "status": "accepted_in_progress",
@@ -410,6 +419,50 @@ fn role_kind_for_instance(
 mod tests {
     use super::*;
 
+    fn release_fixture(tag: &str) -> (std::path::PathBuf, crate::worktree_pool::WorktreeLease) {
+        let root = std::env::temp_dir().join(format!(
+            "agend-mcp-proxy-release-{}-{tag}",
+            std::process::id()
+        ));
+        let home = root.join("home");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("run git fixture command");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        let lease = crate::worktree_pool::lease(&home, &repo, "slow-release", "feat/slow")
+            .expect("lease worktree");
+        crate::binding::bind_full(
+            &home,
+            "slow-release",
+            "T-slow",
+            "feat/slow",
+            &lease.path,
+            &repo,
+            false,
+        )
+        .expect("bind worktree");
+        (home, lease)
+    }
+
     #[test]
     fn fast_tools_get_short_timeout() {
         assert_eq!(tool_timeout("list_instances"), Duration::from_secs(5));
@@ -634,6 +687,56 @@ mod tests {
         completed_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("daemon worker must survive the disconnected caller");
+    }
+
+    #[test]
+    fn slow_release_keeps_binding_until_background_transaction_finishes() {
+        let (home, lease) = release_fixture("transaction");
+        let worker_home = home.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let release = move |_: &str, args: &Value, _: &str| {
+            let _hook = crate::worktree_pool::release_test_seam::install(move |phase| {
+                if phase == crate::worktree_pool::ReleaseTestPhase::BeforeWorktreeRemove {
+                    entered_tx.send(()).expect("announce remove stage");
+                    resume_rx.recv().expect("resume release transaction");
+                }
+            });
+            let result = crate::mcp::handlers::worktree_test_release(&worker_home, args);
+            completed_tx
+                .send(result.clone())
+                .expect("announce release completion");
+            result
+        };
+
+        let response = handle_mcp_tool_inner(
+            "release_worktree",
+            json!({"instance": "slow-release"}),
+            "caller".to_string(),
+            Duration::from_millis(100),
+            None,
+            release,
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release must reach the blocked remove stage");
+        assert_eq!(response["release_in_flight"], true, "{response}");
+        assert!(lease.path.exists(), "blocked target must still exist");
+        assert!(
+            crate::binding::read(&home, "slow-release").is_some(),
+            "binding must remain authoritative while removal is blocked"
+        );
+
+        drop(response); // caller disconnects after receiving the in-flight ticket
+        resume_tx.send(()).expect("resume release");
+        let completed = completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("background release must finish after disconnect");
+        assert_eq!(completed["released"], true, "{completed}");
+        assert!(!lease.path.exists(), "completed target must be removed");
+        assert!(crate::binding::read(&home, "slow-release").is_none());
+        std::fs::remove_dir_all(home.parent().expect("fixture root")).ok();
     }
 
     /// §3.9: a read/idempotent tool that times out keeps the retryable `error`

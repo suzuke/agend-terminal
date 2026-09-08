@@ -199,6 +199,20 @@ fn maybe_auto_bind_lease(
     .map(|outcome| outcome.ci_watch)
     .map_err(|e| {
         let mut result = json!({"ok": false, "error": format!("dispatch rejected: {e}")});
+        if e.code == dispatch_hook::ErrorCode::StaleWorktreeDir {
+            result["code"] = json!("stale_worktree_dir");
+            result["stage"] = json!("preflight");
+            if let Some(context) = e
+                .raw
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            {
+                for key in ["path", "marker", "hint"] {
+                    result[key] = context[key].clone();
+                }
+            }
+            return result;
+        }
         if expected_head.is_some()
             && matches!(
                 e.code,

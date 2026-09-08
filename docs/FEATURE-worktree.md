@@ -127,11 +127,17 @@ The release transaction:
 2. snapshots the guarded binding;
 3. reacquires the branch, agent, and binding locks;
 4. confirms the fresh binding fingerprint still matches the snapshot;
-5. preserves dirty work before removal;
+5. preserves dirty work before removal (ignored content is not included in the recovery snapshot);
 6. verifies the managed marker and exact target;
-7. removes the linked worktree, prunes Git metadata, and clears the matching binding.
+7. deletes the verified worktree-local ignored `target/` build cache;
+8. removes the linked worktree and prunes Git metadata;
+9. clears the matching binding only after removal succeeds.
 
-If preservation fails, release fails closed and keeps the binding. A changed lease fingerprint also stops the operation. A second call after a successful release is an idempotent success.
+If preservation, cache cleanup, or worktree removal fails, release fails closed and keeps the binding. Execution failures use `code: release_incomplete` with `stage`, `path`, and `bytes_remaining`. A changed lease fingerprint also stops the operation. A second call after a successful release is an idempotent success.
+
+The proxy waits at most five seconds for release. If deletion is still running, it returns `accepted:true` and `release_in_flight:true`; the daemon worker continues even if the client disconnects. `binding_state` exposes the active release stage, and the caller receives a `release_completed` notification when the worker finishes.
+
+A marker-bearing target with no binding is reported by checkout/typed dispatch as `stale_worktree_dir`, including its path and marker contents. Recover it with the exact guarded `release_worktree(force:true)` form below; do not retry raw Git provisioning.
 
 Use `dry_run:true` to preview the operation without destructive effects.
 
@@ -156,6 +162,7 @@ The removal implementation first asks Git to remove the worktree. A filesystem f
 - The target must resolve below the daemon worktree pool.
 - Markerless, opaque, ambiguous, ownerless, or mismatched state is preserved rather than guessed away.
 - `repository_path` is an optional hint for Git metadata cleanup.
+- An absent binding plus an exact marker and owning repository may be reclaimed; the same transaction removes the directory and prunes the exact `.git/worktrees` entry.
 
 Force is for stale-state recovery, not a shortcut around the normal release checks.
 

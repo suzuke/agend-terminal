@@ -250,10 +250,13 @@ Drain 或管理 caller 的 durable inbox。
 
 - 必填：`instance`；可選 `dry_run` 與 `force`。
 - `force:true` 還需要 `branch`；`repository_path` 是可選 cleanup hint。Markerless、opaque、ambiguous 或不相符狀態會被保留。
+- 移除已驗證的 managed worktree 前，release 會先刪除被忽略的 `target/` 快取，再移除 Git worktree，最後才清除 binding。任一階段失敗會回 `code: release_incomplete`，並帶 `stage`、`path`、`bytes_remaining`；binding 仍保留為權威狀態。
+- 慢速 release 在 proxy 回傳 `accepted:true, release_in_flight:true` 後仍由 daemon worker 繼續執行。`binding_state` 會回報 `release_in_flight` 與 `release_progress`；完成時送出 `release_completed`。
+- Checkout／typed dispatch 遇到帶 marker、但無 binding 的目標時，會回 `code: stale_worktree_dir`，附 marker 與 guarded force-release 建議。
 
 ### `binding_state`
 
-非破壞性回報 binding 內容、worktree／marker 狀態、signature diagnostics、CI subscriptions、in-flight guard 與 branch holders。
+非破壞性回報 binding 內容、worktree／marker 狀態、signature diagnostics、CI subscriptions、bind／release in-flight 進度與 branch holders。
 
 - 必填：`instance`。
 

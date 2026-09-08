@@ -113,6 +113,8 @@ pub enum Stage {
     /// `worktree_pool::lease` returned error (worktree creation failed,
     /// cross-agent lease conflict, same-agent different-branch conflict).
     WorktreeLeaseConflict,
+    /// A daemon-managed target directory remains after its binding vanished.
+    StaleWorktreePreflight,
     /// Source repo resolution fell through to stub (tier 4) while
     /// `AGEND_BIND_STRICT_MODE=1`.
     ResolveSourceRepo,
@@ -144,6 +146,8 @@ pub enum ErrorCode {
     /// `worktree_pool::lease` rejected — cross-agent branch lease,
     /// same-agent different-branch, worktree::create None, etc.
     LeaseConflict,
+    /// Marker-bearing daemon worktree exists but no binding owns it.
+    StaleWorktreeDir,
     /// E4.5 protected ref guard (`main` / `master`).
     ProtectedBranch,
     /// `bind_in_flight_set` already contains `(home, agent)` — concurrent

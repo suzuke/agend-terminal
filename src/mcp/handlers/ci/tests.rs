@@ -2268,11 +2268,8 @@ fn checkout_reports_stale_managed_worktree_dir_without_binding() {
         "agent={agent}\nbranch={branch}\nsource_repo={}\n",
         source.canonicalize().expect("canonical source").display()
     );
-    std::fs::write(
-        target.join(crate::worktree_pool::MANAGED_MARKER),
-        &marker,
-    )
-    .expect("managed marker");
+    std::fs::write(target.join(crate::worktree_pool::MANAGED_MARKER), &marker)
+        .expect("managed marker");
 
     let response = super::handle_checkout_repo(
         &home,
@@ -2293,7 +2290,10 @@ fn checkout_reports_stale_managed_worktree_dir_without_binding() {
             .is_some_and(|hint| hint.contains("release_worktree") && hint.contains("force")),
         "{response}"
     );
-    assert!(target.exists(), "typed refusal must preserve stale evidence");
+    assert!(
+        target.exists(),
+        "typed refusal must preserve stale evidence"
+    );
     assert!(
         !p780_branch_exists(&source, branch),
         "auto-created branch must be rolled back on stale-dir refusal"

@@ -21,7 +21,8 @@ pub(crate) use rebase_dispatch::dispatch_auto_bind_lease_with_source_and_chain_p
 // t-…-17: the lockstep source→slug normalizer shared by the reviewer-assignment
 // repo resolve and the team-authority ACL (teams::resolve_team_by_source_repo).
 pub(crate) use lifecycle_permit::{
-    is_active as lifecycle_is_active, BindGuard, LifecycleOperation, LifecyclePermit,
+    active_operation as lifecycle_active_operation, is_active as lifecycle_is_active, BindGuard,
+    LifecycleOperation, LifecyclePermit,
 };
 pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
 pub(crate) use types::{
@@ -405,6 +406,40 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             provision.base_from_stale_view,
         )
     };
+
+    if !reused && crate::binding::read(home, target).is_none() {
+        let stale_path = crate::worktree::worktree_path(home, target, branch);
+        let marker_path = stale_path.join(crate::worktree_pool::MANAGED_MARKER);
+        let stale_directory = std::fs::symlink_metadata(&stale_path)
+            .is_ok_and(|metadata| metadata.file_type().is_dir());
+        let regular_marker = std::fs::symlink_metadata(&marker_path)
+            .is_ok_and(|metadata| metadata.file_type().is_file());
+        if stale_directory && regular_marker {
+            if let Ok(marker) = std::fs::read_to_string(marker_path) {
+                if auto_created_branch {
+                    let _ = crate::git_helpers::git_bypass(&source_repo, &["branch", "-D", branch]);
+                }
+                let context = serde_json::json!({
+                    "path": stale_path.display().to_string(),
+                    "marker": marker,
+                    "hint": format!(
+                        "call release_worktree with instance='{target}', branch='{branch}', force=true, and repository_path='{}'",
+                        source_repo.display()
+                    ),
+                });
+                return Err(DispatchError {
+                    message: format!(
+                        "stale daemon-managed worktree directory remains at {}; force-release it before dispatch",
+                        stale_path.display()
+                    ),
+                    code: ErrorCode::StaleWorktreeDir,
+                    stage: Stage::StaleWorktreePreflight,
+                    fetch_attempted,
+                    raw: Some(context.to_string()),
+                });
+            }
+        }
+    }
 
     // #2234 cure-(B): under the flag the agent's WORKSPACE dir IS its worktree
     // (cwd == worktree) — switch it to `branch` IN PLACE instead of leasing a

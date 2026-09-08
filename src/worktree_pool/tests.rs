@@ -1735,10 +1735,8 @@ fn p0x_release_full_missing_worktree_path_clears_binding_anyway() {
 fn p0x_release_full_unmanaged_worktree_skipped_safely() {
     // R14 safety: if the binding points at a worktree that lacks the
     // .agend-managed marker (operator-created, not daemon-leased), the
-    // release MUST NOT remove the worktree. #1879 (WT-LEAK-2): the stale
-    // binding IS cleared, though — leaving it leaked the binding and blocked
-    // a same-agent re-bind. The worktree (operator data) survives for
-    // investigation; the daemon's binding to it does not.
+    // release MUST NOT remove the worktree. A refused removal is an incomplete
+    // release transaction, so the binding stays as durable recovery evidence.
     let home = tmp_home("p0x-unmanaged");
     let unmanaged_wt = tmp_home("p0x-unmanaged-wt-target");
     // Hand-craft a binding pointing at an unmanaged path.
@@ -1768,9 +1766,11 @@ fn p0x_release_full_unmanaged_worktree_skipped_safely() {
         outcome
     );
     assert!(
-        outcome.binding_removed,
-        "#1879 WT-LEAK-2: the stale binding must be CLEARED even when the unmanaged worktree removal is refused"
+        !outcome.binding_removed,
+        "failed removal must retain binding"
     );
+    assert_eq!(outcome.code, Some("release_incomplete"));
+    assert_eq!(outcome.stage, Some("worktree_remove"));
     assert!(
         outcome
             .error
@@ -1782,8 +1782,8 @@ fn p0x_release_full_unmanaged_worktree_skipped_safely() {
     );
     assert!(unmanaged_wt.exists(), "operator-created dir must survive");
     assert!(
-        crate::binding::read(&home, "agent-u").is_none(),
-        "#1879 WT-LEAK-2: the binding must be cleared (no leak / re-bind block)"
+        crate::binding::read(&home, "agent-u").is_some(),
+        "failed removal must preserve the binding for retry/recovery"
     );
 
     std::fs::remove_dir_all(&home).ok();
@@ -4886,7 +4886,11 @@ fn release_remove_failure_retains_binding_with_structured_stage() {
     assert_eq!(response["released"], false, "{response}");
     assert_eq!(response["code"], "release_incomplete", "{response}");
     assert_eq!(response["stage"], "worktree_remove", "{response}");
-    assert_eq!(response["path"], lease.path.display().to_string(), "{response}");
+    assert_eq!(
+        response["path"],
+        lease.path.display().to_string(),
+        "{response}"
+    );
     assert!(response["bytes_remaining"].as_u64().is_some(), "{response}");
     assert!(
         crate::binding::read(&home, "agent-fail").is_some(),
