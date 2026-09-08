@@ -1610,12 +1610,39 @@ fn managed_repo_registry_dedups() {
 /// `binding_branch`, and `$GIT_DIR/HEAD` points at `head_branch`. Returns the
 /// resulting commit message. A stub `git` on PATH answers only what the DCO
 /// half needs; the branch comparison must not depend on it.
+/// How the committing worktree's HEAD is presented to the hook.
+#[cfg(unix)]
+enum HeadState<'a> {
+    /// `$GIT_DIR/HEAD` holds `ref: refs/heads/<name>`.
+    OnBranch(&'a str),
+    /// `$GIT_DIR/HEAD` holds a bare object id — a real detached HEAD.
+    Detached(&'a str),
+    /// `GIT_DIR` is not exported at all, which is what git does for a commit in
+    /// a repository's MAIN worktree (only linked worktrees get it).
+    NoGitDir,
+}
+
 #[cfg(unix)]
 fn run_hook_with_binding(
     tag: &str,
     binding_branch: &str,
     task_id: &str,
     head_branch: &str,
+) -> String {
+    run_hook_with_head(
+        tag,
+        binding_branch,
+        task_id,
+        HeadState::OnBranch(head_branch),
+    )
+}
+
+#[cfg(unix)]
+fn run_hook_with_head(
+    tag: &str,
+    binding_branch: &str,
+    task_id: &str,
+    head: HeadState<'_>,
 ) -> String {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -1659,11 +1686,15 @@ fn run_hook_with_binding(
     // The gitdir of the worktree the commit is ACTUALLY being made in.
     let git_dir = home.join("gitdir");
     std::fs::create_dir_all(&git_dir).unwrap();
-    std::fs::write(
-        git_dir.join("HEAD"),
-        format!("ref: refs/heads/{head_branch}\n"),
-    )
-    .unwrap();
+    match head {
+        HeadState::OnBranch(name) => {
+            std::fs::write(git_dir.join("HEAD"), format!("ref: refs/heads/{name}\n")).unwrap();
+        }
+        HeadState::Detached(oid) => {
+            std::fs::write(git_dir.join("HEAD"), format!("{oid}\n")).unwrap();
+        }
+        HeadState::NoGitDir => {}
+    }
 
     let hook = home.join("prepare-commit-msg");
     std::fs::write(&hook, include_str!("../../assets/hooks/prepare-commit-msg")).unwrap();
@@ -1677,16 +1708,20 @@ fn run_hook_with_binding(
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let status = Command::new("sh")
+    let mut base = Command::new("sh");
+    let cmd = base
         .arg(&hook)
         .arg(&msg)
         .arg("message")
         .env("PATH", &path)
         .env("AGEND_INSTANCE_NAME", agent)
-        .env("AGEND_HOME", &home)
-        .env("GIT_DIR", &git_dir)
-        .status()
-        .unwrap();
+        .env("AGEND_HOME", &home);
+    let cmd = match head {
+        // Not exported at all — the main-worktree shape.
+        HeadState::NoGitDir => cmd.env_remove("GIT_DIR"),
+        _ => cmd.env("GIT_DIR", &git_dir),
+    };
+    let status = cmd.status().unwrap();
     assert!(status.success(), "hook must always exit 0");
     let out = std::fs::read_to_string(&msg).unwrap();
     std::fs::remove_dir_all(&home).ok();
@@ -1743,10 +1778,13 @@ fn trailer_unchanged_when_head_matches_binding_3545() {
     );
 }
 
-/// #3545: when the actual branch cannot be established (no `GIT_DIR`, or a
-/// detached HEAD that names no branch), the hook must not guess. Withholding
-/// the two branch-derived trailers is the same fail-closed choice as the
-/// mismatch case — silence beats a confident wrong answer.
+/// #3545: a HEAD ref naming an EMPTY branch is not a branch this commit can be
+/// on, so the hook must not guess — the same fail-closed choice as the mismatch
+/// case.
+///
+/// The two other ways the branch cannot be established — `GIT_DIR` unset, and a
+/// real detached HEAD — are separate cases below. An earlier version of this
+/// comment claimed this test covered them; it never did.
 #[cfg(unix)]
 #[test]
 fn trailer_omits_task_and_branch_when_head_is_unknown_3545() {
@@ -1758,5 +1796,56 @@ fn trailer_omits_task_and_branch_when_head_is_unknown_3545() {
     assert!(
         !out.contains("Agend-Branch:") && !out.contains("Agend-Task:"),
         "an unknown HEAD must withhold both branch-derived trailers: {out}"
+    );
+}
+
+/// #3545: git exports `GIT_DIR` to hooks in a LINKED worktree — the shape the
+/// daemon binds an agent to — but NOT for a commit in a repository's main
+/// worktree. With nothing to read, the branch cannot be confirmed and the
+/// branch-derived trailers are withheld. That is the fail-closed side, and it
+/// means an ordinary main-worktree commit carries only `Agend-Agent`.
+#[cfg(unix)]
+#[test]
+fn trailer_omits_task_and_branch_when_git_dir_is_unset_3545() {
+    let out = run_hook_with_head(
+        "3545-no-gitdir",
+        "fix/old-branch",
+        "t-OLD",
+        HeadState::NoGitDir,
+    );
+    assert!(
+        out.contains("Agend-Agent: trailer-agent"),
+        "the agent is still true and must stay: {out}"
+    );
+    assert!(
+        !out.contains("Agend-Branch:") && !out.contains("Agend-Task:"),
+        "with no GIT_DIR the branch is unverifiable, so neither may be written: {out}"
+    );
+    assert!(
+        !out.contains("fix/old-branch") && !out.contains("t-OLD"),
+        "and no stale provenance may leak in any other form: {out}"
+    );
+}
+
+/// #3545: a REAL detached HEAD — `$GIT_DIR/HEAD` holding a bare object id with
+/// no `ref:` prefix. There is no branch name to compare, so the same withholding
+/// applies: a commit made mid-rebase or on a checked-out tag must not inherit
+/// the binding's branch.
+#[cfg(unix)]
+#[test]
+fn trailer_omits_task_and_branch_on_a_detached_head_3545() {
+    let out = run_hook_with_head(
+        "3545-bare-sha",
+        "fix/old-branch",
+        "t-OLD",
+        HeadState::Detached("9fceb02d0ae598e95dc970b74767f19372d61af8"),
+    );
+    assert!(
+        out.contains("Agend-Agent: trailer-agent"),
+        "agent trailer still written: {out}"
+    );
+    assert!(
+        !out.contains("Agend-Branch:") && !out.contains("Agend-Task:"),
+        "a detached HEAD names no branch, so neither trailer may be written: {out}"
     );
 }
