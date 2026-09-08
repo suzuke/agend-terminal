@@ -367,13 +367,13 @@ pub(super) fn acquire_bind_lifecycle_permit(
 ///   `stale_binding` (pre-existing behaviour, moved here so the handler stays
 ///   under its LOC ceiling).
 /// - A DIFFERENT branch whose worktree is still on disk → `binding_conflict`.
-///   The worktree path key is `(agent, repo)` and carries no branch
-///   (`checkout_path::bounded_mangled`), so the fresh provision targets the very
-///   directory the current binding occupies and `git worktree add` fails with a
-///   bare `'<path>' already exists` — an error that names neither the binding
-///   nor the branch holding it, which is what issue #3550's reporter read as a
-///   daemon fault. The path-not-clobbered semantics are unchanged: this refuses
-///   EARLIER and more legibly, it never removes the occupied directory.
+///   The binding is global to the agent, while the worktree path key is
+///   `(agent, repo)` and carries no branch (`checkout_path::bounded_mangled`).
+///   For a same-repo checkout, the fresh provision would target the directory
+///   the current binding occupies. A cross-repo checkout has a distinct target,
+///   but must still release the agent's existing binding first. In both cases
+///   this refuses early and names the binding instead of relaying a lower-level
+///   Git error; it never removes the existing worktree.
 ///
 /// A branch auto-created by this now-refused checkout is rolled back, mirroring
 /// the `worktree_add_failed` path it replaces (arch14) — without this, moving
@@ -418,8 +418,8 @@ pub(super) fn binding_mismatch_response(
     }
     Some(json!({
         "error": format!(
-            "already bound to branch '{bound_branch}' in this repository, and that worktree \
-             still occupies the path a checkout of '{branch}' would use"
+            "already bound to branch '{bound_branch}'; release that binding before checking out \
+             '{branch}'"
         ),
         "code": "binding_conflict",
         "branch": branch,
