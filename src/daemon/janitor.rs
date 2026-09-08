@@ -33,7 +33,7 @@ pub(crate) enum DispositionOutcome {
     Kept,
     /// `Release` — the managed `release_full` ran; carries its full outcome (the
     /// auto-release caller needs `released`/`error` for its fail-closed retry).
-    Released(ReleaseOutcome),
+    Released(Box<ReleaseOutcome>),
     /// `Delete` — the caller's remover ran. `Ok(())` = removed; `Err(reason)` =
     /// could not remove, so the caller decides what to do with it (GC hands the
     /// reason to its #2550 archive-fallthrough; the sweep just skips).
@@ -77,10 +77,10 @@ pub(crate) fn dispose(
         Ok(permit) => permit,
         Err(error) => {
             return match disposition {
-                Disposition::Release => DispositionOutcome::Released(ReleaseOutcome {
+                Disposition::Release => DispositionOutcome::Released(Box::new(ReleaseOutcome {
                     error: Some(format!("release refused: {error}")),
                     ..ReleaseOutcome::default()
-                }),
+                })),
                 Disposition::Delete => {
                     DispositionOutcome::Deleted(Err(format!("delete refused: {error}")))
                 }
@@ -114,14 +114,14 @@ pub(crate) fn dispose_with_permit(
         // #2672). Shared verbatim.
         Disposition::Release => {
             if !permit.authorizes(home, agent) {
-                return DispositionOutcome::Released(ReleaseOutcome {
+                return DispositionOutcome::Released(Box::new(ReleaseOutcome {
                     error: Some("release refused: invalid lifecycle permit".to_string()),
                     ..ReleaseOutcome::default()
-                });
+                }));
             }
-            DispositionOutcome::Released(crate::worktree_pool::release_full_with_permit(
+            DispositionOutcome::Released(Box::new(crate::worktree_pool::release_full_with_permit(
                 home, agent, false, permit,
-            ))
+            )))
         }
         // No binding, confirmed-clean terminal → the caller's dir-remover. The
         // wrapper choice stays with the caller (D5-Q3 ruling B).
@@ -168,9 +168,9 @@ pub(crate) fn dispose_release_exact(
     agent: &str,
     expected: &crate::binding::BindingFingerprint,
 ) -> DispositionOutcome {
-    DispositionOutcome::Released(crate::worktree_pool::release_full_exact(
+    DispositionOutcome::Released(Box::new(crate::worktree_pool::release_full_exact(
         home, agent, expected, false,
-    ))
+    )))
 }
 
 #[cfg(test)]
