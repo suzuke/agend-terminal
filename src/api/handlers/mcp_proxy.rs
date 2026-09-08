@@ -559,6 +559,7 @@ mod tests {
             "restart_instance",
             "start_instance",
             "repo",
+            "release_worktree",
             "restart_daemon",
             "inbox",
         ] {
@@ -577,7 +578,6 @@ mod tests {
             "set_metadata",
             "health",
             "bind_self",
-            "release_worktree",
             "ci",
         ] {
             assert!(!is_side_effect_tool(t, None), "{t} must stay retry-safe");
