@@ -40,6 +40,105 @@ fn test_post_and_list() {
 }
 
 #[test]
+fn decision_get_returns_full_record_with_supersession_links_3506() {
+    let home = tmp_home("get-full-3506");
+    let long_content = "詳".repeat(260);
+    let old = post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "old policy", "content": long_content, "tags": ["policy"]
+        }),
+    );
+    let old_id = old["id"].as_str().expect("old id").to_string();
+    let new = post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "new policy", "content": "replacement", "supersedes": old_id
+        }),
+    );
+    let new_id = new["id"].as_str().expect("new id").to_string();
+    std::fs::write(decisions_dir(&home).join("unrelated.json"), "{broken").unwrap();
+
+    let got_old = get(&home, &serde_json::json!({"id": old_id}));
+    assert_eq!(got_old["decision"]["id"], old_id);
+    assert_eq!(got_old["decision"]["content"], long_content);
+    assert_eq!(got_old["decision"]["archived"], true);
+    assert_eq!(got_old["decision"]["supersedes"], Value::Null);
+    assert_eq!(got_old["decision"]["superseded_by"], new_id);
+
+    let got_new = get(&home, &serde_json::json!({"id": new_id}));
+    assert_eq!(got_new["decision"]["supersedes"], old_id);
+    assert_eq!(got_new["decision"]["superseded_by"], Value::Null);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn decision_get_missing_and_not_found_are_structured_3506() {
+    let home = tmp_home("get-errors-3506");
+    let missing = get(&home, &serde_json::json!({}));
+    assert_eq!(missing["code"], "missing_id");
+
+    let absent = get(&home, &serde_json::json!({"id": "d-does-not-exist"}));
+    assert_eq!(absent["code"], "decision_not_found");
+    assert!(absent["error"]
+        .as_str()
+        .expect("error")
+        .contains("not found"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn decision_list_is_utf8_safe_terse_by_default_and_verbose_opt_in_3506() {
+    let home = tmp_home("list-projection-3506");
+    let long_content = "決".repeat(260);
+    post(
+        &home,
+        "lead",
+        &serde_json::json!({"title": "policy", "content": long_content}),
+    );
+
+    let terse = list(&home, &serde_json::json!({}));
+    assert_eq!(terse["terse"], true);
+    assert_eq!(terse["fields"], "full");
+    let capped = terse["decisions"][0]["content"].as_str().expect("content");
+    assert!(
+        capped.starts_with(&"決".repeat(200)),
+        "UTF-8 prefix must stay intact"
+    );
+    assert!(capped.contains("+60 chars; verbose=true for full"));
+
+    let verbose = list(&home, &serde_json::json!({"verbose": true}));
+    assert_eq!(verbose["terse"], false);
+    assert_eq!(verbose["decisions"][0]["content"], long_content);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn decision_list_fields_minimal_has_exact_projection_3506() {
+    let home = tmp_home("list-minimal-3506");
+    post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "policy", "content": "secret detail", "tags": ["release"]
+        }),
+    );
+
+    let listed = list(&home, &serde_json::json!({"fields": "minimal"}));
+    assert_eq!(listed["fields"], "minimal");
+    let row = listed["decisions"][0].as_object().expect("decision object");
+    let mut keys: Vec<_> = row.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["author", "created_at", "id", "status", "tags", "title"]
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn review_class_is_persisted_and_create_only_3419() {
     let home = tmp_home("review_class_3419");
     let posted = post(
@@ -223,6 +322,7 @@ fn make_test_decision(author: &str) -> Decision {
         updated_at: "2026-04-27T00:00:00Z".into(),
         archived: false,
         supersedes: None,
+        superseded_by: None,
         working_directory: None,
         review_class: None,
         schema_version: SCHEMA_VERSION,
