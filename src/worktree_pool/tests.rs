@@ -4823,6 +4823,49 @@ fn release_recovery_snapshot_excludes_gitignored_build_cache() {
 }
 
 #[test]
+fn release_cleans_ignored_target_before_git_worktree_remove() {
+    let home = tmp_home("release-target-order");
+    let repo = tmp_repo("release-target-order-repo");
+    let lease = lease_bound(&home, &repo, "agent-target", "feat/target-order");
+    std::fs::write(lease.path.join(".gitignore"), b"target/\n").unwrap();
+    git_in(&lease.path, &["add", ".gitignore"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "ignore target",
+        ],
+    );
+    let target = lease.path.join("target/debug");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("large-artifact"), vec![b'x'; 1024 * 1024]).unwrap();
+    let target_existed_at_remove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = std::sync::Arc::clone(&target_existed_at_remove);
+    let target_root = lease.path.join("target");
+    let outcome = {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+                observed.store(target_root.exists(), std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        release_full(&home, "agent-target", false)
+    };
+
+    assert!(outcome.released, "{outcome:?}");
+    assert!(
+        !target_existed_at_remove.load(std::sync::atomic::Ordering::SeqCst),
+        "ignored target cache must be gone before git worktree remove starts"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
 fn release_remove_failure_retains_binding_with_structured_stage() {
     let home = tmp_home("release-remove-failure");
     let repo = tmp_repo("release-remove-failure-repo");
