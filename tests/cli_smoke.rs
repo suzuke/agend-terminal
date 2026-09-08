@@ -418,13 +418,65 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// The session id the V1 orphan scope reads (`getsid`), or -1 when unreadable.
+#[cfg(unix)]
+fn session_of(pid: u32) -> i32 {
+    // SAFETY: getsid on any pid returns -1/ESRCH rather than misbehaving.
+    unsafe { libc::getsid(pid as libc::pid_t) }
+}
+
+/// What a reader needs when the residual scan does not list a planted pid:
+/// the kernel's view of each pid (`ps` + `getsid`, i.e. exactly the inputs of
+/// `scope_reparented`) and the full V1 report — every candidate with or without
+/// a hint, plus the scope counts — which bare `doctor` prints without a daemon.
+#[cfg(unix)]
+fn residue_diagnostics(home: &std::path::Path, pids: &[u32]) -> String {
+    let list: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
+    let ps = std::process::Command::new("ps")
+        .args(["-o", "pid,ppid,uid,sess,command", "-p", &list.join(",")])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_else(|e| format!("ps failed: {e}"));
+    let sids: Vec<String> = pids
+        .iter()
+        .map(|p| format!("getsid({p})={}", session_of(*p)))
+        .collect();
+    let doctor = cmd()
+        .env("AGEND_HOME", home)
+        .arg("doctor")
+        .output()
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout).to_string();
+            out.split("Reparented processes in scope")
+                .nth(1)
+                .map(|tail| format!("Reparented processes in scope{tail}"))
+                .unwrap_or(out)
+        })
+        .unwrap_or_else(|e| format!("doctor failed: {e}"));
+    format!(
+        "--- diagnostics ---\nself pid={} getsid={}\n{ps}{}\n--- doctor V1 report ---\n{doctor}",
+        std::process::id(),
+        session_of(std::process::id()),
+        sids.join(" ")
+    )
+}
+
 /// Processes planted as if a test runner had died and left them behind:
 /// `sleep` invoked through a symlink at `…/target/debug/deps/agend_terminal-<hash>`
 /// (the #3539 residue shape — `ps` reports argv[0] as invoked, and a symlink
 /// keeps the real `/bin/sleep`, which macOS would SIGKILL if copied out of its
-/// signed location) and a plain one elsewhere (the control). Both are started
-/// through a throw-away `sh` so they reparent to init, which is the only scope
-/// the V1 report looks at. `Drop` kills them — test-only authority.
+/// signed location) and a plain one elsewhere (the control).
+///
+/// The V1 scope (`scope_reparented`) is `ppid == 1` AND same uid AND `sid != 1`
+/// AND not a session leader. A child backgrounded from a plain `sh` only
+/// guarantees the first: it INHERITS the session, and on the GitHub macOS
+/// runner that inherited session put it outside the scope (deterministic red
+/// at cli_smoke.rs:551 on two heads, green on ubuntu and on a developer
+/// shell). So the throw-away `sh` is started with `setsid()`: it becomes the
+/// leader of a fresh session, the `sleep` inherits that session, and when the
+/// `sh` exits the `sleep` holds a session it did not create whose leader is
+/// dead — the exact #3273 shape — with `ppid == 1`, whatever session the test
+/// process itself runs in. `Drop` kills them — test-only authority.
 #[cfg(unix)]
 struct PlantedResidue {
     hinted_pid: u32,
@@ -449,18 +501,29 @@ impl PlantedResidue {
     }
 
     fn spawn_reparented(exe: &std::path::Path, cwd: &std::path::Path) -> u32 {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
+        use std::os::unix::process::CommandExt;
+        let mut sh = std::process::Command::new("sh");
+        sh.arg("-c")
             .arg("\"$0\" 300 >/dev/null 2>&1 & echo $!")
             .arg(exe)
-            .current_dir(cwd)
-            .output()
-            .expect("spawn via sh");
+            .current_dir(cwd);
+        // SAFETY: `setsid` is async-signal-safe and touches only the child's
+        // own session/group; the same shape as tests/harness_smoke.rs.
+        unsafe {
+            sh.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = sh.output().expect("spawn via sh");
         let pid: u32 = String::from_utf8_lossy(&out.stdout)
             .trim()
             .parse()
             .expect("sh must echo the background pid");
-        // `sh` has exited, so the child now belongs to init.
+        // `sh` has exited, so the child now belongs to init and holds the
+        // session that `sh` created and no longer leads.
         let started = std::time::Instant::now();
         while pid_alive(pid) && started.elapsed() < std::time::Duration::from_secs(5) {
             let ppid = std::process::Command::new("ps")
@@ -469,12 +532,18 @@ impl PlantedResidue {
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
-            if ppid == "1" {
+            let sid = session_of(pid);
+            if ppid == "1" && sid > 1 && sid != pid as i32 {
                 return pid;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        panic!("planted pid {pid} did not reparent to init");
+        panic!(
+            "planted pid {pid} never reached the V1 scope shape (ppid 1, sid > 1, not its own \
+             session leader): alive={} getsid={}",
+            pid_alive(pid),
+            session_of(pid)
+        );
     }
 }
 
@@ -548,16 +617,20 @@ fn stop_waits_for_daemon_exit_and_lists_hinted_residue_untouched_3539() {
     );
 
     // (2) residue: listed with its hint, not acted on; control not listed.
+    // The diagnostics are built only when an assertion fails.
+    let planted = [residue.hinted_pid, residue.control_pid];
     assert!(
         stdout.contains(&format!(
             "pid={} hint=test-runner-binary",
             residue.hinted_pid
         )),
-        "the test-runner-shaped residue must be listed with its hint: {stdout}"
+        "the test-runner-shaped residue must be listed with its hint: {stdout}\n{}",
+        residue_diagnostics(&home, &planted)
     );
     assert!(
         !stdout.contains(&format!("pid={} ", residue.control_pid)),
-        "a reparented process without a hint is not stop's business: {stdout}"
+        "a reparented process without a hint is not stop's business: {stdout}\n{}",
+        residue_diagnostics(&home, &planted)
     );
     assert!(
         pid_alive(residue.hinted_pid) && pid_alive(residue.control_pid),
