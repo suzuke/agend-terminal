@@ -961,6 +961,41 @@ instances:
 }
 
 #[test]
+fn env_from_env_missing_source_refuses_instance_resolution_3540() {
+    let yaml = r#"
+instances:
+  worker:
+    backend: claude
+    env:
+      SERVICE_TOKEN: { from_env: AGEND_TEST_3540_MISSING_SOURCE }
+"#;
+    let config: FleetConfig = serde_yaml_ng::from_str(yaml).expect("structured env reference");
+    assert!(
+        config.resolve_instance("worker").is_none(),
+        "an unset source variable must reject resolution instead of injecting an empty value"
+    );
+}
+
+#[test]
+fn env_from_env_does_not_change_passthrough_resolution_3540() {
+    let yaml = r#"
+passthrough_env: [FLEET_PASS]
+instances:
+  worker:
+    backend: claude
+    passthrough_env: [INSTANCE_PASS]
+    env:
+      SERVICE_TOKEN: { from_env: AGEND_TEST_3540_UNUSED_SOURCE }
+"#;
+    let config: FleetConfig = serde_yaml_ng::from_str(yaml).expect("structured env reference");
+    assert_eq!(
+        config.resolve_passthrough_env("worker"),
+        vec!["FLEET_PASS".to_string(), "INSTANCE_PASS".to_string()],
+        "env value indirection must not alter same-name passthrough semantics"
+    );
+}
+
+#[test]
 fn test_teams_parsing() {
     let dir = std::env::temp_dir().join(format!("agend-fleet-teams-{}", std::process::id()));
     let path = write_fleet(
