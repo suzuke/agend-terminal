@@ -27,6 +27,25 @@ try {
     $Issued = $Json.issued_at
 } catch { exit 0 }
 
+# #3545: same rule as the bash hook — the binding names the BOUND branch, which
+# a `bind:false` dispatch leaves pointing at the previous task. Read the branch
+# actually being committed on from $GIT_DIR/HEAD (never `git rev-parse`, which
+# the shim redirects to the bound worktree, #2234/#2481), and withhold the
+# branch-derived trailers when it cannot be confirmed to match.
+$Actual = ""
+if ($env:GIT_DIR) {
+    $HeadFile = Join-Path $env:GIT_DIR "HEAD"
+    if (Test-Path $HeadFile) {
+        $HeadRef = Get-Content $HeadFile -Raw -ErrorAction SilentlyContinue
+        if ($HeadRef -match "^ref: refs/heads/(.+?)\s*$") { $Actual = $Matches[1] }
+    }
+}
+if ((-not $Actual) -or ($Actual -ne $Branch)) {
+    $Task = ""
+    $Branch = ""
+    $Issued = ""
+}
+
 # Append trailers.
 $Trailers = "`n`nAgend-Agent: $Agent"
 if ($Task) { $Trailers += "`nAgend-Task: $Task" }
