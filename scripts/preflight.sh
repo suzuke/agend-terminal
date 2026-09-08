@@ -8,7 +8,8 @@
 # fmt drift, tray-gated failures, and the 750-LOC file_size_invariant.
 #
 # Runs, in order — the fmt/clippy surface MATCHES CI's `check` job (task83/d-46):
-#   1. scripts/fmt-owned.sh --check   (owned *.rs, vendor/ excluded — CI's exact surface)
+#   1. scripts/fmt-owned.sh --check   (tracked + untracked/non-ignored owned *.rs,
+#                                      vendor/ excluded — CI's exact surface)
 #   2. cargo clippy <owned targets + agentic-git wrapper> --features tray -- -D warnings  (CI's exact targets)
 #   3. cargo nextest run --features tray   (unit + integration + invariants)
 #      This is CI's runner AND selection (unit tests + every tests/*.rs target).
@@ -112,6 +113,15 @@ step() {
         failed+=("$label")
     fi
 }
+
+untracked_rs_found="false"
+while IFS= read -r -d '' _; do
+    untracked_rs_found="true"
+    break
+done < <(git ls-files -z --others --exclude-standard -- '*.rs' ':!:vendor/**')
+if [[ "$untracked_rs_found" == "true" ]]; then
+    echo "[$SCRIPT_NAME] note: untracked, non-ignored *.rs files are included in the fmt check" >&2
+fi
 
 step "fmt --check (owned surface)" \
     scripts/fmt-owned.sh --check
