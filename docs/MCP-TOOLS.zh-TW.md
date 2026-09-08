@@ -18,9 +18,11 @@ Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance 
 
 ### `decision`
 
-管理 durable decision 與 operator question。動作：`post`、`list`、`update`、`answer`。
+管理 durable decision 與 operator question。動作：`post`、`list`、`get`、`update`、`answer`、`archive_batch`。
 
 - Decision 欄位：`id`、`title`、`content`、`tags`、`scope`、`supersedes`、`archive`、`include_archived`、`ttl_days`。
+- `list` 預設為 terse，過長的 `content` 會截在約 200 字元。用 `verbose:true` 取得完整內容，或用 `fields:"minimal"` 只保留 `id`、`title`、`author`、`status`、`tags` 與 `created_at`。
+- `get` 依 `id` 回傳一筆完整記錄，包括 `supersedes`、推導出的 `superseded_by` 與 `archived`。
 - Question 使用 `needs_answer`、`options`、`allow_free_text`、`timeout_secs` 與 `timeout_default`；`answer` 記錄選項或自由文字答案。
 
 ### `team`
