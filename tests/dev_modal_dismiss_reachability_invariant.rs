@@ -23,7 +23,12 @@ const TARGET: &str = "src/agent/mod.rs";
 /// rather than silently making this invariant vacuous.
 const READ_LOOP_FN: &str = "pty_read_loop";
 /// Identifiers that mark a conditional as transport-mode-dependent.
-const TRANSPORT_IDENTS: &[&str] = &["TransportMode", "LegacyPty", "ChannelBridge", "StructuredTransport"];
+const TRANSPORT_IDENTS: &[&str] = &[
+    "TransportMode",
+    "LegacyPty",
+    "ChannelBridge",
+    "StructuredTransport",
+];
 
 #[derive(Default)]
 struct IdentScan {
@@ -90,8 +95,9 @@ impl<'ast> Visit<'ast> for Audit {
             }
             if let Some((_, else_branch)) = node.else_branch.as_ref() {
                 if starts_read_loop(&idents_of(&**else_branch)) {
-                    self.violations
-                        .push(format!("`else` of a transport-mode `if` gates {READ_LOOP_FN}"));
+                    self.violations.push(format!(
+                        "`else` of a transport-mode `if` gates {READ_LOOP_FN}"
+                    ));
                 }
             }
         }
@@ -202,5 +208,8 @@ fn the_audit_rejects_a_transport_gated_read_loop() {
     "#;
     let clean = audit(good);
     assert!(clean.violations.is_empty(), "the healthy shape must pass");
-    assert_eq!(clean.read_loop_sites, 1, "the anchor must still count the call");
+    assert_eq!(
+        clean.read_loop_sites, 1,
+        "the anchor must still count the call"
+    );
 }
