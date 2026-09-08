@@ -414,6 +414,7 @@ mod tests {
     fn fast_tools_get_short_timeout() {
         assert_eq!(tool_timeout("list_instances"), Duration::from_secs(5));
         assert_eq!(tool_timeout("health"), Duration::from_secs(5));
+        assert_eq!(tool_timeout("release_worktree"), Duration::from_secs(5));
     }
 
     #[test]
@@ -590,6 +591,49 @@ mod tests {
             resp.get("error").is_none(),
             "no error field → agent will not resend: {resp}"
         );
+    }
+
+    /// #3613 RED: release is already running in the daemon-owned worker when
+    /// the proxy stops waiting. The caller must receive a non-retryable,
+    /// release-specific in-flight envelope while that worker survives.
+    #[test]
+    fn release_timeout_reports_in_flight_and_worker_survives_disconnect() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let release = move |_: &str, _: &Value, _: &str| {
+            entered_tx.send(()).expect("announce release entry");
+            resume_rx.recv().expect("release resume signal");
+            completed_tx.send(()).expect("announce release completion");
+            json!({"released": true})
+        };
+
+        let response = handle_mcp_tool_inner(
+            "release_worktree",
+            json!({"instance": "slow-release"}),
+            "caller".to_string(),
+            Duration::from_millis(100),
+            None,
+            release,
+        );
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release worker must have entered before the proxy returns");
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["accepted"], true, "{response}");
+        assert_eq!(response["release_in_flight"], true, "{response}");
+        assert_eq!(response["status"], "accepted_in_progress", "{response}");
+        assert!(
+            completed_rx.try_recv().is_err(),
+            "blocked release must still be in flight when the response returns"
+        );
+
+        drop(response); // models the client disconnecting after the response
+        resume_tx.send(()).expect("resume background release");
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("daemon worker must survive the disconnected caller");
     }
 
     /// §3.9: a read/idempotent tool that times out keeps the retryable `error`

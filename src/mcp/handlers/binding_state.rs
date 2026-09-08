@@ -601,6 +601,33 @@ mod tests {
     }
 
     #[test]
+    fn binding_state_reports_release_lifecycle_in_flight() {
+        let home = tmp_home("release-in-flight");
+        let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+            &home,
+            "release-agent",
+            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+        )
+        .expect("release permit");
+
+        let active = handle_binding_state(
+            &home,
+            &json!({"instance": "release-agent"}),
+            &None,
+        );
+        assert_eq!(active["release_in_flight"], true, "{active}");
+
+        drop(permit);
+        let complete = handle_binding_state(
+            &home,
+            &json!({"instance": "release-agent"}),
+            &None,
+        );
+        assert_eq!(complete["release_in_flight"], false, "{complete}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn binding_state_after_release_reports_unbound_clean_state() {
         // Regression-proof against the Sprint 57 lease-block surface:
         // after release_worktree, binding_state must report bound:false,

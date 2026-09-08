@@ -2251,6 +2251,58 @@ fn checkout_bind_true_worktree_add_failure_rolls_back_auto_created_branch_arch14
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// #3613 RED: a marker-bearing checkout target with no binding is a stale
+/// daemon lifecycle artifact, not an opaque Git failure. Preserve it and tell
+/// the caller to use the guarded force-release recovery path.
+#[test]
+#[cfg(unix)]
+fn checkout_reports_stale_managed_worktree_dir_without_binding() {
+    let home = p778_tmp_home("3613-stale-target");
+    let parent = p778_tmp_home("3613-stale-target-src");
+    let source = p780_setup_source_broken_origin(&parent);
+    let agent = "agent-3613-stale";
+    let branch = "feat/stale-3613";
+    let target = p780_checkout_target(&home, agent, &source);
+    std::fs::create_dir_all(&target).expect("stale checkout target");
+    let marker = format!(
+        "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+        source.canonicalize().expect("canonical source").display()
+    );
+    std::fs::write(
+        target.join(crate::worktree_pool::MANAGED_MARKER),
+        &marker,
+    )
+    .expect("managed marker");
+
+    let response = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": branch,
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert_eq!(response["code"], "stale_worktree_dir", "{response}");
+    assert_eq!(response["path"], target.display().to_string(), "{response}");
+    assert_eq!(response["marker"], marker, "{response}");
+    assert!(
+        response["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("release_worktree") && hint.contains("force")),
+        "{response}"
+    );
+    assert!(target.exists(), "typed refusal must preserve stale evidence");
+    assert!(
+        !p780_branch_exists(&source, branch),
+        "auto-created branch must be rolled back on stale-dir refusal"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 /// Arch14 guard: the same worktree-add failure must never delete a branch that
 /// existed before this checkout transaction began.
 #[test]
