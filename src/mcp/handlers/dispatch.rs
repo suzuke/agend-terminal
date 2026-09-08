@@ -471,6 +471,7 @@ action_adapter!(dispatch_ci, "ci", [
 action_adapter!(dispatch_decision, "decision", [
     "post"          => task::handle_post_decision,           hais;
     "list"          => task::handle_list_decisions,           ha;
+    "get"           => task::handle_get_decision,              ha;
     "update"        => task::handle_update_decision,          hai;
     "answer"        => task::handle_answer_decision,          hais;
     "archive_batch" => task::handle_archive_batch_decisions,  hai;
@@ -875,7 +876,7 @@ mod tests {
             ("ci", &["watch", "unwatch", "status", "defer"]),
             (
                 "decision",
-                &["post", "list", "update", "answer", "archive_batch"],
+                &["post", "list", "get", "update", "answer", "archive_batch"],
             ),
             ("deployment", &["deploy", "teardown", "list"]),
             ("health", &["report", "clear"]),

@@ -18,9 +18,11 @@ Manage task boards. Actions: `create`, `list`, `get`, `claim`, `done`, `update`,
 
 ### `decision`
 
-Manage durable decisions and operator questions. Actions: `post`, `list`, `update`, `answer`.
+Manage durable decisions and operator questions. Actions: `post`, `list`, `get`, `update`, `answer`, `archive_batch`.
 
 - Decision fields: `id`, `title`, `content`, `tags`, `scope`, `supersedes`, `archive`, `include_archived`, `ttl_days`.
+- `list` is terse by default and caps long `content` at about 200 characters. Use `verbose:true` for complete content or `fields:"minimal"` for only `id`, `title`, `author`, `status`, `tags`, and `created_at`.
+- `get` returns one full record by `id`, including `supersedes`, derived `superseded_by`, and `archived`.
 - Questions use `needs_answer`, `options`, `allow_free_text`, `timeout_secs`, and `timeout_default`; `answer` records the selected/free-text response.
 
 ### `team`

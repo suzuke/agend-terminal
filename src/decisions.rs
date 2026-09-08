@@ -94,6 +94,8 @@ pub struct Decision {
     pub updated_at: String,
     pub archived: bool,
     pub supersedes: Option<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
     pub working_directory: Option<String>,
     /// Optional typed review authority. Additive and create-only; tasks may
     /// inherit this value when they name the decision as their governor.
@@ -456,6 +458,7 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
                 return;
             }
             old.archived = true;
+            old.superseded_by = Some(id.clone());
             old.updated_at = now_c;
             old.schema_version = SCHEMA_VERSION;
             // Write inline; save() re-acquires the same (non-reentrant)
@@ -482,6 +485,7 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
         updated_at: now,
         archived: false,
         supersedes,
+        superseded_by: None,
         working_directory: working_dir,
         review_class,
         schema_version: SCHEMA_VERSION,
@@ -544,6 +548,40 @@ pub fn list_pending(home: &Path) -> Vec<Decision> {
         .into_iter()
         .filter(|d| !d.archived && d.needs_answer && d.status == Some(DecisionStatus::Pending))
         .collect()
+}
+
+/// Return one decision's complete record. Unlike the bounded list path, this
+/// keyed lookup checks only the exact live and retained-history paths, so its
+/// cost does not grow with the decision store.
+pub fn get(home: &Path, args: &Value) -> Value {
+    let Some(id) = args["id"].as_str() else {
+        return serde_json::json!({"error": "missing 'id'", "code": "missing_id"});
+    };
+    if !is_safe_decision_id(id) {
+        return serde_json::json!({"error": "invalid decision id", "code": "invalid_id"});
+    }
+
+    let live_dir = decisions_dir(home);
+    let archive_dir = live_dir.join(".archive");
+    let decision = [live_dir.as_path(), archive_dir.as_path()]
+        .into_iter()
+        .find_map(|dir| load_decision_file(&dir.join(format!("{id}.json"))))
+        .filter(|decision| decision.id == id);
+    let Some(decision) = decision else {
+        return serde_json::json!({
+            "error": format!("decision not found: {id}"),
+            "code": "decision_not_found",
+        });
+    };
+
+    let record = serde_json::to_value(decision).unwrap_or(Value::Null);
+    serde_json::json!({"decision": record})
+}
+
+fn load_decision_file(path: &Path) -> Option<Decision> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let decision: Decision = serde_json::from_str(&raw).ok()?;
+    (decision.schema_version <= SCHEMA_VERSION).then_some(decision)
 }
 
 /// #2313 P2b: pending-question tally bucketed by author, computed with ONE
@@ -858,6 +896,8 @@ pub fn list(home: &Path, args: &Value) -> Value {
             })
         })
         .unwrap_or(0);
+    let verbose = args["verbose"].as_bool().unwrap_or(false);
+    let minimal = args["fields"].as_str() == Some("minimal");
     let mut decisions = Vec::new();
     let mut errors = Vec::new();
     let mut scanned = 0usize;
@@ -888,7 +928,14 @@ pub fn list(home: &Path, args: &Value) -> Value {
                     since,
                     until,
                 ) {
-                    decisions.push(decision);
+                    let mut value = serde_json::to_value(decision).unwrap_or(Value::Null);
+                    if !verbose {
+                        terse_decision_value(&mut value);
+                    }
+                    if minimal {
+                        minimal_decision_value(&mut value);
+                    }
+                    decisions.push(value);
                 }
             }
             Ok(decision) => errors.push(serde_json::json!({
@@ -930,7 +977,30 @@ pub fn list(home: &Path, args: &Value) -> Value {
         "scan_exhausted": scanned == scan_budget && has_more,
         "next_cursor": next_cursor,
         "errors": errors,
+        "terse": !verbose,
+        "fields": if minimal { "minimal" } else { "full" },
     })
+}
+
+fn terse_decision_value(value: &mut Value) {
+    const CAP: usize = 200;
+    let Some(Value::String(content)) = value.get_mut("content") else {
+        return;
+    };
+    let count = content.chars().count();
+    if count > CAP {
+        let kept: String = content.chars().take(CAP).collect();
+        *content = format!("{kept}… (+{} chars; verbose=true for full)", count - CAP);
+    }
+}
+
+fn minimal_decision_value(value: &mut Value) {
+    const KEEP: &[&str] = &["id", "title", "author", "status", "tags", "created_at"];
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.entry("status".to_string()).or_insert(Value::Null);
+    object.retain(|key, _| KEEP.contains(&key.as_str()));
 }
 
 fn protected_policy(home: &Path) -> anyhow::Result<(Vec<String>, String)> {
