@@ -803,6 +803,43 @@ mod tests {
     }
 
     #[test]
+    fn palette_spawn_missing_default_env_source_does_not_create_pane_3540_r2() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-command-missing-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "defaults:\n  env:\n    DESTINATION_TOKEN:\n      from_env: AGEND_TEST_MISSING_COMMAND_ENV_3540_R2\ninstances: {}\n",
+        )
+        .expect("fleet");
+        let mut layout = Layout::new();
+        let registry = empty_registry();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+        };
+
+        assert!(!execute(
+            "spawn blocked agend-test-missing-command-3540-r2",
+            &mut ctx
+        ));
+        assert!(layout.tabs.is_empty());
+        assert!(crate::agent::lock_registry(&registry).is_empty());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
     fn command_parsing_splits_at_most_3_parts() {
         // Pin the parsing shape: splitn(3, ' ') means at most 3 parts
         let parts: Vec<&str> = "send target hello world".trim().splitn(3, ' ').collect();
