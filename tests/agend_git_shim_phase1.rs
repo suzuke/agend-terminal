@@ -47,6 +47,46 @@ fn hook_script_valid_shell_syntax() {
     );
 }
 
+/// #3545: the PowerShell hook must compare the branch CASE-SENSITIVELY. Its
+/// operators default to case-insensitive, so a plain `-ne` / `-match` would let
+/// `feature/X` and `feature/x` compare equal and write a trailer naming a branch
+/// this commit is not on — exactly what the bash hook (byte comparison) refuses.
+/// Pinned by scanning the script text, the same way the sibling checks in this
+/// file do, so no `pwsh` is needed on the runner.
+#[test]
+fn ps1_hook_compares_branch_case_sensitively_3545() {
+    let hook = include_str!("../assets/hooks/prepare-commit-msg.ps1");
+    assert!(
+        hook.contains("GIT_DIR") && hook.contains("HEAD"),
+        "must read the actual branch from $GIT_DIR/HEAD"
+    );
+    assert!(
+        hook.contains("-cne"),
+        "branch inequality must be the case-sensitive operator"
+    );
+    assert!(
+        hook.contains("-cmatch"),
+        "the HEAD ref parse must be the case-sensitive match operator"
+    );
+    // Scoped to the two branch-comparison lines. The idempotency probe on line
+    // ~20 still uses `-match` and is deliberately out of scope for #3545 — it
+    // tests for a literal trailer prefix, not a branch name.
+    for line in hook.lines() {
+        if line.contains("refs/heads/") {
+            assert!(
+                line.contains("-cmatch"),
+                "the HEAD ref parse must be case-sensitive: {line}"
+            );
+        }
+        if line.contains("$Branch") && line.contains("Actual") {
+            assert!(
+                line.contains("-cne") && !line.contains(" -ne "),
+                "the branch comparison must be case-sensitive: {line}"
+            );
+        }
+    }
+}
+
 /// Hook idempotent: existing trailer → skip.
 #[test]
 fn hook_idempotent_skip_logic() {
