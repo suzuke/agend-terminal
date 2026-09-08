@@ -30,6 +30,10 @@ pub(super) fn handle_list_decisions(home: &Path, args: &Value) -> Value {
     crate::decisions::list(home, args)
 }
 
+pub(super) fn handle_get_decision(home: &Path, args: &Value) -> Value {
+    crate::decisions::get(home, args)
+}
+
 pub(super) fn handle_update_decision(home: &Path, args: &Value, instance_name: &str) -> Value {
     crate::decisions::update(home, instance_name, args)
 }
