@@ -59,6 +59,7 @@ fn decision_get_returns_full_record_with_supersession_links_3506() {
         }),
     );
     let new_id = new["id"].as_str().expect("new id").to_string();
+    std::fs::write(decisions_dir(&home).join("unrelated.json"), "{broken").unwrap();
 
     let got_old = get(&home, &serde_json::json!({"id": old_id}));
     assert_eq!(got_old["decision"]["id"], old_id);
@@ -81,7 +82,10 @@ fn decision_get_missing_and_not_found_are_structured_3506() {
 
     let absent = get(&home, &serde_json::json!({"id": "d-does-not-exist"}));
     assert_eq!(absent["code"], "decision_not_found");
-    assert!(absent["error"].as_str().expect("error").contains("not found"));
+    assert!(absent["error"]
+        .as_str()
+        .expect("error")
+        .contains("not found"));
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -99,7 +103,10 @@ fn decision_list_is_utf8_safe_terse_by_default_and_verbose_opt_in_3506() {
     assert_eq!(terse["terse"], true);
     assert_eq!(terse["fields"], "full");
     let capped = terse["decisions"][0]["content"].as_str().expect("content");
-    assert!(capped.starts_with(&"決".repeat(200)), "UTF-8 prefix must stay intact");
+    assert!(
+        capped.starts_with(&"決".repeat(200)),
+        "UTF-8 prefix must stay intact"
+    );
     assert!(capped.contains("+60 chars; verbose=true for full"));
 
     let verbose = list(&home, &serde_json::json!({"verbose": true}));
@@ -315,6 +322,7 @@ fn make_test_decision(author: &str) -> Decision {
         updated_at: "2026-04-27T00:00:00Z".into(),
         archived: false,
         supersedes: None,
+        superseded_by: None,
         working_directory: None,
         review_class: None,
         schema_version: SCHEMA_VERSION,
