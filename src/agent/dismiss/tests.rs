@@ -1802,6 +1802,7 @@ fn generation_teardown_cancels_a_queued_keystroke_3314() {
         std::sync::Arc::clone(&epoch),
         std::sync::Arc::clone(&generation_over),
         std::sync::Arc::clone(&deleted),
+        std::sync::Arc::new(crate::agent::dev_modal::RefuseTally::default()),
     );
     let barrier = gate.write_barrier();
     assert!(barrier.still_valid(), "valid while the generation is live");
@@ -1826,6 +1827,7 @@ fn instance_deletion_cancels_a_queued_keystroke_3314() {
         std::sync::Arc::clone(&epoch),
         std::sync::Arc::clone(&generation_over),
         std::sync::Arc::clone(&deleted),
+        std::sync::Arc::new(crate::agent::dev_modal::RefuseTally::default()),
     );
     let barrier = gate.write_barrier();
     deleted.store(true, Ordering::SeqCst);

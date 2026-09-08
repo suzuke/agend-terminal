@@ -1972,7 +1972,7 @@ fn pty_read_loop(
     // disarm) from its Drop, so EVERY exit of this loop is covered, including
     // an unwind — which the trailing statements it replaces silently skipped.
     let (dev_modal_guard, mut dev_modal_gate) =
-        dev_modal::arm_generation(pty_writer, *dev_modal_armed, Arc::clone(deleted));
+        dev_modal::arm_generation(pty_writer, *dev_modal_armed, Arc::clone(deleted), name);
     // Monotonic base for the stability window; the gate never reads a clock.
     let dev_modal_clock = std::time::Instant::now();
     // #3314: has the agent reached Idle at least once? That is the point after
@@ -2103,6 +2103,12 @@ fn pty_read_loop(
                 let pre_idle_dev_modal_visible = *dev_modal_armed
                     && !dismiss_agent_ever_idle
                     && dev_modal::complete_modal_digest(&screen).is_some();
+                // #3547 D(ii): hand the gate this frame's prompt-state fact before
+                // it is consulted. It is what distinguishes "the modal is still
+                // painting" from "this pane is blocked on a prompt and the modal
+                // never completed", which is the only case the relaxed anchored
+                // retry is allowed to fire in.
+                dev_modal_gate.set_prompt_blocked(prompt_blocked);
                 if dismiss_scan_armed(
                     dismiss_scan_enabled,
                     prompt_blocked,
