@@ -368,10 +368,11 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                 tracing::warn!(name = %inst_name, error = %e, "failed to write fleet.yaml");
             }
             let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
-            let pane_result = if let Some(resolved) =
-                fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name))
+            let pane_result = match fleet
+                .as_ref()
+                .map(|f| f.resolve_instance_checked(&inst_name))
             {
-                super::pane_factory::create_pane_from_resolved(
+                Some(Ok(Some(resolved))) => super::pane_factory::create_pane_from_resolved(
                     &inst_name,
                     &resolved,
                     ctx.layout,
@@ -382,26 +383,28 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     ctx.wakeup_tx,
                     ctx.name_counter,
                     crate::backend::SpawnMode::Fresh,
-                )
-            } else {
-                let (command, submit_key) = super::pane_factory::resolve_backend(backend_name);
-                super::pane_factory::create_pane(
-                    ctx.layout,
-                    ctx.registry,
-                    ctx.home,
-                    &inst_name,
-                    &command,
-                    &[],
-                    crate::backend::SpawnMode::Fresh,
-                    None,
-                    &HashMap::new(),
-                    &submit_key,
-                    pc,
-                    pr,
-                    ctx.wakeup_tx,
-                    ctx.name_counter,
-                    super::pane_factory::SpawnIdentity::Managed,
-                )
+                ),
+                Some(Err(error)) => Err(anyhow::Error::new(error)),
+                Some(Ok(None)) | None => {
+                    let (command, submit_key) = super::pane_factory::resolve_backend(backend_name);
+                    super::pane_factory::create_pane(
+                        ctx.layout,
+                        ctx.registry,
+                        ctx.home,
+                        &inst_name,
+                        &command,
+                        &[],
+                        crate::backend::SpawnMode::Fresh,
+                        None,
+                        &HashMap::new(),
+                        &submit_key,
+                        pc,
+                        pr,
+                        ctx.wakeup_tx,
+                        ctx.name_counter,
+                        super::pane_factory::SpawnIdentity::Managed,
+                    )
+                }
             };
             match pane_result {
                 Ok(pane) => {
@@ -498,43 +501,45 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                         // Fleet agent — resolve from fleet.yaml (full config)
                         let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
                         let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
-                        if let Some(resolved) =
-                            fleet.as_ref().and_then(|f| f.resolve_instance(fname))
-                        {
-                            super::pane_factory::create_pane_from_resolved(
-                                fname,
-                                &resolved,
-                                ctx.layout,
-                                ctx.registry,
-                                ctx.home,
-                                pc,
-                                pr,
-                                ctx.wakeup_tx,
-                                ctx.name_counter,
-                                crate::backend::SpawnMode::Resume,
-                            )
-                        } else {
-                            let (command, submit_key) =
-                                super::pane_factory::resolve_backend(&backend_cmd);
-                            super::pane_factory::create_pane(
-                                ctx.layout,
-                                ctx.registry,
-                                ctx.home,
-                                &name,
-                                &command,
-                                &[],
-                                // Fleet resolve failed — no resume metadata,
-                                // so start fresh rather than guess.
-                                crate::backend::SpawnMode::Fresh,
-                                work_dir.as_deref(),
-                                &HashMap::new(),
-                                &submit_key,
-                                pc,
-                                pr,
-                                ctx.wakeup_tx,
-                                ctx.name_counter,
-                                super::pane_factory::SpawnIdentity::Managed,
-                            )
+                        match fleet.as_ref().map(|f| f.resolve_instance_checked(fname)) {
+                            Some(Ok(Some(resolved))) => {
+                                super::pane_factory::create_pane_from_resolved(
+                                    fname,
+                                    &resolved,
+                                    ctx.layout,
+                                    ctx.registry,
+                                    ctx.home,
+                                    pc,
+                                    pr,
+                                    ctx.wakeup_tx,
+                                    ctx.name_counter,
+                                    crate::backend::SpawnMode::Resume,
+                                )
+                            }
+                            Some(Err(error)) => Err(anyhow::Error::new(error)),
+                            Some(Ok(None)) | None => {
+                                let (command, submit_key) =
+                                    super::pane_factory::resolve_backend(&backend_cmd);
+                                super::pane_factory::create_pane(
+                                    ctx.layout,
+                                    ctx.registry,
+                                    ctx.home,
+                                    &name,
+                                    &command,
+                                    &[],
+                                    // Fleet resolve failed — no resume metadata,
+                                    // so start fresh rather than guess.
+                                    crate::backend::SpawnMode::Fresh,
+                                    work_dir.as_deref(),
+                                    &HashMap::new(),
+                                    &submit_key,
+                                    pc,
+                                    pr,
+                                    ctx.wakeup_tx,
+                                    ctx.name_counter,
+                                    super::pane_factory::SpawnIdentity::Managed,
+                                )
+                            }
                         }
                     } else {
                         let (command, submit_key) =

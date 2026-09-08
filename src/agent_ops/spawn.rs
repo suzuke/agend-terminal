@@ -89,9 +89,15 @@ pub struct SpawnOutcome {
 
 /// Resolve command, argv, model, declared backend, environment, and wire
 /// metadata with the same precedence as the direct API SPAWN handler.
-pub fn resolve_spawn_request(home: &Path, params: &SpawnParams<'_>) -> SpawnRequest {
+pub fn resolve_spawn_request(
+    home: &Path,
+    params: &SpawnParams<'_>,
+) -> Result<SpawnRequest, crate::fleet::EnvResolveError> {
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-    let fleet_resolved = fleet.as_ref().and_then(|f| f.resolve_instance(params.name));
+    let fleet_resolved = match fleet.as_ref() {
+        Some(fleet) => fleet.resolve_instance_checked(params.name)?,
+        None => None,
+    };
     let command = params
         .backend
         .map(|s| Backend::parse_str(s).command_string())
@@ -135,7 +141,7 @@ pub fn resolve_spawn_request(home: &Path, params: &SpawnParams<'_>) -> SpawnRequ
         Backend::push_effort_arg(&mut args, &declared_backend, effort);
     }
 
-    SpawnRequest {
+    Ok(SpawnRequest {
         name: params.name.to_string(),
         backend: command,
         args,
@@ -155,7 +161,7 @@ pub fn resolve_spawn_request(home: &Path, params: &SpawnParams<'_>) -> SpawnRequ
         layout: params.layout.to_string(),
         spawner: params.spawner.map(str::to_string),
         target_pane: params.target_pane.map(str::to_string),
-    }
+    })
 }
 
 /// Execute the shared SPAWN behavior. Caller-specific fleet persistence,

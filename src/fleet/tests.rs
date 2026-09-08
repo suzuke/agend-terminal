@@ -974,6 +974,19 @@ instances:
         config.resolve_instance("worker").is_none(),
         "an unset source variable must reject resolution instead of injecting an empty value"
     );
+    let error = config
+        .resolve_instance_checked("worker")
+        .expect_err("a configured instance must expose its resolution failure");
+    assert_eq!(error.instance, "worker");
+    assert_eq!(error.destination, "SERVICE_TOKEN");
+    assert_eq!(error.source, "AGEND_TEST_3540_MISSING_SOURCE");
+    assert!(
+        config
+            .resolve_instance_checked("not-configured")
+            .expect("absence is not a resolution error")
+            .is_none(),
+        "an absent fleet entry must remain distinct from an env resolution failure"
+    );
 }
 
 #[test]

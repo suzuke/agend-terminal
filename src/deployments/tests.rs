@@ -439,10 +439,15 @@ templates:
     let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
     let inst = reloaded.instances.get("dev-worker").expect("dev-worker");
     assert_eq!(
-        inst.env.get("MCP_SERVER_URL").map(|s| s.as_str()),
-        Some("https://example.com")
+        inst.env.get("MCP_SERVER_URL"),
+        Some(&crate::fleet::FleetEnvValue::Literal(
+            "https://example.com".to_string()
+        ))
     );
-    assert_eq!(inst.env.get("DEBUG").map(|s| s.as_str()), Some("1"));
+    assert_eq!(
+        inst.env.get("DEBUG"),
+        Some(&crate::fleet::FleetEnvValue::Literal("1".to_string()))
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -675,7 +680,10 @@ templates:
     assert_eq!(inst.args, vec!["--resume".to_string()]);
     assert_eq!(inst.model.as_deref(), Some("sonnet"));
     assert_eq!(inst.model_tier.as_deref(), Some("cheap"));
-    assert_eq!(inst.env.get("API_KEY_VAR").map(|s| s.as_str()), Some("KEY"));
+    assert_eq!(
+        inst.env.get("API_KEY_VAR"),
+        Some(&crate::fleet::FleetEnvValue::Literal("KEY".to_string()))
+    );
     assert_eq!(inst.ready_pattern.as_deref(), Some("now ready"));
     assert_eq!(inst.command.as_deref(), Some("my-runner"));
     assert_eq!(inst.worktree, Some(false));

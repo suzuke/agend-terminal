@@ -1343,8 +1343,12 @@ fn random_token() -> anyhow::Result<String> {
 pub(crate) fn legacy_pty_opt_in(home: &Path, instance: &str) -> bool {
     crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
-        .and_then(|fleet| fleet.resolve_instance(instance))
-        .and_then(|resolved| resolved.env.get("AGEND_TRANSPORT_MODE").cloned())
+        .and_then(|fleet| {
+            fleet
+                .resolve_env_value(instance, "AGEND_TRANSPORT_MODE")
+                .ok()
+                .flatten()
+        })
         .is_some_and(|mode| mode.eq_ignore_ascii_case("legacy_pty"))
 }
 
