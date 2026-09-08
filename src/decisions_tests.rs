@@ -90,6 +90,46 @@ fn decision_get_missing_and_not_found_are_structured_3506() {
 }
 
 #[test]
+fn decision_get_corrupt_json_is_unreadable_without_echoing_contents_3506() {
+    let home = tmp_home("get-corrupt-3506");
+    let path = decisions_dir(&home).join("d-corrupt.json");
+    let secret = "{broken SECRET_FIXTURE_CONTENT";
+    std::fs::write(&path, secret).unwrap();
+
+    let result = get(&home, &serde_json::json!({"id": "d-corrupt"}));
+    assert_eq!(result["code"], "decision_unreadable", "{result}");
+    assert_eq!(result["path"], path.display().to_string(), "{result}");
+    assert!(result["reason"]
+        .as_str()
+        .is_some_and(|reason| !reason.is_empty()));
+    assert!(
+        !result.to_string().contains(secret),
+        "must not echo file contents"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn decision_get_newer_schema_is_unreadable_without_echoing_contents_3506() {
+    let home = tmp_home("get-newer-schema-3506");
+    let path = decisions_dir(&home).join("d-future.json");
+    let mut decision = make_test_decision("lead");
+    decision.id = "d-future".into();
+    decision.content = "SECRET_FUTURE_CONTENT".into();
+    decision.schema_version = SCHEMA_VERSION + 1;
+    crate::store::save_atomic(&path, &decision).unwrap();
+
+    let result = get(&home, &serde_json::json!({"id": "d-future"}));
+    assert_eq!(result["code"], "decision_unreadable", "{result}");
+    assert_eq!(result["path"], path.display().to_string(), "{result}");
+    assert!(result["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("newer schema")));
+    assert!(!result.to_string().contains("SECRET_FUTURE_CONTENT"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn decision_list_is_utf8_safe_terse_by_default_and_verbose_opt_in_3506() {
     let home = tmp_home("list-projection-3506");
     let long_content = "決".repeat(260);
@@ -133,7 +173,15 @@ fn decision_list_fields_minimal_has_exact_projection_3506() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["author", "created_at", "id", "status", "tags", "title"]
+        [
+            "archived",
+            "author",
+            "created_at",
+            "id",
+            "status",
+            "tags",
+            "title"
+        ]
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -237,6 +285,29 @@ fn test_supersede_archives_old() {
         .map(|d| d["id"].as_str().unwrap_or(""))
         .collect();
     assert!(!active_ids.contains(&old_id.as_str()));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn supersede_new_save_failure_leaves_old_unmarked_3506() {
+    let home = tmp_home("supersede-new-save-failure-3506");
+    let posted = post(
+        &home,
+        "lead",
+        &serde_json::json!({"title": "old", "content": "v1"}),
+    );
+    let old_id = posted["id"].as_str().expect("old id").to_string();
+    let mut successor = make_test_decision("lead");
+    successor.id = "d-successor-save-fails".into();
+    successor.supersedes = Some(old_id.clone());
+    crate::store::fail_next_atomic_write_for_test(&decision_path(&home, &successor.id));
+
+    let error = persist_post(&home, &successor).expect_err("successor save must fail");
+    assert!(error.to_string().contains("forced atomic_write failure"));
+    let old = get(&home, &serde_json::json!({"id": old_id}));
+    assert_eq!(old["decision"]["archived"], false, "{old}");
+    assert_eq!(old["decision"]["superseded_by"], Value::Null, "{old}");
+    assert!(!decision_path(&home, &successor.id).exists());
     std::fs::remove_dir_all(&home).ok();
 }
 
