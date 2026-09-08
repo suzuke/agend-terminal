@@ -1243,7 +1243,9 @@ fn main() -> anyhow::Result<()> {
             };
             match cli_stop::run_stop(&home, opts)? {
                 cli_stop::StopOutcome::NotRunning => daemon_not_running_hint(),
-                cli_stop::StopOutcome::TimedOut => std::process::exit(1),
+                cli_stop::StopOutcome::TimedOut | cli_stop::StopOutcome::Unconfirmed => {
+                    std::process::exit(1)
+                }
                 cli_stop::StopOutcome::Initiated | cli_stop::StopOutcome::Exited => {}
             }
         }
