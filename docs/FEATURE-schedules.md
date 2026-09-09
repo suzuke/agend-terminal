@@ -90,13 +90,13 @@ To resolve recovery:
 
 1. Inspect `runs`, preserve needed workspace files, and externally stop the worker and all its tools/descendants. Reconcile any ambiguous delivery outcomes and checkpoints.
 2. Use the existing `delete_instance` operation to remove the worker's fleet entry after that cleanup. Deleting the leader alone does not prove every descendant stopped.
-3. The original schedule creator, after the operator confirms external cleanup, calls:
+3. After confirming external cleanup, the operator runs this from an operator shell:
 
-```json
-{"action":"resolve_recovery","run_id":"<run-id>","attempt_id":1,"cleanup_confirmed":true,"result":"Operator confirmed all worker/tool processes stopped and delivery checkpoints reconciled."}
+```sh
+agend-terminal admin resolve-job-recovery '<run-id>' --attempt 1 --cleanup-confirmed --result "All worker/tool processes stopped; delivery checkpoints reconciled."
 ```
 
-Only the exact Run creator may resolve recovery; the attempt worker cannot resolve itself. The action requires the worker fleet entry to be absent, records the audit note, and performs no process killing. It preserves an existing success receipt or marks unfinished work failed, releases the recovery hold, and never retries that Run. Later schedule occurrences can become eligible; skipped occurrences are not replayed.
+Recovery resolution requires the authenticated Operator API principal. Agent-principal requests are denied, and this CLI refuses ordinary agent environments; the schedule creator and worker cannot approve their own cleanup through agent tools. The action requires the worker fleet entry to be absent, records the audit note, and performs no process killing. It preserves an existing success receipt or marks unfinished work failed, releases the recovery hold, and never retries that Run. Later schedule occurrences can become eligible; skipped occurrences are not replayed.
 
 Create a new schedule to change between Job and instance modes. Updating `job` replaces its configuration for future Runs; existing Runs retain their snapshot. Job mode rejects `instance`, `linked_task_id`, `replacement_key`, and `fire_strategy: "until_success"`.
 

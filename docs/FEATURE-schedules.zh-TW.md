@@ -90,13 +90,13 @@ Daemon 核對目前 attempt 與呼叫者身分後保存完成收據。Idle、程
 
 1. 查看 `runs`、保存需要的工作目錄檔案，並在外部停止 worker 及所有工具／子孫程序；核對不明的推送結果與進度紀錄。
 2. 完成上述清理後，使用既有 `delete_instance` 操作移除 worker 的 fleet 項目。僅刪除主程序並不能證明所有子孫程序已停止。
-3. 操作者確認外部清理完成後，由原排程建立者呼叫：
+3. 操作者確認外部清理完成後，在操作者的 shell 執行：
 
-```json
-{"action":"resolve_recovery","run_id":"<run-id>","attempt_id":1,"cleanup_confirmed":true,"result":"操作者已確認 worker 與工具程序全部停止，推送及進度紀錄已核對。"}
+```sh
+agend-terminal admin resolve-job-recovery '<run-id>' --attempt 1 --cleanup-confirmed --result "worker 與工具程序全部停止，推送及進度紀錄已核對。"
 ```
 
-僅 Run 記錄中的原建立者能解除復原，attempt worker 不能自行解除。此操作要求 worker 已無 fleet 項目，保存稽核說明，但不終止程序。既有成功收據會保留；未完成的工作改記失敗。解除復原後不會重試同一 Run，後續排程到點才可再次執行，已略過的到點不補跑。
+解除復原需要通過驗證的 Operator API 身分。Agent 身分的請求會被拒絕，這個 CLI 也會拒絕一般 agent 環境；排程建立者與 worker 不能透過 agent 工具自行批准清理。此操作要求 worker 已無 fleet 項目，保存稽核說明，但不終止程序。既有成功收據會保留；未完成的工作改記失敗。解除復原後不會重試同一 Run，後續排程到點才可再次執行，已略過的到點不補跑。
 
 Job 與 instance 模式不能互換，需建立新排程。更新 `job` 會替換後續 Run 的設定，既有 Run 保留原快照。Job 不接受 `instance`、`linked_task_id`、`replacement_key` 或 `fire_strategy: "until_success"`。
 

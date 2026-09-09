@@ -541,6 +541,20 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AdminCommands {
+    /// Acknowledge externally completed Job cleanup from an operator shell.
+    ResolveJobRecovery {
+        /// Run requiring manual recovery.
+        run_id: String,
+        /// Current attempt number shown by schedule runs.
+        #[arg(long)]
+        attempt: u32,
+        /// Confirm all worker/tools stopped and delivery outcomes reconciled.
+        #[arg(long, required = true)]
+        cleanup_confirmed: bool,
+        /// Nonempty audit note describing the external cleanup.
+        #[arg(long)]
+        result: String,
+    },
     /// Delete local branches whose PRs have been merged (squash-merge safe).
     /// Default: --dry-run (preview only). Pass --yes to actually delete.
     CleanupBranches {
@@ -1370,6 +1384,34 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Admin { command }) => match command {
+            AdminCommands::ResolveJobRecovery {
+                run_id,
+                attempt,
+                cleanup_confirmed,
+                result,
+            } => {
+                // Match existing operator CLI authentication without promoting
+                // ordinary agent-launched commands to the operator principal.
+                // Same-UID secret isolation remains the existing auth boundary.
+                anyhow::ensure!(
+                    !std::env::var_os("AGEND_INSTANCE_NAME").is_some_and(|name| !name.is_empty()),
+                    "resolve-job-recovery is operator-only; run it from an operator shell"
+                );
+                let args = serde_json::json!({
+                    "action": "resolve_recovery", "run_id": run_id,
+                    "attempt_id": attempt, "cleanup_confirmed": cleanup_confirmed,
+                    "result": result,
+                });
+                // api::call authenticates with the existing Operator credential;
+                // the daemon still checks principal and sender before mutation.
+                let response =
+                    api::call(&home, &mcp_wire::mcp_tool_envelope("", "schedule", &args))?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                anyhow::ensure!(
+                    mcp_wire::classify_response(&response) == mcp_wire::ResponseClass::Ok,
+                    "recovery resolution refused or indeterminate; inspect the response above"
+                );
+            }
             AdminCommands::CleanupBranches { yes } => {
                 let repo = std::env::current_dir()?;
                 let checks = admin::analyze_branches(&repo);
