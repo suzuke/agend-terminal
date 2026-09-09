@@ -436,39 +436,6 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
     let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
     let id = format!("d-{ts}-{seq}");
 
-    // Archive the superseded decision under its own flock. The previous
-    // implementation read-all → mutated-one → saved outside any lock, so
-    // two concurrent callers (post(supersedes=X) + update(X), or two
-    // posts both superseding X) would race: both read the same old
-    // record, both flip fields, whichever wrote last clobbered the other.
-    if let Some(ref old_id) = supersedes {
-        let old_id_c = old_id.clone();
-        let now_c = now.clone();
-        let _ = with_decision_lock(home, &old_id_c, || {
-            let path = decision_path(home, &old_id_c);
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                return;
-            };
-            let Ok(mut old) = serde_json::from_str::<Decision>(&content) else {
-                return;
-            };
-            // #1990: don't archive (and thereby re-save/downgrade) a record a
-            // newer daemon wrote.
-            if old.schema_version > SCHEMA_VERSION {
-                return;
-            }
-            old.archived = true;
-            old.superseded_by = Some(id.clone());
-            old.updated_at = now_c;
-            old.schema_version = SCHEMA_VERSION;
-            // Write inline; save() re-acquires the same (non-reentrant)
-            // flock and would deadlock.
-            if let Err(e) = crate::store::save_atomic(&path, &old) {
-                tracing::warn!(id = %old_id_c, error = %e, "supersede archive write failed");
-            }
-        });
-    }
-
     let working_dir = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
@@ -500,10 +467,50 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
         timeout_default,
     };
 
-    match save(home, &decision) {
+    match persist_post(home, &decision) {
         Ok(()) => serde_json::json!({"id": id, "status": "posted"}),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
+}
+
+/// Persist the successor before recording the reverse link on its predecessor.
+/// This ordering prevents an old decision from pointing at a successor whose
+/// save failed. The predecessor's read→mutate→save remains under its own lock.
+fn persist_post(home: &Path, decision: &Decision) -> anyhow::Result<()> {
+    let Some(old_id) = decision.supersedes.as_ref() else {
+        return save(home, decision);
+    };
+    let old_id_c = old_id.clone();
+    let successor_id = decision.id.clone();
+    let now = decision.updated_at.clone();
+    with_decision_lock(home, &old_id_c, || -> anyhow::Result<()> {
+        // The generated successor id differs from the predecessor id, so this
+        // acquires a distinct lock while keeping the full supersede operation
+        // serialized on the predecessor.
+        save(home, decision)?;
+        let path = decision_path(home, &old_id_c);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let Ok(mut old) = serde_json::from_str::<Decision>(&content) else {
+            return Ok(());
+        };
+        // #1990: don't archive (and thereby re-save/downgrade) a record a
+        // newer daemon wrote.
+        if old.schema_version > SCHEMA_VERSION {
+            return Ok(());
+        }
+        old.archived = true;
+        old.superseded_by = Some(successor_id);
+        old.updated_at = now;
+        old.schema_version = SCHEMA_VERSION;
+        // Write inline; save() re-acquires the same (non-reentrant) flock and
+        // would deadlock.
+        if let Err(e) = crate::store::save_atomic(&path, &old) {
+            tracing::warn!(id = %old_id_c, error = %e, "supersede archive write failed");
+        }
+        Ok(())
+    })?
 }
 
 /// #2305: parse the `options` arg — accepts either `[{label, recommended}]`
@@ -563,10 +570,36 @@ pub fn get(home: &Path, args: &Value) -> Value {
 
     let live_dir = decisions_dir(home);
     let archive_dir = live_dir.join(".archive");
-    let decision = [live_dir.as_path(), archive_dir.as_path()]
-        .into_iter()
-        .find_map(|dir| load_decision_file(&dir.join(format!("{id}.json"))))
-        .filter(|decision| decision.id == id);
+    let mut decision = None;
+    for dir in [live_dir.as_path(), archive_dir.as_path()] {
+        let path = dir.join(format!("{id}.json"));
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return decision_unreadable(&path, format!("read failed: {error}")),
+        };
+        let parsed: Decision = match serde_json::from_str(&raw) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return decision_unreadable(
+                    &path,
+                    format!(
+                        "malformed JSON at line {}, column {}",
+                        error.line(),
+                        error.column()
+                    ),
+                )
+            }
+        };
+        if parsed.schema_version > SCHEMA_VERSION {
+            return decision_unreadable(&path, "record uses a newer schema");
+        }
+        if parsed.id != id {
+            return decision_unreadable(&path, "record id does not match requested id");
+        }
+        decision = Some(parsed);
+        break;
+    }
     let Some(decision) = decision else {
         return serde_json::json!({
             "error": format!("decision not found: {id}"),
@@ -578,10 +611,13 @@ pub fn get(home: &Path, args: &Value) -> Value {
     serde_json::json!({"decision": record})
 }
 
-fn load_decision_file(path: &Path) -> Option<Decision> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let decision: Decision = serde_json::from_str(&raw).ok()?;
-    (decision.schema_version <= SCHEMA_VERSION).then_some(decision)
+fn decision_unreadable(path: &Path, reason: impl Into<String>) -> Value {
+    serde_json::json!({
+        "error": "decision record is unreadable",
+        "code": "decision_unreadable",
+        "path": path.display().to_string(),
+        "reason": reason.into(),
+    })
 }
 
 /// #2313 P2b: pending-question tally bucketed by author, computed with ONE
@@ -995,7 +1031,15 @@ fn terse_decision_value(value: &mut Value) {
 }
 
 fn minimal_decision_value(value: &mut Value) {
-    const KEEP: &[&str] = &["id", "title", "author", "status", "tags", "created_at"];
+    const KEEP: &[&str] = &[
+        "id",
+        "title",
+        "author",
+        "status",
+        "tags",
+        "created_at",
+        "archived",
+    ];
     let Some(object) = value.as_object_mut() else {
         return;
     };
