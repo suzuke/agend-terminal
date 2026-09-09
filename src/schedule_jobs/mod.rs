@@ -67,6 +67,8 @@ pub(crate) struct Run {
     pub next_attempt_at: i64,
     pub deadline: i64,
     pub cleanup_pending: bool,
+    #[serde(default)]
+    pub recovery_required: bool,
     pub task_settled: bool,
     pub notification: NotificationState,
     pub notification_receipt: Option<String>,
@@ -74,7 +76,9 @@ pub(crate) struct Run {
 }
 impl Run {
     fn active(&self) -> bool {
-        !matches!(self.phase, Phase::Succeeded | Phase::Failed) || self.cleanup_pending
+        !matches!(self.phase, Phase::Succeeded | Phase::Failed)
+            || self.cleanup_pending
+            || self.recovery_required
     }
 }
 
@@ -207,6 +211,7 @@ pub(crate) fn admit_due(
             next_attempt_at: now.timestamp(),
             deadline: now.timestamp().saturating_add(config.timeout_secs as i64),
             cleanup_pending: false,
+            recovery_required: false,
             task_settled: false,
             notification: if config.notification.is_some() {
                 NotificationState::Pending
@@ -279,7 +284,7 @@ fn complete_as(
             return Ok(());
         }
         anyhow::ensure!(
-            matches!(run.phase, Phase::Running | Phase::Dispatching),
+            !run.recovery_required && matches!(run.phase, Phase::Running | Phase::Dispatching),
             "attempt is not accepting completion"
         );
         run.result = Some(result.into());
@@ -307,3 +312,74 @@ fn replace(home: &Path, old: &Run, mut new: Run) -> anyhow::Result<bool> {
 }
 
 pub(crate) use controller::tick;
+
+/// Explicit creator acknowledgement after externally verifying all tool work
+/// stopped and delivery was reconciled. This action never kills or retries.
+pub(crate) fn resolve_recovery(
+    home: &Path,
+    caller: &str,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let result = (|| -> anyhow::Result<()> {
+        let id = args["run_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing run_id"))?;
+        let number = args["attempt_id"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("missing attempt_id"))?;
+        anyhow::ensure!(args["cleanup_confirmed"].as_bool() == Some(true), "explicit cleanup_confirmed=true required after verifying all worker tools stopped and delivery reconciled");
+        let note = args["result"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty() && s.len() <= 65536)
+            .ok_or_else(|| {
+                anyhow::anyhow!("nonempty recovery audit note <= 65536 bytes required")
+            })?;
+        let run = read(home)?
+            .runs
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown run"))?;
+        let attempt = run
+            .attempt
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no active attempt"))?;
+        anyhow::ensure!(
+            caller == run.created_by && caller != attempt.name,
+            "only the schedule creator may acknowledge external recovery"
+        );
+        anyhow::ensure!(
+            run.recovery_required && u64::from(attempt.number) == number,
+            "stale or non-recovering attempt"
+        );
+        let _permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+            home,
+            &attempt.name,
+            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))?;
+        anyhow::ensure!(
+            !fleet.instances.contains_key(&attempt.name),
+            "delete the externally stopped worker before acknowledging recovery"
+        );
+        let mut next = run.clone();
+        next.recovery_required = false;
+        next.cleanup_pending = false;
+        if next.phase != Phase::Succeeded {
+            next.phase = Phase::Failed;
+        }
+        next.error = Some(format!(
+            "{}; recovery acknowledged by {caller}: {note}",
+            run.error.as_deref().unwrap_or("manual recovery")
+        ));
+        anyhow::ensure!(
+            replace(home, &run, next)?,
+            "run changed during recovery; inspect current state"
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => serde_json::json!({"status":"recovery_resolved"}),
+        Err(error) => serde_json::json!({"error":error.to_string()}),
+    }
+}

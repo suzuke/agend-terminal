@@ -134,18 +134,6 @@ pub(crate) fn full_delete_instance_with_expected_identity(
     delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
     expected: Option<(&str, Option<&str>)>,
 ) -> Result<(), String> {
-    full_delete_instance_with_exit_receipt(home, name, delete_context, expected, None)
-}
-
-/// Persist a process-exit receipt inside the teardown fence, before fallible
-/// ancillary cleanup. A failed receipt must not be reported as a completed delete.
-pub(crate) fn full_delete_instance_with_exit_receipt(
-    home: &Path,
-    name: &str,
-    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
-    expected: Option<(&str, Option<&str>)>,
-    exit_receipt: Option<&dyn Fn() -> Result<(), String>>,
-) -> Result<(), String> {
     // #2855: reject an invalid (traversal) name BEFORE the lifecycle permit,
     // the deleting-mark, and every name-derived path removal below — this fn
     // joins the raw name into workspace/runtime/backend-data paths.
@@ -226,9 +214,6 @@ pub(crate) fn full_delete_instance_with_exit_receipt(
     let mut step_errors: Vec<String> = Vec::new();
 
     delete_with_runtime_or_legacy(home, name, delete_context, false)?;
-    if let Some(record_exit) = exit_receipt {
-        record_exit()?;
-    }
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
         step_errors.push(format!("fleet.yaml removal: {e}"));
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");

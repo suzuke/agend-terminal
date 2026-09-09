@@ -17,6 +17,7 @@ pub(crate) fn tick(home: &Path, runtime: &impl JobRuntime, now: i64) -> anyhow::
             tracing::error!(run_id = %run.id, %error, "job reconciliation failed; durable state retained");
             if let Some(current) = read(home)?.runs.into_iter().find(|r| r.id == run.id) {
                 let mut updated = current.clone();
+                updated.recovery_required |= error.to_string().contains("recovery_required");
                 updated.error = Some(error.to_string());
                 if updated != current {
                     replace(home, &current, updated)?;
@@ -76,6 +77,10 @@ fn settle_task(home: &Path, run: &Run) -> anyhow::Result<()> {
 }
 fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::Result<()> {
     let mut next = run.clone();
+    if run.recovery_required {
+        reconcile_notification(home, run, |r| super::notification::send(home, r))?;
+        return Ok(());
+    }
     if matches!(run.phase, Phase::Succeeded | Phase::Failed) {
         if !run.task_settled {
             match settle_task(home, run) {
@@ -91,7 +96,10 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
             match stopped {
                 Ok(true) => next.cleanup_pending = false,
                 Ok(false) => {}
-                Err(error) => next.error = Some(format!("cleanup pending: {error}")),
+                Err(error) => {
+                    next.recovery_required |= error.to_string().contains("recovery_required");
+                    next.error = Some(format!("cleanup pending: {error}"));
+                }
             }
         }
         if next != *run {

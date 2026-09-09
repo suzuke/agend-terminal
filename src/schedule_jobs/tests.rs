@@ -371,3 +371,84 @@ fn every_second_cron_admits_latest_due_at_exact_and_fractional_ticks() {
         std::fs::remove_dir_all(h).unwrap();
     }
 }
+
+#[test]
+fn conservative_recovery_requires_creator_confirmation_and_never_retries() {
+    struct Unproven;
+    impl JobRuntime for Unproven {
+        fn start(&self, _: &Run, _: &Attempt) -> anyhow::Result<String> {
+            panic!("no retry")
+        }
+        fn observe(&self, _: &Attempt) -> anyhow::Result<Observation> {
+            panic!("frozen")
+        }
+        fn dispatch(&self, _: &Run, _: &Attempt) -> anyhow::Result<()> {
+            panic!("no redispatch")
+        }
+        fn stop(&self, _: &Attempt) -> anyhow::Result<bool> {
+            anyhow::bail!("recovery_required: no containment")
+        }
+    }
+    for succeeded in [false, true] {
+        let h = TempHome::new();
+        let h = h.path();
+        admit_due(h, &schedule(h), now()).unwrap();
+        advance_to_running(h, &Fake::default(), now().timestamp());
+        let old = read(h).unwrap().runs[0].clone();
+        let mut pending = old.clone();
+        pending.phase = if succeeded {
+            Phase::Succeeded
+        } else {
+            Phase::Stopping
+        };
+        pending.result = succeeded.then(|| "already delivered".into());
+        pending.cleanup_pending = succeeded;
+        replace(h, &old, pending).unwrap();
+        tick(h, &Unproven, now().timestamp()).unwrap();
+        let run = read(h).unwrap().runs[0].clone();
+        assert!(run.recovery_required);
+        tick(h, &Unproven, now().timestamp() + 99999).unwrap();
+        let attempt = run.attempt.as_ref().unwrap();
+        let args = serde_json::json!({"run_id":run.id,"attempt_id":attempt.number,
+            "cleanup_confirmed":true,"result":"all tools stopped; delivery checked"});
+        assert!(resolve_recovery(h, &attempt.name, &args)
+            .get("error")
+            .is_some());
+        assert!(resolve_recovery(h, "other", &args).get("error").is_some());
+        assert!(
+            resolve_recovery(h, &run.created_by, &args)
+                .get("error")
+                .is_some(),
+            "worker still exists"
+        );
+        crate::fleet::remove_instance_from_yaml(h, &attempt.name).unwrap();
+        let mut unconfirmed = args.clone();
+        unconfirmed["cleanup_confirmed"] = false.into();
+        assert!(resolve_recovery(h, &run.created_by, &unconfirmed)
+            .get("error")
+            .is_some());
+        let mut stale = args.clone();
+        stale["attempt_id"] = 999.into();
+        assert!(resolve_recovery(h, &run.created_by, &stale)
+            .get("error")
+            .is_some());
+        let resolved = resolve_recovery(h, &run.created_by, &args);
+        assert!(resolved.get("error").is_none(), "{resolved}");
+        tick(h, &Unproven, now().timestamp() + 99999).unwrap();
+        let resolved = read(h).unwrap().runs[0].clone();
+        assert!(!resolved.active());
+        assert_eq!(
+            resolved.phase,
+            if succeeded {
+                Phase::Succeeded
+            } else {
+                Phase::Failed
+            }
+        );
+        assert_eq!(resolved.result, run.result);
+        assert_eq!(resolved.attempt, run.attempt);
+        assert!(resolve_recovery(h, &run.created_by, &args)
+            .get("error")
+            .is_some());
+    }
+}

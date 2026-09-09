@@ -45,7 +45,7 @@ agent 或操作者想在 PR merge 後 30 分鐘做一次 cleanup，這類只會�
 
 ### Daemon 管理的 Job 排程
 
-使用 `job` 取代 `instance`，讓 daemon 在到點時建立 worker，負責執行紀錄、重試、完成追蹤與回收，不需要常駐協調者。
+使用 `job` 取代 `instance`，讓 daemon 在到點時建立 worker，負責執行紀錄、完成與復原追蹤，不需要常駐協調者。此版只對尚未記錄啟動意圖的失敗自動重試；一旦 attempt 可能已啟動，就不自動換 backend 重跑。
 
 ```json
 {
@@ -64,11 +64,11 @@ agent 或操作者想在 PR merge 後 30 分鐘做一次 cleanup，這類只會�
 }
 ```
 
-`backends` 必須是非空、不重複且有順序的標準 backend 名稱列表：`claude`、`codex`、`kiro-cli`、`opencode`、`antigravity-cli` 或 `grok`。不接受任意命令或 shell。`artifact_directory` 必須是絕對路徑。預設值與範圍：`timeout_secs` 3600（60–86400）、`max_attempts` 3（1–10）、`retry_delay_secs` 60（1–3600）；未知 Job 欄位會被拒絕。
+`backends` 必須是非空、不重複且有順序的標準 backend 名稱列表：`claude`、`codex`、`kiro-cli`、`opencode`、`antigravity-cli` 或 `grok`。不接受任意命令或 shell。`artifact_directory` 必須是絕對路徑。預設值與範圍：`timeout_secs` 3600（60–86400）、`max_attempts` 3（1–10）、`retry_delay_secs` 60（1–3600）；未知 Job 欄位會被拒絕。`backends`、`max_attempts` 與 `retry_delay_secs` 只適用於啟動意圖記錄前的失敗，不適用於啟動後的額度限制或故障。
 
-`output_context` 是固定的業務推送指示，不是憑證，也不會自動建立通道目的地。Worker 必須使用其工具可存取且已獲授權的目的地設定。每次嘗試有獨立工作目錄；逐字稿、摘要及推送紀錄應保存在 `artifact_directory`，回收 worker 時保留。
+`output_context` 是固定的業務推送指示，不是憑證，也不會自動建立通道目的地。Worker 必須使用其工具可存取且已獲授權的目的地設定。每次嘗試有獨立工作目錄；逐字稿、摘要及推送紀錄應保存在 `artifact_directory`。無法證明所有子孫程序都已停止時，daemon 保留 worker 工作目錄並記錄 `recovery_required`，不自動刪除。
 
-選填的 `job.notification` 會在 Run 結束時發出一次狀態通知，與業務推送分開：
+選填的 `job.notification` 會發出一次完成或待人工復原的狀態通知，與業務推送分開：
 
 ```json
 "notification": {"channel": "telegram", "chat_id": -1001234567890, "topic_id": 42}
@@ -76,7 +76,7 @@ agent 或操作者想在 PR merge 後 30 分鐘做一次 cleanup，這類只會�
 
 請將範例 chat ID 換成 fleet 已設定的 Telegram 群組，topic ID 換成既有主題；省略 `topic_id` 則不指定討論串。Daemon 在設定與發送時核對明確的群組，不從建立者或 worker 推測目的地，也不建立新主題。憑證沿用既有通道環境設定。Telegram 回傳的 message ID 會保存在 Run；發送途中當機或傳輸結果不明時記為 `unknown`，不盲目重送。通知狀態與執行成功、清理分開，可透過 `runs` 核對未知結果。此版狀態通知支援 Telegram；Podcast 的 Telegram／LINE 業務推送仍依任務指示執行。
 
-Job 使用獨立且持久化的排程進度。停機期間錯過的 cron 合併為最近一次到點，不累積 worker；前一 Run 仍在執行時，後續到點記為重疊略過。Job 不走舊的一次性訊息補送或目標 instance 遺失停用流程。切換 backend 前必須觀察到舊 worker 已退出，無法確認退出便不啟動替代者。
+Job 使用獨立且持久化的排程進度。停機期間錯過的 cron 合併為最近一次到點，不累積 worker；前一 Run 仍在執行時，後續到點記為重疊略過。Job 不走舊的一次性訊息補送或目標 instance 遺失停用流程。已啟動的 attempt 不會自動換 backend；即使 backend 程序已退出，其工具或其他子孫程序仍可能存活。額度限制、逾時、當機及啟動後故障都需要人工復原。`recovery_required` 或清理尚未解除時，後續到點持續記為重疊略過。
 
 使用 `{"action":"runs","id":"<schedule-id>"}` 查看執行紀錄。成功必須由目前 worker 呼叫：
 
@@ -84,7 +84,19 @@ Job 使用獨立且持久化的排程進度。停機期間錯過的 cron 合併�
 {"action":"complete","run_id":"<run-id>","attempt_id":1,"result":"已完成；成果：/absolute/path/podcast-artifacts/..."}
 ```
 
-Daemon 核對目前 attempt 與呼叫者身分後保存完成收據。Idle、程序退出、訊息已排入及 task 狀態本身都不代表成功。Task 結案與清理在收據保存後接續處理；這些步驟失敗不會重跑已成功的工作。
+Daemon 核對目前 attempt 與呼叫者身分後保存完成收據。Idle、程序退出、訊息已排入及 task 狀態本身都不代表成功。Task 結案在收據保存後接續處理，後續步驟失敗不會重跑已成功的工作。即使 `cleanup_pending` 與 `recovery_required` 仍需人工清理，已成功的 Run 仍保留成功狀態。此版正常成功後也需要完成人工復原，才能啟動後續 Run。
+
+人工解除復原狀態：
+
+1. 查看 `runs`、保存需要的工作目錄檔案，並在外部停止 worker 及所有工具／子孫程序；核對不明的推送結果與進度紀錄。
+2. 完成上述清理後，使用既有 `delete_instance` 操作移除 worker 的 fleet 項目。僅刪除主程序並不能證明所有子孫程序已停止。
+3. 操作者確認外部清理完成後，由原排程建立者呼叫：
+
+```json
+{"action":"resolve_recovery","run_id":"<run-id>","attempt_id":1,"cleanup_confirmed":true,"result":"操作者已確認 worker 與工具程序全部停止，推送及進度紀錄已核對。"}
+```
+
+僅 Run 記錄中的原建立者能解除復原，attempt worker 不能自行解除。此操作要求 worker 已無 fleet 項目，保存稽核說明，但不終止程序。既有成功收據會保留；未完成的工作改記失敗。解除復原後不會重試同一 Run，後續排程到點才可再次執行，已略過的到點不補跑。
 
 Job 與 instance 模式不能互換，需建立新排程。更新 `job` 會替換後續 Run 的設定，既有 Run 保留原快照。Job 不接受 `instance`、`linked_task_id`、`replacement_key` 或 `fire_strategy: "until_success"`。
 
@@ -420,5 +432,3 @@ Daemon 啟動時自動檢查孤兒部署——部署記錄中的 instance 在 `f
 2. 加上幾週後在 log 裡仍看得懂的標籤。
 3. deployments 用於可重複的 fleet 配置，而不是臨時提醒。
 4. 除非有充分理由，否則讓 cron 表達式保持簡單。
-
-Daemon 突然中斷時，舊 worker 的子程序可能尚未結束。執行器會先保存啟動意圖，再記錄 PID 與程序出生識別。若重啟後沒有可用的 child handle，也沒有已確認停止的持久紀錄，Run 會標示 `recovery_required` 並保留工作目錄，不另開重複 worker。PID 消失或被重用，不能單獨證明所有子程序都已退出；這類不確定情況需要操作人員復原，不會被誤報為自動重試成功。

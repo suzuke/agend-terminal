@@ -63,15 +63,21 @@ fn send_with(
     let status = match run.phase {
         Phase::Succeeded => "succeeded",
         Phase::Failed => "failed",
-        _ => anyhow::bail!("only terminal runs may send completion notifications"),
+        _ if run.recovery_required => "recovery_required",
+        _ => anyhow::bail!("only terminal or recovery-required runs may notify"),
     };
     let detail = if run.phase == Phase::Succeeded {
         run.result.as_deref()
     } else {
         run.error.as_deref()
     };
+    let recovery = if run.recovery_required {
+        "Manual recovery required: confirm worker and background tools stopped, reconcile delivery, delete the worker, then ask the schedule creator to resolve_recovery. No automatic handoff.\n"
+    } else {
+        ""
+    };
     let header = format!(
-        "Scheduled job {status}\nSchedule: {}\nRun: {}\nTask: {}\n",
+        "Scheduled job {status}\n{recovery}Schedule: {}\nRun: {}\nTask: {}\n",
         run.schedule_id,
         run.id,
         run.task_id.as_deref().unwrap_or("none")

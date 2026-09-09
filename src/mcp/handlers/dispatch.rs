@@ -531,6 +531,7 @@ action_adapter!(dispatch_schedule, "schedule", [
     "create" => schedule::handle_create_schedule,  hai;
     "runs" => schedule::handle_job_runs, ha;
     "complete" => schedule::handle_job_complete, hai;
+    "resolve_recovery" => schedule::handle_job_resolve_recovery, hai;
     "list"   => schedule::handle_list_schedules,   ha;
     "update" => schedule::handle_update_schedule,  ha;
     "delete" => schedule::handle_delete_schedule,  ha;

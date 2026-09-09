@@ -44,3 +44,7 @@ pub(super) fn handle_job_runs(home: &Path, args: &Value) -> Value {
 pub(super) fn handle_job_complete(home: &Path, args: &Value, instance_name: &str) -> Value {
     crate::schedule_jobs::complete(home, instance_name, args)
 }
+
+pub(super) fn handle_job_resolve_recovery(home: &Path, args: &Value, instance_name: &str) -> Value {
+    crate::schedule_jobs::resolve_recovery(home, instance_name, args)
+}
