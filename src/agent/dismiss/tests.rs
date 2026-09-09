@@ -46,7 +46,7 @@ fn reviewer_3561_short_quote_real_patterns_write_nothing() {
 fn real_patterns_only_recover_a_recognized_modal_tail_3561() {
     let _inline = InlineWrite::arm();
     let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
-    let anchor = live.split("  ❯ 1.").next().unwrap();
+    let anchor = live.split("  ❯ 1.").next().expect("modal anchor");
     for (label, tail, expected) in [
         ("unknown-prompt", "  Continue? [y/N]\n", vec![]),
         ("unknown-text", "  Confirm deletion\n", vec![]),
