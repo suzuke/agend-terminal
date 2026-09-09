@@ -762,13 +762,22 @@ mod tests {
             }
 
             fn reap(&mut self) -> Result<(), String> {
+                let mut errors = Vec::new();
                 if let Some(leader) = &mut self.leader {
-                    Self::reap_child(leader)?;
+                    if let Err(error) = Self::reap_child(leader) {
+                        errors.push(format!("leader: {error}"));
+                    }
                 }
                 if let Some(member) = &mut self.member {
-                    Self::reap_child(member)?;
+                    if let Err(error) = Self::reap_child(member) {
+                        errors.push(format!("member: {error}"));
+                    }
                 }
-                Ok(())
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
             }
         }
         impl Drop for GroupGuard {
@@ -797,12 +806,28 @@ mod tests {
                 .spawn()
                 .unwrap(),
         );
-        group.leader.as_mut().unwrap().kill().unwrap();
-        group.leader.as_mut().unwrap().wait().unwrap();
+        let member_pid = group.member.as_ref().unwrap().id();
+        assert_eq!(
+            unsafe { libc::getpgid(member_pid as i32) },
+            pgid as i32,
+            "fixture member must join the leader's process group before leader reap"
+        );
         assert_eq!(
             unsafe { libc::kill(-(pgid as i32), 0) },
             0,
-            "fixture requires a surviving sibling group member"
+            "fixture requires a surviving sibling group member before leader reap"
+        );
+        group.leader.as_mut().unwrap().kill().unwrap();
+        group.leader.as_mut().unwrap().wait().unwrap();
+        assert_eq!(
+            unsafe { libc::getpgid(member_pid as i32) },
+            pgid as i32,
+            "fixture member must remain in the process group after leader reap"
+        );
+        assert_eq!(
+            unsafe { libc::kill(-(pgid as i32), 0) },
+            0,
+            "fixture requires a surviving sibling group member after leader reap"
         );
         let home = TempHome::new();
         let (runtime, _, attempt) = reserved_fixture(home.path());
@@ -887,6 +912,7 @@ mod tests {
             .cleanup()
             .expect("registered worker fixture cleanup must succeed");
         assert!(child.lock().try_wait().unwrap().is_some());
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_none());
     }
 
     #[test]
