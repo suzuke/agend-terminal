@@ -51,6 +51,19 @@ Exact isolation record from that run:
 
 No separate reviewer agent was assigned for task 278. The completed review was a local self-review of the final diff; external independent verification remains pending with the orchestrator.
 
+## Decision 61 original-feature RED audit
+
+The exact original full schedule-Job v1 pre-implementation RED artifact does not exist. The authoritative manifest `/tmp/pr3582-task251-coverage-manifest.md` records that implementation commit `fb9c1cfd273e5f230b4cb75fba2df9ddd3a831ca` introduced the implementation and its 14 schedule-job tests together, while pre-feature base `d4da139c3af3af31dd566166b40b56db6ebd8628` contains no `src/schedule_jobs` files and no recovery integration tests. The manifest explicitly marks the opt-in Job requirement as “No original RED.”
+
+The preserved base checks were structural, not RED test executions:
+
+```sh
+git ls-tree -r --name-only d4da139c3af3af31dd566166b40b56db6ebd8628 -- src/schedule_jobs
+git ls-tree -r --name-only d4da139c3af3af31dd566166b40b56db6ebd8628 -- src/api/tests/job_recovery.rs tests/admin_job_recovery.rs
+```
+
+Both produced no paths. The meaningful pre-feature substitute was an isolated base external-entry probe: `tool schedule --action create` succeeded but persisted a legacy `target="offline"` row with no `job` field (`/tmp/pr3582-task257-base-tool-create5.log`, `/tmp/pr3582-task257-base-external-entry5.log`); the exact shell invocation text was not preserved in those output logs. This proves feature absence at the external entry, not the full original Job acceptance matrix. Later regression REDs for PTY replacement, recovery refusal/access, queue/refusal, or cleanup races are post-feature evidence and are not original v1 REDs.
+
 ## Exact-head isolation comparison
 
 After inspecting each fixture's setup and containment, the nine tests were run one at a time with the exact command template `cargo test --locked --bin agend-terminal '<test>' -- --nocapture --test-threads=1`.
