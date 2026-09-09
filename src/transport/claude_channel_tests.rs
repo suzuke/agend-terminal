@@ -231,6 +231,48 @@ fn explicit_legacy_pty_is_the_only_claude_fallback() {
 }
 
 #[test]
+fn unrelated_missing_env_source_preserves_legacy_pty_opt_in_3540_r1() {
+    let home = home("legacy-missing-unrelated-env");
+    fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  claude-agent:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n      DESTINATION_TOKEN:\n        from_env: AGEND_TEST_MISSING_ENV_3540_R1\n",
+    )
+    .expect("fleet");
+
+    assert!(
+        legacy_pty_opt_in(&home, "claude-agent"),
+        "an unrelated missing source must not erase the declared legacy PTY opt-in"
+    );
+    assert_eq!(
+        mode_for_instance(&home, "claude-agent"),
+        TransportMode::LegacyPty
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[tracing_test::traced_test]
+#[test]
+fn missing_transport_mode_source_is_reported_and_keeps_channel_bridge_3540_r2() {
+    let home = home("transport-mode-missing-source");
+    fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  claude-agent:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE:\n        from_env: AGEND_TEST_MISSING_TRANSPORT_MODE_3540_R2\n",
+    )
+    .expect("fleet");
+
+    assert!(!legacy_pty_opt_in(&home, "claude-agent"));
+    assert!(logs_contain(
+        "Claude transport mode environment resolution failed; retaining ChannelBridge"
+    ));
+    assert!(logs_contain("AGEND_TEST_MISSING_TRANSPORT_MODE_3540_R2"));
+    assert_eq!(
+        mode_for_instance(&home, "claude-agent"),
+        TransportMode::ChannelBridge
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn channel_locator_persists_across_daemon_restart() {
     let home = home("locator");
     let (first, first_listener) =

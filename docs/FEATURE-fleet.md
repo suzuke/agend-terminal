@@ -301,8 +301,24 @@ defaults:
 # Then reference in fleet.yaml only if you need to rename:
 defaults:
   env:
-    SERVICE_KEY_ALIAS: "${MY_SERVICE_API_KEY}"
+    SERVICE_KEY_ALIAS:
+      from_env: MY_SERVICE_API_KEY
 ```
+
+`from_env` is a whole-value reference read from the daemon process environment
+when the instance is resolved. If the source variable is unset or is not valid
+Unicode, AgEnD refuses to start the instance and reports the source variable
+name. Literal strings are never interpolated, so `"${NAME}"` remains exactly
+`"${NAME}"`.
+The referenced value is never written back to `fleet.yaml` or included in this
+error or its logs. An instance name that is not present in `fleet.yaml` still
+uses the existing unmanaged/default resolution path; it is distinct from a
+configured instance whose `from_env` source cannot be resolved.
+
+The sensitive-variable policy is still applied to the destination key
+(`SERVICE_KEY_ALIAS` above), including the existing backend-credential
+exception. The source variable name and value do not bypass that policy.
+`passthrough_env` is unchanged and continues to pass through same-name keys.
 
 **Per-instance overrides:**
 

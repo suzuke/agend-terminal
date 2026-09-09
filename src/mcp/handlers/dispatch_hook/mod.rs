@@ -249,9 +249,18 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         })?,
     };
     let lifecycle_permit = _guard.permit();
-    let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-        .ok()
-        .and_then(|f| f.resolve_instance(target));
+    let resolved = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+        Ok(fleet) => fleet
+            .resolve_instance_checked(target)
+            .map_err(|error| DispatchError {
+                message: error.to_string(),
+                code: ErrorCode::EnvSourceMissing,
+                stage: Stage::ResolveSourceRepo,
+                fetch_attempted: false,
+                raw: None,
+            })?,
+        Err(_) => None,
+    };
     let (source_repo, source_repo_tier) =
         resolve_source_repo(home, target, source_repo_override, resolved.as_ref());
     let expected_head = exact_head::resolve(&source_repo, expected_head)?;
@@ -942,11 +951,27 @@ pub(crate) fn resolve_team_source_repo(home: &Path, agent: &str) -> Option<PathB
 /// as ordinary branch dispatch. Review assignments use this path to provision
 /// their separate disposable workspace while keeping the subject branch in
 /// assignment authority.
-pub(crate) fn resolve_source_repo_for_target(home: &Path, target: &str) -> PathBuf {
-    let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-        .ok()
-        .and_then(|f| f.resolve_instance(target));
-    resolve_source_repo(home, target, None, resolved.as_ref()).0
+pub(crate) fn resolve_source_repo_for_target(
+    home: &Path,
+    target: &str,
+) -> Result<PathBuf, serde_json::Value> {
+    let resolved = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+        Ok(fleet) => fleet
+            .resolve_instance_checked(target)
+            .map_err(env_resolve_error_json)?,
+        Err(_) => None,
+    };
+    Ok(resolve_source_repo(home, target, None, resolved.as_ref()).0)
+}
+
+fn env_resolve_error_json(error: crate::fleet::EnvResolveError) -> serde_json::Value {
+    serde_json::json!({
+        "error": error.to_string(),
+        "code": "env_source_missing",
+        "instance": error.instance,
+        "destination": error.destination,
+        "source": error.source,
+    })
 }
 
 /// Parse `owner/repo` from a `git remote get-url origin` output.
@@ -1079,9 +1104,12 @@ pub(crate) fn resolve_review_assignment_repo(
         return provider_neutral_slug::canonicalize_repo_slug_any_forge(repo)
             .ok_or_else(unresolved);
     }
-    let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-        .ok()
-        .and_then(|f| f.resolve_instance(resolved_target));
+    let resolved = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+        Ok(fleet) => fleet
+            .resolve_instance_checked(resolved_target)
+            .map_err(env_resolve_error_json)?,
+        Err(_) => None,
+    };
     let (source_repo, _tier) = resolve_source_repo(home, resolved_target, None, resolved.as_ref());
     canonical_repo_slug_for_source(&source_repo).ok_or_else(unresolved)
 }

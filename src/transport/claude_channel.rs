@@ -1341,11 +1341,22 @@ fn random_token() -> anyhow::Result<String> {
 }
 
 pub(crate) fn legacy_pty_opt_in(home: &Path, instance: &str) -> bool {
-    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+    let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
-        .and_then(|fleet| fleet.resolve_instance(instance))
-        .and_then(|resolved| resolved.env.get("AGEND_TRANSPORT_MODE").cloned())
-        .is_some_and(|mode| mode.eq_ignore_ascii_case("legacy_pty"))
+        .map(|fleet| fleet.resolve_env_value(instance, "AGEND_TRANSPORT_MODE"));
+    match resolved {
+        Some(Ok(Some(mode))) => mode.eq_ignore_ascii_case("legacy_pty"),
+        Some(Err(error)) => {
+            tracing::error!(
+                instance = %error.instance,
+                destination = %error.destination,
+                source = %error.source,
+                "Claude transport mode environment resolution failed; retaining ChannelBridge"
+            );
+            false
+        }
+        Some(Ok(None)) | None => false,
+    }
 }
 
 pub(crate) fn prepare_claude_channel(
