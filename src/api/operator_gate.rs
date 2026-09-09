@@ -827,4 +827,16 @@ mod tests {
             &json!({"tool": "usage_limit_takeover", "instance": ""})
         ));
     }
+    #[test]
+    fn capability_agent_cannot_acknowledge_job_recovery() {
+        for instance in ["", "operator", "creator"] {
+            let params = json!({"tool":"schedule","instance":instance,
+                "arguments":{"action":"resolve_recovery","cleanup_confirmed":true}});
+            assert!(!capability_allows_request(P::Agent, method::MCP_TOOL, &params));
+            assert!(capability_allows_request(P::Operator, method::MCP_TOOL, &params));
+        }
+        assert!(capability_allows_request(P::Agent, method::MCP_TOOL,
+            &json!({"tool":"schedule","arguments":{"action":"complete"}})));
+    }
+
 }
