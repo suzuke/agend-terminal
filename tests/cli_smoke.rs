@@ -810,7 +810,8 @@ fn stop_transport_failure_is_not_reported_as_absent_3559() {
     assert!(pid_alive(daemon_pid), "daemon must be alive before stop");
 
     // Keep the daemon alive but make the published API endpoint unreachable.
-    // `home_guard` owns the daemon and reaps it after this assertion.
+    // `daemon` owns the exact foreground child and tears it down after this
+    // assertion; `home_guard` removes the unique home after `daemon` drops.
     std::fs::write(
         home.join("run")
             .join(daemon_pid.to_string())
