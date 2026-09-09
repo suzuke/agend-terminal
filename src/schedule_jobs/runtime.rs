@@ -691,4 +691,63 @@ mod tests {
         runtime.stop(&attempt).unwrap();
         assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_none());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_leader_receipt_does_not_authorize_cleanup_of_live_group() {
+        use std::os::unix::process::CommandExt;
+        struct GroupGuard {
+            leader: Option<std::process::Child>,
+            pgid: u32,
+        }
+        impl Drop for GroupGuard {
+            fn drop(&mut self) {
+                if self.pgid > 0 {
+                    unsafe {
+                        libc::kill(-(self.pgid as i32), libc::SIGKILL);
+                    }
+                }
+                if let Some(child) = &mut self.leader {
+                    let _ = child.wait();
+                }
+            }
+        }
+        let mut group = GroupGuard {
+            leader: None,
+            pgid: 0,
+        };
+        group.leader = Some(
+            std::process::Command::new("sh")
+                .args(["-c", "sleep 60 >/dev/null 2>&1 &"])
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        group.pgid = group.leader.as_ref().unwrap().id();
+        group.leader.as_mut().unwrap().wait().unwrap();
+        assert_eq!(
+            unsafe { libc::kill(-(group.pgid as i32), 0) },
+            0,
+            "fixture requires a surviving descendant in the isolated group"
+        );
+        let home = TempHome::new();
+        let (runtime, _, attempt) = reserved_fixture(home.path());
+        let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
+        let id = register_worker(home.path(), &attempt, &workspace).unwrap();
+        std::fs::create_dir_all(home.path().join("schedule_job_processes")).unwrap();
+        crate::store::save_atomic(
+            &journal_path(home.path(), &attempt.name),
+            &serde_json::json!({
+                "uuid": id, "phase": "Stopped", "pid": group.pgid,
+                "start_token": null, "pgid": group.pgid,
+            }),
+        )
+        .unwrap();
+        let result = runtime.stop(&attempt);
+        assert!(
+            result.is_err(),
+            "leader-only receipt allowed cleanup while its descendant group is alive"
+        );
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
+    }
 }
