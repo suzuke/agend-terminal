@@ -592,7 +592,10 @@ mod tests {
         std::fs::create_dir_all(&run.config.artifact_directory).unwrap();
 
         let error = runtime.start(&run, &attempt).unwrap_err().to_string();
-        assert!(error.contains("outside disposable worker workspace"), "{error}");
+        assert!(
+            error.contains("outside disposable worker workspace"),
+            "{error}"
+        );
         assert!(!journal_path(home.path(), &attempt.name).exists());
         assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_none());
     }

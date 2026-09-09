@@ -283,14 +283,20 @@ fn task257_cron_entry_keeps_legacy_reminder_and_job_watermarks_independent() {
     crate::daemon::cron_tick::check_schedules(&h);
 
     let schedules = crate::schedules::load(&h).schedules;
-    let legacy = schedules.iter().find(|s| s.id == "legacy-reminder").unwrap();
+    let legacy = schedules
+        .iter()
+        .find(|s| s.id == "legacy-reminder")
+        .unwrap();
     assert_eq!(
         legacy.run_history.last().map(|r| r.status.as_str()),
         Some("ok_inbox")
     );
     let jobs = read(&h).unwrap();
     assert_eq!(jobs.runs.len(), 1);
-    assert_eq!(jobs.watermarks.get("job-cron").copied(), Some(jobs.runs[0].scheduled_at));
+    assert_eq!(
+        jobs.watermarks.get("job-cron").copied(),
+        Some(jobs.runs[0].scheduled_at)
+    );
     assert_eq!(crate::inbox::drain(&h, "offline").len(), 1);
     std::fs::remove_dir_all(h).unwrap();
 }
@@ -395,8 +401,7 @@ fn task257_accepted_notification_then_response_error_is_unknown_without_retry() 
         .notification_error
         .as_deref()
         .is_some_and(|error| error.contains("accepted by transport")));
-    controller::reconcile_notification(&h, &unknown, |_| panic!("must not resend"))
-        .unwrap();
+    controller::reconcile_notification(&h, &unknown, |_| panic!("must not resend")).unwrap();
     assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
     std::fs::remove_dir_all(h).unwrap();
 }
@@ -431,10 +436,19 @@ fn task257_status_receipt_does_not_interpret_business_receipts() {
     controller::reconcile_notification(&h, &run, |_| Ok("status-telegram-1".into())).unwrap();
     let status = read(&h).unwrap().runs[0].clone();
     assert_eq!(status.notification, NotificationState::Sent);
-    assert_eq!(status.notification_receipt.as_deref(), Some("status-telegram-1"));
+    assert_eq!(
+        status.notification_receipt.as_deref(),
+        Some("status-telegram-1")
+    );
     assert_eq!(std::fs::read(receipt_path).unwrap(), business_receipt_bytes);
-    assert_ne!(status.notification_receipt.as_deref(), Some("business-tg-1"));
-    assert_ne!(status.notification_receipt.as_deref(), Some("business-line-1"));
+    assert_ne!(
+        status.notification_receipt.as_deref(),
+        Some("business-tg-1")
+    );
+    assert_ne!(
+        status.notification_receipt.as_deref(),
+        Some("business-line-1")
+    );
     std::fs::remove_dir_all(h).unwrap();
 }
 

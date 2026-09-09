@@ -371,3 +371,20 @@ fn recovery_fixture_reaps_daemon_when_observation_panics() {
     );
     std::fs::remove_dir_all(&home).unwrap();
 }
+
+#[test]
+fn child_guard_drop_after_reap_skips_grace_window() {
+    let child = Command::new(env!("CARGO_BIN_EXE_agend-terminal"))
+        .arg("--version")
+        .spawn()
+        .unwrap();
+    let mut guard = ChildGuard::new(child);
+    assert!(guard.wait_bounded(DAEMON_GRACE));
+
+    let drop_started = Instant::now();
+    drop(guard);
+    assert!(
+        drop_started.elapsed() < Duration::from_secs(1),
+        "already-reaped ChildGuard must not wait through its grace window"
+    );
+}
