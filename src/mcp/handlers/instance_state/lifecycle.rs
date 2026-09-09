@@ -163,7 +163,7 @@ pub(crate) fn full_delete_instance_with_precondition(
     // early `Err`, panic), so the name is always re-creatable afterwards — a
     // leaked mark would make it un-spawnable for the daemon's lifetime.
     let mut delete_fence =
-        crate::daemon::lifecycle::DeleteFence::new(home, name, delete_context.is_some());
+        crate::daemon::lifecycle::DeleteFence::admit(home, name, delete_context.is_some());
     if let Some((creator, expected_uuid)) = expected {
         let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .map_err(|error| format!("identity lookup refused: {error}"))?;
@@ -186,6 +186,7 @@ pub(crate) fn full_delete_instance_with_precondition(
     if let Some(check) = precondition {
         check()?;
     }
+    delete_fence.commit_cleanup(name);
     // Fence transport delivery before any teardown side effect. The keyed
     // guard invalidates queued epochs and excludes same-agent I/O for the full
     // delete transaction, including removal of the receipt files below.

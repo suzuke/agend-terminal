@@ -177,9 +177,11 @@ pub(crate) mod test_support {
 /// still active; the transport guard then performs its final epoch bump and
 /// releases the lane. This prevents an enqueue from observing a fresh epoch
 /// after the marker disappears but before transport invalidation completes.
+/// A refused admission instead releases its lane without invalidating delivery.
 pub(crate) struct DeleteFence {
     deleting: Option<crate::agent::deleting::DeletingGuard>,
     transport: Option<crate::daemon::delivery_worker::TransportGenerationGuard>,
+    admission: Option<crate::daemon::delivery_worker::TransportAdmissionGuard>,
 }
 
 impl DeleteFence {
@@ -196,11 +198,32 @@ impl DeleteFence {
         Self {
             deleting,
             transport,
+            admission: None,
+        }
+    }
+
+    /// Block competing spawns while validation can still refuse without
+    /// invalidating queued delivery or erasing pending inject verification.
+    pub(crate) fn admit(home: &Path, name: &str, hold_transport: bool) -> Self {
+        let deleting = Some(crate::agent::deleting::mark_deleting(home, name));
+        let admission = hold_transport
+            .then(|| crate::daemon::delivery_worker::begin_transport_admission(home, name));
+        Self {
+            deleting,
+            admission,
+            transport: None,
+        }
+    }
+
+    pub(crate) fn commit_cleanup(&mut self, name: &str) {
+        if let Some(admission) = self.admission.take() {
+            self.transport = Some(admission.into_cleanup());
+            crate::daemon::inject_delivery::forget(name);
         }
     }
 
     pub(crate) fn attach_transport_cleanup(&mut self, home: &Path, name: &str) {
-        debug_assert!(self.transport.is_none());
+        debug_assert!(self.transport.is_none() && self.admission.is_none());
         self.transport = Some(crate::daemon::delivery_worker::begin_transport_cleanup(
             home, name,
         ));
@@ -212,6 +235,7 @@ impl Drop for DeleteFence {
     fn drop(&mut self) {
         drop(self.deleting.take());
         drop(self.transport.take());
+        drop(self.admission.take());
     }
 }
 
