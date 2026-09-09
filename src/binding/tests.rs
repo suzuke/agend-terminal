@@ -294,50 +294,7 @@ fn install_hooks_rewrites_legacy_vendor_prepare_commit_msg_3557() {
         include_str!("../../assets/hooks/prepare-commit-msg.ps1"),
         "daemon reconciliation must replace stale PowerShell hook content"
     );
-    assert!(
-        std::fs::write(hooks.join("prepare-commit-msg"), "vendor overwrite\n").is_err(),
-        "a later vendor writer must fail loudly instead of replacing the daemon hook"
-    );
-    assert_eq!(
-        std::fs::read_to_string(hooks.join("prepare-commit-msg")).unwrap(),
-        include_str!("../../assets/hooks/prepare-commit-msg"),
-        "the daemon hook must survive a later conflicting writer"
-    );
     std::fs::remove_dir_all(&home).ok();
-}
-
-/// A vendor write that already opened the old file must not overwrite the
-/// canonical hook after reconciliation returns. chmod cannot revoke an fd.
-#[cfg(unix)]
-#[test]
-fn install_hooks_isolates_inflight_vendor_writer_3557() {
-    use std::io::Write;
-
-    let home = tmp_home("inflight-vendor-prepare-commit-msg");
-    let hooks = home.join("hooks");
-    std::fs::create_dir_all(&hooks).unwrap();
-    let path = hooks.join("prepare-commit-msg");
-    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
-    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-    let vendor_path = path.clone();
-    let vendor = std::thread::spawn(move || {
-        // Pause std::fs::write's open/truncate -> write sequence at its syscall
-        // boundary, while the real daemon install_hooks entry point runs.
-        let mut file = std::fs::File::create(vendor_path).unwrap();
-        opened_tx.send(()).unwrap();
-        resume_rx.recv().unwrap();
-        file.write_all(include_bytes!(
-            "../../vendor/agentic-git/crates/agentic-git/assets/hooks/prepare-commit-msg"
-        ))
-        .unwrap();
-    });
-    opened_rx.recv().unwrap();
-    install_hooks(&home, &home.join("not-a-repo"));
-    resume_tx.send(()).unwrap();
-    vendor.join().unwrap();
-    let installed = std::fs::read(&path).unwrap();
-    std::fs::remove_dir_all(&home).unwrap();
-    assert_eq!(installed, include_bytes!("../../assets/hooks/prepare-commit-msg"));
 }
 
 /// #2234: the reference-transaction hook is (1) FAIL-OPEN — always exits 0, even

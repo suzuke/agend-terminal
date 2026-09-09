@@ -750,47 +750,6 @@ pub(crate) use worktree_state::{refresh_cached, worktree_binding_state, Worktree
 /// Install the prepare-commit-msg hook into a worktree via core.hooksPath.
 /// Points to `$AGEND_HOME/hooks/` unified directory.
 /// Installs bash hook on Unix, PowerShell hook on Windows.
-fn write_daemon_owned_hook(path: &Path, content: &str, _executable: bool) -> std::io::Result<()> {
-    if std::fs::read(path).is_ok_and(|installed| installed != content.as_bytes()) {
-        tracing::warn!(path = %path.display(), "replacing non-canonical daemon-owned hook content");
-    }
-
-    for _ in 0..3 {
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut permissions = metadata.permissions();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(if _executable { 0o755 } else { 0o644 });
-            }
-            #[cfg(not(unix))]
-            // Windows requires clearing the read-only file attribute before replacement.
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            std::fs::set_permissions(path, permissions)?;
-        }
-
-        std::fs::write(path, content)?;
-        let mut permissions = std::fs::metadata(path)?.permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            permissions.set_mode(if _executable { 0o555 } else { 0o444 });
-        }
-        #[cfg(not(unix))]
-        permissions.set_readonly(true);
-        std::fs::set_permissions(path, permissions)?;
-        if std::fs::read(path)?.as_slice() == content.as_bytes() {
-            return Ok(());
-        }
-    }
-
-    Err(std::io::Error::other(format!(
-        "hook content changed while installing {}",
-        path.display()
-    )))
-}
-
 pub fn install_hooks(home: &Path, worktree: &Path) {
     let hooks_dir = home.join("hooks");
     std::fs::create_dir_all(&hooks_dir).ok();
@@ -798,14 +757,19 @@ pub fn install_hooks(home: &Path, worktree: &Path) {
     // Extract embedded hook scripts (both platforms for portability).
     let bash_hook = include_str!("../assets/hooks/prepare-commit-msg");
     let bash_path = hooks_dir.join("prepare-commit-msg");
-    if let Err(error) = write_daemon_owned_hook(&bash_path, bash_hook, true) {
+    if let Err(error) = std::fs::write(&bash_path, bash_hook) {
         tracing::error!(path = %bash_path.display(), %error, "failed to install daemon-owned prepare-commit-msg hook");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&bash_path, std::fs::Permissions::from_mode(0o755));
     }
 
     // Windows: also install PowerShell version.
     let ps_hook = include_str!("../assets/hooks/prepare-commit-msg.ps1");
     let ps_path = hooks_dir.join("prepare-commit-msg.ps1");
-    if let Err(error) = write_daemon_owned_hook(&ps_path, ps_hook, false) {
+    if let Err(error) = std::fs::write(&ps_path, ps_hook) {
         tracing::error!(path = %ps_path.display(), %error, "failed to install daemon-owned prepare-commit-msg PowerShell hook");
     }
 
