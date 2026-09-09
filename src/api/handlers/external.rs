@@ -162,6 +162,24 @@ mod tests {
     }
 
     #[test]
+    fn register_external_refuses_name_while_delete_fence_is_active() {
+        let (ctx, home) = test_ctx();
+        let name = "job-prelaunch-fence";
+        let mark = crate::agent::deleting::mark_deleting(&home, name);
+        let params = json!({"name": name, "backend": "claude", "pid": 4242});
+        let rejected = handle_register_external(&params, &ctx);
+        assert_eq!(
+            rejected["ok"],
+            json!(false),
+            "external registration ignored active deletion fence"
+        );
+        assert!(agent::lock_external(ctx.externals).is_empty());
+        drop(mark);
+        assert_eq!(handle_register_external(&params, &ctx)["ok"], json!(true));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn register_external_valid_pid_registers_1891() {
         let (ctx, home) = test_ctx();
         let resp = handle_register_external(
