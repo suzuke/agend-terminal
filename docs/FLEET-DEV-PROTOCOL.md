@@ -783,7 +783,7 @@ A PR that resolves a tracked issue MUST carry a closing keyword (`Closes #N` / `
 
 `↳ 緣由 A-§12.7`
 
-## §13. `AGEND_GIT_BYPASS=1` Usage
+## §13. `AGENTIC_GIT_BYPASS=1` Usage
 
 **TL;DR:** agents use normal git inside their daemon-managed worktree and never bypass a shim denial. Bypass is reserved for daemon internals and explicitly operator-authorized repair/bootstrapping exceptions.
 
@@ -797,7 +797,7 @@ git add / commit / fetch
 git push origin <your-branch>     # any branch except main
 ```
 
-Do not preemptively prefix `AGEND_GIT_BYPASS=1`. If the shim denies an action, stop and follow the daemon-managed remediation or ask the lead/operator; the denial is not permission to retry beneath the guard.
+Do not preemptively prefix `AGENTIC_GIT_BYPASS=1`. If the shim denies an action, stop and follow the daemon-managed remediation or ask the lead/operator; the denial is not permission to retry beneath the guard. The legacy `AGEND_GIT_BYPASS=1` spelling is also accepted by the shim.
 
 ### 13.2 Authorized bypass scopes
 
@@ -828,7 +828,7 @@ Any one of these can invalidate review or strand operator state; treat bypass as
 3. Follow a daemon-managed remediation (`repo`, `bind_self`, `release_worktree`) when offered.
 4. If the only proposed remediation is bypass, an agent pauses and requests lead/operator direction. Only the operator or an explicitly authorized procedure may approve the exact one-command scope.
 
-`AGEND_GIT_BYPASS_UNTIL=<epoch>` is for audited, time-bounded operator interventions; it is not an agent convenience flag.
+`AGENTIC_GIT_BYPASS_UNTIL=<epoch>` is for audited, time-bounded operator interventions; it is not an agent convenience flag. The legacy `AGEND_GIT_BYPASS_UNTIL=<epoch>` spelling is also accepted by the shim.
 
 ### 13.5 Bug-Blocks-Its-Own-Fix Exception (Sprint 62)
 
