@@ -17,10 +17,8 @@ fn reviewer_3561_short_quote_real_patterns_write_nothing() {
     let patterns = claude_prepared_patterns_3314();
     let (writer, bytes) = recording_writer_3314();
     let mut gate = DevModalGate::new(true);
-        let mut tracker = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
-        // The modal was visible before a pane resize cropped its footer.
-        tracker.feed(live);
-        tracker.feed(&screen);
+    let mut tracker = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+    tracker.feed(&screen);
     gate.set_prompt_blocked(is_dismissible_prompt_state(tracker.get_state()));
     let mut spent = false;
     for frame in 0..30 {
@@ -62,6 +60,8 @@ fn real_patterns_only_recover_a_recognized_modal_tail_3561() {
         let mut gate = DevModalGate::new(true);
         let mut tracker =
             crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+        // The modal was visible before a pane resize cropped its footer.
+        tracker.feed(live);
         tracker.feed(&screen);
         gate.set_prompt_blocked(is_dismissible_prompt_state(tracker.get_state()));
         let mut spent = false;
