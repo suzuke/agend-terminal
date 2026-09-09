@@ -29,6 +29,34 @@ fn reviewer_3561_short_quote_real_patterns_write_nothing() {
     assert!(bytes.lock().is_empty(), "quoted warning must not answer a different prompt: {:?}", *bytes.lock());
 }
 
+#[test]
+fn real_patterns_only_recover_a_recognized_modal_tail_3561() {
+    let _inline = InlineWrite::arm();
+    let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
+    let anchor = live.split("  ❯ 1.").next().unwrap();
+    for (label, tail, expected) in [
+        ("unknown-prompt", "  Continue? [y/N]\n", vec![]),
+        ("unknown-text", "  Confirm deletion\n", vec![]),
+        ("short-modal", "  ❯ 1. I am using this for local development\n    2. Exit\n", vec![13]),
+    ] {
+        let screen = format!("{anchor}{tail}");
+        let patterns = claude_prepared_patterns_3314();
+        let (writer, bytes) = recording_writer_3314();
+        let mut gate = DevModalGate::new(true);
+        let mut tracker = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+        tracker.feed(&screen);
+        gate.set_prompt_blocked(is_dismissible_prompt_state(tracker.get_state()));
+        let mut spent = false;
+        for frame in 0..30 {
+            try_prepared_dismiss_dialog_once_per_spawn(
+                &format!("real-tail-3561-{label}"), &screen, &writer, &patterns,
+                DismissScanScope::Startup, &mut gate, LogicalMs(frame * 400), &mut spent,
+            );
+        }
+        assert_eq!(*bytes.lock(), expected, "{label}");
+    }
+}
+
 /// Pre-#3314-r1 tests exercise the MATCHER, not the generation gate. Give
 /// them a permanently-armed gate already past the stability window so their
 /// meaning is unchanged by the new parameters.
