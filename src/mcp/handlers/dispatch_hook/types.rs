@@ -127,6 +127,8 @@ pub enum Stage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
+    /// A configured fleet environment source was absent or non-Unicode.
+    EnvSourceMissing,
     /// `expected_head` was not a full 40/64-hex SHA.
     InvalidExpectedHead,
     /// `expected_head` did not resolve or differed from the bound HEAD.

@@ -114,7 +114,7 @@ pub(super) fn spawn_runtime_or_legacy(
         spawner: params["spawner"].as_str().filter(|s| !s.is_empty()),
         target_pane: params["target_pane"].as_str().filter(|s| !s.is_empty()),
     };
-    let spawn_request = crate::agent_ops::spawn::resolve_spawn_request(home, &spawn_params);
+    let spawn_request = crate::agent_ops::spawn::resolve_spawn_request(home, &spawn_params)?;
     let outcome = crate::agent_ops::spawn::spawn_instance(
         &crate::agent_ops::spawn::SpawnContext {
             home,

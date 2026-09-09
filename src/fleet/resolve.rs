@@ -129,8 +129,10 @@ fn resolve_effort(fleet: &super::FleetConfig, inst: &super::InstanceConfig) -> O
 pub(super) fn resolve_instance(
     fleet: &super::FleetConfig,
     name: &str,
-) -> Option<super::ResolvedInstance> {
-    let inst = fleet.instances.get(name)?;
+) -> Result<Option<super::ResolvedInstance>, super::EnvResolveError> {
+    let Some(inst) = fleet.instances.get(name) else {
+        return Ok(None);
+    };
     let defaults = &fleet.defaults;
 
     let backend = inst
@@ -152,14 +154,23 @@ pub(super) fn resolve_instance(
         defaults.args.clone()
     };
 
-    let mut env = defaults.env.clone();
-    env.extend(inst.env.clone());
+    let mut configured_env = defaults.env.clone();
+    configured_env.extend(inst.env.clone());
+    let mut env = std::collections::HashMap::with_capacity(configured_env.len() + 1);
+    for (key, value) in configured_env {
+        let value = resolve_env_entry(name, &key, value)?;
+        env.insert(key, value);
+    }
     env.insert("AGEND_INSTANCE_NAME".to_string(), name.to_string());
 
-    let ready_pattern = resolve_ready_pattern(inst, defaults, &preset, name)?;
-    let working_directory = resolve_working_directory(inst, name)?;
+    let Some(ready_pattern) = resolve_ready_pattern(inst, defaults, &preset, name) else {
+        return Ok(None);
+    };
+    let Some(working_directory) = resolve_working_directory(inst, name) else {
+        return Ok(None);
+    };
 
-    Some(super::ResolvedInstance {
+    Ok(Some(super::ResolvedInstance {
         name: name.to_string(),
         backend: backend.clone(),
         backend_command: backend_cmd,
@@ -186,5 +197,40 @@ pub(super) fn resolve_instance(
             .or_else(|| defaults.instructions.clone()),
         source_repo: inst.source_repo.as_ref().map(|d| expand_tilde_path(d)),
         repo: inst.repo.clone(),
-    })
+    }))
+}
+
+pub(super) fn resolve_env_value(
+    fleet: &super::FleetConfig,
+    name: &str,
+    destination: &str,
+) -> Result<Option<String>, super::EnvResolveError> {
+    let Some(inst) = fleet.instances.get(name) else {
+        return Ok(None);
+    };
+    let configured = inst
+        .env
+        .get(destination)
+        .or_else(|| fleet.defaults.env.get(destination));
+    configured
+        .cloned()
+        .map(|value| resolve_env_entry(name, destination, value))
+        .transpose()
+}
+
+fn resolve_env_entry(
+    instance: &str,
+    destination: &str,
+    value: super::FleetEnvValue,
+) -> Result<String, super::EnvResolveError> {
+    match value {
+        super::FleetEnvValue::Literal(value) => Ok(value),
+        super::FleetEnvValue::FromEnv { from_env } => {
+            std::env::var(&from_env).map_err(|_| super::EnvResolveError {
+                instance: instance.to_string(),
+                destination: destination.to_string(),
+                source: from_env,
+            })
+        }
+    }
 }
