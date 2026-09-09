@@ -99,11 +99,9 @@ pub(crate) const MODAL_STATIC_LINES: &[&str] = &[
 /// actually blocking the pane satisfies the anchor, and `prompt_blocked` is true
 /// — because of that other prompt. The CR would have answered it.
 ///
-/// Two further conditions close that, and both are about the FRAME rather than
-/// the text: the match must be the bottom-most thing on screen
-/// ([`ANCHOR_TAIL_MAX_LINES`]), and no other dismiss pattern may match the same
-/// frame ([`DevModalGate::set_other_prompt_on_screen`]). A live modal owns the
-/// bottom of its pane; a quotation has the rest of the transcript under it.
+/// The tail must fit the modal's known option text, as well as the bounded
+/// bottom region ([`ANCHOR_TAIL_MAX_LINES`]). The other-dismiss-pattern check
+/// is additional protection; its pattern set does not enumerate every prompt.
 pub(crate) const MODAL_ANCHOR_LINES: &[&str] = &[
     "WARNING: Loading development channels",
     "is for local channel development",
@@ -121,18 +119,9 @@ pub(crate) const MODAL_ANCHOR_LINES: &[&str] = &[
 /// while nothing is being drawn.
 pub(crate) const RELAXED_AFTER_INCOMPLETE_FRAMES: u32 = 24;
 
-/// How many non-blank lines may follow an anchored match and still leave it the
-/// bottom-most thing on screen.
-///
-/// #3561 R1 B1, remedy (a). Derived from the modal's own shape rather than
-/// chosen: below [`MODAL_ANCHOR_LINES`]'s last entry the shipped modal renders
-/// exactly four more non-blank lines — option 1, option 2, and
-/// `Enter to confirm` (with a blank between). A pane too short to show the whole
-/// modal cuts that tail off, so the anchor ends at or near the last rendered
-/// line. A frame that QUOTES the warning has the rest of the transcript below
-/// it, which does not fit in four lines. Deliberately not "zero lines": the
-/// complete match can fail with option 1 still visible, and refusing that case
-/// would give up the recovery this whole path exists for.
+/// Bound the tail to the channel-line remainder, two options, and footer.
+/// Line count alone is insufficient: a different prompt can occupy one line.
+/// `anchor_reaches_bottom` also checks the option text and order.
 pub(crate) const ANCHOR_TAIL_MAX_LINES: usize = 4;
 
 /// Hard ceiling on answers per generation, across all fingerprints.
@@ -405,16 +394,21 @@ fn digest_and_end_of_lines(screen: &str, lines: &[&str]) -> Option<(u64, usize)>
     Some((hash, end))
 }
 
-/// Is the anchored match the bottom-most content of the frame?
-///
-/// #3561 R1 B1 remedy (a). Counts only non-blank lines after the match, so
-/// trailing padding a terminal emits does not disarm the recovery.
+/// Require the known modal tail rather than accepting arbitrary short prompts.
+/// The first line is the remainder of `Channels: <channel>`. After it, only
+/// the modal's ordered options/footer (possibly cut off by pane height) fit.
 fn anchor_reaches_bottom(screen: &str, end: usize) -> bool {
-    screen[end..]
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count()
-        <= ANCHOR_TAIL_MAX_LINES
+    let tail = &screen[end..];
+    if tail.lines().filter(|line| !line.trim().is_empty()).count() > ANCHOR_TAIL_MAX_LINES {
+        return false;
+    }
+    let Some((_, options)) = tail.split_once('\n') else {
+        return true;
+    };
+    let options = options.split_whitespace().collect::<Vec<_>>().join(" ");
+    let expected =
+        "❯ 1. I am using this for local development 2. Exit Enter to confirm · Esc to cancel";
+    expected.starts_with(&options)
 }
 
 /// Find an ASCII literal while tolerating terminal-induced wrapping inside its
@@ -1142,16 +1136,11 @@ mod resilience_3547_tests {
         }
     }
 
-    /// The same shape with a SHORT trailing prompt, so the bottom-region rule
-    /// alone would admit it. Only remedy (b) — "something else on this frame is
-    /// answerable" — refuses it. Kept separate so the two guards cannot mask
-    /// each other.
+    /// The other-pattern fact remains an additional refusal even when the
+    /// modal tail itself is recognized. Production wiring has real-entry tests.
     #[test]
-    fn a_quoted_warning_above_a_short_prompt_is_refused_by_the_other_prompt_fact_3561() {
-        // Short on purpose: the remainder of the matched line and the quoted
-        // blank already consume part of the tail budget, so the trailing prompt
-        // has to be terse for this frame to reach remedy (b) at all.
-        let screen = quoted_warning_then("  Continue? [y/N]\n");
+    fn a_recognized_short_modal_is_refused_by_the_other_prompt_fact_3561() {
+        let screen = frame_missing_tail();
         assert!(
             anchored_modal_digest(&screen).is_some(),
             "this frame must pass the bottom-region rule, or it does not isolate remedy (b)"
