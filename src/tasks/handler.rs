@@ -939,6 +939,8 @@ fn handle_done(
     // self-IPC or take other locks) runs AFTER the per-id flock drops (#1629). The
     // fingerprint match guarantees `routed.board()` still names the appended board,
     // so the post-lock read-back reads the right board.
+    #[cfg(test)]
+    super::fire_before_mutation_commit_hook_for_test();
     let append_result = routed.with_revalidated_board(home, |board| {
         crate::task_events::append_checked_at(board, &emitter, event, |state| {
             let tv = state

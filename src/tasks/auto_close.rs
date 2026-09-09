@@ -144,6 +144,8 @@ fn auto_close_on_report_with_mode(
     // route revalidation (the closure does ONLY the append; the cascade below —
     // terminal cleanup + release recompute, which may self-IPC — runs AFTER the
     // flock drops, #1629). A route change under the lock → not closed.
+    #[cfg(test)]
+    super::fire_before_mutation_commit_hook_for_test();
     let closed = match routed.with_revalidated_board(home, |board| {
         crate::task_events::append_done_if_legal_at(board, &emitter, correlation_id, vec![event])
     }) {

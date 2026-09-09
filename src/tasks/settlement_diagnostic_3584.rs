@@ -204,6 +204,7 @@ fn signed_other_task_receipt_completion_3584(
     report: bool,
     invalid_signature: bool,
     same_task: bool,
+    rebind: bool,
 ) {
     let home = Home::new();
     let id = task(&home);
@@ -297,6 +298,35 @@ fn signed_other_task_receipt_completion_3584(
         !intents_before.is_empty(),
         "must preserve an actual existing intent"
     );
+    let rebound = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let wip = worktree.join("current-wip.txt");
+    if rebind {
+        std::fs::write(&wip, b"preserve new work").unwrap();
+        crate::binding::unbind(&home.0, "dev");
+        let hook_home = home.0.clone();
+        let hook_worktree = worktree.to_path_buf();
+        let hook_source = source.clone();
+        let hook_task = other_id.to_string();
+        let captured = std::rc::Rc::clone(&rebound);
+        super::set_before_mutation_commit_hook_for_test(move || {
+            crate::binding::bind_full(
+                &hook_home,
+                "dev",
+                &hook_task,
+                "fix/other",
+                &hook_worktree,
+                &hook_source,
+                false,
+            )
+            .unwrap();
+            let path = crate::paths::runtime_dir(&hook_home).join("dev/binding.json");
+            *captured.borrow_mut() = Some((
+                std::fs::read(&path).unwrap(),
+                std::fs::read(path.with_file_name("binding.json.sig")).unwrap(),
+                crate::binding::read(&hook_home, "dev").unwrap(),
+            ));
+        });
+    }
     if report {
         let accepted = super::auto_close::auto_close_on_report(
             &home.0,
@@ -322,6 +352,15 @@ fn signed_other_task_receipt_completion_3584(
             assert_eq!(accepted["status"], "done", "{accepted}");
         }
     }
+    let (before_bytes, signature_before, binding) = if rebind {
+        assert_eq!(std::fs::read(&wip).unwrap(), b"preserve new work");
+        rebound
+            .borrow_mut()
+            .take()
+            .expect("rebind hook must execute")
+    } else {
+        (before_bytes, signature_before, binding)
+    };
     assert_eq!(std::fs::read(&binding_path).unwrap(), before_bytes);
     assert_eq!(std::fs::read(&signature_path).unwrap(), signature_before);
     assert_eq!(crate::binding::read(&home.0, "dev").unwrap(), binding);
@@ -349,31 +388,40 @@ fn signed_other_task_receipt_completion_3584(
 
 #[test]
 fn corrective_done_preserves_signed_other_task_3584() {
-    signed_other_task_receipt_completion_3584(false, false, false);
+    signed_other_task_receipt_completion_3584(false, false, false, false);
 }
 
 #[test]
 fn corrective_report_preserves_signed_other_task_3584() {
-    signed_other_task_receipt_completion_3584(true, false, false);
+    signed_other_task_receipt_completion_3584(true, false, false, false);
 }
 
 #[test]
 fn invalid_signature_denies_done_3584() {
-    signed_other_task_receipt_completion_3584(false, true, false);
+    signed_other_task_receipt_completion_3584(false, true, false, false);
 }
 
 #[test]
 fn invalid_signature_denies_report_3584() {
-    signed_other_task_receipt_completion_3584(true, true, false);
+    signed_other_task_receipt_completion_3584(true, true, false, false);
 }
 
 #[test]
 fn same_task_branch_mismatch_denies_done_3584() {
-    signed_other_task_receipt_completion_3584(false, false, true);
+    signed_other_task_receipt_completion_3584(false, false, true, false);
 }
 #[test]
 fn same_task_branch_mismatch_denies_report_3584() {
-    signed_other_task_receipt_completion_3584(true, false, true);
+    signed_other_task_receipt_completion_3584(true, false, true, false);
+}
+
+#[test]
+fn rebind_before_done_preserves_new_work_3584() {
+    signed_other_task_receipt_completion_3584(false, false, false, true);
+}
+#[test]
+fn rebind_before_report_preserves_new_work_3584() {
+    signed_other_task_receipt_completion_3584(true, false, false, true);
 }
 
 #[test]
