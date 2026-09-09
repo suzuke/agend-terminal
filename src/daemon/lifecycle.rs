@@ -614,6 +614,90 @@ mod tests {
     }
 
     #[test]
+    fn refused_admission_does_not_drop_delivery_before_lane_acquisition() {
+        let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _delivery = crate::transport::test_support::delivery_hook_guard();
+        let _before_lane =
+            crate::daemon::delivery_worker::test_support::cleanup_before_lane_acquire_hook_guard();
+        let home = tmp_home("refused-admission-queue");
+        let agent = "refused-admission-queue-agent";
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), format!(
+            "instances:\n  {agent}:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n"
+        )).unwrap();
+        let (delivered_tx, delivered_rx) = std::sync::mpsc::channel();
+        let hook_home = home.clone();
+        crate::transport::test_support::set_delivery_hook(Some(Arc::new(
+            move |home, name, body| {
+                if home != hook_home.as_path() || name != agent {
+                    return None;
+                }
+                delivered_tx.send(()).unwrap();
+                let envelope = crate::transport::DeliveryEnvelope::new(
+                    name,
+                    crate::transport::SessionLocator::codex(
+                        std::path::PathBuf::from("/tmp/admission-fixture.sock"),
+                        Some("admission-fixture".into()),
+                    ),
+                    crate::transport::DeliveryKind::Notification,
+                    body,
+                    None,
+                );
+                Some(Ok(crate::transport::DeliveryReceipt::for_state(
+                    &envelope,
+                    crate::transport::DeliveryState::ProtocolAccepted,
+                )))
+            },
+        )));
+        let hook_home = home.clone();
+        crate::daemon::delivery_worker::test_support::set_cleanup_before_lane_acquire_hook(Some(
+            Arc::new(move |home, name| {
+                if home != hook_home.as_path() || name != agent {
+                    return;
+                }
+                crate::daemon::delivery_worker::enqueue_transport_delivery(
+                    home,
+                    name,
+                    "legitimate queued task",
+                )
+                .unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while crate::daemon::delivery_worker::test_support::transport_dispatch_count(
+                    home, name,
+                ) == 0
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "queued dispatcher must run before admission continues"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }),
+        ));
+        let registry = empty_registry();
+        let configs = Arc::new(Mutex::new(HashMap::new()));
+        let externals = Arc::new(Mutex::new(HashMap::new()));
+        let reject = || Err("refused admission fixture".to_string());
+        let result =
+            crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_precondition(
+                &home,
+                agent,
+                Some(&crate::agent_ops::DeleteContext {
+                    registry: &registry,
+                    configs: &configs,
+                    externals: &externals,
+                    notifier: None,
+                }),
+                None,
+                Some(&reject),
+            );
+        assert!(result.unwrap_err().contains("refused admission fixture"));
+        assert!(delivered_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "provisional deletion marker discarded a legitimate queued delivery before cleanup was refused");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn delete_fence_clears_marker_before_transport_finalization() {
         let _ff = crate::daemon::delivery_worker::test_support::force_full_guard();
         crate::daemon::delivery_worker::test_support::set_force_full(false);
