@@ -8,10 +8,10 @@ The latest main commit `07ca9298cfbbf7a0c5f46d4d9135e373141500b7` was integrated
 
 The final fixture correction also asserts the sibling's PGID before and after leader reap, checks the fleet entry is absent after registered-worker cleanup, and aggregates cleanup errors across both held children.
 
-Validation is complete for the owned runtime scope, formatting, clippy, and diff checks. The full binary suite was run and is red with 7,491 passes and 9 unrelated fixture failures; see `TASK278-EVIDENCE.md` for the exact failure names and commands. Do not describe the full suite as green.
+Validation is complete for the owned runtime scope, formatting, clippy, and diff checks. The full binary suite was run and is red with 7,491 passes and 9 fixture failures whose aggregate cause remains unproven; see `TASK278-EVIDENCE.md` for the exact failure names and commands. Do not describe the full suite as green.
 
 Each of those nine tests was then run individually on exact task head `951f028...` and exact base `07ca9298...` in a separately managed disposable worktree; all 18 focused runs passed. The failures were not reproduced in isolated serial runs; the aggregate cause remains unproven, and the aggregate red result is preserved.
 
 Decision 61’s original-feature RED audit found no exact pre-implementation full Job v1 fixture or replay command. Base `d4da139...` has no Job test/module surface; only structural absence checks and an external-entry substitute (legacy offline row without `job`) are preserved. See the evidence artifact for immutable commits, commands, and log paths.
 
-Next action: orchestrator/reviewer should inspect the two normal commits and decide whether the unrelated full-suite failures require separate follow-up. No publication or merge has been performed by this branch.
+Next action: orchestrator/reviewer should inspect the two normal commits and decide whether the aggregate full-suite failures require separate follow-up. No publication or merge has been performed by this branch.
