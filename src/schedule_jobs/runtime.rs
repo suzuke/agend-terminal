@@ -1,6 +1,6 @@
 //! Managed workers use the same spawn and teardown services as interactive instances.
 use super::{Attempt, Run};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -311,90 +311,23 @@ impl JobRuntime for ManagedRuntime {
 
     fn stop(&self, attempt: &Attempt) -> Result<bool> {
         let identity = self.identity(attempt)?;
-        let (tail, child) = {
-            let registry = crate::agent::lock_registry(&self.registry);
-            if registry
-                .values()
-                .any(|h| h.name.as_str() == attempt.name && Some(h.id) != identity)
-            {
-                bail!("refusing to stop a different worker identity");
-            }
-            let handle = identity.and_then(|id| registry.get(&id));
-            (
-                handle.map(|h| h.core.lock().vterm.tail_lines(10000)),
-                handle.map(|h| Arc::clone(&h.child)),
-            )
-        };
-        let journal = read_journal(&self.home, &attempt.name)?;
-        if let Some(journal) = &journal {
-            if let Some(expected) = &attempt.uuid {
-                anyhow::ensure!(&journal.uuid == expected, "process journal UUID changed");
-            }
-            if let Some(id) = identity {
-                anyhow::ensure!(journal.uuid == id.full(), "process journal UUID changed");
-            }
-        }
-        if let (Some(journal), Some(child)) = (&journal, &child) {
-            if journal.phase == ProcessPhase::Running {
-                let pid = child.lock().process_id();
-                anyhow::ensure!(
-                    pid == journal.pid,
-                    "recovery_required: registered process identity changed"
-                );
-                if let Some(token) = journal.start_token {
-                    // An already-exited child can no longer expose a birth token.
-                    let exited = child.lock().try_wait()?.is_some();
-                    anyhow::ensure!(
-                        exited || pid.and_then(crate::process::process_start_token) == Some(token),
-                        "recovery_required: registered process birth token changed"
-                    );
-                }
-            }
-        }
-        if tail.is_none() {
-            anyhow::ensure!(journal.as_ref().is_some_and(|j| j.phase == ProcessPhase::Stopped)
-                || (journal.is_none() && attempt.uuid.is_none()),
-                "recovery_required: worker is not registered and process-tree exit is unproven; cleanup refused");
-        }
-        if let Some(tail) = tail {
-            let logs = self.home.join("schedule_job_logs");
-            std::fs::create_dir_all(&logs)?;
-            std::fs::write(logs.join(format!("{}.txt", attempt.name)), tail)?;
-        }
-        let record_exit = || -> std::result::Result<(), String> {
-            if let Some(id) = identity
-                .map(|id| id.full())
-                .or_else(|| journal.as_ref().map(|j| j.uuid.clone()))
-            {
-                write_journal(
-                    &self.home,
-                    &attempt.name,
-                    &ProcessJournal {
-                        uuid: id,
-                        phase: ProcessPhase::Stopped,
-                        pid: journal.as_ref().and_then(|j| j.pid),
-                        start_token: journal.as_ref().and_then(|j| j.start_token),
-                    },
-                )
-                .map_err(|error| {
-                    format!("recovery_required: exit receipt could not persist: {error}")
-                })?;
-            }
-            Ok(())
-        };
-        crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_exit_receipt(
-            &self.home,
-            &attempt.name,
-            Some(&crate::agent_ops::DeleteContext {
-                registry: &self.registry,
-                configs: &self.configs,
-                externals: &self.externals,
+        let registered = crate::agent::lock_registry(&self.registry)
+            .values()
+            .any(|handle| handle.name.as_str() == attempt.name);
+        // No supported containment primitive proves that a launched worker's
+        // detached tools are gone. Even legacy Stopped receipts only proved
+        // leader exit. Preserve every launched attempt for explicit recovery.
+        anyhow::ensure!(read_journal(&self.home, &attempt.name)?.is_none()
+            && attempt.uuid.is_none() && !registered,
+            "recovery_required: launched job cleanup requires descendant containment proof; instance and artifacts retained");
+        // No spawn intent was ever written: only a pre-launch reservation can
+        // reach deletion. The shared permit rechecks its identity before effects.
+        crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_expected_identity(
+            &self.home, &attempt.name, Some(&crate::agent_ops::DeleteContext {
+                registry: &self.registry, configs: &self.configs, externals: &self.externals,
                 notifier: None,
-            }),
-            Some((OWNER, identity.as_ref().map(|id| id.full()).as_deref())),
-            Some(&record_exit),
-        )
-        .map_err(anyhow::Error::msg)?;
+            }), Some((OWNER, identity.as_ref().map(|id| id.full()).as_deref())),
+        ).map_err(anyhow::Error::msg)?;
         Ok(true)
     }
 
@@ -564,6 +497,7 @@ mod tests {
             deadline: 100,
             cleanup_pending: false,
             task_settled: false,
+            recovery_required: false,
             notification: super::super::NotificationState::NotRequested,
             notification_receipt: None,
             notification_error: None,
@@ -646,50 +580,56 @@ mod tests {
     }
 
     #[test]
-    fn exit_receipt_runs_before_ancillary_cleanup_and_failure_retains_fleet() {
+    fn legacy_stopped_receipt_never_authorizes_cleanup() {
         let home = TempHome::new();
         let (runtime, _, attempt) = reserved_fixture(home.path());
         let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
         let id = register_worker(home.path(), &attempt, &workspace).unwrap();
-        let record_exit = || {
-            write_journal(
-                home.path(),
-                &attempt.name,
-                &ProcessJournal {
-                    uuid: id.clone(),
-                    phase: ProcessPhase::Stopped,
-                    pid: None,
-                    start_token: None,
-                },
-            )
-            .unwrap();
-            Err("injected post-exit receipt failure".to_string())
-        };
-        let result =
-            crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_exit_receipt(
-                home.path(),
-                &attempt.name,
-                Some(&crate::agent_ops::DeleteContext {
-                    registry: &runtime.registry,
-                    configs: &runtime.configs,
-                    externals: &runtime.externals,
-                    notifier: None,
-                }),
-                Some((OWNER, Some(&id))),
-                Some(&record_exit),
-            );
-        assert!(result.unwrap_err().contains("injected post-exit"));
-        assert!(
-            read_journal(home.path(), &attempt.name)
-                .unwrap()
-                .unwrap()
-                .phase
-                == ProcessPhase::Stopped
+        write_journal(
+            home.path(),
+            &attempt.name,
+            &ProcessJournal {
+                uuid: id,
+                phase: ProcessPhase::Stopped,
+                pid: None,
+                start_token: None,
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(crate::fleet::fleet_yaml_path(home.path())).unwrap();
+        assert!(runtime
+            .stop(&attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required"));
+        assert_eq!(
+            std::fs::read(crate::fleet::fleet_yaml_path(home.path())).unwrap(),
+            before
         );
-        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
-        // Reconstructed runtime can repeat ancillary cleanup using the receipt.
-        runtime.stop(&attempt).unwrap();
+    }
+
+    #[test]
+    fn never_launched_reservation_can_be_cleaned() {
+        let home = TempHome::new();
+        let (runtime, _, attempt) = reserved_fixture(home.path());
+        let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
+        register_worker(home.path(), &attempt, &workspace).unwrap();
+        assert!(runtime.stop(&attempt).unwrap());
         assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_none());
+    }
+
+    #[test]
+    fn launched_uuid_without_journal_still_requires_recovery() {
+        let home = TempHome::new();
+        let (runtime, _, mut attempt) = reserved_fixture(home.path());
+        let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
+        attempt.uuid = Some(register_worker(home.path(), &attempt, &workspace).unwrap());
+        assert!(runtime
+            .stop(&attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required"));
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
     }
 
     #[cfg(unix)]
@@ -748,6 +688,48 @@ mod tests {
             result.is_err(),
             "leader-only receipt allowed cleanup while its descendant group is alive"
         );
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launched_registered_worker_is_retained_for_explicit_recovery() {
+        let home = TempHome::new();
+        let (runtime, mut run, mut attempt) = reserved_fixture(home.path());
+        attempt.backend = "sh".into();
+        run.attempt = Some(attempt.clone());
+        // Install cleanup before launching the shell fixture. It receives no
+        // task and launches no tools; production stop must still retain it.
+        struct Cleanup<'a> {
+            runtime: &'a ManagedRuntime,
+            name: String,
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
+                    &self.runtime.home, &self.name, Some(&crate::agent_ops::DeleteContext {
+                        registry: &self.runtime.registry, configs: &self.runtime.configs,
+                        externals: &self.runtime.externals, notifier: None,
+                    }),
+                );
+            }
+        }
+        let _cleanup = Cleanup {
+            runtime: &runtime,
+            name: attempt.name.clone(),
+        };
+        let id = runtime.start(&run, &attempt).unwrap();
+        attempt.uuid = Some(id.clone());
+        let parsed = crate::types::InstanceId::parse(&id).unwrap();
+        let child = Arc::clone(&crate::agent::lock_registry(&runtime.registry)[&parsed].child);
+        assert!(child.lock().try_wait().unwrap().is_none());
+        assert!(runtime
+            .stop(&attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required"));
+        assert!(crate::agent::lock_registry(&runtime.registry).contains_key(&parsed));
+        assert!(child.lock().try_wait().unwrap().is_none());
         assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
     }
 }
