@@ -16,6 +16,8 @@ mod sweep;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "tests.rs"]
 mod tests;
+#[cfg(test)]
+mod settlement_diagnostic_3584;
 
 // #2760 RED (frozen-plan d-…-7): strict-routing contract for `load_routed`.
 // Proven-failing against the checkpoint stub; the GREEN strict-resolution body
