@@ -4,6 +4,31 @@
 // path. Same module path (agent::dismiss::tests); no content change.
 use super::*;
 
+#[test]
+fn reviewer_3561_short_quote_real_patterns_write_nothing() {
+    let _inline = InlineWrite::arm();
+    let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
+    let quoted: String = live.lines()
+        .take_while(|line| !line.contains("I am using this for local development"))
+        .map(|line| format!("> {line}\n"))
+        .collect();
+    let screen = format!("{quoted}  Continue? [y/N]\n");
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    let mut tracker = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+    tracker.feed(&screen);
+    gate.set_prompt_blocked(is_dismissible_prompt_state(tracker.get_state()));
+    let mut spent = false;
+    for frame in 0..30 {
+        try_prepared_dismiss_dialog_once_per_spawn(
+            "reviewer-3561-short-quote", &screen, &writer, &patterns,
+            DismissScanScope::Startup, &mut gate, LogicalMs(frame * 400), &mut spent,
+        );
+    }
+    assert!(bytes.lock().is_empty(), "quoted warning must not answer a different prompt: {:?}", *bytes.lock());
+}
+
 /// Pre-#3314-r1 tests exercise the MATCHER, not the generation gate. Give
 /// them a permanently-armed gate already past the stability window so their
 /// meaning is unchanged by the new parameters.
