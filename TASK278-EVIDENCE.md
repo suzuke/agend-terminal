@@ -5,7 +5,7 @@
 - Integration source: `5351eff81027bb11eb9c79b93d27221fa85c6300`.
 - Latest main integrated: `07ca9298cfbbf7a0c5f46d4d9135e373141500b7`.
 - Integration merge: `9e337901`.
-- Final local head: `28206e15990b77cb4233ec464ed41da3ebcc2bfb`.
+- Code-change head: `28206e15990b77cb4233ec464ed41da3ebcc2bfb` (the branch tip also contains the documentation commits listed below).
 - Feature requirements from decisions 60/61 were retained; this task changes test fixtures only.
 - No production runtime permission or process-kill behavior was broadened.
 
