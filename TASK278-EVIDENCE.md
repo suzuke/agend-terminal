@@ -58,7 +58,7 @@ After inspecting each fixture's setup and containment, the nine tests were run o
 - On task head `951f028007c17f462f476d6e050bea423ca17c49`, all nine commands exited 0 and each reported `1 passed, 0 failed`.
 - On base `07ca9298cfbbf7a0c5f46d4d9135e373141500b7`, the same nine commands were run in separately managed disposable branch `validation/278-base-07ca-3`; all nine exited 0 and each reported `1 passed, 0 failed`.
 
-Therefore the nine failures occur only in the aggregate full-binary run's parallel/shared-fixture conditions. They are not deterministic on either exact head, and no feature-caused defect was found. The task branch was restored without reset to `951f028...` and remains clean.
+Therefore the nine failures were not reproduced in isolated serial runs on either exact head. The aggregate cause remains unproven; the aggregate red result is preserved and no failure is waived. The task branch was restored without reset to `951f028...` and remains clean.
 
 ## Commit history
 
