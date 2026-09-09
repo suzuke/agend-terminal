@@ -73,6 +73,18 @@ impl ManagedRuntime {
         }
     }
 
+    fn ensure_never_launched(&self, attempt: &Attempt) -> Result<()> {
+        let registered = crate::agent::lock_registry(&self.registry)
+            .values()
+            .any(|handle| handle.name.as_str() == attempt.name);
+        let external = crate::agent::lock_external(&self.externals).contains_key(&attempt.name);
+        let journal = read_journal(&self.home, &attempt.name)
+            .context("recovery_required: job process journal unreadable")?;
+        anyhow::ensure!(journal.is_none() && attempt.uuid.is_none() && !registered && !external,
+            "recovery_required: launched job cleanup requires descendant containment proof; instance and artifacts retained");
+        Ok(())
+    }
+
     fn identity(&self, attempt: &Attempt) -> Result<Option<crate::types::InstanceId>> {
         crate::agent::validate_name(&attempt.name).map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
@@ -311,25 +323,29 @@ impl JobRuntime for ManagedRuntime {
 
     fn stop(&self, attempt: &Attempt) -> Result<bool> {
         let identity = self.identity(attempt)?;
-        let registered = crate::agent::lock_registry(&self.registry)
-            .values()
-            .any(|handle| handle.name.as_str() == attempt.name);
-        // No supported containment primitive proves that a launched worker's
-        // detached tools are gone. Even legacy Stopped receipts only proved
-        // leader exit. Preserve every launched attempt for explicit recovery.
-        anyhow::ensure!(read_journal(&self.home, &attempt.name)?.is_none()
-            && attempt.uuid.is_none() && !registered,
-            "recovery_required: launched job cleanup requires descendant containment proof; instance and artifacts retained");
+        // Fast rejection only; authoritative proof is repeated inside DeleteFence.
+        self.ensure_never_launched(attempt)?;
         #[cfg(test)]
         tests::before_stop(self, attempt);
         // No spawn intent was ever written: only a pre-launch reservation can
         // reach deletion. The shared permit rechecks its identity before effects.
-        crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_expected_identity(
-            &self.home, &attempt.name, Some(&crate::agent_ops::DeleteContext {
-                registry: &self.registry, configs: &self.configs, externals: &self.externals,
+        let precondition = || {
+            self.ensure_never_launched(attempt)
+                .map_err(|error| error.to_string())
+        };
+        crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_precondition(
+            &self.home,
+            &attempt.name,
+            Some(&crate::agent_ops::DeleteContext {
+                registry: &self.registry,
+                configs: &self.configs,
+                externals: &self.externals,
                 notifier: None,
-            }), Some((OWNER, identity.as_ref().map(|id| id.full()).as_deref())),
-        ).map_err(anyhow::Error::msg)?;
+            }),
+            Some((OWNER, identity.as_ref().map(|id| id.full()).as_deref())),
+            Some(&precondition),
+        )
+        .map_err(anyhow::Error::msg)?;
         Ok(true)
     }
 

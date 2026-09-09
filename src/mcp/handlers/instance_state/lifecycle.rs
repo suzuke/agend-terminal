@@ -134,6 +134,17 @@ pub(crate) fn full_delete_instance_with_expected_identity(
     delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
     expected: Option<(&str, Option<&str>)>,
 ) -> Result<(), String> {
+    full_delete_instance_with_precondition(home, name, delete_context, expected, None)
+}
+
+/// Recheck a caller's deletion precondition after all spawn/delete fences admit.
+pub(crate) fn full_delete_instance_with_precondition(
+    home: &Path,
+    name: &str,
+    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+    expected: Option<(&str, Option<&str>)>,
+    precondition: Option<&dyn Fn() -> Result<(), String>>,
+) -> Result<(), String> {
     // #2855: reject an invalid (traversal) name BEFORE the lifecycle permit,
     // the deleting-mark, and every name-derived path removal below — this fn
     // joins the raw name into workspace/runtime/backend-data paths.
@@ -144,6 +155,15 @@ pub(crate) fn full_delete_instance_with_expected_identity(
         crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
     )
     .map_err(|error| format!("delete refused: {error}"))?;
+    // #1915: mark this instance "deleting" for the ENTIRE teardown — the guard is
+    // held until this fn returns (after workspace cleanup + the residual audit
+    // below), so any concurrent spawn (boot-stagger / crash-respawn worker /
+    // stage2) is refused at the `spawn_agent` / `spawn_and_register_agent`
+    // chokepoints. `DeletingGuard::drop` un-marks on EVERY path (normal return,
+    // early `Err`, panic), so the name is always re-creatable afterwards — a
+    // leaked mark would make it un-spawnable for the daemon's lifetime.
+    let mut delete_fence =
+        crate::daemon::lifecycle::DeleteFence::new(home, name, delete_context.is_some());
     if let Some((creator, expected_uuid)) = expected {
         let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .map_err(|error| format!("identity lookup refused: {error}"))?;
@@ -154,24 +174,18 @@ pub(crate) fn full_delete_instance_with_expected_identity(
                 return Err("delete refused: worker identity changed".into());
             }
         } else if let Some(context) = delete_context {
-            if crate::agent::lock_registry(context.registry)
+            let managed = crate::agent::lock_registry(context.registry)
                 .values()
-                .any(|h| h.name.as_str() == name)
-                || crate::agent::lock_external(context.externals).contains_key(name)
-            {
+                .any(|h| h.name.as_str() == name);
+            let external = crate::agent::lock_external(context.externals).contains_key(name);
+            if managed || external {
                 return Err("delete refused: live worker has no durable identity".into());
             }
         }
     }
-    // #1915: mark this instance "deleting" for the ENTIRE teardown — the guard is
-    // held until this fn returns (after workspace cleanup + the residual audit
-    // below), so any concurrent spawn (boot-stagger / crash-respawn worker /
-    // stage2) is refused at the `spawn_agent` / `spawn_and_register_agent`
-    // chokepoints. `DeletingGuard::drop` un-marks on EVERY path (normal return,
-    // early `Err`, panic), so the name is always re-creatable afterwards — a
-    // leaked mark would make it un-spawnable for the daemon's lifetime.
-    let mut delete_fence =
-        crate::daemon::lifecycle::DeleteFence::new(home, name, delete_context.is_some());
+    if let Some(check) = precondition {
+        check()?;
+    }
     // Fence transport delivery before any teardown side effect. The keyed
     // guard invalidates queued epochs and excludes same-agent I/O for the full
     // delete transaction, including removal of the receipt files below.

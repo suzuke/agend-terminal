@@ -51,6 +51,11 @@ fn register_external_with_seam(
     // external lock here, so this is NOT the registry→external nesting #2197
     // removed.
     let mut ext = agent::lock_external(ctx.externals);
+    // DeleteFence marks the name before its precondition reads this registry.
+    // Under this lock, registration either precedes that read or is refused.
+    if agent::deleting::is_deleting(ctx.home, name) {
+        return json!({"ok": false, "error": format!("agent '{name}' is being deleted")});
+    }
     if ext.contains_key(name) {
         return json!({"ok": false, "error": format!("agent '{name}' already exists (external)")});
     }
