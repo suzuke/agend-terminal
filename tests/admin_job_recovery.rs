@@ -43,6 +43,9 @@ impl ChildGuard {
     }
 
     fn wait_bounded(&mut self, timeout: Duration) -> bool {
+        if self.child.is_none() {
+            return true;
+        }
         let deadline = Instant::now() + timeout;
         loop {
             let status = self.child.as_mut().map_or(Ok(None), Child::try_wait);
