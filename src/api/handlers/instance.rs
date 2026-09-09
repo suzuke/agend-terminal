@@ -144,7 +144,19 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         spawner: params["spawner"].as_str().filter(|s| !s.is_empty()),
         target_pane: params["target_pane"].as_str().filter(|s| !s.is_empty()),
     };
-    let request = crate::agent_ops::spawn::resolve_spawn_request(ctx.home, &spawn_params);
+    let request = match crate::agent_ops::spawn::resolve_spawn_request(ctx.home, &spawn_params) {
+        Ok(request) => request,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": error.to_string(),
+                "code": "env_source_missing",
+                "instance": error.instance,
+                "destination": error.destination,
+                "source": error.source,
+            })
+        }
+    };
     match crate::agent_ops::spawn::spawn_instance(
         &crate::agent_ops::spawn::SpawnContext {
             home: ctx.home,

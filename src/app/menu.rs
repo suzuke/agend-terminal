@@ -150,8 +150,11 @@ pub(super) fn pane_from_menu_item(
             }
             // Resolve from fleet to get defaults merged
             let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-            if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {
-                pane_factory::create_pane_from_resolved(
+            match fleet
+                .as_ref()
+                .map(|f| f.resolve_instance_checked(&inst_name))
+            {
+                Some(Ok(Some(resolved))) => pane_factory::create_pane_from_resolved(
                     &inst_name,
                     &resolved,
                     layout,
@@ -162,26 +165,28 @@ pub(super) fn pane_from_menu_item(
                     wakeup_tx,
                     name_counter,
                     crate::backend::SpawnMode::Fresh,
-                )
-            } else {
-                // Preset args are added by spawn_agent; no need to compose here.
-                pane_factory::create_pane(
-                    layout,
-                    registry,
-                    home,
-                    &inst_name,
-                    preset.command,
-                    &[],
-                    crate::backend::SpawnMode::Fresh,
-                    None,
-                    &HashMap::new(),
-                    preset.submit_key,
-                    cols,
-                    rows,
-                    wakeup_tx,
-                    name_counter,
-                    pane_factory::SpawnIdentity::Managed,
-                )
+                ),
+                Some(Err(error)) => Err(anyhow::Error::new(error)),
+                Some(Ok(None)) | None => {
+                    // Preset args are added by spawn_agent; no need to compose here.
+                    pane_factory::create_pane(
+                        layout,
+                        registry,
+                        home,
+                        &inst_name,
+                        preset.command,
+                        &[],
+                        crate::backend::SpawnMode::Fresh,
+                        None,
+                        &HashMap::new(),
+                        preset.submit_key,
+                        cols,
+                        rows,
+                        wakeup_tx,
+                        name_counter,
+                        pane_factory::SpawnIdentity::Managed,
+                    )
+                }
             }
         }
         MenuItemKind::Fugu => {
@@ -340,6 +345,57 @@ mod tests {
             matches!(&item.kind, MenuItemKind::FleetInstance(name) if name == "available")
         }));
 
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn backend_menu_missing_default_env_source_does_not_create_pane_3540_r2() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-menu-missing-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        std::fs::write(
+            &fleet_path,
+            "defaults:\n  env:\n    DESTINATION_TOKEN:\n      from_env: AGEND_TEST_MISSING_MENU_ENV_3540_R2\ninstances: {}\n",
+        )
+        .expect("fleet");
+        let mut layout = Layout::new();
+        let registry: AgentRegistry = Default::default();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+
+        let result = pane_from_menu_item(
+            MenuItem {
+                label: "test backend".to_string(),
+                kind: MenuItemKind::Backend(Backend::Raw(
+                    "agend-test-missing-menu-command-3540-r2".to_string(),
+                )),
+            },
+            &fleet_path,
+            &mut layout,
+            &registry,
+            &home,
+            120,
+            40,
+            &wakeup_tx,
+            &mut name_counter,
+        );
+        let error = match result {
+            Ok(_) => panic!("missing environment source must refuse the menu spawn"),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("AGEND_TEST_MISSING_MENU_ENV_3540_R2"));
+        assert!(!message.contains("secret-value-must-not-leak"));
+        assert!(layout.tabs.is_empty());
+        assert!(crate::agent::lock_registry(&registry).is_empty());
         std::fs::remove_dir_all(home).ok();
     }
 

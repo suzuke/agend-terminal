@@ -2152,6 +2152,64 @@ fn checkout_bind_reports_binding_conflict_for_other_branch_3550() {
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// #3550 follow-up: an agent binding is global even though checkout paths are
+/// keyed by `(agent, repo)`. A checkout in repo B must therefore describe the
+/// existing repo-A binding without claiming that it occupies repo B's target.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_cross_repo_conflict_does_not_claim_target_is_occupied_3550() {
+    let home = p778_tmp_home("3550-cross-repo-conflict");
+    let parent_a = p778_tmp_home("3550-cross-repo-a");
+    let parent_b = p778_tmp_home("3550-cross-repo-b");
+    let source_a = p780_setup_source_broken_origin(&parent_a);
+    let source_b = p780_setup_source_broken_origin(&parent_b);
+    let agent = "agent-3550-cross-repo";
+
+    let first = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source_a.display().to_string(),
+            "branch": "feat/bound-cross-repo-3550",
+            "bind": true,
+            "task_id": "t-3550-cross-repo-owner",
+        }),
+        agent,
+    );
+    assert!(
+        first.get("error").is_none(),
+        "first checkout must bind: {first}"
+    );
+
+    let second = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source_b.display().to_string(),
+            "branch": "feat/other-cross-repo-3550",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert_eq!(
+        second["code"].as_str(),
+        Some("binding_conflict"),
+        "{second}"
+    );
+    let error = second["error"].as_str().unwrap_or_default();
+    assert!(
+        !error.contains("in this repository") && !error.contains("occupies the path"),
+        "cross-repo refusal must not claim repo B's target is occupied: {second}"
+    );
+    assert!(
+        error.contains("feat/bound-cross-repo-3550"),
+        "refusal must still name the existing branch: {second}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent_a).ok();
+    std::fs::remove_dir_all(&parent_b).ok();
+}
+
 /// Arch14 residue: a checkout that auto-created its branch must delete only that
 /// branch when the fixed worktree target is already occupied and `git worktree add`
 /// fails. The occupied target is deliberately preserved as out-of-scope state.

@@ -428,8 +428,8 @@ pub(super) fn handle_start_instance_with_runtime(
         Ok(c) => c,
         Err(e) => return json!({"error": format!("fleet.yaml: {e}")}),
     };
-    match config.resolve_instance(name) {
-        Some(resolved) => {
+    match config.resolve_instance_checked(name) {
+        Ok(Some(resolved)) => {
             let cmd_args = resolved.args.join(" ");
             // #900: forward the resolved env explicitly so the daemon's
             // SPAWN handler doesn't have to re-read fleet.yaml for what
@@ -456,7 +456,14 @@ pub(super) fn handle_start_instance_with_runtime(
                 Err(e) => json!({"error": format!("API unavailable: {e}")}),
             }
         }
-        None => json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
+        Ok(None) => json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
+        Err(error) => json!({
+            "error": error.to_string(),
+            "code": "env_source_missing",
+            "instance": error.instance,
+            "destination": error.destination,
+            "source": error.source,
+        }),
     }
 }
 
@@ -506,9 +513,18 @@ pub(super) fn handle_restart_instance_with_runtime(
         Ok(c) => c,
         Err(e) => return json!({"error": format!("fleet.yaml: {e}")}),
     };
-    let resolved = match config.resolve_instance(name) {
-        Some(r) => r,
-        None => return json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
+    let resolved = match config.resolve_instance_checked(name) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
+        Err(error) => {
+            return json!({
+                "error": error.to_string(),
+                "code": "env_source_missing",
+                "instance": error.instance,
+                "destination": error.destination,
+                "source": error.source,
+            })
+        }
     };
 
     // #3414 PREFLIGHT — must stay HERE: after `resolve_instance` (it needs the

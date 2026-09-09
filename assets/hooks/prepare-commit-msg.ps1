@@ -17,7 +17,7 @@ if (-not (Test-Path $Binding)) { exit 0 }
 
 # Idempotent: skip if trailer already present.
 $Content = Get-Content $CommitMsgFile -Raw -ErrorAction SilentlyContinue
-if ($Content -match "^Agend-Agent:") { exit 0 }
+if ($Content -match "(?m)^Agend-Agent:") { exit 0 }
 
 # Parse binding.json.
 try {

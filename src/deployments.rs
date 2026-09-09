@@ -493,7 +493,13 @@ fn spawn_instances(
                 spawner: None,
                 target_pane: None,
             };
-            let request = crate::agent_ops::spawn::resolve_spawn_request(home, &params);
+            let request = match crate::agent_ops::spawn::resolve_spawn_request(home, &params) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::error!(instance = %inst_name, error = %error, "deploy: Phase 3 spawn refused");
+                    continue;
+                }
+            };
             let context = crate::agent_ops::spawn::SpawnContext {
                 home,
                 registry: runtime.registry,

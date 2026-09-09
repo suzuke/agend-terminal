@@ -427,6 +427,34 @@ fn default_discord_bot_token_env() -> String {
     "AGEND_DISCORD_BOT_TOKEN".to_string()
 }
 
+/// A fleet environment value is either stored literally or read from the
+/// daemon's environment when an instance is resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FleetEnvValue {
+    Literal(String),
+    FromEnv { from_env: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvResolveError {
+    pub instance: String,
+    pub destination: String,
+    pub source: String,
+}
+
+impl std::fmt::Display for EnvResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "fleet env source '{}' for destination '{}' is missing or is not valid Unicode",
+            self.source, self.destination
+        )
+    }
+}
+
+impl std::error::Error for EnvResolveError {}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceDefaults {
     /// Backend preset name (e.g., "claude", "kiro-cli").
@@ -444,7 +472,7 @@ pub struct InstanceDefaults {
     pub effort: Option<String>,
     pub ready_pattern: Option<String>,
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub env: HashMap<String, FleetEnvValue>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub instructions: Option<String>,
@@ -539,7 +567,7 @@ pub struct InstanceConfig {
     pub repo: Option<String>,
     pub ready_pattern: Option<String>,
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub env: HashMap<String, FleetEnvValue>,
     /// #1440: per-instance env keys to pass through under `AGEND_ENV_ISOLATION`
     /// (additive with fleet-level [`FleetConfig::passthrough_env`]). Still
     /// `is_sensitive_env_key`-gated.
@@ -866,7 +894,35 @@ impl FleetConfig {
     /// the binary path to spawn — useful for users pointing a preset at a
     /// custom-built binary (`backend: claude` + `command: /opt/claude-v2/claude`).
     pub fn resolve_instance(&self, name: &str) -> Option<ResolvedInstance> {
+        match self.resolve_instance_checked(name) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::error!(
+                    instance = %error.instance,
+                    destination = %error.destination,
+                    source = %error.source,
+                    "fleet env source is missing or is not valid Unicode; refusing instance resolution"
+                );
+                None
+            }
+        }
+    }
+
+    /// Resolve an instance while distinguishing an absent fleet entry from an
+    /// environment source that could not be read.
+    pub fn resolve_instance_checked(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<ResolvedInstance>, EnvResolveError> {
         resolve::resolve_instance(self, name)
+    }
+
+    pub(crate) fn resolve_env_value(
+        &self,
+        name: &str,
+        destination: &str,
+    ) -> std::result::Result<Option<String>, EnvResolveError> {
+        resolve::resolve_env_value(self, name, destination)
     }
 
     /// Get all instance names.

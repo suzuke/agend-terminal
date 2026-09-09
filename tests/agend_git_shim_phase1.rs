@@ -68,9 +68,8 @@ fn ps1_hook_compares_branch_case_sensitively_3545() {
         hook.contains("-cmatch"),
         "the HEAD ref parse must be the case-sensitive match operator"
     );
-    // Scoped to the two branch-comparison lines. The idempotency probe on line
-    // ~20 still uses `-match` and is deliberately out of scope for #3545 — it
-    // tests for a literal trailer prefix, not a branch name.
+    // Scoped to the two branch-comparison lines. The idempotency probe also
+    // uses `-match`, but needs multiline rather than case-sensitive semantics.
     for line in hook.lines() {
         if line.contains("refs/heads/") {
             assert!(
@@ -94,6 +93,18 @@ fn hook_idempotent_skip_logic() {
     assert!(
         hook.contains("grep -q \"^Agend-Agent:\""),
         "must check for existing trailer"
+    );
+}
+
+/// #3545 follow-up: PowerShell applies `^` to the whole `-Raw` string unless
+/// multiline mode is explicit. A trailer below the subject must still make a
+/// second hook invocation a no-op.
+#[test]
+fn ps1_hook_idempotency_uses_multiline_anchor_3545() {
+    let hook = include_str!("../assets/hooks/prepare-commit-msg.ps1");
+    assert!(
+        hook.contains(r#"-match "(?m)^Agend-Agent:""#),
+        "the idempotency probe must match Agend-Agent at the start of any line"
     );
 }
 

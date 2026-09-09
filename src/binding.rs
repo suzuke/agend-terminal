@@ -757,7 +757,9 @@ pub fn install_hooks(home: &Path, worktree: &Path) {
     // Extract embedded hook scripts (both platforms for portability).
     let bash_hook = include_str!("../assets/hooks/prepare-commit-msg");
     let bash_path = hooks_dir.join("prepare-commit-msg");
-    let _ = std::fs::write(&bash_path, bash_hook);
+    if let Err(error) = std::fs::write(&bash_path, bash_hook) {
+        tracing::error!(path = %bash_path.display(), %error, "failed to install daemon-owned prepare-commit-msg hook");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -767,7 +769,9 @@ pub fn install_hooks(home: &Path, worktree: &Path) {
     // Windows: also install PowerShell version.
     let ps_hook = include_str!("../assets/hooks/prepare-commit-msg.ps1");
     let ps_path = hooks_dir.join("prepare-commit-msg.ps1");
-    let _ = std::fs::write(&ps_path, ps_hook);
+    if let Err(error) = std::fs::write(&ps_path, ps_hook) {
+        tracing::error!(path = %ps_path.display(), %error, "failed to install daemon-owned prepare-commit-msg PowerShell hook");
+    }
 
     // #2234: canonical-HEAD-detach instrument. A reference-transaction hook dropped
     // in `<repo>/.git/hooks/` is SHADOWED by this same `core.hooksPath` and never
