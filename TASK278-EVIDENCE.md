@@ -5,7 +5,7 @@
 - Integration source: `5351eff81027bb11eb9c79b93d27221fa85c6300`.
 - Latest main integrated: `07ca9298cfbbf7a0c5f46d4d9135e373141500b7`.
 - Integration merge: `9e337901`.
-- Final local head: `8793788a0e06e4a80417c6751bf258bec6330dd8`.
+- Final local head: `28206e15990b77cb4233ec464ed41da3ebcc2bfb`.
 - Feature requirements from decisions 60/61 were retained; this task changes test fixtures only.
 - No production runtime permission or process-kill behavior was broadened.
 
@@ -39,5 +39,6 @@ ran: `cargo test --locked --bin agend-terminal` → 7,491 passed, 9 failed, 11 i
 
 - `188e11c0e764f68fb43dfe65405fc670b7cc8ce1` — anchor schedule-job fixture cleanup.
 - `8793788a0e06e4a80417c6751bf258bec6330dd8` — name the sibling group-member ownership explicitly.
+- `28206e15990b77cb4233ec464ed41da3ebcc2bfb` — record validation and handoff evidence.
 
 No push, PR publication, merge, or reviewer worktree mutation was performed.
