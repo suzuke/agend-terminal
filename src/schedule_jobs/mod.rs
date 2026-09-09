@@ -6,6 +6,7 @@ mod controller;
 pub(crate) mod notification;
 pub(crate) mod runtime;
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests;
 
 use chrono::{DateTime, Utc};

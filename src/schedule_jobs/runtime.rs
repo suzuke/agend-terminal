@@ -423,6 +423,7 @@ impl JobRuntime for ManagedRuntime {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     struct TempHome(PathBuf);
