@@ -609,6 +609,7 @@ fn pid_alive(pid: u32) -> bool {
 #[cfg(unix)]
 struct UniqueFixtureHome {
     path: std::path::PathBuf,
+    cleaned: bool,
 }
 
 #[cfg(unix)]
@@ -624,19 +625,46 @@ impl UniqueFixtureHome {
                 std::process::id()
             ));
             match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        cleaned: false,
+                    })
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(format!("create unique fixture home: {error}")),
             }
         }
         Err("could not allocate a unique fixture home".into())
     }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.cleaned {
+            return Ok(());
+        }
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {
+                self.cleaned = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cleaned = true;
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "remove fixture home {}: {error}",
+                self.path.display()
+            )),
+        }
+    }
 }
 
 #[cfg(unix)]
 impl Drop for UniqueFixtureHome {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if let Err(error) = self.cleanup() {
+            eprintln!("fixture-home cleanup incomplete: {error}");
+        }
     }
 }
 
@@ -671,6 +699,37 @@ impl OwnedForegroundDaemon {
         self.child.id()
     }
 
+    fn reap(&mut self) -> Result<(), String> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|error| format!("poll foreground daemon before cleanup: {error}"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.child
+            .kill()
+            .map_err(|error| format!("kill owned foreground daemon {}: {error}", self.pid()))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match self
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll owned foreground daemon {}: {error}", self.pid()))?
+            {
+                Some(_) => return Ok(()),
+                None if std::time::Instant::now() >= deadline => {
+                    return Err(format!(
+                        "owned foreground daemon {} remained alive after 3s",
+                        self.pid()
+                    ));
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    }
+
     fn wait_ready(&mut self) -> Result<(), String> {
         let run_dir = self.home.join("run").join(self.pid().to_string());
         let started = std::time::Instant::now();
@@ -700,18 +759,11 @@ impl OwnedForegroundDaemon {
 #[cfg(unix)]
 impl Drop for OwnedForegroundDaemon {
     fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(Some(_))) {
-            return;
-        }
         // The Child handle is the ownership proof; no process-table lookup or
-        // PID/argv/PPID matching is used for teardown.
-        let _ = self.child.kill();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while std::time::Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        // PID/argv/PPID matching is used for teardown. Panic unwinding is
+        // best-effort, while the normal test path asserts `reap()` directly.
+        if let Err(error) = self.reap() {
+            eprintln!("owned foreground daemon cleanup incomplete: {error}");
         }
     }
 }
@@ -984,7 +1036,7 @@ fn stop_no_wait_returns_on_the_accepted_request_only_3539() {
 #[cfg(unix)]
 #[test]
 fn stop_transport_failure_is_not_reported_as_absent_3559() {
-    let home_guard = UniqueFixtureHome::new().expect("create unique fixture home");
+    let mut home_guard = UniqueFixtureHome::new().expect("create unique fixture home");
     let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
@@ -992,7 +1044,7 @@ fn stop_transport_failure_is_not_reported_as_absent_3559() {
     )
     .expect("write fleet.yaml");
 
-    let daemon = OwnedForegroundDaemon::spawn(&home).expect("foreground daemon must start");
+    let mut daemon = OwnedForegroundDaemon::spawn(&home).expect("foreground daemon must start");
     let daemon_pid = daemon.pid();
     assert!(pid_alive(daemon_pid), "daemon must be alive before stop");
 
@@ -1026,4 +1078,14 @@ fn stop_transport_failure_is_not_reported_as_absent_3559() {
         pid_alive(daemon_pid),
         "the daemon remains live after the refused request: stdout={stdout} stderr={stderr}"
     );
+    daemon
+        .reap()
+        .expect("owned foreground daemon must be reaped");
+    assert!(
+        !pid_alive(daemon_pid),
+        "owned foreground daemon must be gone after explicit cleanup"
+    );
+    home_guard
+        .cleanup()
+        .expect("unique fixture home must be removed after child reap");
 }
