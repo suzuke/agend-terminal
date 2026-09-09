@@ -598,6 +598,43 @@ mod tests {
     }
 
     #[test]
+    fn task257_fresh_runtime_restart_preserves_spawn_intent_fence() {
+        let home = TempHome::new();
+        let (runtime, run, attempt) = reserved_fixture(home.path());
+        let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
+        let registry = Arc::clone(&runtime.registry);
+        let configs = Arc::clone(&runtime.configs);
+        let externals = Arc::clone(&runtime.externals);
+        let id = register_worker(home.path(), &attempt, &workspace).unwrap();
+        write_journal(
+            home.path(),
+            &attempt.name,
+            &ProcessJournal {
+                uuid: id,
+                phase: ProcessPhase::Intent,
+                pid: None,
+                start_token: None,
+            },
+        )
+        .unwrap();
+        drop(runtime);
+
+        let restarted = ManagedRuntime::new(home.path(), &registry, &configs, &externals);
+        assert!(restarted
+            .start(&run, &attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required"));
+        assert!(restarted
+            .stop(&attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required"));
+        assert!(read_journal(home.path(), &attempt.name).unwrap().is_some());
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
+    }
+
+    #[test]
     fn durable_live_orphan_cannot_be_replaced_or_deleted() {
         let home = TempHome::new();
         let (runtime, run, attempt) = reserved_fixture(home.path());

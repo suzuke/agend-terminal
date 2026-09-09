@@ -370,6 +370,74 @@ fn lost_notification_receipt_becomes_unknown_without_resending() {
 }
 
 #[test]
+fn task257_accepted_notification_then_response_error_is_unknown_without_retry() {
+    let h = home();
+    admit_due(&h, &schedule(&h), now()).unwrap();
+    let old = read(&h).unwrap().runs[0].clone();
+    let mut next = old.clone();
+    next.phase = Phase::Succeeded;
+    next.notification = NotificationState::Pending;
+    replace(&h, &old, next).unwrap();
+    let run = read(&h).unwrap().runs[0].clone();
+    let accepted = std::sync::atomic::AtomicU32::new(0);
+
+    controller::reconcile_notification(&h, &run, |_| {
+        accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // The mock transport has accepted the message, but its response is
+        // lost. This is distinct from the persistence-failure fixture above.
+        anyhow::bail!("accepted by transport; response lost")
+    })
+    .unwrap();
+    let unknown = read(&h).unwrap().runs[0].clone();
+    assert_eq!(unknown.notification, NotificationState::Unknown);
+    assert_eq!(unknown.notification_receipt, None);
+    assert!(unknown
+        .notification_error
+        .as_deref()
+        .is_some_and(|error| error.contains("accepted by transport")));
+    controller::reconcile_notification(&h, &unknown, |_| panic!("must not resend"))
+        .unwrap();
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    std::fs::remove_dir_all(h).unwrap();
+}
+
+#[test]
+fn task257_status_receipt_does_not_interpret_business_receipts() {
+    let h = home();
+    let s = schedule(&h);
+    std::fs::create_dir_all(s.job.as_ref().unwrap().artifact_directory.clone()).unwrap();
+    let business_receipts = serde_json::json!({
+        "destinations": [
+            {"channel": "telegram", "receipt": "business-tg-1"},
+            {"channel": "line", "receipt": "business-line-1"}
+        ]
+    });
+    let receipt_path = s
+        .job
+        .as_ref()
+        .unwrap()
+        .artifact_directory
+        .join("business-delivery-receipts.json");
+    std::fs::write(&receipt_path, serde_json::to_vec(&business_receipts).unwrap()).unwrap();
+    admit_due(&h, &s, now()).unwrap();
+    let old = read(&h).unwrap().runs[0].clone();
+    let mut next = old.clone();
+    next.phase = Phase::Succeeded;
+    next.notification = NotificationState::Pending;
+    replace(&h, &old, next).unwrap();
+    let run = read(&h).unwrap().runs[0].clone();
+
+    controller::reconcile_notification(&h, &run, |_| Ok("status-telegram-1".into())).unwrap();
+    let status = read(&h).unwrap().runs[0].clone();
+    assert_eq!(status.notification, NotificationState::Sent);
+    assert_eq!(status.notification_receipt.as_deref(), Some("status-telegram-1"));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(receipt_path).unwrap()).unwrap(), business_receipts);
+    assert_ne!(status.notification_receipt.as_deref(), Some("business-tg-1"));
+    assert_ne!(status.notification_receipt.as_deref(), Some("business-line-1"));
+    std::fs::remove_dir_all(h).unwrap();
+}
+
+#[test]
 fn subsecond_one_shot_is_not_early_or_dropped() {
     let h = home();
     let mut s = schedule(&h);
