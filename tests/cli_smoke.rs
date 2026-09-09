@@ -418,6 +418,117 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// Owns a unique fixture directory and removes only that exact path.
+#[cfg(unix)]
+struct UniqueFixtureHome {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl UniqueFixtureHome {
+    fn new() -> Result<Self, String> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("read clock: {error}"))?
+            .as_nanos();
+        for attempt in 0..16 {
+            let path = std::env::temp_dir().join(format!(
+                "agend-cli-smoke-stop-transport-{}-{stamp}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("create unique fixture home: {error}")),
+            }
+        }
+        Err("could not allocate a unique fixture home".into())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UniqueFixtureHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Owns one foreground daemon through its `Child` handle. The guard is
+/// created immediately after spawn, before readiness polling can fail.
+#[cfg(unix)]
+struct OwnedForegroundDaemon {
+    child: std::process::Child,
+    home: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl OwnedForegroundDaemon {
+    fn spawn(home: &std::path::Path) -> Result<Self, String> {
+        let binary = cmd().get_program().to_owned();
+        let child = std::process::Command::new(binary)
+            .args(["start", "--foreground"])
+            .env("AGEND_HOME", home)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| format!("spawn foreground daemon: {error}"))?;
+        let mut daemon = Self {
+            child,
+            home: home.to_path_buf(),
+        };
+        daemon.wait_ready()?;
+        Ok(daemon)
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn wait_ready(&mut self) -> Result<(), String> {
+        let run_dir = self.home.join("run").join(self.pid().to_string());
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_secs(30);
+        while started.elapsed() < budget {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll foreground daemon: {error}"))?
+            {
+                return Err(format!("foreground daemon exited early: {status}"));
+            }
+            if run_dir.join(".daemon").exists()
+                && run_dir.join("api.port").exists()
+                && run_dir.join(".ready").exists()
+            {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Err(format!(
+            "foreground daemon did not become ready within {budget:?}"
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedForegroundDaemon {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // The Child handle is the ownership proof; no process-table lookup or
+        // PID/argv/PPID matching is used for teardown.
+        let _ = self.child.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 /// The session id the V1 orphan scope reads (`getsid`), or -1 when unreadable.
 #[cfg(unix)]
 fn session_of(pid: u32) -> i32 {
@@ -686,21 +797,16 @@ fn stop_no_wait_returns_on_the_accepted_request_only_3539() {
 #[cfg(unix)]
 #[test]
 fn stop_transport_failure_is_not_reported_as_absent_3559() {
-    let stamp = std::process::id();
-    let home_guard = FixtureHome::new(&format!("agend-cli-smoke-stop-transport-{stamp}"));
-    let home = home_guard.path().to_path_buf();
+    let home_guard = UniqueFixtureHome::new().expect("create unique fixture home");
+    let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+        "defaults:\n  command: /bin/cat\ninstances: {}\n",
     )
     .expect("write fleet.yaml");
 
-    cmd()
-        .env("AGEND_HOME", &home)
-        .arg("start")
-        .assert()
-        .success();
-    let daemon_pid = wait_for_daemon_identity(&home, std::time::Duration::from_secs(30));
+    let daemon = OwnedForegroundDaemon::spawn(&home).expect("foreground daemon must start");
+    let daemon_pid = daemon.pid();
     assert!(pid_alive(daemon_pid), "daemon must be alive before stop");
 
     // Keep the daemon alive but make the published API endpoint unreachable.
