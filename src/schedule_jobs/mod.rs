@@ -157,7 +157,13 @@ pub(crate) fn admit_due(
             };
             let cron = cron::Schedule::from_str(&expr)?;
             let tz: chrono_tz::Tz = schedule.timezone.parse().map_err(anyhow::Error::msg)?;
-            cron.after(&(now + chrono::Duration::seconds(1)).with_timezone(&tz))
+            // Cron's reverse iterator includes the current integer second
+            // only for a fractional bound. Use the next WHOLE second as an
+            // exclusive bound so both exact and fractional ticks select <= now.
+            let exclusive_upper = now
+                - chrono::Duration::nanoseconds(i64::from(now.timestamp_subsec_nanos()))
+                + chrono::Duration::seconds(1);
+            cron.after(&exclusive_upper.with_timezone(&tz))
                 .next_back()
                 .filter(|d| d.with_timezone(&Utc) > created && d.with_timezone(&Utc) <= now)
                 .map(|d| d.timestamp_millis())
