@@ -750,7 +750,7 @@ pub(crate) use worktree_state::{refresh_cached, worktree_binding_state, Worktree
 /// Install the prepare-commit-msg hook into a worktree via core.hooksPath.
 /// Points to `$AGEND_HOME/hooks/` unified directory.
 /// Installs bash hook on Unix, PowerShell hook on Windows.
-fn write_daemon_owned_hook(path: &Path, content: &str, executable: bool) -> std::io::Result<()> {
+fn write_daemon_owned_hook(path: &Path, content: &str, _executable: bool) -> std::io::Result<()> {
     if std::fs::read(path).is_ok_and(|installed| installed != content.as_bytes()) {
         tracing::warn!(path = %path.display(), "replacing non-canonical daemon-owned hook content");
     }
@@ -761,9 +761,11 @@ fn write_daemon_owned_hook(path: &Path, content: &str, executable: bool) -> std:
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(if executable { 0o755 } else { 0o644 });
+                permissions.set_mode(if _executable { 0o755 } else { 0o644 });
             }
             #[cfg(not(unix))]
+            // Windows requires clearing the read-only file attribute before replacement.
+            #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
             std::fs::set_permissions(path, permissions)?;
         }
@@ -773,7 +775,7 @@ fn write_daemon_owned_hook(path: &Path, content: &str, executable: bool) -> std:
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            permissions.set_mode(if executable { 0o555 } else { 0o444 });
+            permissions.set_mode(if _executable { 0o555 } else { 0o444 });
         }
         #[cfg(not(unix))]
         permissions.set_readonly(true);
