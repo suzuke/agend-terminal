@@ -283,36 +283,59 @@ fn subsecond_one_shot_is_not_early_or_dropped() {
 
 #[test]
 fn completion_and_stop_race_has_one_winner() {
+    struct RacingRuntime(std::sync::Barrier);
+    impl JobRuntime for RacingRuntime {
+        fn start(&self, _: &Run, _: &Attempt) -> anyhow::Result<String> {
+            panic!("race must not spawn a replacement")
+        }
+        fn observe(&self, _: &Attempt) -> anyhow::Result<Observation> {
+            self.0.wait();
+            Ok(Observation::UsageLimited)
+        }
+        fn stop(&self, _: &Attempt) -> anyhow::Result<bool> {
+            panic!("this tick must only decide whether to enter Stopping")
+        }
+        fn dispatch(&self, _: &Run, _: &Attempt) -> anyhow::Result<()> {
+            panic!("running attempt must not redispatch")
+        }
+    }
     for _ in 0..12 {
         let h = home();
         admit_due(&h, &schedule(&h), now()).unwrap();
         let old = read(&h).unwrap().runs[0].clone();
+        let uuid = crate::types::InstanceId::new().full();
+        std::fs::write(
+            h.join("fleet.yaml"),
+            format!("instances:\n  worker:\n    id: {uuid}\n    backend: codex\n"),
+        )
+        .unwrap();
         let mut active = old.clone();
         active.phase = Phase::Running;
         active.attempt = Some(Attempt {
             number: 1,
             name: "worker".into(),
-            uuid: Some("uuid".into()),
+            uuid: Some(uuid),
             backend: "codex".into(),
-            started_at: 0,
+            started_at: now().timestamp(),
         });
         replace(&h, &old, active).unwrap();
-        let active = read(&h).unwrap().runs[0].clone();
-        let barrier = std::sync::Barrier::new(2);
-        let (completed, stopped) = std::thread::scope(|scope| {
-            let first = scope.spawn(|| {
-                barrier.wait();
-                complete_as(&h, &active.id, 1, "worker", "uuid", "done").is_ok()
-            });
-            let second = scope.spawn(|| {
-                barrier.wait();
-                let mut stopping = active.clone();
-                stopping.phase = Phase::Stopping;
-                replace(&h, &active, stopping).unwrap()
-            });
-            (first.join().unwrap(), second.join().unwrap())
+        let rt = RacingRuntime(std::sync::Barrier::new(2));
+        // The actual controller has read Running before releasing the API
+        // caller. This races its Stopping CAS against authenticated receipt
+        // resolution, rather than hand-feeding a replacement state.
+        let completed = std::thread::scope(|scope| {
+            let driver = scope.spawn(|| tick(&h, &rt, now().timestamp()).unwrap());
+            rt.0.wait();
+            let result = complete(
+                &h,
+                "worker",
+                &serde_json::json!({
+                    "run_id":old.id,"attempt_id":1,"result":"done"
+                }),
+            );
+            driver.join().unwrap();
+            result.get("error").is_none()
         });
-        assert_ne!(completed, stopped);
         assert_eq!(
             read(&h).unwrap().runs[0].phase,
             if completed {
