@@ -1617,6 +1617,8 @@ enum HeadState<'a> {
     OnBranch(&'a str),
     /// `$GIT_DIR/HEAD` holds a bare object id — a real detached HEAD.
     Detached(&'a str),
+    /// `GIT_DIR` is exported, but its HEAD file is absent.
+    MissingHead,
     /// `GIT_DIR` is not exported at all, which is what git does for a commit in
     /// a repository's MAIN worktree (only linked worktrees get it).
     NoGitDir,
@@ -1693,7 +1695,7 @@ fn run_hook_with_head(
         HeadState::Detached(oid) => {
             std::fs::write(git_dir.join("HEAD"), format!("{oid}\n")).unwrap();
         }
-        HeadState::NoGitDir => {}
+        HeadState::MissingHead | HeadState::NoGitDir => {}
     }
 
     let hook = home.join("prepare-commit-msg");
@@ -1848,4 +1850,195 @@ fn trailer_omits_task_and_branch_on_a_detached_head_3545() {
         !out.contains("Agend-Branch:") && !out.contains("Agend-Task:"),
         "a detached HEAD names no branch, so neither trailer may be written: {out}"
     );
+}
+
+/// #3545 follow-up: an empty binding branch can never confirm provenance,
+/// even when the committing worktree has a valid symbolic HEAD.
+#[cfg(unix)]
+#[test]
+fn trailer_omits_task_and_branch_when_binding_branch_is_empty_3545() {
+    let out = run_hook_with_binding("3545-empty-binding", "", "t-OLD", "fix/current");
+    assert!(out.contains("Agend-Agent: trailer-agent"), "{out}");
+    assert!(
+        !out.contains("Agend-Branch:") && !out.contains("Agend-Task:"),
+        "an empty binding branch must withhold branch-derived trailers: {out}"
+    );
+}
+
+/// #3545 follow-up: an exported `GIT_DIR` is not enough when its HEAD file is
+/// missing; the hook must fail closed just as it does for an unset GIT_DIR.
+#[cfg(unix)]
+#[test]
+fn trailer_omits_task_and_branch_when_git_dir_head_is_missing_3545() {
+    let out = run_hook_with_head(
+        "3545-missing-head",
+        "fix/old-branch",
+        "t-OLD",
+        HeadState::MissingHead,
+    );
+    assert!(out.contains("Agend-Agent: trailer-agent"), "{out}");
+    assert!(
+        !out.contains("Agend-Branch:") && !out.contains("Agend-Task:"),
+        "a missing GIT_DIR/HEAD must withhold branch-derived trailers: {out}"
+    );
+}
+
+#[cfg(windows)]
+enum Ps1HeadState<'a> {
+    OnBranch(&'a str),
+    Detached(&'a str),
+    MissingHead,
+    NoGitDir,
+}
+
+#[cfg(windows)]
+fn run_ps1_hook_with_head(
+    tag: &str,
+    binding_branch: &str,
+    task_id: &str,
+    head: Ps1HeadState<'_>,
+    initial_message: &str,
+) -> String {
+    use std::process::Command;
+
+    let home = tmp_home(tag);
+    let agent = "trailer-agent";
+    let runtime = home.join("runtime").join(agent);
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::write(
+        runtime.join("binding.json"),
+        format!(
+            "{{\n  \"task_id\": \"{task_id}\",\n  \"branch\": \"{binding_branch}\",\n  \
+             \"issued_at\": \"2026-09-07T00:00:00Z\"\n}}\n"
+        ),
+    )
+    .unwrap();
+
+    let git_dir = home.join("gitdir");
+    std::fs::create_dir_all(&git_dir).unwrap();
+    match head {
+        Ps1HeadState::OnBranch(name) => {
+            std::fs::write(git_dir.join("HEAD"), format!("ref: refs/heads/{name}\n")).unwrap();
+        }
+        Ps1HeadState::Detached(oid) => {
+            std::fs::write(git_dir.join("HEAD"), format!("{oid}\n")).unwrap();
+        }
+        Ps1HeadState::MissingHead | Ps1HeadState::NoGitDir => {}
+    }
+
+    let hook = home.join("prepare-commit-msg.ps1");
+    std::fs::write(
+        &hook,
+        include_str!("../../assets/hooks/prepare-commit-msg.ps1"),
+    )
+    .unwrap();
+    let msg = home.join("COMMIT_EDITMSG");
+    std::fs::write(&msg, initial_message).unwrap();
+
+    let mut base = Command::new("pwsh");
+    let cmd = base
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&hook)
+        .arg(&msg)
+        .arg("message")
+        .env("AGEND_INSTANCE_NAME", agent)
+        .env("AGEND_HOME", &home);
+    let cmd = match head {
+        Ps1HeadState::NoGitDir => cmd.env_remove("GIT_DIR"),
+        _ => cmd.env("GIT_DIR", &git_dir),
+    };
+    let status = cmd.status().unwrap();
+    assert!(status.success(), "PowerShell hook must always exit 0");
+    let out = std::fs::read_to_string(&msg).unwrap();
+    std::fs::remove_dir_all(&home).ok();
+    out
+}
+
+/// #3545 follow-up: run the PowerShell hook on Windows across the five branch
+/// states that determine whether task/branch provenance may be emitted, then
+/// prove a trailer below the subject is idempotent.
+#[cfg(windows)]
+#[test]
+fn ps1_hook_truth_table_and_idempotency_3545() {
+    let matching = run_ps1_hook_with_head(
+        "3545-ps1-match",
+        "fix/current",
+        "t-CURRENT",
+        Ps1HeadState::OnBranch("fix/current"),
+        "subject\n",
+    );
+    assert!(matching.contains("Agend-Task: t-CURRENT"), "{matching}");
+    assert!(matching.contains("Agend-Branch: fix/current"), "{matching}");
+
+    let mismatch = run_ps1_hook_with_head(
+        "3545-ps1-mismatch",
+        "fix/old",
+        "t-OLD",
+        Ps1HeadState::OnBranch("fix/current"),
+        "subject\n",
+    );
+    assert!(!mismatch.contains("Agend-Task:") && !mismatch.contains("Agend-Branch:"));
+
+    let empty_binding = run_ps1_hook_with_head(
+        "3545-ps1-empty-binding",
+        "",
+        "t-OLD",
+        Ps1HeadState::OnBranch("fix/current"),
+        "subject\n",
+    );
+    assert!(!empty_binding.contains("Agend-Task:") && !empty_binding.contains("Agend-Branch:"));
+
+    let detached = run_ps1_hook_with_head(
+        "3545-ps1-detached",
+        "fix/old",
+        "t-OLD",
+        Ps1HeadState::Detached("9fceb02d0ae598e95dc970b74767f19372d61af8"),
+        "subject\n",
+    );
+    assert!(!detached.contains("Agend-Task:") && !detached.contains("Agend-Branch:"));
+
+    let no_git_dir = run_ps1_hook_with_head(
+        "3545-ps1-no-gitdir",
+        "fix/old",
+        "t-OLD",
+        Ps1HeadState::NoGitDir,
+        "subject\n",
+    );
+    assert!(!no_git_dir.contains("Agend-Task:") && !no_git_dir.contains("Agend-Branch:"));
+
+    let idempotent = run_ps1_hook_with_head(
+        "3545-ps1-idempotent",
+        "fix/current",
+        "t-CURRENT",
+        Ps1HeadState::OnBranch("fix/current"),
+        "subject\n\nAgend-Agent: trailer-agent\n",
+    );
+    assert_eq!(
+        idempotent.matches("Agend-Agent:").count(),
+        1,
+        "{idempotent}"
+    );
+    assert!(!idempotent.contains("Agend-Task:"), "{idempotent}");
+}
+
+/// #3545 follow-up: Windows must also fail closed when GIT_DIR exists but its
+/// HEAD file does not.
+#[cfg(windows)]
+#[test]
+fn ps1_hook_withholds_when_git_dir_head_is_missing_3545() {
+    let out = run_ps1_hook_with_head(
+        "3545-ps1-missing-head",
+        "fix/old",
+        "t-OLD",
+        Ps1HeadState::MissingHead,
+        "subject\n",
+    );
+    assert!(out.contains("Agend-Agent: trailer-agent"), "{out}");
+    assert!(!out.contains("Agend-Task:") && !out.contains("Agend-Branch:"));
 }
