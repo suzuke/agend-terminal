@@ -602,9 +602,6 @@ mod tests {
         let home = TempHome::new();
         let (runtime, run, attempt) = reserved_fixture(home.path());
         let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
-        let registry = Arc::clone(&runtime.registry);
-        let configs = Arc::clone(&runtime.configs);
-        let externals = Arc::clone(&runtime.externals);
         let id = register_worker(home.path(), &attempt, &workspace).unwrap();
         write_journal(
             home.path(),
@@ -619,6 +616,11 @@ mod tests {
         .unwrap();
         drop(runtime);
 
+        // Rebuild every in-memory registry from empty state. The restart proof
+        // must rely on the durable fleet reservation and process journal only.
+        let registry = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let externals = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let restarted = ManagedRuntime::new(home.path(), &registry, &configs, &externals);
         assert!(restarted
             .start(&run, &attempt)

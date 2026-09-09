@@ -418,7 +418,8 @@ fn task257_status_receipt_does_not_interpret_business_receipts() {
         .unwrap()
         .artifact_directory
         .join("business-delivery-receipts.json");
-    std::fs::write(&receipt_path, serde_json::to_vec(&business_receipts).unwrap()).unwrap();
+    let business_receipt_bytes = serde_json::to_vec(&business_receipts).unwrap();
+    std::fs::write(&receipt_path, &business_receipt_bytes).unwrap();
     admit_due(&h, &s, now()).unwrap();
     let old = read(&h).unwrap().runs[0].clone();
     let mut next = old.clone();
@@ -431,7 +432,7 @@ fn task257_status_receipt_does_not_interpret_business_receipts() {
     let status = read(&h).unwrap().runs[0].clone();
     assert_eq!(status.notification, NotificationState::Sent);
     assert_eq!(status.notification_receipt.as_deref(), Some("status-telegram-1"));
-    assert_eq!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(receipt_path).unwrap()).unwrap(), business_receipts);
+    assert_eq!(std::fs::read(receipt_path).unwrap(), business_receipt_bytes);
     assert_ne!(status.notification_receipt.as_deref(), Some("business-tg-1"));
     assert_ne!(status.notification_receipt.as_deref(), Some("business-line-1"));
     std::fs::remove_dir_all(h).unwrap();
