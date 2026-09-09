@@ -69,6 +69,8 @@ pub(crate) struct Run {
     pub cleanup_pending: bool,
     #[serde(default)]
     pub recovery_required: bool,
+    #[serde(default)]
+    pub recovery_resolution: Option<String>,
     pub task_settled: bool,
     pub notification: NotificationState,
     pub notification_receipt: Option<String>,
@@ -212,6 +214,7 @@ pub(crate) fn admit_due(
             deadline: now.timestamp().saturating_add(config.timeout_secs as i64),
             cleanup_pending: false,
             recovery_required: false,
+            recovery_resolution: None,
             task_settled: false,
             notification: if config.notification.is_some() {
                 NotificationState::Pending
@@ -361,10 +364,7 @@ pub(crate) fn resolve_recovery(home: &Path, args: &serde_json::Value) -> serde_j
         if next.phase != Phase::Succeeded {
             next.phase = Phase::Failed;
         }
-        next.error = Some(format!(
-            "{}; recovery acknowledged by {caller}: {note}",
-            run.error.as_deref().unwrap_or("manual recovery")
-        ));
+        next.recovery_resolution = Some(format!("Recovery acknowledged by {caller}: {note}"));
         anyhow::ensure!(
             replace(home, &run, next)?,
             "run changed during recovery; inspect current state"
