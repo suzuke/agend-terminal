@@ -8,7 +8,8 @@ use super::*;
 fn reviewer_3561_short_quote_real_patterns_write_nothing() {
     let _inline = InlineWrite::arm();
     let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
-    let quoted: String = live.lines()
+    let quoted: String = live
+        .lines()
         .take_while(|line| !line.contains("I am using this for local development"))
         .map(|line| format!("> {line}\n"))
         .collect();
@@ -16,17 +17,29 @@ fn reviewer_3561_short_quote_real_patterns_write_nothing() {
     let patterns = claude_prepared_patterns_3314();
     let (writer, bytes) = recording_writer_3314();
     let mut gate = DevModalGate::new(true);
-    let mut tracker = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
-    tracker.feed(&screen);
+        let mut tracker = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+        // The modal was visible before a pane resize cropped its footer.
+        tracker.feed(live);
+        tracker.feed(&screen);
     gate.set_prompt_blocked(is_dismissible_prompt_state(tracker.get_state()));
     let mut spent = false;
     for frame in 0..30 {
         try_prepared_dismiss_dialog_once_per_spawn(
-            "reviewer-3561-short-quote", &screen, &writer, &patterns,
-            DismissScanScope::Startup, &mut gate, LogicalMs(frame * 400), &mut spent,
+            "reviewer-3561-short-quote",
+            &screen,
+            &writer,
+            &patterns,
+            DismissScanScope::Startup,
+            &mut gate,
+            LogicalMs(frame * 400),
+            &mut spent,
         );
     }
-    assert!(bytes.lock().is_empty(), "quoted warning must not answer a different prompt: {:?}", *bytes.lock());
+    assert!(
+        bytes.lock().is_empty(),
+        "quoted warning must not answer a different prompt: {:?}",
+        *bytes.lock()
+    );
 }
 
 #[test]
@@ -37,20 +50,31 @@ fn real_patterns_only_recover_a_recognized_modal_tail_3561() {
     for (label, tail, expected) in [
         ("unknown-prompt", "  Continue? [y/N]\n", vec![]),
         ("unknown-text", "  Confirm deletion\n", vec![]),
-        ("short-modal", "  ❯ 1. I am using this for local development\n    2. Exit\n", vec![13]),
+        (
+            "short-modal",
+            "  ❯ 1. I am using this for local development\n    2. Exit\n",
+            vec![13],
+        ),
     ] {
         let screen = format!("{anchor}{tail}");
         let patterns = claude_prepared_patterns_3314();
         let (writer, bytes) = recording_writer_3314();
         let mut gate = DevModalGate::new(true);
-        let mut tracker = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+        let mut tracker =
+            crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
         tracker.feed(&screen);
         gate.set_prompt_blocked(is_dismissible_prompt_state(tracker.get_state()));
         let mut spent = false;
         for frame in 0..30 {
             try_prepared_dismiss_dialog_once_per_spawn(
-                &format!("real-tail-3561-{label}"), &screen, &writer, &patterns,
-                DismissScanScope::Startup, &mut gate, LogicalMs(frame * 400), &mut spent,
+                &format!("real-tail-3561-{label}"),
+                &screen,
+                &writer,
+                &patterns,
+                DismissScanScope::Startup,
+                &mut gate,
+                LogicalMs(frame * 400),
+                &mut spent,
             );
         }
         assert_eq!(*bytes.lock(), expected, "{label}");
