@@ -373,7 +373,7 @@ fn every_second_cron_admits_latest_due_at_exact_and_fractional_ticks() {
 }
 
 #[test]
-fn conservative_recovery_requires_creator_confirmation_and_never_retries() {
+fn conservative_recovery_requires_confirmation_and_never_retries() {
     struct Unproven;
     impl JobRuntime for Unproven {
         fn start(&self, _: &Run, _: &Attempt) -> anyhow::Result<String> {
@@ -395,6 +395,12 @@ fn conservative_recovery_requires_creator_confirmation_and_never_retries() {
         admit_due(h, &schedule(h), now()).unwrap();
         advance_to_running(h, &Fake::default(), now().timestamp());
         let old = read(h).unwrap().runs[0].clone();
+        if !succeeded {
+            let done = crate::tasks::handle(h, "system:schedule_job", &serde_json::json!({
+                "action":"done","id":old.task_id,"result":"worker marked task done without receipt"
+            }));
+            assert!(done.get("error").is_none(), "{done}");
+        }
         let mut pending = old.clone();
         pending.phase = if succeeded {
             Phase::Succeeded
@@ -411,28 +417,18 @@ fn conservative_recovery_requires_creator_confirmation_and_never_retries() {
         let attempt = run.attempt.as_ref().unwrap();
         let args = serde_json::json!({"run_id":run.id,"attempt_id":attempt.number,
             "cleanup_confirmed":true,"result":"all tools stopped; delivery checked"});
-        assert!(resolve_recovery(h, &attempt.name, &args)
-            .get("error")
-            .is_some());
-        assert!(resolve_recovery(h, "other", &args).get("error").is_some());
         assert!(
-            resolve_recovery(h, &run.created_by, &args)
-                .get("error")
-                .is_some(),
+            resolve_recovery(h, &args).get("error").is_some(),
             "worker still exists"
         );
         crate::fleet::remove_instance_from_yaml(h, &attempt.name).unwrap();
         let mut unconfirmed = args.clone();
         unconfirmed["cleanup_confirmed"] = false.into();
-        assert!(resolve_recovery(h, &run.created_by, &unconfirmed)
-            .get("error")
-            .is_some());
+        assert!(resolve_recovery(h, &unconfirmed).get("error").is_some());
         let mut stale = args.clone();
         stale["attempt_id"] = 999.into();
-        assert!(resolve_recovery(h, &run.created_by, &stale)
-            .get("error")
-            .is_some());
-        let resolved = resolve_recovery(h, &run.created_by, &args);
+        assert!(resolve_recovery(h, &stale).get("error").is_some());
+        let resolved = resolve_recovery(h, &args);
         assert!(resolved.get("error").is_none(), "{resolved}");
         tick(h, &Unproven, now().timestamp() + 99999).unwrap();
         let resolved = read(h).unwrap().runs[0].clone();
@@ -446,9 +442,10 @@ fn conservative_recovery_requires_creator_confirmation_and_never_retries() {
             }
         );
         assert_eq!(resolved.result, run.result);
+        assert!(serde_json::to_value(&resolved).unwrap()["recovery_resolution"]
+            .as_str().is_some_and(|note| note.contains("all tools stopped; delivery checked")),
+            "recovery audit must survive subsequent task projection failure");
         assert_eq!(resolved.attempt, run.attempt);
-        assert!(resolve_recovery(h, &run.created_by, &args)
-            .get("error")
-            .is_some());
+        assert!(resolve_recovery(h, &args).get("error").is_some());
     }
 }

@@ -313,13 +313,10 @@ fn replace(home: &Path, old: &Run, mut new: Run) -> anyhow::Result<bool> {
 
 pub(crate) use controller::tick;
 
-/// Explicit creator acknowledgement after externally verifying all tool work
+/// Operator-gated acknowledgement after externally verifying all tool work
 /// stopped and delivery was reconciled. This action never kills or retries.
-pub(crate) fn resolve_recovery(
-    home: &Path,
-    caller: &str,
-    args: &serde_json::Value,
-) -> serde_json::Value {
+pub(crate) fn resolve_recovery(home: &Path, args: &serde_json::Value) -> serde_json::Value {
+    let caller = "operator";
     let result = (|| -> anyhow::Result<()> {
         let id = args["run_id"]
             .as_str()
@@ -343,10 +340,6 @@ pub(crate) fn resolve_recovery(
             .attempt
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no active attempt"))?;
-        anyhow::ensure!(
-            caller == run.created_by && caller != attempt.name,
-            "only the schedule creator may acknowledge external recovery"
-        );
         anyhow::ensure!(
             run.recovery_required && u64::from(attempt.number) == number,
             "stale or non-recovering attempt"

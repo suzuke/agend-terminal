@@ -335,7 +335,7 @@ pub(crate) fn def_schedule() -> Value {
             "action": {"type": "string", "enum": ["create", "list", "update", "delete", "runs", "complete", "resolve_recovery"]},
             "id": {"type": "string"},
             "run_id": {"type": "string", "description": "Job run to complete or resolve recovery."},
-            "cleanup_confirmed": {"type": "boolean", "description": "resolve_recovery only: creator confirms worker/tools stopped, delivery reconciled, and worker deleted. Never authorizes automatic retry."},
+            "cleanup_confirmed": {"type": "boolean", "description": "resolve_recovery only: operator confirms worker/tools stopped, delivery reconciled, and worker deleted. Never authorizes automatic retry."},
             "attempt_id": {"type": "integer", "minimum": 1, "description": "Current attempt number required for complete."},
             "result": {"type": "string", "description": "Completion result and artifact locations."},
             "job": {"type": "object", "additionalProperties": false, "description": "Create a daemon-owned job instead of targeting an instance. Mode is immutable; updates affect future runs. No automatic replacement after spawn intent; manual recovery is required even after successful execution when descendant cleanup cannot be proven.", "properties": {

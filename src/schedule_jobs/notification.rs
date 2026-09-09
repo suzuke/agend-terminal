@@ -72,7 +72,7 @@ fn send_with(
         run.error.as_deref()
     };
     let recovery = if run.recovery_required {
-        "Manual recovery required: confirm worker and background tools stopped, reconcile delivery, delete the worker, then ask the schedule creator to resolve_recovery. No automatic handoff.\n"
+        "Manual recovery required: confirm worker and background tools stopped, reconcile delivery, delete the worker, then use the operator admin resolve-job-recovery command. No automatic handoff.\n"
     } else {
         ""
     };

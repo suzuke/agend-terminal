@@ -177,12 +177,14 @@ pub(crate) fn capability_allows_request(
     if !capability_allows(principal, method) {
         return false;
     }
-    // `usage_limit_takeover` is an operator-only seam. Enforce that authority
+    // Takeover and manual Job recovery acknowledgement are operator-only seams. Enforce that authority
     // from the authenticated principal before the mcp_tool worker resolves
     // the spoofable payload instance or enters the mode gate.
     if principal == crate::auth_cookie::Principal::Agent
         && method == super::method::MCP_TOOL
-        && params.get("tool").and_then(Value::as_str) == Some("usage_limit_takeover")
+        && (params.get("tool").and_then(Value::as_str) == Some("usage_limit_takeover")
+            || (params.get("tool").and_then(Value::as_str) == Some("schedule")
+                && params["arguments"]["action"].as_str() == Some("resolve_recovery")))
     {
         return false;
     }
@@ -832,11 +834,21 @@ mod tests {
         for instance in ["", "operator", "creator"] {
             let params = json!({"tool":"schedule","instance":instance,
                 "arguments":{"action":"resolve_recovery","cleanup_confirmed":true}});
-            assert!(!capability_allows_request(P::Agent, method::MCP_TOOL, &params));
-            assert!(capability_allows_request(P::Operator, method::MCP_TOOL, &params));
+            assert!(!capability_allows_request(
+                P::Agent,
+                method::MCP_TOOL,
+                &params
+            ));
+            assert!(capability_allows_request(
+                P::Operator,
+                method::MCP_TOOL,
+                &params
+            ));
         }
-        assert!(capability_allows_request(P::Agent, method::MCP_TOOL,
-            &json!({"tool":"schedule","arguments":{"action":"complete"}})));
+        assert!(capability_allows_request(
+            P::Agent,
+            method::MCP_TOOL,
+            &json!({"tool":"schedule","arguments":{"action":"complete"}})
+        ));
     }
-
 }
