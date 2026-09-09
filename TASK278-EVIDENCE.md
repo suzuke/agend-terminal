@@ -51,6 +51,15 @@ Exact isolation record from that run:
 
 No separate reviewer agent was assigned for task 278. The completed review was a local self-review of the final diff; external independent verification remains pending with the orchestrator.
 
+## Exact-head isolation comparison
+
+After inspecting each fixture's setup and containment, the nine tests were run one at a time with the exact command template `cargo test --locked --bin agend-terminal '<test>' -- --nocapture --test-threads=1`.
+
+- On task head `951f028007c17f462f476d6e050bea423ca17c49`, all nine commands exited 0 and each reported `1 passed, 0 failed`.
+- On base `07ca9298cfbbf7a0c5f46d4d9135e373141500b7`, the same nine commands were run in separately managed disposable branch `validation/278-base-07ca-3`; all nine exited 0 and each reported `1 passed, 0 failed`.
+
+Therefore the nine failures occur only in the aggregate full-binary run's parallel/shared-fixture conditions. They are not deterministic on either exact head, and no feature-caused defect was found. The task branch was restored without reset to `951f028...` and remains clean.
+
 ## Commit history
 
 - `188e11c0e764f68fb43dfe65405fc670b7cc8ce1` — anchor schedule-job fixture cleanup.

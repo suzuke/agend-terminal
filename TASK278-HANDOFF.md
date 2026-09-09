@@ -10,4 +10,6 @@ The final fixture correction also asserts the sibling's PGID before and after le
 
 Validation is complete for the owned runtime scope, formatting, clippy, and diff checks. The full binary suite was run and is red with 7,491 passes and 9 unrelated fixture failures; see `TASK278-EVIDENCE.md` for the exact failure names and commands. Do not describe the full suite as green.
 
+Each of those nine tests was then run individually on exact task head `951f028...` and exact base `07ca9298...` in a separately managed disposable worktree; all 18 focused runs passed. The aggregate failures are therefore parallel/shared-fixture-only and are not reproducible on either head.
+
 Next action: orchestrator/reviewer should inspect the two normal commits and decide whether the unrelated full-suite failures require separate follow-up. No publication or merge has been performed by this branch.
