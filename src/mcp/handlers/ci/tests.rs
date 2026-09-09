@@ -2082,6 +2082,63 @@ fn checkout_path_warn_strategy_preserves_old_raw_digest_directory_3550() {
     std::fs::remove_dir_all(parent).ok();
 }
 
+#[test]
+#[cfg(unix)]
+#[tracing_test::traced_test]
+fn reviewer_real_checkout_warns_about_raw_identity_3570() {
+    struct Cleanup(Vec<std::path::PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+    let home = std::env::temp_dir().join(format!("review3570-home-{}", uuid::Uuid::new_v4()));
+    let parent = std::env::temp_dir().join(format!("review3570-source-{}", uuid::Uuid::new_v4()));
+    let _cleanup = Cleanup(vec![home.clone(), parent.clone()]);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&parent).unwrap();
+    let source = p780_setup_source_broken_origin(&parent);
+    let alias = source
+        .parent()
+        .unwrap()
+        .join(".")
+        .join(source.file_name().unwrap());
+    let alias = alias.display().to_string();
+    let raw_digest = crate::daemon::utils::sha256_hex(alias.as_bytes());
+    let label: String = source
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .take(16)
+        .collect();
+    let raw_target = home
+        .join("worktrees")
+        .join(format!("review3570-{label}-{}", &raw_digest[..32]));
+    std::fs::create_dir_all(&raw_target).unwrap();
+    let response = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": alias, "branch": "main", "bind": false
+        }),
+        "review3570",
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(raw_target.exists());
+    let entry_warned = logs_contain("legacy raw-path checkout identity remains");
+    let _ = super::checkout_path::resolve_worktree_target(&home, "review3570", &alias);
+    assert!(
+        logs_contain("legacy raw-path checkout identity remains"),
+        "positive helper control must prove log capture and raw target identity"
+    );
+    assert!(
+        entry_warned,
+        "real checkout must emit the claimed legacy warning"
+    );
+}
+
 #[cfg(unix)]
 fn p780_branch_exists(source: &Path, branch: &str) -> bool {
     std::process::Command::new("git")
