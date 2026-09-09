@@ -6536,3 +6536,74 @@ fn codex_preset_has_no_trust_dismiss_matcher_3317() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+#[cfg(unix)]
+#[allow(clippy::unwrap_used)]
+fn scheduled_job_pty_exit_retains_original_child_for_runner() {
+    let home = std::env::temp_dir().join(format!("job-pty-exit-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).unwrap();
+    let id = crate::types::InstanceId::new();
+    let name = "job-exit-fixture";
+    let mut handle = mk_test_handle(name, id);
+    handle.child.lock().wait().unwrap();
+    handle.spawned_at = std::time::Instant::now() - std::time::Duration::from_secs(120);
+    let original_child = Arc::clone(&handle.child);
+    let core = Arc::clone(&handle.core);
+    let deleted = Arc::clone(&handle.deleted);
+    let generation = handle.generation;
+    let registry: AgentRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    registry.lock().insert(id, handle);
+    // Cleanup exists before the real exit handler can create a shell on RED.
+    struct Cleanup(std::path::PathBuf, AgentRegistry);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for handle in self.1.lock().values() {
+                handle
+                    .deleted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let mut child = handle.child.lock();
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(home.clone(), Arc::clone(&registry));
+    std::fs::write(home.join("fleet.yaml"), format!("instances:\n  {name}:\n    id: {}\n    backend: codex\n    created_by: system:schedule_job\n", id.full())).unwrap();
+    let run = serde_json::json!({
+        "id":"j-exit", "schedule_id":"s-exit", "scheduled_at":0,"created_by":"test",
+        "message":"test", "config":{"backends":["codex"],"artifact_directory":home.join("artifacts")},
+        "phase":"running","revision":0,
+        "attempt":{"number":1,"name":name,"uuid":id.full(),"backend":"codex","started_at":0},
+        "previous_attempts":[],"task_id":null,"result":null,"error":null,"next_attempt_at":0,
+        "deadline":i64::MAX,"cleanup_pending":false,"task_settled":false,
+        "notification":"not_requested","notification_receipt":null,"notification_error":null
+    });
+    std::fs::write(
+        home.join("schedule-jobs.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version":1,"watermarks":{},"runs":[run],"overlap_skips":{}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(crate::schedule_jobs::owns_worker(&home, name));
+    handle_pty_close(
+        name,
+        &id,
+        &registry,
+        &Some(home.clone()),
+        &None,
+        &None,
+        &deleted,
+        &core,
+        generation,
+    );
+    let reg = registry.lock();
+    assert!(
+        reg.get(&id)
+            .is_some_and(|h| Arc::ptr_eq(&h.child, &original_child)),
+        "Job PTY exit must retain the original child; no shell replacement or registry removal"
+    );
+}
