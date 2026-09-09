@@ -680,3 +680,56 @@ fn stop_no_wait_returns_on_the_accepted_request_only_3539() {
     );
     // `home_guard` reaps whatever is still shutting down.
 }
+
+/// A live, owned daemon with an unreachable API is not the same as an absent
+/// daemon: stop must not report success or invite a restart.
+#[cfg(unix)]
+#[test]
+fn stop_transport_failure_is_not_reported_as_absent_3559() {
+    let stamp = std::process::id();
+    let home_guard = FixtureHome::new(&format!("agend-cli-smoke-stop-transport-{stamp}"));
+    let home = home_guard.path().to_path_buf();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+    )
+    .expect("write fleet.yaml");
+
+    cmd()
+        .env("AGEND_HOME", &home)
+        .arg("start")
+        .assert()
+        .success();
+    let daemon_pid = wait_for_daemon_identity(&home, std::time::Duration::from_secs(30));
+    assert!(pid_alive(daemon_pid), "daemon must be alive before stop");
+
+    // Keep the daemon alive but make the published API endpoint unreachable.
+    // `home_guard` owns the daemon and reaps it after this assertion.
+    std::fs::write(
+        home.join("run")
+            .join(daemon_pid.to_string())
+            .join("api.port"),
+        "1\n",
+    )
+    .expect("replace api port with a refused endpoint");
+
+    let output = cmd()
+        .env("AGEND_HOME", &home)
+        .arg("stop")
+        .output()
+        .expect("run stop");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "transport failure must not be reported as success: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Unable to contact daemon"),
+        "transport failure must be explicit: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        pid_alive(daemon_pid),
+        "the daemon remains live after the refused request: stdout={stdout} stderr={stderr}"
+    );
+}
