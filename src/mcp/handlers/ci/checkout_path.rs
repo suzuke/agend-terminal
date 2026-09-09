@@ -107,14 +107,7 @@ fn resolve_worktree_target_with_common_dir(
     let legacy_path = home.join("worktrees").join(&legacy_mangled);
     let bounded_mangled = bounded_mangled(instance_name, source_path);
     let bounded_path = home.join("worktrees").join(&bounded_mangled);
-    let raw_bounded = bounded_mangled_for_key(instance_name, source_path);
-    let raw_present = home.join("worktrees").join(&raw_bounded).exists()
-        || legacy_journal_exists(home, &raw_bounded);
-    if raw_bounded != bounded_mangled && raw_present {
-        tracing::warn!(
-            "legacy raw-path checkout identity remains; preserving it for binding/GC recovery"
-        );
-    }
+    warn_legacy_raw_identity(home, instance_name, source_path, source_path);
     let legacy_present = legacy_identity_matches(
         home,
         &legacy_path,
@@ -191,6 +184,9 @@ fn validate_target_budget(
     }
     Ok(())
 }
+
+mod raw_warning;
+pub(super) use raw_warning::warn_legacy_raw_identity;
 
 fn legacy_mangled(instance_name: &str, source_path: &str) -> String {
     format!(

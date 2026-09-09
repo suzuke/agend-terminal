@@ -54,6 +54,9 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             Ok(pair) => pair,
             Err(e) => return e,
         };
+    if source != source_path {
+        super::checkout_path::warn_legacy_raw_identity(home, instance_name, source, &source_path);
+    }
     let target =
         match super::checkout_path::resolve_worktree_target(home, instance_name, &source_path) {
             Ok(target) => target,
