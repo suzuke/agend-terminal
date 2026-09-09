@@ -980,7 +980,11 @@ fn handle_done(
                     .as_ref()
                     .map(|o| o.0.clone())
                     .unwrap_or_else(|| caller.clone());
-                if let Some(binding) = crate::binding::read(home, &owner) {
+                // Receipt completion concerns an already released old task,
+                // never the owner's current (possibly rebound) workspace.
+                if let Some(binding) =
+                    crate::binding::read(home, &owner).filter(|_| completion_receipt.is_none())
+                {
                     // P0 cross-lease identity guard: only touch the owner's
                     // worktree / enqueue release when the binding's task_id
                     // matches the completed task. A stale task_done for an OLD

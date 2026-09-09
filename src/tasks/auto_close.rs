@@ -167,7 +167,9 @@ fn auto_close_on_report_with_mode(
         // own) never enqueues an intent → its binding leaks (immortal review
         // worktree). `assignee == reporter` was enforced above; repo="" → the
         // sweeper derives it from the binding's source_repo.
-        if let Some(binding) = crate::binding::read(home, reporter) {
+        if let Some(binding) = crate::binding::read(home, reporter).filter(|binding| {
+            completion_receipt.is_none() && binding["task_id"].as_str() == Some(correlation_id)
+        }) {
             if let Some(branch) = binding["branch"].as_str() {
                 crate::daemon::auto_release::enqueue_release_recompute(
                     home,
