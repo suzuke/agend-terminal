@@ -22,7 +22,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::admin::orphan_provenance::{self, ProvenanceSupport, ResidualHint};
+use crate::admin::orphan_provenance::{
+    self, OrphanCandidate, OrphanReport, ProvenanceSupport, ResidualHint,
+};
 
 pub struct StopOptions {
     /// Poll for the daemon process to exit before returning.
@@ -229,26 +231,36 @@ fn report_residuals(home: &Path) {
     }
     orphan_provenance::annotate_residual_hints(home, &mut report);
 
-    let hinted: Vec<_> = report
+    print!("{}", render_residual_report(&report));
+}
+
+/// Render the stop command's narrowed residual view. This is deliberately
+/// separate from the process snapshot so the report's classification and
+/// formatting can be tested with synthetic candidates without creating or
+/// signalling any process.
+fn render_residual_report(report: &OrphanReport) -> String {
+    if let ProvenanceSupport::Unsupported { platform, reason } = &report.support {
+        return format!("Residual scan: not available on {platform} ({reason}).\n");
+    }
+
+    let hinted: Vec<&OrphanCandidate> = report
         .candidates
         .iter()
         .filter(|c| c.hint.is_some())
         .collect();
     if hinted.is_empty() {
-        println!(
-            "Residual scan: no reparented process in scope looks agend-related \
-             (scoped snapshot, not a global clean result; `agend-terminal doctor` shows the full scope)."
-        );
-        return;
+        return "Residual scan: no reparented process in scope looks agend-related \
+             (scoped snapshot, not a global clean result; `agend-terminal doctor` shows the full scope).\n"
+            .to_string();
     }
-    println!(
+    let mut out = format!(
         "Residual scan: {} reparented process(es) look agend-related. UNPROVEN — the daemon \
-         did not own them and takes no action:",
+         did not own them and takes no action:\n",
         hinted.len()
     );
     for c in hinted {
-        println!(
-            "  pid={} hint={} elapsed_secs={} argv={} cwd={}",
+        out.push_str(&format!(
+            "  pid={} hint={} elapsed_secs={} argv={} cwd={}\n",
             c.pid,
             c.hint.map(ResidualHint::label).unwrap_or("none"),
             c.elapsed_secs
@@ -256,12 +268,13 @@ fn report_residuals(home: &Path) {
                 .unwrap_or_else(|| "unknown".into()),
             c.argv.as_deref().unwrap_or("unknown"),
             c.cwd.as_deref().unwrap_or("unknown"),
-        );
+        ));
     }
-    println!(
+    out.push_str(
         "  Disposition is an operator decision: `agend-terminal doctor` lists every candidate \
-         and `doctor orphans preview` starts a manual, confirmed cleanup."
+         and `doctor orphans preview` starts a manual, confirmed cleanup.\n",
     );
+    out
 }
 
 fn now_epoch_ms() -> i64 {
@@ -274,6 +287,7 @@ fn now_epoch_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::orphan_provenance::UnprovenReason;
 
     #[test]
     fn wait_for_exit_returns_as_soon_as_the_process_is_gone_3539() {
@@ -404,5 +418,53 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn residual_report_formats_hinted_candidates_without_signalling_3539() {
+        let home = Path::new("/tmp/agend-stop-report-home");
+        let hinted_argv = home
+            .join("target/debug/deps/agend_terminal-deadbeef3539")
+            .display()
+            .to_string();
+        let hinted = orphan_provenance::residual_hint(home, Some(&hinted_argv), None);
+        let control = orphan_provenance::residual_hint(
+            home,
+            Some("/tmp/control/plain-sleeper"),
+            Some("/tmp/control"),
+        );
+        assert_eq!(hinted, Some(ResidualHint::TestRunnerBinary));
+        assert_eq!(control, None);
+
+        let candidate = |pid: u32, hint: Option<ResidualHint>, argv: &str| OrphanCandidate {
+            pid,
+            start_token: Some(17),
+            lstart_ms: Some(42),
+            sid: Some(9),
+            pgid: Some(8),
+            leader_alive: Some(false),
+            argv: Some(argv.to_string()),
+            cwd: None,
+            elapsed_secs: Some(3),
+            cpu_percent: Some(0.0),
+            suggested_instance: None,
+            unproven_reason: UnprovenReason::NoObservation,
+            hint,
+        };
+        let report = OrphanReport {
+            support: ProvenanceSupport::Supported,
+            candidates: vec![
+                candidate(101, hinted, &hinted_argv),
+                candidate(202, control, "/tmp/control/plain-sleeper"),
+            ],
+            scope: orphan_provenance::ScopeCounts::default(),
+        };
+
+        let output = render_residual_report(&report);
+        assert!(output.contains("Residual scan: 1 reparented process(es)"));
+        assert!(output.contains("pid=101 hint=test-runner-binary"));
+        assert!(!output.contains("pid=202 "));
+        assert!(output.contains("did not own them and takes no action"));
+        assert!(!output.contains("SIGTERM") && !output.contains("SIGKILL"));
     }
 }
