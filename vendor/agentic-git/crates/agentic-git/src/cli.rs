@@ -658,8 +658,10 @@ fn write_hook(path: &Path, content: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn install_hooks(home: &Path) -> Result<(), String> {
-    let hooks_dir = home.join("hooks");
+fn install_hooks(home: &Path) -> Result<PathBuf, String> {
+    // Standalone sessions may share a home with AgEnD. Never write its hooks:
+    // separate paths establish ownership without racing chmod or open files.
+    let hooks_dir = home.join("hooks").join("agentic-git");
     std::fs::create_dir_all(&hooks_dir).map_err(|e| format!("mkdir hooks: {e}"))?;
     write_hook(
         &hooks_dir.join("prepare-commit-msg"),
@@ -674,7 +676,7 @@ fn install_hooks(home: &Path) -> Result<(), String> {
         &hooks_dir.join("prepare-commit-msg.ps1"),
         HOOK_PREPARE_COMMIT_MSG_PS1,
     )?;
-    Ok(())
+    Ok(hooks_dir)
 }
 
 /// Amended step 6: `extensions.worktreeConfig` is a repo-wide switch (must
@@ -983,11 +985,14 @@ fn run_cmd(raw_args: &[String]) -> ! {
     }
 
     // Step 6: hooks — embed + wire, always (idempotent whether fresh or reused).
-    if let Err(e) = install_hooks(&home) {
-        eprintln!("agentic-git: run: {e}");
-        std::process::exit(1);
-    }
-    if let Err(e) = configure_worktree_hooks(&real_git, &wt_path, &home.join("hooks")) {
+    let hooks_dir = match install_hooks(&home) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("agentic-git: run: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = configure_worktree_hooks(&real_git, &wt_path, &hooks_dir) {
         eprintln!("agentic-git: run: {e}");
         std::process::exit(1);
     }
