@@ -1141,6 +1141,11 @@ fn tick(
         if !reaction_intents.is_empty() {
             let config = crate::runtime_config::get();
             for intent in &reaction_intents {
+                if intent.to == crate::state::AgentState::UsageLimit
+                    && crate::schedule_jobs::owns_worker(home, &name)
+                {
+                    continue;
+                }
                 for kind in reaction_kinds(intent.to, config.usage_limit_propagation_enabled) {
                     match kind {
                         ReactionKind::NotifyOperator => {

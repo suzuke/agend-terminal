@@ -1425,6 +1425,7 @@ mod tests {
                 "shadow_observe",
                 "snapshot_rotation",
                 "check_schedules",
+                "schedule_jobs",
                 "ci_watch_poll",
                 "pr_state_scan",
                 "assignment_reconcile",

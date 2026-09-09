@@ -312,6 +312,40 @@ pub(crate) struct TransportGenerationGuard {
     cleanup: bool,
 }
 
+/// Exclusive lane admission without changing delivery epochs or pending wakes.
+pub(crate) struct TransportAdmissionGuard {
+    serial: TransportLaneGuard,
+    key: (PathBuf, String),
+    state: Arc<TransportEpochEntry>,
+}
+
+impl TransportAdmissionGuard {
+    pub(crate) fn into_cleanup(self) -> TransportGenerationGuard {
+        {
+            let mut state_guard = self.state.state.lock();
+            state_guard.cleanup_active = true;
+            state_guard.epoch = state_guard.epoch.saturating_add(1);
+            self.state.publish_admission_snapshot(&state_guard);
+        }
+        TransportGenerationGuard {
+            _serial: self.serial,
+            _key: self.key,
+            state: self.state,
+            cleanup: true,
+        }
+    }
+}
+
+pub(crate) fn begin_transport_admission(home: &Path, agent: &str) -> TransportAdmissionGuard {
+    #[cfg(test)]
+    test_support::run_cleanup_before_lane_acquire_hook(home, agent);
+    TransportAdmissionGuard {
+        serial: TransportLaneGuard::acquire(home, agent),
+        key: (home.to_path_buf(), agent.to_string()),
+        state: transport_epoch_state(home, agent),
+    }
+}
+
 struct TransportLaneGuard {
     guard: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, ()>>,
 }

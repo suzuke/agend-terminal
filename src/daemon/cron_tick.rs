@@ -43,6 +43,12 @@ pub fn check_schedules(home: &Path) {
         if !sched.enabled {
             continue;
         }
+        if sched.job.is_some() {
+            if let Err(error) = crate::schedule_jobs::admit_due(home, sched, now_utc) {
+                tracing::warn!(schedule = %sched.id, %error, "job admission failed; durable watermark retained");
+            }
+            continue;
+        }
 
         // Resolve target timezone once — used by Cron dispatch and by
         // log/error messages. `Once` stores an absolute RFC 3339 instant

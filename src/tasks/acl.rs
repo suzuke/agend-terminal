@@ -86,6 +86,7 @@ const SYSTEM_IDENTITIES: &[&str] = &[
     "system:overdue_sweep",
     "system:reclaim_usage_limit",
     "system:task_sweep",
+    "system:schedule_job",
 ];
 
 /// Check if a caller is a recognized system identity.

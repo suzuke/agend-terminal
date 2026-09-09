@@ -71,6 +71,7 @@ pub(crate) mod reclaim;
 pub(crate) mod reconcile_backups_gc;
 pub(crate) mod recovery_dispatcher;
 pub(crate) mod respawn_watchdog;
+pub(crate) mod schedule_jobs;
 pub(crate) mod shadow_observe;
 pub(crate) mod snapshot;
 pub(crate) mod supervisor_trackers;
@@ -420,6 +421,7 @@ pub(crate) fn build_default_handlers(
         Box::new(ShadowObserveHandler::new()),
         Box::new(SnapshotRotationHandler::new()),
         Box::new(CheckSchedulesHandler::new()),
+        Box::new(schedule_jobs::ScheduleJobsHandler::new()),
         Box::new(CiWatchPollHandler::new()),
         Box::new(PrStateScanHandler::new()),
         // t-…-17 C12: reconcile the durable reviewer-assignment authority every tick
