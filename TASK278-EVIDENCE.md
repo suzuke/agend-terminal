@@ -35,7 +35,7 @@ ran: `cargo clippy --locked --bin agend-terminal --tests -- -D warnings` → pas
 
 ran: `git diff --check` → passed.
 
-ran: `cargo test --locked --bin agend-terminal` → 7,491 passed, 9 failed, 11 ignored. The nine failures were in unrelated API, daemon, dispatch-tracking, binding-state, and checkout-submodule fixtures; none were in `schedule_jobs::runtime`, and the failures showed shared temporary-state/timing issues. This result is reported as suite red, not waived.
+ran: `cargo test --locked --bin agend-terminal` at the pre-final terminology-only fixture head → 7,491 passed, 9 failed, 11 ignored. The nine failures were in unrelated API, daemon, dispatch-tracking, binding-state, and checkout-submodule fixtures; none were in `schedule_jobs::runtime`, and the failures showed shared temporary-state/timing issues. The final correction is covered by the post-correction 14-test runtime suite above. This result is reported as suite red, not waived.
 
 ## Commit history
 
