@@ -306,6 +306,40 @@ fn install_hooks_rewrites_legacy_vendor_prepare_commit_msg_3557() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// A vendor write that already opened the old file must not overwrite the
+/// canonical hook after reconciliation returns. chmod cannot revoke an fd.
+#[cfg(unix)]
+#[test]
+fn install_hooks_isolates_inflight_vendor_writer_3557() {
+    use std::io::Write;
+
+    let home = tmp_home("inflight-vendor-prepare-commit-msg");
+    let hooks = home.join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let path = hooks.join("prepare-commit-msg");
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let vendor_path = path.clone();
+    let vendor = std::thread::spawn(move || {
+        // Pause std::fs::write's open/truncate -> write sequence at its syscall
+        // boundary, while the real daemon install_hooks entry point runs.
+        let mut file = std::fs::File::create(vendor_path).unwrap();
+        opened_tx.send(()).unwrap();
+        resume_rx.recv().unwrap();
+        file.write_all(include_bytes!(
+            "../../vendor/agentic-git/crates/agentic-git/assets/hooks/prepare-commit-msg"
+        ))
+        .unwrap();
+    });
+    opened_rx.recv().unwrap();
+    install_hooks(&home, &home.join("not-a-repo"));
+    resume_tx.send(()).unwrap();
+    vendor.join().unwrap();
+    let installed = std::fs::read(&path).unwrap();
+    std::fs::remove_dir_all(&home).unwrap();
+    assert_eq!(installed, include_bytes!("../../assets/hooks/prepare-commit-msg"));
+}
+
 /// #2234: the reference-transaction hook is (1) FAIL-OPEN — always exits 0, even
 /// in the `prepared` phase, so it can NEVER abort a ref transaction and wedge the
 /// fleet — and (2) SIGNATURE-SCOPED — logs ONLY a HEAD detach to origin/main, NOT
