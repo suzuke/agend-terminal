@@ -33,7 +33,7 @@ pub struct StopOptions {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StopOutcome {
-    /// No active run dir, or the API was unreachable.
+    /// No active run dir was discoverable.
     NotRunning,
     /// Request accepted; `--no-wait` so nothing further was observed.
     Initiated,
@@ -110,7 +110,7 @@ pub fn run_stop(home: &Path, opts: StopOptions) -> anyhow::Result<StopOutcome> {
         &serde_json::json!({"method": crate::api::method::SHUTDOWN}),
     ) {
         Ok(resp) => resp,
-        Err(_) => return Ok(StopOutcome::NotRunning),
+        Err(error) => anyhow::bail!("Unable to contact daemon for shutdown request: {error}"),
     };
     if resp["ok"].as_bool() != Some(true) {
         anyhow::bail!("Shutdown request failed.");
