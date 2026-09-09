@@ -205,9 +205,11 @@ impl DeleteFence {
     /// Block competing spawns while validation can still refuse without
     /// invalidating queued delivery or erasing pending inject verification.
     pub(crate) fn admit(home: &Path, name: &str, hold_transport: bool) -> Self {
-        let deleting = Some(crate::agent::deleting::mark_deleting(home, name));
+        // Earlier queued deliveries must finish before a provisional deleting
+        // mark can make them stale. Validation may still refuse this cleanup.
         let admission = hold_transport
             .then(|| crate::daemon::delivery_worker::begin_transport_admission(home, name));
+        let deleting = Some(crate::agent::deleting::mark_deleting(home, name));
         Self {
             deleting,
             admission,
