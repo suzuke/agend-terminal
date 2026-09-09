@@ -324,3 +324,27 @@ fn completion_and_stop_race_has_one_winner() {
         std::fs::remove_dir_all(h).unwrap();
     }
 }
+
+#[test]
+fn every_second_cron_admits_latest_due_at_exact_and_fractional_ticks() {
+    // Exercise the same admission entry cron_tick calls, with deterministic
+    // clock samples. A fractional upper bound must not choose a future second
+    // and then discard it instead of admitting the latest due occurrence.
+    for offset_ms in [0, 1, 500, 999] {
+        let h = home();
+        let mut s = schedule(&h);
+        s.trigger = crate::schedules::Trigger::Cron {
+            expr: "* * * * * *".into(),
+        };
+        let tick_at = now() + chrono::Duration::milliseconds(offset_ms);
+        admit_due(&h, &s, tick_at).unwrap();
+        let state = read(&h).unwrap();
+        assert_eq!(state.runs.len(), 1, "missing occurrence at {tick_at}");
+        assert_eq!(state.runs[0].scheduled_at, now().timestamp_millis());
+        assert_eq!(state.watermarks[&s.id], now().timestamp_millis());
+        // Repeated scans of this fraction of the second are idempotent.
+        admit_due(&h, &s, tick_at).unwrap();
+        assert_eq!(read(&h).unwrap().runs.len(), 1);
+        std::fs::remove_dir_all(h).unwrap();
+    }
+}
