@@ -729,35 +729,77 @@ mod tests {
         use std::os::unix::process::CommandExt;
         struct GroupGuard {
             leader: Option<std::process::Child>,
-            pgid: u32,
+            descendant: Option<std::process::Child>,
+        }
+        impl GroupGuard {
+            fn reap_child(child: &mut std::process::Child) -> Result<(), String> {
+                if child
+                    .try_wait()
+                    .map_err(|error| format!("poll fixture child: {error}"))?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                child
+                    .kill()
+                    .map_err(|error| format!("kill fixture child {}: {error}", child.id()))?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                loop {
+                    match child
+                        .try_wait()
+                        .map_err(|error| format!("poll fixture child {}: {error}", child.id()))?
+                    {
+                        Some(_) => return Ok(()),
+                        None if std::time::Instant::now() >= deadline => {
+                            return Err(format!(
+                                "fixture child {} remained alive after 3s",
+                                child.id()
+                            ));
+                        }
+                        None => std::thread::sleep(std::time::Duration::from_millis(20)),
+                    }
+                }
+            }
+
+            fn reap(&mut self) -> Result<(), String> {
+                if let Some(leader) = &mut self.leader {
+                    Self::reap_child(leader)?;
+                }
+                if let Some(descendant) = &mut self.descendant {
+                    Self::reap_child(descendant)?;
+                }
+                Ok(())
+            }
         }
         impl Drop for GroupGuard {
             fn drop(&mut self) {
-                if self.pgid > 0 {
-                    unsafe {
-                        libc::kill(-(self.pgid as i32), libc::SIGKILL);
-                    }
-                }
-                if let Some(child) = &mut self.leader {
-                    let _ = child.wait();
+                if let Err(error) = self.reap() {
+                    eprintln!("stopped-leader fixture cleanup incomplete: {error}");
                 }
             }
         }
         let mut group = GroupGuard {
             leader: None,
-            pgid: 0,
+            descendant: None,
         };
-        group.leader = Some(
-            std::process::Command::new("sh")
-                .args(["-c", "sleep 60 >/dev/null 2>&1 &"])
-                .process_group(0)
+        let leader = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = leader.id();
+        group.leader = Some(leader);
+        group.descendant = Some(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(pgid as i32)
                 .spawn()
                 .unwrap(),
         );
-        group.pgid = group.leader.as_ref().unwrap().id();
+        group.leader.as_mut().unwrap().kill().unwrap();
         group.leader.as_mut().unwrap().wait().unwrap();
         assert_eq!(
-            unsafe { libc::kill(-(group.pgid as i32), 0) },
+            unsafe { libc::kill(-(pgid as i32), 0) },
             0,
             "fixture requires a surviving descendant in the isolated group"
         );
@@ -769,8 +811,8 @@ mod tests {
         crate::store::save_atomic(
             &journal_path(home.path(), &attempt.name),
             &serde_json::json!({
-                "uuid": id, "phase": "Stopped", "pid": group.pgid,
-                "start_token": null, "pgid": group.pgid,
+                "uuid": id, "phase": "Stopped", "pid": pgid,
+                "start_token": null, "pgid": pgid,
             }),
         )
         .unwrap();
@@ -780,6 +822,14 @@ mod tests {
             "leader-only receipt allowed cleanup while its descendant group is alive"
         );
         assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
+        group.reap().unwrap();
+        assert!(group
+            .descendant
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_some());
     }
 
     #[cfg(unix)]
@@ -794,20 +844,36 @@ mod tests {
         struct Cleanup<'a> {
             runtime: &'a ManagedRuntime,
             name: String,
+            cleaned: bool,
         }
-        impl Drop for Cleanup<'_> {
-            fn drop(&mut self) {
-                let _ = crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
+        impl Cleanup<'_> {
+            fn cleanup(&mut self) -> Result<(), String> {
+                if self.cleaned {
+                    return Ok(());
+                }
+                let result = crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
                     &self.runtime.home, &self.name, Some(&crate::agent_ops::DeleteContext {
                         registry: &self.runtime.registry, configs: &self.runtime.configs,
                         externals: &self.runtime.externals, notifier: None,
                     }),
                 );
+                if result.is_ok() {
+                    self.cleaned = true;
+                }
+                result
             }
         }
-        let _cleanup = Cleanup {
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                if let Err(error) = self.cleanup() {
+                    eprintln!("registered-worker fixture cleanup incomplete: {error}");
+                }
+            }
+        }
+        let mut _cleanup = Cleanup {
             runtime: &runtime,
             name: attempt.name.clone(),
+            cleaned: false,
         };
         let id = runtime.start(&run, &attempt).unwrap();
         attempt.uuid = Some(id.clone());
@@ -822,6 +888,10 @@ mod tests {
         assert!(crate::agent::lock_registry(&runtime.registry).contains_key(&parsed));
         assert!(child.lock().try_wait().unwrap().is_none());
         assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
+        _cleanup
+            .cleanup()
+            .expect("registered worker fixture cleanup must succeed");
+        assert!(child.lock().try_wait().unwrap().is_some());
     }
 
     #[test]
