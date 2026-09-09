@@ -117,6 +117,38 @@ fn worktree_path(home: &Path, agent: &str, branch: &str) -> PathBuf {
 
 // ── Issue Testing list, items 1–6 ───────────────────────────────────────
 
+#[test]
+fn run_preserves_daemon_hooks_in_shared_home() {
+    let root = tempdir("daemon-hook-owner");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    init_repo(&repo);
+    let home = root.join("home");
+    let hooks = home.join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    for _ in 0..2 {
+        // Writable daemon files: isolation must not depend on chmod. Reinstall
+        // between fresh and reused sessions to exercise both run paths.
+        for name in ["prepare-commit-msg", "prepare-commit-msg.ps1", "reference-transaction"] {
+            std::fs::write(hooks.join(name), "daemon-owned\n").unwrap();
+        }
+        let out = run_cli(&repo, &home, &[
+            "run", "--agent", "hook-owner", "--branch", "sess/owner", "--", "git", "status", "--porcelain",
+        ]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        for name in ["prepare-commit-msg", "prepare-commit-msg.ps1", "reference-transaction"] {
+            assert_eq!(std::fs::read_to_string(hooks.join(name)).unwrap(), "daemon-owned\n",
+                "vendor run must not overwrite {name}");
+        }
+        let wt = worktree_path(&home, "hook-owner", "sess/owner");
+        let configured = git_config_get(&wt, "core.hooksPath").unwrap();
+        assert_eq!(Path::new(&configured), hooks.join("agentic-git"));
+        assert_eq!(std::fs::read(hooks.join("agentic-git/prepare-commit-msg")).unwrap(),
+            include_bytes!("../assets/hooks/prepare-commit-msg"));
+    }
+    cleanup(&root);
+}
+
 /// 1. `run --branch t -- sh -c 'git status'` → exit 0, cwd was the worktree.
 #[test]
 fn test1_run_spawns_in_worktree_with_shim_routing() {

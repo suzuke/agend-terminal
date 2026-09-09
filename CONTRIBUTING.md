@@ -14,7 +14,7 @@ cargo nextest run --features tray <filter>   # same gate, filtered; still compil
 cargo test --tests --features tray   # same selection without nextest; a binary's tests then share one process and can race — CI never runs this form
 cargo test                           # unit + integration + MCP round-trip (+ doc-tests, default features)
 cargo test --test integration        # ONE integration target (tests/integration.rs; Unix-only for now)
-scripts/fmt-owned.sh --check         # THE owned-source fmt surface (excludes vendor/); no arg = format
+scripts/fmt-owned.sh --check         # THE owned-source fmt surface (includes untracked/non-ignored *.rs; excludes vendor/); no arg = format
 cargo clippy -- -D warnings          # quick check; scripts/preflight.sh runs CI's exact owned-target set
 ```
 
@@ -54,7 +54,7 @@ Run the one-shot CI-parity preflight to catch failures locally instead of after 
 scripts/preflight.sh          # full matrix; --quick skips the Windows cross-check
 ```
 
-It runs the same fmt/clippy surface CI's `check` job runs — `scripts/fmt-owned.sh --check` (owned `*.rs`, `vendor/` excluded) and the owned-target `cargo clippy` — plus the test gate (`cargo nextest run --features tray`, the runner CI uses; it falls back to `cargo test --tests --features tray` only when cargo-nextest is not installed) and a **Windows cross-check** (`x86_64-pc-windows-msvc`) that catches windows-only compile errors a unix dev box would otherwise miss. (A floating stable toolchain is not byte-exact over time — so preflight is a strong pre-check, not a byte-exact CI guarantee.) The Windows step prefers [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) (`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`) since a transitive C dependency (`ring`) won't cross-compile on macOS/Linux without the MSVC toolchain; if it's not installed the step SKIPs with a hint rather than false-failing.
+It runs the same fmt/clippy surface CI's `check` job runs — `scripts/fmt-owned.sh --check` (tracked plus untracked/non-ignored `*.rs`, `vendor/` excluded) and the owned-target `cargo clippy` — plus the test gate (`cargo nextest run --features tray`, the runner CI uses; it falls back to `cargo test --tests --features tray` only when cargo-nextest is not installed) and a **Windows cross-check** (`x86_64-pc-windows-msvc`) that catches windows-only compile errors a unix dev box would otherwise miss. New Rust files do not need to be staged before this format check, and preflight prints a note when it finds any; staging them first is still a useful way to review the complete PR diff. (A floating stable toolchain is not byte-exact over time — so preflight is a strong pre-check, not a byte-exact CI guarantee.) The Windows step prefers [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) (`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`) since a transitive C dependency (`ring`) won't cross-compile on macOS/Linux without the MSVC toolchain; if it's not installed the step SKIPs with a hint rather than false-failing.
 
 ### Cross-platform lint patterns
 
@@ -150,6 +150,11 @@ git config user.email "1557604+suzuke@users.noreply.github.com"
 This is local to `.git/config` and is **not** version-controlled, so re-run it after a
 fresh `git clone`. Fleet agents commit in linked worktrees of this clone and inherit
 the same identity automatically.
+
+Fleet provenance trailers are branch-verified. In a repository's main worktree Git
+does not export `GIT_DIR` to the hook, so `Agend-Task` and `Agend-Branch` are withheld
+and only `Agend-Agent` is kept. Agent bindings use linked worktrees, where Git does
+export `GIT_DIR`, so matching task and branch provenance is retained.
 
 ## Review Process
 
@@ -251,7 +256,7 @@ Real-PTY captures grow the regression corpus in `tests/fixtures/state-replay/` a
 
 ## Style
 
-- `cargo fmt` always. CI will fail on unformatted diffs.
+- Run `scripts/fmt-owned.sh` before committing. It formats tracked and untracked/non-ignored Rust files while excluding `vendor/`; CI will fail on unformatted diffs.
 - `cargo clippy -- -D warnings` — fix warnings, don't `#[allow]` them unless the check is genuinely wrong and you leave a one-line comment explaining why.
 - No `unwrap()` / `expect()` in non-test code. Use `?` with `anyhow::Context` for error annotation.
 - No `println!` / `eprintln!` in production code paths. Use `tracing::{info, warn, error, debug}`.
