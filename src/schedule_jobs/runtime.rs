@@ -320,6 +320,8 @@ impl JobRuntime for ManagedRuntime {
         anyhow::ensure!(read_journal(&self.home, &attempt.name)?.is_none()
             && attempt.uuid.is_none() && !registered,
             "recovery_required: launched job cleanup requires descendant containment proof; instance and artifacts retained");
+        #[cfg(test)]
+        tests::before_stop(self, attempt);
         // No spawn intent was ever written: only a pre-launch reservation can
         // reach deletion. The shared permit rechecks its identity before effects.
         crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_expected_identity(
@@ -359,6 +361,22 @@ impl JobRuntime for ManagedRuntime {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    type StopHook = Box<dyn FnOnce(&ManagedRuntime, &Attempt) + Send>;
+    static STOP_HOOK: parking_lot::Mutex<Option<(PathBuf, StopHook)>> =
+        parking_lot::Mutex::new(None);
+    pub(super) fn before_stop(runtime: &ManagedRuntime, attempt: &Attempt) {
+        let hook = {
+            let mut slot = STOP_HOOK.lock();
+            if slot.as_ref().is_some_and(|(home, _)| home == &runtime.home) {
+                slot.take().map(|(_, hook)| hook)
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            hook(runtime, attempt);
+        }
+    }
     struct TempHome(PathBuf);
     impl TempHome {
         fn new() -> Self {
@@ -498,6 +516,7 @@ mod tests {
             cleanup_pending: false,
             task_settled: false,
             recovery_required: false,
+            recovery_resolution: None,
             notification: super::super::NotificationState::NotRequested,
             notification_receipt: None,
             notification_error: None,
@@ -731,5 +750,43 @@ mod tests {
         assert!(crate::agent::lock_registry(&runtime.registry).contains_key(&parsed));
         assert!(child.lock().try_wait().unwrap().is_none());
         assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
+    }
+
+    #[test]
+    fn stop_rechecks_spawn_intent_after_deletion_fence_admission() {
+        let home = TempHome::new();
+        let (runtime, _, attempt) = reserved_fixture(home.path());
+        let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
+        let id = register_worker(home.path(), &attempt, &workspace).unwrap();
+        *STOP_HOOK.lock() = Some((
+            home.path().to_path_buf(),
+            Box::new(move |runtime, attempt| {
+                assert!(!crate::agent::deleting::is_deleting(
+                    &runtime.home,
+                    &attempt.name
+                ));
+                write_journal(
+                    &runtime.home,
+                    &attempt.name,
+                    &ProcessJournal {
+                        uuid: id,
+                        phase: ProcessPhase::Intent,
+                        pid: None,
+                        start_token: None,
+                    },
+                )
+                .unwrap();
+            }),
+        ));
+        let result = runtime.stop(&attempt);
+        assert!(
+            result.is_err(),
+            "spawn intent arriving after quick check was destructively deleted"
+        );
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
+        assert!(!crate::agent::deleting::is_deleting(
+            home.path(),
+            &attempt.name
+        ));
     }
 }
