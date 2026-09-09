@@ -281,7 +281,7 @@ fn provision_review_workspace(
     slot: crate::review_receipt::ReviewSlot,
     assignment_id: uuid::Uuid,
 ) -> Result<String, Value> {
-    let source_repo = dispatch_hook::resolve_source_repo_for_target(home, target);
+    let source_repo = dispatch_hook::resolve_source_repo_for_target(home, target)?;
     let branch = review_workspace_branch(pr_number, reviewed_head, slot, assignment_id);
     let checkout = crate::mcp::handlers::ci::handle_checkout_repo(
         home,

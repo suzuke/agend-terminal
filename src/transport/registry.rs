@@ -16,9 +16,14 @@ pub(crate) fn backend_for_instance(home: &Path, instance: &str) -> Option<Backen
     crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|fleet| {
-            fleet
-                .resolve_instance(instance)
-                .map(|resolved| resolved.backend)
+            let configured = fleet.instances.get(instance)?;
+            Some(
+                configured
+                    .backend
+                    .clone()
+                    .or_else(|| fleet.defaults.backend.clone())
+                    .unwrap_or(Backend::ClaudeCode),
+            )
         })
 }
 

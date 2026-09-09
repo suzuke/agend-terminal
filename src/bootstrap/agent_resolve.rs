@@ -54,7 +54,18 @@ pub(super) fn resolve(config: &FleetConfig, fleet_dir: &Path, home: &Path) -> Ve
 /// [`resolve`] so hot-reload-added agents are set up identically to ones
 /// materialized at startup.
 fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Option<AgentDef> {
-    let mut resolved = config.resolve_instance(name)?;
+    let mut resolved = match config.resolve_instance_checked(name) {
+        Ok(resolved) => resolved?,
+        Err(error) => {
+            tracing::error!(
+                instance = name,
+                destination = %error.destination,
+                source = %error.source,
+                "bootstrap fleet environment resolution failed — refusing to start instance"
+            );
+            return None;
+        }
+    };
 
     if let Some(ref base_dir) = resolved.working_directory {
         std::fs::create_dir_all(base_dir).ok();

@@ -204,6 +204,10 @@ pub(crate) fn format_canonical_bypass_deny(agent: &str, sub: &str) -> Vec<String
         "           or, if you genuinely must: set AGENTIC_GIT_ALLOW_CANONICAL_MUTATE=1 for a one-shot (or ask lead)."
             .to_string(),
     );
+    lines.push(
+        "           legacy alias AGEND_GIT_ALLOW_CANONICAL_MUTATE=1 is also accepted."
+            .to_string(),
+    );
     lines
 }
 
@@ -239,6 +243,14 @@ pub(crate) fn format_deny_error(
     );
     lines.push(
         "             AGENTIC_GIT_BYPASS_UNTIL=<epoch>   time-limited exemption (Unix seconds, not ISO)"
+            .to_string(),
+    );
+    lines.push(
+        "             legacy aliases accepted: AGEND_GIT_BYPASS=1, AGEND_GIT_BYPASS_AGENT=<name>,"
+            .to_string(),
+    );
+    lines.push(
+        "             AGEND_GIT_BYPASS_UNTIL=<epoch>"
             .to_string(),
     );
     lines

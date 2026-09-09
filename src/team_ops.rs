@@ -159,6 +159,24 @@ pub(crate) fn create(
     let mut spawned: Vec<(String, String)> = Vec::new();
     let size = crossterm::terminal::size().unwrap_or((120, 40));
     for (inst_name, backend, work_dir) in &planned {
+        let resolved = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .map(|fleet| fleet.resolve_instance_checked(inst_name))
+        {
+            Some(Ok(resolved)) => resolved,
+            Some(Err(error)) => {
+                tracing::error!(
+                    team = %team_name,
+                    member = %inst_name,
+                    destination = %error.destination,
+                    source = %error.source,
+                    "team spawn: fleet environment resolution failed — skipping member"
+                );
+                failed.push(format!("{inst_name}: {error}"));
+                continue;
+            }
+            None => None,
+        };
         if let Err(e) =
             crate::agent_ops::spawn::prepare_instructions(home, inst_name, backend, work_dir, None)
         {
@@ -166,9 +184,6 @@ pub(crate) fn create(
                 "team spawn: provisioning refused — skipping member");
             continue;
         }
-        let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-            .ok()
-            .and_then(|f| f.resolve_instance(inst_name));
         let resolved_env = resolved.as_ref().map(|r| r.env.clone());
         let mut member_args = resolved
             .as_ref()

@@ -780,7 +780,7 @@ Impl/reviewer 必須在 worktree 中工作，絕不能使用 canonical working t
 
 `↳ 緣由 A-§12.7`
 
-## §13. `AGEND_GIT_BYPASS=1` 使用方式
+## §13. `AGENTIC_GIT_BYPASS=1` 使用方式
 
 **TL;DR：** agent 在 daemon-managed worktree 內使用一般 git，且絕不 bypass shim denial。Bypass 只保留給 daemon internal，以及經 operator 明確授權的 repair/bootstrapping exception。
 
@@ -794,7 +794,7 @@ git add / commit / fetch
 git push origin <your-branch>     # any branch except main
 ```
 
-不得預先加上 `AGEND_GIT_BYPASS=1`。若 shim deny 某個 action，請停止，依照 daemon-managed remediation 處理，或詢問 lead/operator；deny 不是從 guard 下方重試的許可。
+不得預先加上 `AGENTIC_GIT_BYPASS=1`。若 shim deny 某個 action，請停止，依照 daemon-managed remediation 處理，或詢問 lead/operator；deny 不是從 guard 下方重試的許可。Shim 也接受 legacy 的 `AGEND_GIT_BYPASS=1` 拼法。
 
 ### 13.2 已授權的 bypass scope
 
@@ -825,7 +825,7 @@ Raw worktree lifecycle、切換 protected branch 與 push 至 main 都不屬於 
 3. 若有建議，依照 daemon-managed remediation（`repo`、`bind_self`、`release_worktree`）處理。
 4. 如果唯一建議的 remediation 是 bypass，agent 應暫停並要求 lead/operator 指示。只有 operator 或明確授權的 procedure 能核准 exact one-command scope。
 
-`AGEND_GIT_BYPASS_UNTIL=<epoch>` 用於 audited、time-bounded operator intervention；它不是 agent convenience flag。
+`AGENTIC_GIT_BYPASS_UNTIL=<epoch>` 用於 audited、time-bounded operator intervention；它不是 agent convenience flag。Shim 也接受 legacy 的 `AGEND_GIT_BYPASS_UNTIL=<epoch>` 拼法。
 
 ### 13.5 Bug-Blocks-Its-Own-Fix Exception（Sprint 62）
 

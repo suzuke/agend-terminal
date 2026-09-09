@@ -15,6 +15,34 @@ fn tmp_home_for_create_instance_team(tag: &str) -> std::path::PathBuf {
     home
 }
 
+#[test]
+#[allow(clippy::unwrap_used)]
+fn start_instance_rejects_missing_env_source_with_structured_error_3540_r1() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("missing-env-source");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  guarded:\n    backend: claude\n    env:\n      DESTINATION_TOKEN:\n        from_env: AGEND_TEST_MISSING_ENV_3540_R1\n",
+    )
+    .unwrap();
+
+    let result = handle_start_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "guarded"}),
+        None,
+    );
+
+    assert_eq!(result["code"], "env_source_missing", "{result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("DESTINATION_TOKEN")
+                && message.contains("AGEND_TEST_MISSING_ENV_3540_R1")),
+        "the refusal must identify only the destination and source names: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2454 residual RED: pure generated-member team mode must route a live MCP
 /// RuntimeContext directly to the merged typed CREATE_TEAM owner. The missing
 /// owner wire-up currently tries the API socket and therefore reports its

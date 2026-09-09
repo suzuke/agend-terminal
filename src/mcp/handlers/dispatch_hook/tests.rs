@@ -130,6 +130,44 @@ fn setup_test_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
     repo
 }
 
+#[test]
+fn dispatch_rejects_missing_env_source_before_stub_fallback_3540_r1() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = std::env::temp_dir().join(format!(
+        "agend-3540-r1-dispatch-missing-env-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "target-agent");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  target-agent:\n    backend: claude\n    working_directory: {}\n    env:\n      DESTINATION_TOKEN:\n        from_env: AGEND_TEST_MISSING_ENV_3540_R1\n",
+            repo.display()
+        ),
+    )
+    .expect("fleet");
+
+    let result = super::dispatch_auto_bind_lease_with_source_and_chain(
+        &home,
+        "target-agent",
+        "task-3540-r1",
+        "feat/3540-r1-missing-env",
+        None,
+        None,
+        None,
+        &[],
+        None,
+        false,
+    );
+
+    let error = result.expect_err("configured but unresolvable target must fail closed");
+    assert!(error.message.contains("AGEND_TEST_MISSING_ENV_3540_R1"));
+    assert_eq!(error.stage, super::Stage::ResolveSourceRepo);
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #1755: `ensure_branch_exists` must REFRESH a remote-tracking `from_ref`
 /// (`origin/main`) before creating a new branch — otherwise a fresh checkout
 /// starts on a stale local ref and silently reverse-reverts merges that landed
