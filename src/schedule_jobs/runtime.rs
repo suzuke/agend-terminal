@@ -729,7 +729,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
         struct GroupGuard {
             leader: Option<std::process::Child>,
-            descendant: Option<std::process::Child>,
+            member: Option<std::process::Child>,
         }
         impl GroupGuard {
             fn reap_child(child: &mut std::process::Child) -> Result<(), String> {
@@ -765,8 +765,8 @@ mod tests {
                 if let Some(leader) = &mut self.leader {
                     Self::reap_child(leader)?;
                 }
-                if let Some(descendant) = &mut self.descendant {
-                    Self::reap_child(descendant)?;
+                if let Some(member) = &mut self.member {
+                    Self::reap_child(member)?;
                 }
                 Ok(())
             }
@@ -780,7 +780,7 @@ mod tests {
         }
         let mut group = GroupGuard {
             leader: None,
-            descendant: None,
+            member: None,
         };
         let leader = std::process::Command::new("sleep")
             .arg("60")
@@ -789,7 +789,8 @@ mod tests {
             .unwrap();
         let pgid = leader.id();
         group.leader = Some(leader);
-        group.descendant = Some(
+        // This sibling joins the leader's process group; it is not an escaped descendant.
+        group.member = Some(
             std::process::Command::new("sleep")
                 .arg("60")
                 .process_group(pgid as i32)
@@ -801,7 +802,7 @@ mod tests {
         assert_eq!(
             unsafe { libc::kill(-(pgid as i32), 0) },
             0,
-            "fixture requires a surviving descendant in the isolated group"
+            "fixture requires a surviving sibling group member"
         );
         let home = TempHome::new();
         let (runtime, _, attempt) = reserved_fixture(home.path());
@@ -819,17 +820,11 @@ mod tests {
         let result = runtime.stop(&attempt);
         assert!(
             result.is_err(),
-            "leader-only receipt allowed cleanup while its descendant group is alive"
+            "leader-only receipt allowed cleanup while its sibling group member is alive"
         );
         assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
         group.reap().unwrap();
-        assert!(group
-            .descendant
-            .as_mut()
-            .unwrap()
-            .try_wait()
-            .unwrap()
-            .is_some());
+        assert!(group.member.as_mut().unwrap().try_wait().unwrap().is_some());
     }
 
     #[cfg(unix)]
