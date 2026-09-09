@@ -6541,12 +6541,33 @@ fn codex_preset_has_no_trust_dismiss_matcher_3317() {
 #[cfg(unix)]
 #[allow(clippy::unwrap_used)]
 fn scheduled_job_pty_exit_retains_original_child_for_runner() {
+    for (exit_code, phase) in [(0, "running"), (143, "running"), (0, "succeeded")] {
+        assert_scheduled_job_exit_retains_child(exit_code, phase);
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::unwrap_used)]
+fn assert_scheduled_job_exit_retains_child(exit_code: i32, phase: &str) {
     let home = std::env::temp_dir().join(format!("job-pty-exit-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&home).unwrap();
     let id = crate::types::InstanceId::new();
     let name = "job-exit-fixture";
     let mut handle = mk_test_handle(name, id);
     handle.child.lock().wait().unwrap();
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new("sh");
+    command.args(["-c", &format!("exit {exit_code}")]);
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    child.wait().unwrap();
+    handle.child = Arc::new(Mutex::new(child));
     handle.spawned_at = std::time::Instant::now() - std::time::Duration::from_secs(120);
     let original_child = Arc::clone(&handle.child);
     let core = Arc::clone(&handle.core);
@@ -6574,7 +6595,7 @@ fn scheduled_job_pty_exit_retains_original_child_for_runner() {
     let run = serde_json::json!({
         "id":"j-exit", "schedule_id":"s-exit", "scheduled_at":0,"created_by":"test",
         "message":"test", "config":{"backends":["codex"],"artifact_directory":home.join("artifacts")},
-        "phase":"running","revision":0,
+        "phase":phase,"revision":0,
         "attempt":{"number":1,"name":name,"uuid":id.full(),"backend":"codex","started_at":0},
         "previous_attempts":[],"task_id":null,"result":null,"error":null,"next_attempt_at":0,
         "deadline":i64::MAX,"cleanup_pending":false,"task_settled":false,
