@@ -2,13 +2,11 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::io::Read;
-use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
@@ -20,34 +18,38 @@ const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// kills if still alive, then reaps the direct child.
 struct ChildGuard {
     child: Option<Child>,
-    reaped: Option<Arc<AtomicBool>>,
+    reap_receipt: Option<Arc<Mutex<Option<ExitStatus>>>>,
 }
 
 impl ChildGuard {
     fn new(child: Child) -> Self {
         Self {
             child: Some(child),
-            reaped: None,
+            reap_receipt: None,
         }
     }
 
-    fn with_reap_marker(child: Child, reaped: Arc<AtomicBool>) -> Self {
+    fn with_reap_receipt(child: Child, reap_receipt: Arc<Mutex<Option<ExitStatus>>>) -> Self {
         Self {
             child: Some(child),
-            reaped: Some(reaped),
+            reap_receipt: Some(reap_receipt),
+        }
+    }
+
+    fn record_reaped(&self, status: ExitStatus) {
+        if let Some(receipt) = &self.reap_receipt {
+            *receipt.lock().unwrap() = Some(status);
         }
     }
 
     fn wait_bounded(&mut self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            let status = match self.child.as_mut() {
-                Some(child) => child.try_wait(),
-                None => return true,
-            };
+            let status = self.child.as_mut().map_or(Ok(None), Child::try_wait);
             match status {
-                Ok(Some(_)) => {
-                    self.mark_reaped();
+                Ok(Some(status)) => {
+                    self.child.take();
+                    self.record_reaped(status);
                     return true;
                 }
                 Ok(None) if Instant::now() < deadline => {
@@ -59,20 +61,25 @@ impl ChildGuard {
         }
     }
 
-    fn kill_and_reap(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            return;
+    fn kill_and_reap(&mut self) -> bool {
+        let status = {
+            let Some(child) = self.child.as_mut() else {
+                return true;
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => Some(status),
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    child.wait().ok()
+                }
+            }
         };
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.mark_reaped();
-    }
-
-    fn mark_reaped(&self) {
-        if let Some(marker) = &self.reaped {
-            marker.store(true, Ordering::Release);
+        if let Some(status) = status {
+            self.child.take();
+            self.record_reaped(status);
+            true
+        } else {
+            false
         }
     }
 }
@@ -80,8 +87,48 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if !self.wait_bounded(DAEMON_GRACE) {
-            self.kill_and_reap();
+            let _ = self.kill_and_reap();
         }
+    }
+}
+
+struct OutputCapture {
+    path: PathBuf,
+    reader: File,
+}
+
+impl OutputCapture {
+    fn new(label: &str) -> io::Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "agend-admin-job-recovery-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Self {
+            path,
+            reader: file.try_clone()?,
+        })
+    }
+
+    fn stdio(&self) -> io::Result<Stdio> {
+        Ok(Stdio::from(self.reader.try_clone()?))
+    }
+
+    fn read(&mut self) -> io::Result<Vec<u8>> {
+        self.reader.seek(SeekFrom::Start(0))?;
+        let mut output = Vec::new();
+        self.reader.read_to_end(&mut output)?;
+        Ok(output)
+    }
+}
+
+impl Drop for OutputCapture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -89,36 +136,40 @@ impl Drop for ChildGuard {
 /// the child exits; timeout cleanup kills and reaps before returning, so a
 /// blocked child cannot strand this test process.
 fn run_cli_bounded(mut command: Command) -> std::io::Result<Output> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
+    let mut stdout_capture = OutputCapture::new("stdout")?;
+    let mut stderr_capture = OutputCapture::new("stderr")?;
+    command
+        .stdout(stdout_capture.stdio()?)
+        .stderr(stderr_capture.stdio()?);
+    let child = command.spawn()?;
+    let mut child = ChildGuard::new(child);
     let deadline = Instant::now() + CLI_TIMEOUT;
     loop {
-        match child.try_wait()? {
-            Some(status) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    pipe.read_to_end(&mut stdout)?;
-                }
-                if let Some(mut pipe) = child.stderr.take() {
-                    pipe.read_to_end(&mut stderr)?;
-                }
+        let status = child.child.as_mut().map_or(Ok(None), Child::try_wait);
+        match status {
+            Ok(Some(status)) => {
+                child.child.take();
+                let stdout = stdout_capture.read()?;
+                let stderr = stderr_capture.read()?;
                 return Ok(Output {
                     status,
                     stdout,
                     stderr,
                 });
             }
-            None if Instant::now() < deadline => {
+            Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
             }
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
+            Ok(None) => {
+                let _ = child.kill_and_reap();
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "CLI command exceeded bounded test timeout",
                 ));
+            }
+            Err(error) => {
+                let _ = child.kill_and_reap();
+                return Err(error);
             }
         }
     }
@@ -302,18 +353,18 @@ fn recovery_fixture_reaps_daemon_when_observation_panics() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("fleet.yaml"), "instances: {}\n").unwrap();
 
-    let reaped = Arc::new(AtomicBool::new(false));
-    let marker = Arc::clone(&reaped);
+    let reap_receipt = Arc::new(Mutex::new(None));
+    let receipt = Arc::clone(&reap_receipt);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let daemon = daemon_command(&home).spawn().unwrap();
-        let _daemon = ChildGuard::with_reap_marker(daemon, marker);
+        let _daemon = ChildGuard::with_reap_receipt(daemon, receipt);
         panic!("controlled fixture observation failure");
     }));
 
     assert!(result.is_err(), "control must exercise panic cleanup");
     assert!(
-        reaped.load(Ordering::Acquire),
-        "ChildGuard must kill and reap a daemon during unwinding"
+        reap_receipt.lock().unwrap().is_some(),
+        "ChildGuard must observe an owned daemon exit status during unwinding"
     );
     std::fs::remove_dir_all(&home).unwrap();
 }
