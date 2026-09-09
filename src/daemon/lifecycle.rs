@@ -626,7 +626,7 @@ mod tests {
         let agent = "refused-admission-queue-agent";
         std::fs::write(crate::fleet::fleet_yaml_path(&home), format!(
             "instances:\n  {agent}:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n"
-        )).unwrap();
+        )).expect("write fixture fleet");
         let (delivered_tx, delivered_rx) = std::sync::mpsc::channel();
         let hook_home = home.clone();
         crate::transport::test_support::set_delivery_hook(Some(Arc::new(
@@ -634,7 +634,7 @@ mod tests {
                 if home != hook_home.as_path() || name != agent {
                     return None;
                 }
-                delivered_tx.send(()).unwrap();
+                delivered_tx.send(()).expect("record transport delivery");
                 let envelope = crate::transport::DeliveryEnvelope::new(
                     name,
                     crate::transport::SessionLocator::codex(
@@ -662,7 +662,7 @@ mod tests {
                     name,
                     "legitimate queued task",
                 )
-                .unwrap();
+                .expect("enqueue accepted delivery");
                 let deadline = std::time::Instant::now() + Duration::from_secs(2);
                 while crate::daemon::delivery_worker::test_support::transport_dispatch_count(
                     home, name,
@@ -693,7 +693,9 @@ mod tests {
                 None,
                 Some(&reject),
             );
-        assert!(result.unwrap_err().contains("refused admission fixture"));
+        assert!(result
+            .expect_err("cleanup must refuse")
+            .contains("refused admission fixture"));
         assert!(delivered_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
             "provisional deletion marker discarded a legitimate queued delivery before cleanup was refused");
         let _ = std::fs::remove_dir_all(home);
