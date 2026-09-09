@@ -396,9 +396,13 @@ fn conservative_recovery_requires_confirmation_and_never_retries() {
         advance_to_running(h, &Fake::default(), now().timestamp());
         let old = read(h).unwrap().runs[0].clone();
         if !succeeded {
-            let done = crate::tasks::handle(h, "system:schedule_job", &serde_json::json!({
-                "action":"done","id":old.task_id,"result":"worker marked task done without receipt"
-            }));
+            let done = crate::tasks::handle(
+                h,
+                "system:schedule_job",
+                &serde_json::json!({
+                    "action":"done","id":old.task_id,"result":"worker marked task done without receipt"
+                }),
+            );
             assert!(done.get("error").is_none(), "{done}");
         }
         let mut pending = old.clone();
@@ -442,9 +446,12 @@ fn conservative_recovery_requires_confirmation_and_never_retries() {
             }
         );
         assert_eq!(resolved.result, run.result);
-        assert!(serde_json::to_value(&resolved).unwrap()["recovery_resolution"]
-            .as_str().is_some_and(|note| note.contains("all tools stopped; delivery checked")),
-            "recovery audit must survive subsequent task projection failure");
+        assert!(
+            serde_json::to_value(&resolved).unwrap()["recovery_resolution"]
+                .as_str()
+                .is_some_and(|note| note.contains("all tools stopped; delivery checked")),
+            "recovery audit must survive subsequent task projection failure"
+        );
         assert_eq!(resolved.attempt, run.attempt);
         assert!(resolve_recovery(h, &args).get("error").is_some());
     }

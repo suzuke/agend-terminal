@@ -1394,7 +1394,7 @@ fn main() -> anyhow::Result<()> {
                 // ordinary agent-launched commands to the operator principal.
                 // Same-UID secret isolation remains the existing auth boundary.
                 anyhow::ensure!(
-                    !std::env::var_os("AGEND_INSTANCE_NAME").is_some_and(|name| !name.is_empty()),
+                    std::env::var_os("AGEND_INSTANCE_NAME").is_none_or(|name| name.is_empty()),
                     "resolve-job-recovery is operator-only; run it from an operator shell"
                 );
                 let args = serde_json::json!({
