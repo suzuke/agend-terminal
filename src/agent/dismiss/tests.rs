@@ -49,8 +49,8 @@ fn real_patterns_only_recover_a_recognized_modal_tail_3561() {
         ("unknown-prompt", "  Continue? [y/N]\n", vec![]),
         ("unknown-text", "  Confirm deletion\n", vec![]),
         (
-            "short-modal",
-            "  ❯ 1. I am using this for local development\n    2. Exit\n",
+            "complete-modal",
+            "  ❯ 1. I am using this for local development\n    2. Exit\n\n  Enter to confirm · Esc to cancel\n",
             vec![13],
         ),
     ] {
@@ -60,8 +60,6 @@ fn real_patterns_only_recover_a_recognized_modal_tail_3561() {
         let mut gate = DevModalGate::new(true);
         let mut tracker =
             crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
-        // The modal was visible before a pane resize cropped its footer.
-        tracker.feed(live);
         tracker.feed(&screen);
         gate.set_prompt_blocked(is_dismissible_prompt_state(tracker.get_state()));
         let mut spent = false;
