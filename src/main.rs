@@ -94,6 +94,7 @@ mod review_repro_test_util;
 mod runtime;
 pub mod runtime_config;
 pub(crate) mod runtime_controls;
+mod schedule_jobs;
 mod schedules;
 mod scm;
 #[cfg_attr(windows, allow(dead_code))]

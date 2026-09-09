@@ -138,6 +138,26 @@ fn parse_assignee_for_update(args: &Value) -> Result<AssigneePatch, Value> {
 }
 
 fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &Value) -> Value {
+    handle_create_with_id(home, emitter, args, None)
+}
+
+/// The durable Job run reserves its task id before the first side effect.
+/// Private daemon entry: public task args cannot choose a task identity.
+pub(crate) fn create_schedule_task(home: &Path, id: &str, args: &Value) -> Value {
+    handle_create_with_id(
+        home,
+        crate::task_events::InstanceName::from("system:schedule_job"),
+        args,
+        Some(id),
+    )
+}
+
+fn handle_create_with_id(
+    home: &Path,
+    emitter: crate::task_events::InstanceName,
+    args: &Value,
+    reserved_id: Option<&str>,
+) -> Value {
     let title = match args["title"].as_str() {
         Some(t) => t,
         None => return serde_json::json!({"error": "missing 'title'"}),
@@ -180,7 +200,9 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     // its strict validator, and the `has_task_id` probe accept both this and the
     // legacy two-segment form (see src/daemon/task_sweep.rs).
     let pid = std::process::id();
-    let id = format!("t-{ts}-{pid}-{seq}");
+    let id = reserved_id
+        .map(String::from)
+        .unwrap_or_else(|| format!("t-{ts}-{pid}-{seq}"));
     let assignee = match parse_assignee_for_create(args) {
         Ok(a) => a,
         Err(e) => return e,

@@ -124,6 +124,28 @@ pub(crate) fn full_delete_instance_with_runtime(
     name: &str,
     delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
 ) -> Result<(), String> {
+    full_delete_instance_with_expected_identity(home, name, delete_context, None)
+}
+
+/// Job teardown validates its durable identity while holding the lifecycle permit.
+pub(crate) fn full_delete_instance_with_expected_identity(
+    home: &Path,
+    name: &str,
+    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+    expected: Option<(&str, Option<&str>)>,
+) -> Result<(), String> {
+    full_delete_instance_with_exit_receipt(home, name, delete_context, expected, None)
+}
+
+/// Persist a process-exit receipt inside the teardown fence, before fallible
+/// ancillary cleanup. A failed receipt must not be reported as a completed delete.
+pub(crate) fn full_delete_instance_with_exit_receipt(
+    home: &Path,
+    name: &str,
+    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+    expected: Option<(&str, Option<&str>)>,
+    exit_receipt: Option<&dyn Fn() -> Result<(), String>>,
+) -> Result<(), String> {
     // #2855: reject an invalid (traversal) name BEFORE the lifecycle permit,
     // the deleting-mark, and every name-derived path removal below — this fn
     // joins the raw name into workspace/runtime/backend-data paths.
@@ -134,6 +156,25 @@ pub(crate) fn full_delete_instance_with_runtime(
         crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
     )
     .map_err(|error| format!("delete refused: {error}"))?;
+    if let Some((creator, expected_uuid)) = expected {
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .map_err(|error| format!("identity lookup refused: {error}"))?;
+        if let Some(entry) = fleet.instances.get(name) {
+            if entry.created_by.as_deref() != Some(creator)
+                || expected_uuid.is_some_and(|id| entry.id.as_deref() != Some(id))
+            {
+                return Err("delete refused: worker identity changed".into());
+            }
+        } else if let Some(context) = delete_context {
+            if crate::agent::lock_registry(context.registry)
+                .values()
+                .any(|h| h.name.as_str() == name)
+                || crate::agent::lock_external(context.externals).contains_key(name)
+            {
+                return Err("delete refused: live worker has no durable identity".into());
+            }
+        }
+    }
     // #1915: mark this instance "deleting" for the ENTIRE teardown — the guard is
     // held until this fn returns (after workspace cleanup + the residual audit
     // below), so any concurrent spawn (boot-stagger / crash-respawn worker /
@@ -185,6 +226,9 @@ pub(crate) fn full_delete_instance_with_runtime(
     let mut step_errors: Vec<String> = Vec::new();
 
     delete_with_runtime_or_legacy(home, name, delete_context, false)?;
+    if let Some(record_exit) = exit_receipt {
+        record_exit()?;
+    }
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
         step_errors.push(format!("fleet.yaml removal: {e}"));
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");

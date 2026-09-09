@@ -85,6 +85,8 @@ pub struct Schedule {
     pub trigger: Trigger,
     pub message: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<crate::schedule_jobs::config::JobConfig>,
     pub label: Option<String>,
     pub timezone: String,
     pub enabled: bool,
@@ -170,6 +172,8 @@ struct ScheduleRaw {
     #[serde(default)]
     target: String,
     #[serde(default)]
+    job: Option<crate::schedule_jobs::config::JobConfig>,
+    #[serde(default)]
     label: Option<String>,
     #[serde(default)]
     timezone: String,
@@ -213,6 +217,7 @@ impl From<ScheduleRaw> for Schedule {
             trigger,
             message: r.message,
             target: r.target,
+            job: r.job,
             label: r.label,
             timezone: r.timezone,
             enabled: r.enabled,
@@ -277,6 +282,9 @@ fn auto_replacement_key(message: &str) -> Option<String> {
 }
 
 fn effective_replacement_key(schedule: &Schedule) -> Option<String> {
+    if schedule.job.is_some() {
+        return None;
+    }
     schedule
         .replacement_key
         .clone()
@@ -377,7 +385,7 @@ pub fn replay_missed_oneshots(home: &Path) -> Vec<Schedule> {
     persist_or_log!(
         crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
             for sched in store.schedules.iter_mut() {
-                if !sched.enabled {
+                if !sched.enabled || sched.job.is_some() {
                     continue;
                 }
                 let at = match &sched.trigger {
@@ -465,7 +473,7 @@ pub fn orphan_schedules_for_target(home: &Path, deleted_target: &str) -> usize {
         crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
             let now = chrono::Utc::now().to_rfc3339();
             for sched in store.schedules.iter_mut() {
-                if sched.target != target {
+                if sched.job.is_some() || sched.target != target {
                     continue;
                 }
                 let reason = DisabledReason::TargetOrphaned {
@@ -564,7 +572,43 @@ fn trigger_from_args(args: &Value, tz_name: &str) -> Result<Trigger, String> {
     }
 }
 
+fn job_from_args(
+    home: &Path,
+    args: &Value,
+) -> Result<Option<crate::schedule_jobs::config::JobConfig>, String> {
+    let Some(value) = args.get("job") else {
+        return Ok(None);
+    };
+    let job: crate::schedule_jobs::config::JobConfig =
+        serde_json::from_value(value.clone()).map_err(|e| format!("invalid job: {e}"))?;
+    job.validate_for_home(home)?;
+    Ok(Some(job))
+}
+
+fn validate_job_options(args: &Value) -> Result<(), String> {
+    if args.get("instance").is_some()
+        || args.get("linked_task_id").is_some()
+        || args.get("replacement_key").is_some()
+        || args.get("fire_strategy").is_some_and(|v| v != "always")
+    {
+        return Err(
+            "job is incompatible with instance, linked_task_id, replacement_key, or until_success"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
+    let job = match job_from_args(home, args) {
+        Ok(job) => job,
+        Err(e) => return serde_json::json!({"error": e}),
+    };
+    if job.is_some() {
+        if let Err(e) = validate_job_options(args) {
+            return serde_json::json!({"error": e});
+        }
+    }
     let message = match args["message"].as_str() {
         Some(m) => m,
         None => return serde_json::json!({"error": "missing 'message'"}),
@@ -593,6 +637,7 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
     let replacement_key =
         match optional_identity_arg(args, "replacement_key", MAX_REPLACEMENT_KEY_BYTES) {
             Ok(Some(key)) => Some(key),
+            Ok(None) if job.is_some() => None,
             Ok(None) => auto_replacement_key(message),
             Err(error) => return serde_json::json!({"error": error}),
         };
@@ -610,10 +655,15 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         id: id.clone(),
         trigger,
         message: message.to_string(),
-        target: args["instance"]
-            .as_str()
-            .unwrap_or(instance_name)
-            .to_string(),
+        target: if job.is_some() {
+            String::new()
+        } else {
+            args["instance"]
+                .as_str()
+                .unwrap_or(instance_name)
+                .to_string()
+        },
+        job,
         label: args["label"].as_str().map(String::from),
         timezone,
         enabled: true,
@@ -786,6 +836,10 @@ pub fn update(home: &Path, args: &Value) -> Value {
         return serde_json::json!({"error": "'cron' and 'run_at' are mutually exclusive"});
     }
 
+    let new_job = match job_from_args(home, args) {
+        Ok(job) => job,
+        Err(e) => return serde_json::json!({"error": e}),
+    };
     let new_message = args["message"].as_str().map(String::from);
     let new_target = args["instance"].as_str().map(String::from);
     let new_label = args["label"].as_str().map(String::from);
@@ -816,10 +870,20 @@ pub fn update(home: &Path, args: &Value) -> Value {
         .find(|s| s.id == id)
     {
         Some(schedule) => {
+            if schedule.job.is_some() {
+                validate_job_options(args).map_err(anyhow::Error::msg)?;
+                if let Some(ref job) = new_job {
+                    schedule.job = Some(job.clone());
+                }
+            } else if new_job.is_some() {
+                return Err(anyhow::anyhow!(
+                    "schedule mode is immutable; create a new job schedule"
+                ));
+            }
             let previous_fire_strategy = schedule.fire_strategy;
             // Materialize the effective key before applying message edits so a
             // migrated AGEND-AUTO row cannot silently change replacement scope.
-            if schedule.replacement_key.is_none() {
+            if schedule.job.is_none() && schedule.replacement_key.is_none() {
                 schedule.replacement_key = auto_replacement_key(&schedule.message);
             }
             if new_target
@@ -1117,6 +1181,121 @@ fn gc_disabled_schedules_at_before_delete(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn job_args(home: &Path) -> Value {
+        serde_json::json!({"cron": "0 9 * * *", "message": "podcast", "timezone": "UTC",
+            "job": {"backends": ["codex", "claude"], "artifact_directory": home.join("artifacts")}})
+    }
+
+    #[test]
+    fn job_schedule_roundtrip_and_legacy_default() {
+        let home = tmp_home("job-roundtrip");
+        let created = create(&home, "creator", &job_args(&home));
+        assert!(created.get("error").is_none(), "{created}");
+        let job = load(&home).schedules.remove(0);
+        assert!(job.target.is_empty());
+        assert_eq!(job.job.as_ref().unwrap().timeout_secs, 3600);
+        assert_eq!(
+            serde_json::from_value::<Schedule>(serde_json::to_value(&job).unwrap()).unwrap(),
+            job
+        );
+        assert_eq!(orphan_schedules_for_target(&home, ""), 0);
+        let legacy: Schedule = serde_json::from_value(cron_row("legacy", "creator", true)).unwrap();
+        assert!(legacy.job.is_none());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn job_schedule_rejects_invalid_config_and_mode_changes() {
+        let home = tmp_home("job-invalid");
+        for (field, value) in [
+            ("backends", serde_json::json!([])),
+            ("backends", serde_json::json!(["codex", "codex"])),
+            ("backends", serde_json::json!(["shell"])),
+            ("artifact_directory", serde_json::json!("relative")),
+            ("timeout_secs", serde_json::json!(59)),
+            ("max_attempts", serde_json::json!(0)),
+            ("retry_delay_secs", serde_json::json!(3601)),
+            ("unknown", serde_json::json!(true)),
+        ] {
+            let mut args = job_args(&home);
+            args["job"][field] = value;
+            assert!(
+                create(&home, "creator", &args).get("error").is_some(),
+                "{args}"
+            );
+        }
+        for (field, value) in [
+            ("instance", serde_json::json!("creator")),
+            ("linked_task_id", serde_json::json!("task")),
+            ("replacement_key", serde_json::json!("key")),
+            ("fire_strategy", serde_json::json!("until_success")),
+        ] {
+            let mut args = job_args(&home);
+            args[field] = value;
+            assert!(
+                create(&home, "creator", &args).get("error").is_some(),
+                "{args}"
+            );
+        }
+        assert!(load(&home).schedules.is_empty());
+        let created = create(&home, "creator", &job_args(&home));
+        let id = &created["id"];
+        for patch in [
+            serde_json::json!({"id": id, "job": null}),
+            serde_json::json!({"id": id, "instance": "creator"}),
+        ] {
+            assert!(update(&home, &patch).get("error").is_some());
+        }
+        let mut args = job_args(&home);
+        args.as_object_mut().unwrap().remove("job");
+        let legacy = create(&home, "creator", &args);
+        assert!(update(
+            &home,
+            &serde_json::json!({"id": legacy["id"], "job": job_args(&home)["job"]})
+        )
+        .get("error")
+        .is_some());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn job_survives_real_orphan_sweep_and_paused_retention() {
+        let home = tmp_home("job-orphan-retention");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  alive:\n    backend: claude\n",
+        )
+        .unwrap();
+        let created = create(&home, "creator", &job_args(&home));
+        assert!(created.get("error").is_none(), "{created}");
+        crate::daemon::orphan_sweep::run(&home);
+        let after = load(&home).schedules.remove(0);
+        assert!(after.enabled);
+        assert!(after.disabled_reason.is_none());
+        assert!(after.run_history.is_empty());
+        let mut paused = serde_json::to_value(after).unwrap();
+        paused["enabled"] = serde_json::json!(false);
+        paused["disabled_reason"] = serde_json::json!({"kind": "operator_paused"});
+        paused["disabled_at"] =
+            serde_json::json!((chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339());
+        seed_schedule_rows(&home, serde_json::json!([paused]));
+        assert_eq!(gc_disabled_schedules(&home), 0);
+        assert!(load(&home).schedules[0].job.is_some());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn job_oneshot_is_not_consumed_by_legacy_boot_replay() {
+        let home = tmp_home("job-boot");
+        let mut row = cron_row("job-once", "", true);
+        row["trigger"] = serde_json::json!({"kind": "once", "at": (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339()});
+        row["job"] = job_args(&home)["job"].clone();
+        seed_schedule_rows(&home, serde_json::json!([row]));
+        assert!(replay_missed_oneshots(&home).is_empty());
+        assert!(load(&home).schedules[0].enabled);
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     fn tmp_home(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};

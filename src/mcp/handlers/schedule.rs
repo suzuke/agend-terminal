@@ -37,3 +37,10 @@ pub(super) fn handle_teardown_deployment(
 pub(super) fn handle_list_deployments(home: &Path) -> Value {
     crate::deployments::list(home)
 }
+
+pub(super) fn handle_job_runs(home: &Path, args: &Value) -> Value {
+    crate::schedule_jobs::list(home, args["id"].as_str())
+}
+pub(super) fn handle_job_complete(home: &Path, args: &Value, instance_name: &str) -> Value {
+    crate::schedule_jobs::complete(home, instance_name, args)
+}

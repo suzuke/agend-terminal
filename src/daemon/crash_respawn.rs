@@ -90,6 +90,10 @@ pub(super) fn handle_crash_observation(
     ctx: &DaemonContext,
 ) {
     let crashed_name = observation.name.as_str();
+    if crate::schedule_jobs::owns_worker(home, crashed_name) {
+        agent::crash_disposition::owner_ledger().discard(observation.key());
+        return;
+    }
     let key = observation.key();
     let ledger = agent::crash_disposition::owner_ledger();
     if ledger.disposition(key).is_none() && !ledger.publish(observation.clone()) {

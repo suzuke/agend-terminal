@@ -43,6 +43,53 @@ For repeatable team setups, a deployment can create the whole arrangement at onc
 }
 ```
 
+### Daemon-owned Job schedules
+
+Set `job` instead of `instance` to create a worker when the schedule becomes due. The daemon owns admission, retry, completion tracking, and worker cleanup; no permanent coordinator instance is required.
+
+```json
+{
+  "action": "create",
+  "cron": "0 15 * * 4,7",
+  "timezone": "Asia/Taipei",
+  "message": "Find new podcast episodes, reuse saved transcripts, summarize, and deliver using the output context. Persist progress by episode GUID and destination.",
+  "job": {
+    "backends": ["codex", "claude"],
+    "artifact_directory": "/absolute/path/podcast-artifacts",
+    "timeout_secs": 3600,
+    "max_attempts": 3,
+    "retry_delay_secs": 60,
+    "output_context": "Deliver using the configured Telegram and LINE destinations; keep a separate delivery receipt for each."
+  }
+}
+```
+
+`backends` is a nonempty, unique ordered list of canonical managed backend names: `claude`, `codex`, `kiro-cli`, `opencode`, `antigravity-cli`, or `grok`. Raw commands and shell backends are rejected. `artifact_directory` must be absolute. Defaults and bounds are: `timeout_secs` 3600 (60–86400), `max_attempts` 3 (1–10), and `retry_delay_secs` 60 (1–3600). Unknown Job fields are rejected.
+
+`output_context` holds fixed business delivery instructions, not credentials or an automatically provisioned channel endpoint. Workers must use the authorized destination configuration available to their tools. Each attempt has its own workspace; persistent transcripts, summaries, and delivery records belong in `artifact_directory` and survive worker cleanup.
+
+Optional `job.notification` sends one terminal status notice independently of business delivery:
+
+```json
+"notification": {"channel": "telegram", "chat_id": -1001234567890, "topic_id": 42}
+```
+
+Replace the example chat ID with the configured fleet Telegram group and the topic ID with an existing topic. Omitting `topic_id` sends without a thread. The daemon validates the explicit group at configuration and send time; it does not derive the destination from the creator/worker or create topics. Credentials stay in the existing channel environment configuration. The returned Telegram message ID is saved in the Run. A send interrupted by a crash or an ambiguous transport error becomes `unknown` and is not blindly retried. Notification state is separate from execution success and cleanup; inspect `runs` to reconcile an unknown outcome. This first notification endpoint supports Telegram only; Telegram/LINE podcast delivery still follows the task's business instructions.
+
+Job admission has a durable per-schedule watermark. Missed cron occurrences coalesce to the latest due occurrence rather than creating a backlog. If a Run is still active, a later occurrence is recorded as an overlap skip. Jobs bypass legacy one-shot message replay and target-orphan handling. A backend replacement starts only after the previous worker's exit is observed; inability to confirm exit blocks fallback.
+
+Inspect executions with `{"action":"runs","id":"<schedule-id>"}`. Successful completion requires the current worker to call:
+
+```json
+{"action":"complete","run_id":"<run-id>","attempt_id":1,"result":"Completed; artifacts: /absolute/path/podcast-artifacts/..."}
+```
+
+The daemon checks the current attempt and caller identity and persists a completion receipt. Idle state, process exit, message admission, and task status alone do not prove success. Task settlement and cleanup follow the receipt; failures in those follow-up steps do not rerun successful work.
+
+Create a new schedule to change between Job and instance modes. Updating `job` replaces its configuration for future Runs; existing Runs retain their snapshot. Job mode rejects `instance`, `linked_task_id`, `replacement_key`, and `fire_strategy: "until_success"`.
+
+Admission deduplication does not guarantee exactly-once external delivery. Tasks must preserve episode-level and destination-level progress, and reconcile unknown delivery outcomes before retrying endpoints that lack idempotency support.
+
 ### Operations
 
 #### create — create a schedule
@@ -373,3 +420,5 @@ If the deployment template does not match the fleet structure, the resulting set
 2. Add labels that will make sense in logs weeks later.
 3. Use deployments for repeatable fleet setups, not ad hoc reminders.
 4. Keep cron expressions simple unless you have a strong reason to complicate them.
+
+A daemon crash can leave a worker's process tree unaccounted for. The runner records a spawn-intent journal, then the process PID and birth token. If the restarted daemon has no live child handle and no durable confirmed-stop record, the Run reports `recovery_required` and retains its workspace instead of spawning a duplicate. A missing or reused PID alone does not prove descendant tools exited. This uncertain case requires operator recovery; it is not reported as an automatic retry success.
