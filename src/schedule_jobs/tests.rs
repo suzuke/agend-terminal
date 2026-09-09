@@ -239,6 +239,109 @@ fn real_cron_entry_admits_jobs_even_with_future_legacy_cursor() {
     assert_eq!(read(&h).unwrap().runs.len(), 1);
     std::fs::remove_dir_all(h).unwrap();
 }
+
+#[test]
+fn task257_cron_entry_keeps_legacy_reminder_and_job_watermarks_independent() {
+    let h = home();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&h),
+        "instances:\n  offline:\n    backend: claude\n",
+    )
+    .unwrap();
+    let now = chrono::Utc::now();
+    let job = serde_json::to_value(schedule(&h)).unwrap();
+    let legacy = serde_json::json!({
+        "id": "legacy-reminder",
+        "message": "ordinary reminder",
+        "target": "offline",
+        "trigger": {"kind": "cron", "expr": "* * * * * *"},
+        "enabled": true,
+        "timezone": "UTC",
+        "created_at": (now - chrono::Duration::hours(1)).to_rfc3339(),
+        "updated_at": (now - chrono::Duration::hours(1)).to_rfc3339(),
+        "run_history": []
+    });
+    let mut job = job;
+    job["id"] = serde_json::json!("job-cron");
+    job["trigger"] = serde_json::json!({"kind": "cron", "expr": "* * * * * *"});
+    job["created_at"] = serde_json::json!((now - chrono::Duration::hours(1)).to_rfc3339());
+    job["updated_at"] = job["created_at"].clone();
+    crate::store::save_atomic(
+        &h.join("schedules.json"),
+        &serde_json::json!({"schema_version": 2, "schedules": [legacy, job]}),
+    )
+    .unwrap();
+    std::fs::write(
+        h.join(".schedule_last_check"),
+        (now - chrono::Duration::seconds(10)).to_rfc3339(),
+    )
+    .unwrap();
+
+    // This is the daemon's actual cron entry. The registered subscriber routes
+    // the ordinary reminder to the offline inbox while Job admission uses its
+    // own durable watermark and state store.
+    crate::daemon::cron_tick::check_schedules(&h);
+
+    let schedules = crate::schedules::load(&h).schedules;
+    let legacy = schedules.iter().find(|s| s.id == "legacy-reminder").unwrap();
+    assert_eq!(
+        legacy.run_history.last().map(|r| r.status.as_str()),
+        Some("ok_inbox")
+    );
+    let jobs = read(&h).unwrap();
+    assert_eq!(jobs.runs.len(), 1);
+    assert_eq!(jobs.watermarks.get("job-cron").copied(), Some(jobs.runs[0].scheduled_at));
+    assert_eq!(crate::inbox::drain(&h, "offline").len(), 1);
+    std::fs::remove_dir_all(h).unwrap();
+}
+
+#[test]
+fn task257_cleanup_hold_skips_later_occurrence_after_reload() {
+    let h = home();
+    let mut s = schedule(&h);
+    s.id = "cleanup-hold".into();
+    s.trigger = crate::schedules::Trigger::Cron {
+        expr: "* * * * * *".into(),
+    };
+    s.created_at = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+    crate::store::save_atomic(
+        &h.join("schedules.json"),
+        &serde_json::json!({"schema_version": 2, "schedules": [s]}),
+    )
+    .unwrap();
+    crate::daemon::cron_tick::check_schedules(&h);
+    assert_eq!(read(&h).unwrap().runs.len(), 1);
+
+    let rt = Fake::default();
+    let clock = chrono::Utc::now().timestamp();
+    advance_to_running(&h, &rt, clock);
+    let run = read(&h).unwrap().runs[0].clone();
+    let attempt = run.attempt.as_ref().unwrap();
+    complete_as(
+        &h,
+        &run.id,
+        u64::from(attempt.number),
+        &attempt.name,
+        attempt.uuid.as_deref().unwrap(),
+        "completed without releasing cleanup hold",
+    )
+    .unwrap();
+    let held = read(&h).unwrap().runs[0].clone();
+    assert_eq!(held.phase, Phase::Succeeded);
+    assert!(held.cleanup_pending);
+
+    // Cross a real whole-second cron boundary, then enter through the daemon
+    // tick again. The durable Job watermark/reload must record overlap, not a
+    // second run, while the successful worker remains cleanup-pending.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    crate::daemon::cron_tick::check_schedules(&h);
+    let reloaded = read(&h).unwrap();
+    assert_eq!(reloaded.runs.len(), 1);
+    assert_eq!(reloaded.overlap_skips.get("cleanup-hold"), Some(&1));
+    assert!(reloaded.runs[0].cleanup_pending);
+    assert_eq!(reloaded.runs[0].phase, Phase::Succeeded);
+    std::fs::remove_dir_all(h).unwrap();
+}
 #[test]
 fn lost_notification_receipt_becomes_unknown_without_resending() {
     let h = home();

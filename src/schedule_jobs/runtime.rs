@@ -584,6 +584,20 @@ mod tests {
     }
 
     #[test]
+    fn task257_pre_intent_validation_failure_leaves_no_process_journal() {
+        let home = TempHome::new();
+        let (runtime, mut run, attempt) = reserved_fixture(home.path());
+        let worker_workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
+        run.config.artifact_directory = worker_workspace.join("artifacts");
+        std::fs::create_dir_all(&run.config.artifact_directory).unwrap();
+
+        let error = runtime.start(&run, &attempt).unwrap_err().to_string();
+        assert!(error.contains("outside disposable worker workspace"), "{error}");
+        assert!(!journal_path(home.path(), &attempt.name).exists());
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_none());
+    }
+
+    #[test]
     fn durable_live_orphan_cannot_be_replaced_or_deleted() {
         let home = TempHome::new();
         let (runtime, run, attempt) = reserved_fixture(home.path());
