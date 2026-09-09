@@ -225,11 +225,9 @@ fn emit_to(home: &Path, recipient: &str, kind: &str, text: &str, correlation_age
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = uuid::Uuid::new_v4();
         std::env::temp_dir().join(format!("agend-test-waiting-stale-{tag}-{id}"))
     }
 
