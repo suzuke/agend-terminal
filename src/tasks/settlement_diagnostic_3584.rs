@@ -200,7 +200,11 @@ fn unreadable_binding_denies_report_3584() {
     opaque_binding_denies_receipt(true, false, true);
 }
 
-fn signed_other_task_receipt_completion_3584(report: bool, invalid_signature: bool) {
+fn signed_other_task_receipt_completion_3584(
+    report: bool,
+    invalid_signature: bool,
+    same_task: bool,
+) {
     let home = Home::new();
     let id = task(&home);
     let proof = receipt(&id);
@@ -244,9 +248,25 @@ fn signed_other_task_receipt_completion_3584(report: bool, invalid_signature: bo
         "dev",
     );
     assert_eq!(checkout["bound"], true, "{checkout}");
+    if same_task {
+        let current = crate::binding::read(&home.0, "dev").unwrap();
+        crate::binding::bind_full(
+            &home.0,
+            "dev",
+            &id,
+            "fix/other",
+            std::path::Path::new(current["worktree"].as_str().unwrap()),
+            &source,
+            false,
+        )
+        .unwrap();
+    }
     assert!(crate::binding::signature_valid(&home.0, "dev"));
     let binding = crate::binding::read(&home.0, "dev").unwrap();
-    assert_eq!(binding["task_id"], other_id);
+    assert_eq!(
+        binding["task_id"],
+        if same_task { id.as_str() } else { other_id }
+    );
     let worktree = std::path::Path::new(binding["worktree"].as_str().unwrap());
     assert!(crate::worktree_pool::is_daemon_managed(worktree));
     assert_eq!(
@@ -286,14 +306,14 @@ fn signed_other_task_receipt_completion_3584(report: bool, invalid_signature: bo
             "isolated completion evidence",
             true,
         );
-        if invalid_signature {
+        if invalid_signature || same_task {
             assert!(accepted.is_err(), "{accepted:?}");
         } else {
             assert!(matches!(accepted, Ok(true)), "{accepted:?}");
         }
     } else {
         let accepted = done(&home, &id);
-        if invalid_signature {
+        if invalid_signature || same_task {
             assert_eq!(
                 accepted["code"], "assignee_completion_blocked",
                 "{accepted}"
@@ -316,9 +336,9 @@ fn signed_other_task_receipt_completion_3584(report: bool, invalid_signature: bo
     assert_eq!(release_intents(&home), intents_before);
     assert_eq!(
         crate::merge_receipt::find_for_task_completion(&home.0, &id, "dev").is_some(),
-        invalid_signature
+        invalid_signature || same_task
     );
-    if invalid_signature {
+    if invalid_signature || same_task {
         assert_eq!(
             serde_json::to_value(super::load_routed(&home.0, &id).unwrap().record()).unwrap(),
             task_before
@@ -329,22 +349,31 @@ fn signed_other_task_receipt_completion_3584(report: bool, invalid_signature: bo
 
 #[test]
 fn corrective_done_preserves_signed_other_task_3584() {
-    signed_other_task_receipt_completion_3584(false, false);
+    signed_other_task_receipt_completion_3584(false, false, false);
 }
 
 #[test]
 fn corrective_report_preserves_signed_other_task_3584() {
-    signed_other_task_receipt_completion_3584(true, false);
+    signed_other_task_receipt_completion_3584(true, false, false);
 }
 
 #[test]
 fn invalid_signature_denies_done_3584() {
-    signed_other_task_receipt_completion_3584(false, true);
+    signed_other_task_receipt_completion_3584(false, true, false);
 }
 
 #[test]
 fn invalid_signature_denies_report_3584() {
-    signed_other_task_receipt_completion_3584(true, true);
+    signed_other_task_receipt_completion_3584(true, true, false);
+}
+
+#[test]
+fn same_task_branch_mismatch_denies_done_3584() {
+    signed_other_task_receipt_completion_3584(false, false, true);
+}
+#[test]
+fn same_task_branch_mismatch_denies_report_3584() {
+    signed_other_task_receipt_completion_3584(true, false, true);
 }
 
 #[test]
