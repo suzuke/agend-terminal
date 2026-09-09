@@ -241,7 +241,7 @@ pub(crate) fn def_instance() -> Value {
 }
 
 pub(crate) fn def_decision() -> Value {
-    json!({"name": "decision", "description": "Manage decisions. Actions: post, list, get, update, answer, archive_batch. `get` returns one full record by id. Listing is bounded, cursor-paginated, and terse by default; use verbose:true for full content or fields:\"minimal\" for id/title/author/status/tags/created_at only. audit_history is a separate view. archive_batch is dry-run-first and requires an actor-bound confirmation token for apply.",
+    json!({"name": "decision", "description": "Manage decisions. Actions: post, list, get, update, answer, archive_batch. `get` returns one full record by id. Listing is bounded, cursor-paginated, and terse by default; use verbose:true for full content or fields:\"minimal\" for id/title/author/status/tags/created_at/archived only. Decision minimal retains created_at for chronological context; task minimal omits it for lighter routine polling. audit_history is a separate view. archive_batch is dry-run-first and requires an actor-bound confirmation token for apply.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["post", "list", "get", "update", "answer", "archive_batch"]},
             "title": {"type": "string"}, "content": {"type": "string", "description": "Decision body (alias: text — #2037). For a question, the prompt text."}, "text": {"type": "string", "description": "Alias of `content` (#2037)."},
@@ -261,7 +261,7 @@ pub(crate) fn def_decision() -> Value {
             "scan_budget": {"type": "integer", "minimum": 1, "maximum": 5000},
             "cursor": {"type": "string", "description": "Opaque cursor returned by the preceding list page."},
             "verbose": {"type": "boolean", "description": "list: return complete content. Default false caps content at about 200 characters; get is always full."},
-            "fields": {"type": "string", "enum": ["full", "minimal"], "description": "list: minimal keeps only id, title, author, status, tags, and created_at."},
+            "fields": {"type": "string", "enum": ["full", "minimal"], "description": "list: minimal keeps only id, title, author, status, tags, created_at, and archived. Unlike task minimal, decision minimal retains created_at because chronological context is part of decision review."},
             "apply": {"type": "boolean", "description": "archive_batch only: false/omitted previews; true applies an exact confirmation."},
             "confirm_token": {"type": "string", "description": "archive_batch apply: opaque actor-bound token from dry-run."},
             "confirm_ids": {"type": "array", "items": {"type": "string"}},
