@@ -399,6 +399,9 @@ fn deny_hint_lists_all_three_bypass_forms() {
         "AGENTIC_GIT_BYPASS=1",
         "AGENTIC_GIT_BYPASS_AGENT=",
         "AGENTIC_GIT_BYPASS_UNTIL=",
+        "AGEND_GIT_BYPASS=1",
+        "AGEND_GIT_BYPASS_AGENT=",
+        "AGEND_GIT_BYPASS_UNTIL=",
     ] {
         assert!(
             joined.contains(var),
@@ -501,6 +504,10 @@ fn deny_copy_has_no_security_wording_2379() {
     assert!(
         !joined.contains("安全"),
         "deny copy must not use '安全' wording:\n{joined}"
+    );
+    assert!(
+        joined.contains("AGEND_GIT_ALLOW_CANONICAL_MUTATE=1"),
+        "canonical-bypass deny must name the accepted legacy alias:\n{joined}"
     );
 }
 

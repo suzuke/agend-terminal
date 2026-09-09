@@ -266,6 +266,37 @@ fn install_hooks_writes_reference_transaction_2234() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3557: the daemon is the sole owner of prepare-commit-msg under
+/// `$AGEND_HOME/hooks`. If the legacy vendor writer ran first, reconciliation
+/// must actively replace its content instead of treating file existence as
+/// sufficient.
+#[test]
+fn install_hooks_rewrites_legacy_vendor_prepare_commit_msg_3557() {
+    let home = tmp_home("rewrite-vendor-prepare-commit-msg");
+    let hooks = home.join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("prepare-commit-msg"),
+        include_str!("../../vendor/agentic-git/crates/agentic-git/assets/hooks/prepare-commit-msg"),
+    )
+    .unwrap();
+    std::fs::write(hooks.join("prepare-commit-msg.ps1"), "stale vendor hook\n").unwrap();
+
+    install_hooks(&home, &home.join("not-a-repo"));
+
+    assert_eq!(
+        std::fs::read_to_string(hooks.join("prepare-commit-msg")).unwrap(),
+        include_str!("../../assets/hooks/prepare-commit-msg"),
+        "daemon reconciliation must replace a vendor-owned bash hook"
+    );
+    assert_eq!(
+        std::fs::read_to_string(hooks.join("prepare-commit-msg.ps1")).unwrap(),
+        include_str!("../../assets/hooks/prepare-commit-msg.ps1"),
+        "daemon reconciliation must replace stale PowerShell hook content"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2234: the reference-transaction hook is (1) FAIL-OPEN — always exits 0, even
 /// in the `prepared` phase, so it can NEVER abort a ref transaction and wedge the
 /// fleet — and (2) SIGNATURE-SCOPED — logs ONLY a HEAD detach to origin/main, NOT
