@@ -541,6 +541,7 @@ mod tests {
             epoch,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::agent::dev_modal::RefuseTally::default()),
         );
         let barrier = gate.write_barrier();
         agent::lock_registry(&registry).insert(instance_id, handle);
