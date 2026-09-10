@@ -270,7 +270,7 @@ fn second_detached_start_rejects_existing_daemon() {
     let home = home_guard.path().to_path_buf();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances: {}\n",
+        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
