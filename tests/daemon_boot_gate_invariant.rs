@@ -139,15 +139,17 @@ fn agendharness_users_are_in_the_flake_gate_filter() {
 ///      path that spawns agents, so it is deliberately NOT flagged; wiring a
 ///      real pty is what gets `app` far enough to actually boot one.
 ///
-/// A file matching either shape must also reference `FixtureHome`,
-/// `AgendHarness`, or `TestDaemon` (imported, constructed, whatever — the
-/// scan only checks that the name occurs somewhere in the AST, which is
-/// enough to prove intent to use the guard without caring how it is wired).
-/// All three genuinely reap: `FixtureHome` (`tests/common/daemon_reaper.rs`),
+/// A file matching either shape must also reference a known reaping guard
+/// (`FixtureHome`, `AgendHarness`, `TestDaemon`, or a custom `ChildGuard`)
+/// (imported, constructed, whatever — the scan only checks that the name
+/// occurs somewhere in the AST, which is enough to prove intent to use the
+/// guard without caring how it is wired).
+/// All four genuinely reap: `FixtureHome` (`tests/common/daemon_reaper.rs`),
 /// `AgendHarness::drop` (`tests/common/harness.rs`) SIGTERMs then SIGKILLs
 /// the process group and waits (or closes the kill-on-close Windows job
 /// handle), and `TestDaemon::drop` (`tests/integration.rs`) kills and waits
-/// the child. `tool_cli_phase0a_real_red.rs` boots via `AgendHarness` and
+/// the child, and a custom `ChildGuard` when its `Drop` implementation owns
+/// bounded wait/kill/reap. `tool_cli_phase0a_real_red.rs` boots via `AgendHarness` and
 /// carries no `FixtureHome`; it is guarded, not exempt.
 ///
 /// ## Known pre-existing debt (not this invariant's to fix)
@@ -162,7 +164,7 @@ fn agendharness_users_are_in_the_flake_gate_filter() {
 /// visible rather than silently exempted; the stale-entry check just below
 /// forces this list to be corrected the day one of them is migrated, and
 /// nothing new may be added to it — a new direct-boot test must use
-/// `FixtureHome`, full stop.
+/// one of the known reaping guards, full stop.
 /// Every entry below shares ONE shape, and the reasoning the assertion above
 /// demands of a future author is recorded here for them:
 ///
@@ -209,6 +211,7 @@ struct DirectBootScan {
     uses_fixture_home: bool,
     uses_agend_harness: bool,
     uses_test_daemon: bool,
+    uses_child_guard: bool,
     builds_crate_binary: bool,
 }
 
@@ -237,14 +240,19 @@ impl DirectBootScan {
             || (self.arg_literals.contains("app") && self.uses_openpty)
     }
 
-    /// A file counts as guarded if it holds ANY of the three reaping
+    /// A file counts as guarded if it holds ANY of the known reaping
     /// mechanisms proven (by reading their `Drop` impls) to actually kill
     /// and wait the daemon: `FixtureHome` (`tests/common/daemon_reaper.rs`),
     /// `AgendHarness` (`tests/common/harness.rs` — SIGTERM/SIGKILL the
     /// process group, or close the Windows job handle), or `TestDaemon`
-    /// (`tests/integration.rs` — kill + wait the child).
+    /// (`tests/integration.rs` — kill + wait the child), or a custom
+    /// `ChildGuard` that owns the direct child and performs bounded
+    /// wait/kill/reap in `Drop` (as in `admin_job_recovery.rs`).
     fn is_guarded(&self) -> bool {
-        self.uses_fixture_home || self.uses_agend_harness || self.uses_test_daemon
+        self.uses_fixture_home
+            || self.uses_agend_harness
+            || self.uses_test_daemon
+            || self.uses_child_guard
     }
 }
 
@@ -352,13 +360,16 @@ impl<'ast> syn::visit::Visit<'ast> for DirectBootScan {
             if ident == "TestDaemon" {
                 self.uses_test_daemon = true;
             }
+            if ident == "ChildGuard" {
+                self.uses_child_guard = true;
+            }
         }
         syn::visit::visit_path(self, p);
     }
 }
 
 /// True iff `src` (one `tests/*.rs` file's text) has the direct-boot shape
-/// and does NOT reference `FixtureHome` anywhere. Used identically by the
+/// and does NOT reference a known reaping guard anywhere. Used identically by the
 /// real invariant below and by its counter-test, so the counter-test proves
 /// something about the actual detector, not a reimplementation of it.
 fn is_unguarded_direct_boot(src: &str) -> bool {
@@ -414,7 +425,7 @@ fn direct_boot_tests_use_the_reaping_guard() {
         "these test binaries direct-boot a real daemon (they build the crate binary and \
          pass `start` — with or without `--foreground`, since the CLI detaches on its \
          own — or pass `app` under a real pty) without holding a reaping guard \
-         (`FixtureHome`, `AgendHarness` or `TestDaemon`) — add `let _home = FixtureHome::new(..)` (see \
+         (`FixtureHome`, `AgendHarness`, `TestDaemon` or `ChildGuard`) — add `let _home = FixtureHome::new(..)` (see \
          `app_singleton_fail_closed.rs` / `cli_smoke.rs`) or, if it truly cannot leak, say why \
          and add it to KNOWN_UNGUARDED_DIRECT_BOOT_DEBT with that reasoning:\n  {violations:#?}"
     );
@@ -629,6 +640,25 @@ fn direct_boot_detector_fires_on_unguarded_shapes_and_only_those() {
         !is_unguarded_direct_boot(GUARDED_BY_TESTDAEMON),
         "detector false-fired on a file guarded by TestDaemon (a genuine reaping guard) — \
          integration.rs's shape"
+    );
+
+    // Negative control: a custom bounded child guard is also a valid reaping
+    // mechanism when the test owns the direct daemon child itself.
+    const GUARDED_BY_CHILD_GUARD: &str = r#"
+        struct ChildGuard;
+        use assert_cmd::Command;
+        fn boot() {
+            let _daemon = ChildGuard;
+            Command::cargo_bin("agend-terminal")
+                .unwrap()
+                .arg("start")
+                .spawn()
+                .unwrap();
+        }
+    "#;
+    assert!(
+        !is_unguarded_direct_boot(GUARDED_BY_CHILD_GUARD),
+        "detector false-fired on a file guarded by a custom ChildGuard"
     );
 
     // Negative control: a file that passes the literal `"start"` to `.arg`
