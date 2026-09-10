@@ -304,12 +304,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // Bounded worktree rollback (LOCAL git via bypass), reused by every failure
     // path below so each checked-save failure leaves no orphan.
     let remove_worktree = || {
-        crate::git_helpers::git_bypass(
-            Path::new(&source_path),
-            &["worktree", "remove", "--force", &worktree_path_str],
-        )
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        super::checkout_helpers::remove_worktree(Path::new(&source_path), &worktree_path_str)
     };
     // Prepared: durably journal the intent BEFORE any filesystem side effect. A
     // failed save here is fatal-but-clean (no side effect yet).
