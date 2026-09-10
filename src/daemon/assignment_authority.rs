@@ -1152,8 +1152,8 @@ fn retire_under_lock(
     cleanup_tasks: &mut Vec<String>,
 ) -> anyhow::Result<bool> {
     let path = record_file(home, repo, branch, target);
-    let record = match read_record(&path) {
-        Ok(Some(record)) if record.assignment_id == expected_id => record,
+    let record = match read_record(&path)? {
+        Some(record) if record.assignment_id == expected_id => record,
         _ => return Ok(false),
     };
 
