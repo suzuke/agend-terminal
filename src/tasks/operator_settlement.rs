@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
 
+// An unused preview is short-lived; durable applied-operation proof is checked
+// first so expiration never turns a committed retry into a new write.
+const CONFIRMATION_TTL_SECS: i64 = 15 * 60;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreviewRequest {
@@ -74,6 +78,12 @@ pub(crate) fn apply(home: &Path, params: &Value, actor_digest: &str) -> Value {
                 }
             }
         }
+        let created = chrono::DateTime::parse_from_rfc3339(&confirmation.created_at)
+            .map_err(|_| "confirmation_invalid".to_owned())?;
+        let age = chrono::Utc::now().signed_duration_since(created);
+        if age < chrono::Duration::zero() || age >= chrono::Duration::seconds(CONFIRMATION_TTL_SECS) {
+            return Err("confirmation_expired".into());
+        }
         let record = state.tasks.get(&tid).ok_or("stale_preview")?;
         if record.status.is_terminal()
             || serde_json::to_value(record).map_err(|e| e.to_string())? != confirmation.subject {
@@ -140,6 +150,6 @@ pub(crate) fn preview(home: &Path, params: &Value, actor_digest: &str) -> Value 
     json!({"ok":true,"result":{
         "task_id":confirmation.task_id,"board":confirmation.board,
         "subject":confirmation.subject,"target":confirmation.target,"result":confirmation.result,
-        "confirmation":token,"worktree_cleanup":false
+        "confirmation":token,"valid_for_seconds":CONFIRMATION_TTL_SECS,"worktree_cleanup":false
     }})
 }
