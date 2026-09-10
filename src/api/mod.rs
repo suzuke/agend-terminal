@@ -1046,6 +1046,9 @@ mod readiness_tests;
 mod working_directory_smoke_tests;
 
 #[cfg(test)]
+mod operator_settlement_tests;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
