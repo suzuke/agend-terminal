@@ -260,32 +260,19 @@ fn connect_failed_spawn_deregisters_external_agent() {
     );
 }
 
-/// A second detached-default `start` must not mistake the first daemon's
-/// already-published run dir for evidence that its own child started.
+/// A detached-default `start` must reject an already-running owned daemon.
 #[cfg(unix)]
 #[test]
-fn second_detached_start_rejects_existing_daemon() {
-    let stamp = std::process::id();
-    let home_guard = FixtureHome::new(&format!("agend-cli-smoke-second-start-{stamp}"));
-    let home = home_guard.path().to_path_buf();
+fn detached_start_rejects_existing_owned_daemon() {
+    let mut home_guard = UniqueFixtureHome::new().expect("create unique fixture home");
+    let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+        "defaults:\n  command: /bin/true\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
-    cmd()
-        .env("AGEND_HOME", &home)
-        .env_remove("AGEND_SUCCESSOR_HANDOFF")
-        .env_remove("AGEND_SUCCESSOR_REQUESTER")
-        .env_remove("AGEND_RESTART_HANDOFF")
-        .env_remove("AGEND_TELEGRAM_BOT_TOKEN")
-        .env_remove("AGEND_BOT_TOKEN")
-        .env_remove("AGEND_TELEGRAM_GROUP_ID")
-        .env_remove("AGEND_DISCORD_BOT_TOKEN")
-        .arg("start")
-        .assert()
-        .success();
+    let mut daemon = OwnedForegroundDaemon::spawn(&home).expect("foreground daemon must start");
     cmd()
         .env("AGEND_HOME", &home)
         .env_remove("AGEND_SUCCESSOR_HANDOFF")
@@ -301,6 +288,12 @@ fn second_detached_start_rejects_existing_daemon() {
         .stderr(predicate::str::contains(
             "another agend-terminal daemon is already running",
         ));
+    daemon
+        .reap()
+        .expect("owned foreground daemon must be reaped");
+    home_guard
+        .cleanup()
+        .expect("unique fixture home must be removed after child reap");
 }
 
 /// `agend app` without a TTY must fail with a clean, actionable error rather
@@ -659,7 +652,7 @@ fn stop_waits_for_daemon_exit_and_reports_residuals_untouched_3539() {
     let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+        "defaults:\n  command: /bin/true\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
@@ -744,7 +737,7 @@ fn stop_no_wait_returns_on_the_accepted_request_only_3539() {
     let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+        "defaults:\n  command: /bin/true\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
@@ -783,7 +776,7 @@ fn stop_transport_failure_is_not_reported_as_absent_3559() {
     let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+        "defaults:\n  command: /bin/true\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
