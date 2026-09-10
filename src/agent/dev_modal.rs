@@ -125,8 +125,9 @@ pub(crate) const RELAXED_AFTER_INCOMPLETE_FRAMES: u32 = 24;
 pub(crate) const ANCHOR_TAIL_MAX_LINES: usize = 4;
 
 /// Keep the relaxed anchor itself local to one rendered modal block. A quoted
-/// or replayed warning can otherwise satisfy the five literals across an
-/// arbitrarily long transcript before the bounded tail check is reached.
+/// or replayed warning must not satisfy the five literals across a long
+/// transcript before the bounded tail check is reached.
+pub(crate) const ANCHOR_BLOCK_MAX_LINES: usize = 8;
 
 /// Hard ceiling on answers per generation, across all fingerprints.
 ///
@@ -366,17 +367,18 @@ pub(crate) fn complete_modal_digest(screen: &str) -> Option<u64> {
 /// only the required line set is smaller. The digests cannot collide across the
 /// two: a complete match hashes a strictly longer region.
 pub(crate) fn anchored_modal_digest(screen: &str) -> Option<u64> {
-    let (digest, end) = digest_and_end_of_lines(screen, MODAL_ANCHOR_LINES)?;
-    anchor_reaches_bottom(screen, end).then_some(digest)
+    let (digest, start, end) = digest_and_end_of_lines(screen, MODAL_ANCHOR_LINES)?;
+    (anchor_block_is_bounded(screen, start, end) && anchor_reaches_bottom(screen, end))
+        .then_some(digest)
 }
 
 fn digest_of_lines(screen: &str, lines: &[&str]) -> Option<u64> {
-    digest_and_end_of_lines(screen, lines).map(|(digest, _)| digest)
+    digest_and_end_of_lines(screen, lines).map(|(digest, _, _)| digest)
 }
 
 /// As [`digest_of_lines`], but also reports the byte offset just past the last
 /// matched literal, so a caller can ask what is BELOW the match.
-fn digest_and_end_of_lines(screen: &str, lines: &[&str]) -> Option<(u64, usize)> {
+fn digest_and_end_of_lines(screen: &str, lines: &[&str]) -> Option<(u64, usize, usize)> {
     let mut cursor = 0usize;
     let mut start = None;
     let mut end = 0usize;
@@ -395,7 +397,11 @@ fn digest_and_end_of_lines(screen: &str, lines: &[&str]) -> Option<(u64, usize)>
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    Some((hash, end))
+    Some((hash, start?, end))
+}
+
+fn anchor_block_is_bounded(screen: &str, start: usize, end: usize) -> bool {
+    screen[start..end].lines().count() <= ANCHOR_BLOCK_MAX_LINES
 }
 
 /// Require the known modal tail rather than accepting arbitrary short prompts.
