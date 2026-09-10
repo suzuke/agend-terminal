@@ -36,6 +36,106 @@ fn sample_event(id: &str) -> TaskEvent {
     }
 }
 
+/// Storage contract only: authentication and confirmation belong to the real
+/// operator ingress tests, not to this event-level fixture.
+#[test]
+fn operator_settlement_3553_is_exact_and_keeps_replay_audit() {
+    struct TestHome(PathBuf);
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    for target in ["done", "cancelled"] {
+        let guard = TestHome(tmp_home("operator-settlement-3553"));
+        let home = guard.0.as_path();
+        let operator = InstanceName::from("operator");
+        append(home, &operator, sample_event("t-root")).unwrap();
+        let mut child = sample_event("t-child");
+        if let TaskEvent::Created { parent_id, .. } = &mut child {
+            *parent_id = Some(TaskId::from("t-root"));
+        }
+        append(home, &operator, child).unwrap();
+        let event = serde_json::json!({
+            "kind": "OperatorSettled",
+            "task_id": "t-root",
+            "operation_id": "op-3553",
+            "preview_digest": "exact-preview-digest",
+            "by": "operator",
+            "holder_instance": null,
+            "target": target,
+            "result": "operator inspected this exact row"
+        });
+        let event: TaskEvent = serde_json::from_value(event).expect("audited settlement event");
+        append(home, &operator, event).unwrap();
+        let state = replay(home).unwrap();
+        let root = &state.tasks[&TaskId::from("t-root")];
+        assert_eq!(root.status.to_string(), target);
+        assert_eq!(
+            state.tasks[&TaskId::from("t-child")].status,
+            TaskStatus::Open
+        );
+        let row = serde_json::to_value(root).unwrap();
+        let proof = &row["last_operator_settlement"];
+        assert_eq!(proof["operation_id"], "op-3553");
+        assert_eq!(proof["preview_digest"], "exact-preview-digest");
+        assert_eq!(proof["by"], "operator");
+        assert_eq!(proof["target"], target);
+        assert_eq!(proof["result"], "operator inspected this exact row");
+        // A later reopen must retain proof so replaying an old confirmation
+        // can report its original outcome without re-settling this task.
+        append(
+            home,
+            &operator,
+            TaskEvent::Reopened {
+                task_id: "t-root".into(),
+                reason: "new work".into(),
+                source_evidence: String::new(),
+            },
+        )
+        .unwrap();
+        let reopened = replay(home).unwrap();
+        let row = serde_json::to_value(&reopened.tasks[&TaskId::from("t-root")]).unwrap();
+        assert_eq!(row["status"], "open");
+        assert_eq!(row["last_operator_settlement"], *proof);
+        // Projection stays bounded after another settlement. The original
+        // operation remains durable evidence even after it leaves the hot log.
+        let second: TaskEvent = serde_json::from_value(serde_json::json!({
+            "kind": "OperatorSettled",
+            "task_id": "t-root",
+            "operation_id": "op-3553-second",
+            "preview_digest": "second-preview-digest",
+            "by": "operator",
+            "holder_instance": null,
+            "target": target,
+            "result": "second exact confirmation"
+        }))
+        .unwrap();
+        append(home, &operator, second).unwrap();
+        compact_at_with_keep(home, 1).unwrap();
+        let compacted = replay(home).unwrap();
+        let row = serde_json::to_value(&compacted.tasks[&TaskId::from("t-root")]).unwrap();
+        assert_eq!(
+            row["last_operator_settlement"]["operation_id"],
+            "op-3553-second"
+        );
+        assert_eq!(
+            compacted.tasks[&TaskId::from("t-child")].status,
+            TaskStatus::Open
+        );
+        let operations: Vec<_> = envelopes_for_task_at(home, "t-root")
+            .unwrap()
+            .into_iter()
+            .filter(|env| env.event.kind_str() == "operator_settled")
+            .map(|env| serde_json::to_value(env.event).unwrap())
+            .collect();
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0]["operation_id"], "op-3553");
+        assert_eq!(operations[0]["preview_digest"], "exact-preview-digest");
+        assert_eq!(operations[1]["operation_id"], "op-3553-second");
+    }
+}
+
 /// #3279: compile-visible terminality guard. Adding a TaskStatus variant makes
 /// this exhaustive match fail to compile until its lifecycle class is chosen.
 #[test]

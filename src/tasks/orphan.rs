@@ -506,6 +506,7 @@ pub fn build_health_response(
     let mut by_status: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
     let mut non_terminal_ages_days: Vec<i64> = Vec::new();
+    let mut total_terminal = 0;
     for record in state.tasks.values() {
         let key = match record.status {
             TaskStatus::Backlog => "backlog",
@@ -520,7 +521,9 @@ pub fn build_health_response(
             TaskStatus::Superseded => "superseded",
         };
         *by_status.entry(key).or_insert(0) += 1;
-        if !record.status.is_terminal() {
+        if record.status.is_terminal() {
+            total_terminal += 1;
+        } else {
             if let Ok(dt) = DateTime::parse_from_rfc3339(&record.created_at) {
                 let age = now.signed_duration_since(dt.with_timezone(&chrono::Utc));
                 non_terminal_ages_days.push(age.num_days());
@@ -528,8 +531,6 @@ pub fn build_health_response(
         }
     }
     let total_all: usize = by_status.values().copied().sum();
-    let total_terminal = by_status.get("done").copied().unwrap_or(0)
-        + by_status.get("cancelled").copied().unwrap_or(0);
     let total_non_terminal = total_all.saturating_sub(total_terminal);
 
     // ── Ghost owners (reuse #829 scan_orphan_candidates) ──

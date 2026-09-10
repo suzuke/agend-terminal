@@ -113,6 +113,20 @@ fn receipt(
     reviewed_head: &str,
     review_class: crate::daemon::pr_state::ReviewClass,
 ) -> crate::review_receipt::ReviewReceiptSummary {
+    receipt_with_verdict(
+        reviewer,
+        reviewed_head,
+        review_class,
+        crate::review_receipt::ReviewVerdict::Verified,
+    )
+}
+
+fn receipt_with_verdict(
+    reviewer: &str,
+    reviewed_head: &str,
+    review_class: crate::daemon::pr_state::ReviewClass,
+    verdict: crate::review_receipt::ReviewVerdict,
+) -> crate::review_receipt::ReviewReceiptSummary {
     let source_id = format!("source-{reviewer}");
     crate::review_receipt::ReviewReceiptSummary {
         receipt_id: format!("review-receipt:{source_id}"),
@@ -132,7 +146,7 @@ fn receipt(
         } else {
             crate::review_receipt::ReviewSlot::Secondary
         },
-        verdict: crate::review_receipt::ReviewVerdict::Verified,
+        verdict,
     }
 }
 
@@ -156,6 +170,158 @@ fn seed(home: &Path, state: &crate::daemon::pr_state::PrState) {
 
 fn install_provider(recorded: Arc<Mutex<Option<MergeOpts>>>) -> impl Drop {
     crate::scm::set_test_scm_provider(Arc::new(MergeMock::new(recorded)))
+}
+
+/// #3588: every `MergeDeficit` variant refuses with its own actionable error
+/// text. Non-review deficits must not borrow review-threshold wording
+/// (retro #739: a `ci_not_green` refusal was misread as a review problem).
+/// `code` is unchanged — caller-side guidance keys on it.
+#[test]
+fn each_deficit_returns_actionable_error_text() {
+    let recorded = Arc::new(Mutex::new(None));
+    let _g = install_provider(recorded.clone());
+
+    let single_green = || state(crate::daemon::pr_state::ReviewClass::Single, Vec::new());
+    let check = |tag: &str,
+                 seed_state: Option<crate::daemon::pr_state::PrState>,
+                 expected_code: &str,
+                 expected_error: &str| {
+        let home = home(&format!("deficit-text-{tag}"));
+        if let Some(s) = seed_state.as_ref() {
+            seed(&home, s);
+        }
+        let result = super::handle_merge_repo(&home, &args(), "lead");
+        assert_eq!(result["code"], expected_code, "{result}");
+        assert_eq!(result["error"], expected_error, "{result}");
+        std::fs::remove_dir_all(home).ok();
+    };
+
+    // No linkage: no seed at all.
+    check(
+        "no-linkage",
+        None,
+        "no_linkage",
+        "no merge-authority record for this head — merge refused",
+    );
+
+    // Unreadable assignment authority fails closed before anything else.
+    let mut s = single_green();
+    s.authority_unknown = true;
+    check(
+        "authority-unknown",
+        Some(s),
+        "authority_unknown",
+        "reviewer assignment authority unreadable — merge refused",
+    );
+
+    // A reserved-but-unverified required reviewer holds the PR closed.
+    let mut s = single_green();
+    s.reserved_assignments = vec![crate::daemon::pr_state::ReservedAssignment {
+        target: "reviewer-2".into(),
+        review_author: crate::mcp::handlers::comms_gates::ReviewAuthor::Agent("dev".into()),
+        assignment_id: uuid::Uuid::new_v4(),
+    }];
+    check(
+        "reserved",
+        Some(s),
+        "review_assignment_pending",
+        "reviewer assignment still pending — merge refused",
+    );
+
+    // An unresolved review class is never satisfiable.
+    check(
+        "unresolved",
+        Some(state(
+            crate::daemon::pr_state::ReviewClass::Unresolved,
+            Vec::new(),
+        )),
+        "unresolved_class",
+        "review class unresolved — merge refused",
+    );
+
+    // Draft refuses before CI is even consulted.
+    let mut s = single_green();
+    s.draft_state = crate::daemon::pr_state::DraftState::Draft;
+    check(
+        "draft",
+        Some(s),
+        "draft",
+        "PR is still a draft — merge refused",
+    );
+
+    // CI has not reported green for this head.
+    let mut s = single_green();
+    s.ci_state = crate::daemon::pr_state::CiState::Pending;
+    check(
+        "ci-not-green",
+        Some(s),
+        "ci_not_green",
+        "CI has not reported green for this head — merge refused",
+    );
+
+    // CI green belongs to another head.
+    let mut s = single_green();
+    s.ci_state = crate::daemon::pr_state::CiState::Green {
+        sha: OTHER_HEAD.into(),
+        observed_at: "2026-08-31T00:00:00Z".into(),
+    };
+    check(
+        "ci-head-mismatch",
+        Some(s),
+        "ci_head_mismatch",
+        "CI green is for a different head — merge refused",
+    );
+
+    // A current-head receipt that is not VERIFIED.
+    check(
+        "non-verified",
+        Some(state(
+            crate::daemon::pr_state::ReviewClass::Single,
+            vec![receipt_with_verdict(
+                "reviewer-1",
+                HEAD,
+                crate::daemon::pr_state::ReviewClass::Single,
+                crate::review_receipt::ReviewVerdict::Unverified,
+            )],
+        )),
+        "non_verified_receipt",
+        "review receipt is not VERIFIED — merge refused",
+    );
+
+    // The N-of-M deficit keeps review-threshold wording — it IS one.
+    check(
+        "insufficient",
+        Some(state(
+            crate::daemon::pr_state::ReviewClass::Dual,
+            vec![receipt(
+                "reviewer-1",
+                HEAD,
+                crate::daemon::pr_state::ReviewClass::Dual,
+            )],
+        )),
+        "insufficient_verified",
+        "review threshold not satisfied — merge refused",
+    );
+
+    // A stale receipt names the older-head problem.
+    check(
+        "stale",
+        Some(state(
+            crate::daemon::pr_state::ReviewClass::Dual,
+            vec![receipt(
+                "reviewer-1",
+                OTHER_HEAD,
+                crate::daemon::pr_state::ReviewClass::Dual,
+            )],
+        )),
+        "stale_head",
+        "review receipt pinned to an older head — merge refused",
+    );
+
+    assert!(
+        recorded.lock().unwrap().is_none(),
+        "no deficit case may reach pr_merge"
+    );
 }
 
 /// RED 1: no canonical PrState linkage must refuse before `pr_merge`.

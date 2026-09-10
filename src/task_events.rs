@@ -312,6 +312,13 @@ pub enum TaskEvent {
         by: InstanceName,
         reason: String,
     },
+    /// Exact operator settlement: status and audit proof are one durable event.
+    /// Unlike ordinary cancellation, this never changes children.
+    OperatorSettled {
+        task_id: TaskId,
+        #[serde(flatten)]
+        proof: OperatorSettlement,
+    },
     /// #3279: terminal predecessor relation created atomically with its
     /// successor on the same board. Distinct from Cancelled so replay and
     /// operators retain why the work item ended and the exact successor ID.
@@ -447,6 +454,7 @@ impl TaskEvent {
             | TaskEvent::Verified { task_id, .. }
             | TaskEvent::Done { task_id, .. }
             | TaskEvent::Cancelled { task_id, .. }
+            | TaskEvent::OperatorSettled { task_id, .. }
             | TaskEvent::Superseded { task_id, .. }
             | TaskEvent::Linked { task_id, .. }
             | TaskEvent::Blocked { task_id, .. }
@@ -474,6 +482,7 @@ impl TaskEvent {
             TaskEvent::Verified { .. } => "verified",
             TaskEvent::Done { .. } => "done",
             TaskEvent::Cancelled { .. } => "cancelled",
+            TaskEvent::OperatorSettled { .. } => "operator_settled",
             TaskEvent::Superseded { .. } => "superseded",
             TaskEvent::Linked { .. } => "linked",
             TaskEvent::Blocked { .. } => "blocked",
@@ -675,6 +684,7 @@ impl<'de> Deserialize<'de> for HistoryEntry {
             "verified" => "verified",
             "done" => "done",
             "cancelled" => "cancelled",
+            "operator_settled" => "operator_settled",
             "superseded" => "superseded",
             "linked" => "linked",
             "blocked" => "blocked",
@@ -706,6 +716,34 @@ impl<'de> Deserialize<'de> for HistoryEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorSettlementTarget {
+    Done,
+    Cancelled,
+}
+
+impl OperatorSettlementTarget {
+    pub fn status(self) -> TaskStatus {
+        match self {
+            Self::Done => TaskStatus::Done,
+            Self::Cancelled => TaskStatus::Cancelled,
+        }
+    }
+}
+
+/// Latest proof is bounded in the projection; older operations stay in the log.
+/// This is replay data, not an authorization token for a public handler.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OperatorSettlement {
+    pub operation_id: String,
+    pub preview_digest: String,
+    pub by: InstanceName,
+    pub holder_instance: Option<InstanceName>,
+    pub target: OperatorSettlementTarget,
+    pub result: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskRecord {
     pub id: TaskId,
@@ -730,6 +768,8 @@ pub struct TaskRecord {
     /// #3279: exact typed successor for a terminal Superseded predecessor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<TaskId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_operator_settlement: Option<OperatorSettlement>,
     pub branch: Option<String>,
     /// Sprint 55 P0-C — opt-out flag for daemon auto-bind on dispatch.
     /// `Some(false)` means RCA/audit/design class; auto-bind was skipped.
@@ -879,6 +919,14 @@ impl TaskBoardState {
             }
             TaskEvent::Done { source, .. } => self.apply_done(task_id, touch_at, source),
             TaskEvent::Cancelled { .. } => self.apply_cancelled(task_id, touch_at),
+            TaskEvent::OperatorSettled { proof, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.status = proof.target.status();
+                    task.result = Some(proof.result.clone());
+                    task.updated_at = touch_at.to_string();
+                    task.last_operator_settlement = Some(proof.clone());
+                }
+            }
             TaskEvent::Superseded { successor_id, .. } => {
                 self.apply_superseded(task_id, touch_at, successor_id)
             }
@@ -993,6 +1041,7 @@ impl TaskBoardState {
                 routed_to: routed_to.clone(),
                 result: None,
                 superseded_by: None,
+                last_operator_settlement: None,
                 branch: branch.clone(),
                 bind: *bind,
                 started_at: None,
@@ -2106,6 +2155,11 @@ pub(crate) fn compact_at(board: &Path) -> anyhow::Result<()> {
 /// events are all archived keeps a correct seq high-water ([`next_seq_under_lock`]).
 fn compact_at_with_keep(board: &Path, keep: usize) -> anyhow::Result<()> {
     catalog::compact_at_with_keep(board, keep)
+}
+
+#[cfg(test)]
+pub(crate) fn compact_with_keep_for_test(board: &Path, keep: usize) -> anyhow::Result<()> {
+    compact_at_with_keep(board, keep)
 }
 
 /// Opportunistic, non-fatal hot-log compaction after an append (mirrors

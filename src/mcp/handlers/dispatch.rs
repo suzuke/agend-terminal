@@ -339,11 +339,11 @@ adapter!(dispatch_bind_topic, ha, instance::handle_bind_topic);
 pub(crate) fn dispatch_restart_instance(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_restart_instance_with_runtime(ctx.home, ctx.args, ctx.runtime)
 }
-adapter!(
-    dispatch_set_model,
-    has,
-    instance::set_model::handle_set_model
-);
+/// #3572: preserve the API-owned RuntimeContext through set_model's optional
+/// restart so DELETE/SPAWN use the same in-process lifecycle as restart_instance.
+pub(crate) fn dispatch_set_model(ctx: &HandlerCtx<'_>) -> Value {
+    instance::set_model::handle_set_model_with_runtime(ctx.home, ctx.args, ctx.sender, ctx.runtime)
+}
 /// #2454: move_pane is a runtime-aware adapter over the neutral service.
 pub(crate) fn dispatch_move_pane(ctx: &HandlerCtx<'_>) -> Value {
     // The owned notifier travels inside RuntimeContext to the MCP adapter.

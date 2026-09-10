@@ -4658,7 +4658,10 @@ templates:
     );
     assert_eq!(projected_args, vec!["--fixture", "value"]);
     assert_eq!(projected_model.as_deref(), Some("sonnet"));
-    assert_eq!(projected_marker.as_deref(), Some("present"));
+    assert_eq!(
+        projected_marker,
+        Some(crate::fleet::FleetEnvValue::Literal("present".to_string()))
+    );
     assert_eq!(projected_topic_binding.as_deref(), Some("skip"));
     assert_eq!(
         teardown["status"].as_str(),

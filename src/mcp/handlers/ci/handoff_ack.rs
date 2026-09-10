@@ -67,38 +67,49 @@ pub(crate) fn handle_ack_handoff_ci(home: &Path, args: &Value, instance_name: &s
             }
         }
         // Draft/REJECTED resolution may remove the sidecar before the exact
-        // recipient ACKs the feature handoff. The unique trusted feature row
-        // remains the only authority in that race; settle it without touching
-        // the watch or inferring a newer episode.
-        let row_outcome = settle_ci_handoff_row_exact(
-            home,
-            instance_name,
-            &correlation,
-            episode,
+        // recipient ACKs the handoff. The unique trusted row remains the only
+        // authority in that race; settle it without touching the watch or
+        // inferring a newer episode. Feature is probed first to preserve the
+        // #3180 behavior; Protected (#3574) extends the same pattern to
+        // exact-head protected-ref watches. Missing in one class falls
+        // through to the next; ambiguous/lock/write failures stay fail-closed.
+        let mut settled_class = None;
+        let mut already_acked = false;
+        for class in [
             crate::inbox::CiHandoffClass::Feature,
-        );
-        let already_acked = match row_outcome {
-            HandoffRowSettleOutcome::Settled => false,
-            HandoffRowSettleOutcome::AlreadySettled => true,
-            HandoffRowSettleOutcome::Missing => {
-                return json!({"error": "matching inbox row not found", "code": "track_not_found"})
+            crate::inbox::CiHandoffClass::Protected,
+        ] {
+            match settle_ci_handoff_row_exact(home, instance_name, &correlation, episode, class) {
+                HandoffRowSettleOutcome::Settled => {
+                    settled_class = Some(class);
+                    break;
+                }
+                HandoffRowSettleOutcome::AlreadySettled => {
+                    settled_class = Some(class);
+                    already_acked = true;
+                    break;
+                }
+                HandoffRowSettleOutcome::Missing => continue,
+                HandoffRowSettleOutcome::Ambiguous => {
+                    return json!({"error": "matching inbox row is ambiguous", "code": "row_ambiguous"})
+                }
+                HandoffRowSettleOutcome::WriteFailed => {
+                    return json!({"error": "failed to settle inbox row", "code": "row_write_failed"})
+                }
+                HandoffRowSettleOutcome::LockFailed => {
+                    return json!({"error": "failed to lock inbox row", "code": "row_lock_failed"})
+                }
             }
-            HandoffRowSettleOutcome::Ambiguous => {
-                return json!({"error": "matching inbox row is ambiguous", "code": "row_ambiguous"})
-            }
-            HandoffRowSettleOutcome::WriteFailed => {
-                return json!({"error": "failed to settle inbox row", "code": "row_write_failed"})
-            }
-            HandoffRowSettleOutcome::LockFailed => {
-                return json!({"error": "failed to lock inbox row", "code": "row_lock_failed"})
-            }
+        }
+        let Some(settled_class) = settled_class else {
+            return json!({"error": "matching inbox row not found", "code": "track_not_found"});
         };
         crate::event_log::log(
             home,
             "ci_handoff_acknowledged",
             instance_name,
             &format!(
-                "correlation={correlation} episode={episode} class=Feature track_already_resolved=true watch_preserved=true"
+                "correlation={correlation} episode={episode} class={settled_class:?} track_already_resolved=true watch_preserved=true"
             ),
         );
         return json!({

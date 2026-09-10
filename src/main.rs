@@ -540,6 +540,21 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AdminCommands {
+    /// Preview one exact task settlement; returns a 15-minute confirmation.
+    TaskSettlementPreview {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long, value_parser = ["done", "cancelled"])]
+        target: String,
+        /// Nonempty explanation recorded with the settlement.
+        #[arg(long)]
+        result: String,
+    },
+    /// Apply an operator preview token; never performs inline worktree cleanup.
+    TaskSettlementApply {
+        #[arg(long)]
+        confirmation: String,
+    },
     /// Delete local branches whose PRs have been merged (squash-merge safe).
     /// Default: --dry-run (preview only). Pass --yes to actually delete.
     CleanupBranches {
@@ -1369,6 +1384,32 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Admin { command }) => match command {
+            AdminCommands::TaskSettlementPreview {
+                task_id,
+                target,
+                result,
+            } => {
+                let response = api::call(
+                    &home,
+                    &serde_json::json!({
+                        "method":"task_settlement_preview", "params":{
+                            "task_id":task_id,"target":target,"result":result
+                        }
+                    }),
+                )?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                anyhow::ensure!(response["ok"] == true, "task settlement preview refused");
+            }
+            AdminCommands::TaskSettlementApply { confirmation } => {
+                let response = api::call(
+                    &home,
+                    &serde_json::json!({
+                        "method":"task_settlement_apply", "params":{"confirmation":confirmation}
+                    }),
+                )?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                anyhow::ensure!(response["ok"] == true, "task settlement apply refused");
+            }
             AdminCommands::CleanupBranches { yes } => {
                 let repo = std::env::current_dir()?;
                 let checks = admin::analyze_branches(&repo);
@@ -1826,6 +1867,42 @@ mod tests {
             s.contains(".agend") || s.contains("agend"),
             "home_dir should contain 'agend': {s}"
         );
+    }
+
+    #[test]
+    fn operator_settlement_3553_cli_commands_parse() {
+        assert!(Cli::try_parse_from([
+            "agend-terminal",
+            "admin",
+            "task-settlement-preview",
+            "--task-id",
+            "t-exact",
+            "--target",
+            "cancelled",
+            "--result",
+            "duplicate confirmed",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "agend-terminal",
+            "admin",
+            "task-settlement-apply",
+            "--confirmation",
+            "opaque-token",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "agend-terminal",
+            "admin",
+            "task-settlement-preview",
+            "--task-id",
+            "t-exact",
+            "--target",
+            "claimed",
+            "--result",
+            "invalid target",
+        ])
+        .is_err());
     }
 
     #[test]

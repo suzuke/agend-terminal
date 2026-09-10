@@ -211,14 +211,16 @@ fn ack_handoff_resolved_feature_episode_mismatch_leaves_row_untouched_3179() {
 }
 
 #[test]
-fn ack_handoff_resolved_protected_row_is_not_feature_fallback_3179() {
+fn ack_handoff_settles_protected_row_after_track_resolved_3574() {
     let home = std::env::temp_dir().join(format!(
-        "agend-3179-ack-resolved-protected-{}-{}",
+        "agend-3574-ack-resolved-protected-{}-{}",
         std::process::id(),
         line!()
     ));
     let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(home.join("ci-watches")).unwrap();
+    let watch = home.join("ci-watches").join("main.json");
+    std::fs::write(&watch, b"watch-must-survive").unwrap();
     let corr = "o/r@main";
     let episode = "ep-protected";
     seed_handoff_row_with_class(
@@ -226,17 +228,24 @@ fn ack_handoff_resolved_protected_row_is_not_feature_fallback_3179() {
         "lead",
         corr,
         episode,
-        "m-3179-resolved-protected",
+        "m-3574-resolved-protected",
         crate::inbox::CiHandoffClass::Protected,
     );
+
+    // The protected-track resolver has already removed the sidecar track.
+    assert!(crate::daemon::ci_handoff_track::list(&home).is_empty());
 
     let response = handle_ack_handoff_ci(
         &home,
         &json!({"repository": "o/r", "branch": "main", "episode": episode}),
         "lead",
     );
-    assert_eq!(response["code"], "track_not_found", "{response}");
-    assert!(ack_row(&home, "lead", episode).read_at.is_none());
+    assert_eq!(
+        response["ok"], true,
+        "exact protected row ACK must succeed: {response}"
+    );
+    assert_eq!(response["track_already_resolved"], true, "{response}");
+    assert_eq!(response["watch_preserved"], true, "{response}");
     assert_eq!(
         crate::inbox::storage::handoff_row_state(
             &home,
@@ -245,9 +254,70 @@ fn ack_handoff_resolved_protected_row_is_not_feature_fallback_3179() {
             episode,
             crate::inbox::CiHandoffClass::Protected,
         ),
-        crate::inbox::storage::ProtectedHandoffRowState::Pending
+        crate::inbox::storage::ProtectedHandoffRowState::ExplicitlyAcked
     );
+    assert_eq!(std::fs::read(&watch).unwrap(), b"watch-must-survive");
     std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn ack_handoff_missing_or_ambiguous_resolved_protected_row_fails_closed_3574() {
+    let missing_home = std::env::temp_dir().join(format!(
+        "agend-3574-ack-missing-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&missing_home);
+    std::fs::create_dir_all(&missing_home).unwrap();
+    let missing = handle_ack_handoff_ci(
+        &missing_home,
+        &json!({"repository": "o/r", "branch": "main", "episode": "ep-missing"}),
+        "lead",
+    );
+    assert_eq!(
+        missing["code"], "track_not_found",
+        "missing protected row must fail closed: {missing}"
+    );
+    assert_ne!(missing["ok"], true);
+    std::fs::remove_dir_all(&missing_home).ok();
+
+    let ambiguous_home = std::env::temp_dir().join(format!(
+        "agend-3574-ack-ambiguous-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&ambiguous_home);
+    std::fs::create_dir_all(&ambiguous_home).unwrap();
+    let corr = "o/r@main";
+    let episode = "ep-ambiguous";
+    seed_handoff_row_with_class(
+        &ambiguous_home,
+        "lead",
+        corr,
+        episode,
+        "m-3574-ambiguous-a",
+        crate::inbox::CiHandoffClass::Protected,
+    );
+    seed_handoff_row_with_class(
+        &ambiguous_home,
+        "lead",
+        corr,
+        episode,
+        "m-3574-ambiguous-b",
+        crate::inbox::CiHandoffClass::Protected,
+    );
+    let ambiguous = handle_ack_handoff_ci(
+        &ambiguous_home,
+        &json!({"repository": "o/r", "branch": "main", "episode": episode}),
+        "lead",
+    );
+    assert_eq!(
+        ambiguous["code"], "row_ambiguous",
+        "ambiguous protected rows must fail closed: {ambiguous}"
+    );
+    assert!(ack_row(&ambiguous_home, "lead", episode).read_at.is_none());
+    assert!(crate::daemon::ci_handoff_track::list(&ambiguous_home).is_empty());
+    std::fs::remove_dir_all(&ambiguous_home).ok();
 }
 
 #[test]

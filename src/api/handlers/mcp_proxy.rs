@@ -406,6 +406,10 @@ fn role_kind_for_instance(
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "set_model_success_3573.rs"]
+mod set_model_success_3573;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,6 +1512,78 @@ mod tests {
                 !trimmed.starts_with("//") && line.contains("crate::api::call")
             }),
             "D8 runtime-present SPAWN must use the shared runtime service, not crate::api::call"
+        );
+    }
+
+    /// #3572 RED: the real MCP set_model ingress must preserve RuntimeContext
+    /// into its restart:true path. The runtime spawn boundary records the
+    /// request even when the deliberate shared-workspace collision rejects the
+    /// replacement; the unfixed adapter drops RuntimeContext and falls back to
+    /// the unavailable loopback API, leaving this boundary unobserved.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn set_model_restart_real_entry_uses_runtime_spawn_without_listener_3572() {
+        use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-s11-mcp-set-model-{0}-{1}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let shared_work_dir = home.join("shared-workdir");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  restart-target:\n    backend: claude\n    working_directory: {}\n  restart-collider:\n    backend: claude\n    working_directory: {}\n",
+                shared_work_dir.display(),
+                shared_work_dir.display()
+            ),
+        )
+        .unwrap();
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+        *LAST_SPAWN_ARGS.lock() = None;
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let response = invoke_runtime_mcp_tool(
+            &home,
+            &registry,
+            &configs,
+            &externals,
+            "set_model",
+            "restart-target",
+            json!({
+                "instance": "restart-target",
+                "model": "claude-opus-5",
+                "restart": true
+            }),
+        );
+        let spawn_args = LAST_SPAWN_ARGS.lock().clone();
+
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            response["ok"], true,
+            "MCP set_model must return a response: {response}"
+        );
+        assert_eq!(
+            response["result"]["restart_ok"], false,
+            "the collision should reject the replacement spawn, not hide the runtime result: {response}"
+        );
+        assert!(
+            spawn_args.is_some(),
+            "set_model restart:true must reach the runtime-owned SPAWN service without an API listener: {response}"
         );
     }
 

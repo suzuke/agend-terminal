@@ -1718,6 +1718,8 @@ pub struct ProjectedTaskRecord {
     pub result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_operator_settlement: Option<super::OperatorSettlement>,
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind: Option<bool>,
@@ -1752,7 +1754,12 @@ impl From<TaskRecord> for ProjectedTaskRecord {
                 task.history
                     .iter()
                     .rev()
-                    .find(|entry| matches!(entry.kind, "done" | "cancelled" | "superseded"))
+                    .find(|entry| {
+                        matches!(
+                            entry.kind,
+                            "done" | "cancelled" | "superseded" | "operator_settled"
+                        )
+                    })
                     .map(|entry| (entry.instance.clone(), entry.seq))
             })
             .flatten();
@@ -1783,6 +1790,7 @@ impl From<TaskRecord> for ProjectedTaskRecord {
             routed_to: task.routed_to,
             result: task.result,
             superseded_by: task.superseded_by,
+            last_operator_settlement: task.last_operator_settlement,
             branch: task.branch,
             bind: task.bind,
             started_at: task.started_at,
@@ -1818,6 +1826,7 @@ impl ProjectedTaskRecord {
             routed_to: self.routed_to.clone(),
             result: self.result.clone(),
             superseded_by: self.superseded_by.clone(),
+            last_operator_settlement: self.last_operator_settlement.clone(),
             branch: self.branch.clone(),
             bind: self.bind,
             started_at: self.started_at.clone(),
@@ -2056,7 +2065,10 @@ impl BoardProjection {
             let task = Arc::make_mut(task);
             if matches!(
                 env.event,
-                TaskEvent::Done { .. } | TaskEvent::Cancelled { .. } | TaskEvent::Superseded { .. }
+                TaskEvent::Done { .. }
+                    | TaskEvent::Cancelled { .. }
+                    | TaskEvent::Superseded { .. }
+                    | TaskEvent::OperatorSettled { .. }
             ) {
                 task.terminal_event = Some((env.instance.clone(), env.seq));
             } else if !task.status.is_terminal() {
@@ -2142,6 +2154,7 @@ impl BoardProjection {
                         routed_to: routed_to.clone(),
                         result: None,
                         superseded_by: None,
+                        last_operator_settlement: None,
                         branch: branch.clone(),
                         bind: *bind,
                         started_at: None,
@@ -2197,6 +2210,14 @@ impl BoardProjection {
             }
             TaskEvent::Verified { .. } => {
                 self.set_status(task_id, timestamp, TaskStatus::Verified);
+            }
+            TaskEvent::OperatorSettled { proof, .. } => {
+                self.mutate_task(task_id, |task| {
+                    task.status = proof.target.status();
+                    task.result = Some(proof.result.clone());
+                    task.updated_at = timestamp.to_string();
+                    task.last_operator_settlement = Some(proof.clone());
+                });
             }
             TaskEvent::Done { source, .. } => {
                 self.mutate_task(task_id, |task| {

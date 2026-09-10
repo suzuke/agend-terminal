@@ -2470,6 +2470,104 @@ fn build_command_allows_operator_backend_credential_2106() {
     );
 }
 
+struct ScopedEnv3540 {
+    key: &'static str,
+    prior: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnv3540 {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prior = std::env::var_os(key);
+        // SAFETY: this test is serialized with every other `serial_test::serial(env)` test.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, prior }
+    }
+}
+
+impl Drop for ScopedEnv3540 {
+    fn drop(&mut self) {
+        // SAFETY: the owning test remains inside the same serial-test critical section.
+        unsafe {
+            match self.prior.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial(env)]
+fn fleet_env_from_env_expands_then_applies_destination_key_policy_3540() {
+    const SOURCE: &str = "AGEND_TEST_3540_SHARED_SECRET";
+    const SECRET: &str = "secret-from-process-env-3540";
+    let _source = ScopedEnv3540::set(SOURCE, SECRET);
+    let yaml = format!(
+        r#"
+defaults:
+  env:
+    LITERAL_DOLLAR: "${{UNCHANGED}}"
+instances:
+  worker:
+    backend: claude
+    env:
+      ANTHROPIC_AUTH_TOKEN: {{ from_env: {SOURCE} }}
+      LD_PRELOAD: {{ from_env: {SOURCE} }}
+      SERVICE_TOKEN_ALIAS: {{ from_env: {SOURCE} }}
+"#
+    );
+    assert!(
+        !yaml.contains(SECRET),
+        "fleet.yaml must contain only the source variable name, never its secret value"
+    );
+    let fleet: crate::fleet::FleetConfig =
+        serde_yaml_ng::from_str(&yaml).expect("structured env references parse");
+    let resolved = fleet.resolve_instance("worker").expect("source is set");
+    assert_eq!(
+        resolved.env.get("LITERAL_DOLLAR").map(String::as_str),
+        Some("${UNCHANGED}")
+    );
+    assert_eq!(
+        resolved.env.get("SERVICE_TOKEN_ALIAS").map(String::as_str),
+        Some(SECRET)
+    );
+
+    let config = SpawnConfig {
+        name: "worker",
+        backend: Some(&resolved.backend),
+        backend_command: &resolved.backend_command,
+        args: &resolved.args,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: Some(&resolved.env),
+        working_dir: None,
+        submit_key: &resolved.submit_key,
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+    let (cmd, _, _prov) = build_command(&config).expect("build command");
+    assert_eq!(
+        cmd.get_env("ANTHROPIC_AUTH_TOKEN")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some(SECRET.to_string()),
+        "#2106 backend credential exception must still key off the destination name"
+    );
+    assert_eq!(
+        cmd.get_env("SERVICE_TOKEN_ALIAS")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some(SECRET.to_string()),
+        "a benign destination key must receive the referenced value"
+    );
+    assert_ne!(
+        cmd.get_env("LD_PRELOAD")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some(SECRET.to_string()),
+        "deny-list must still key off the destination name, not inspect the referenced value"
+    );
+}
+
 /// #2106 scope guard: the override is PER-BACKEND (it reuses
 /// `credential_env_keys`). A credential one backend declares must NOT slip
 /// through for a different backend that doesn't — `ANTHROPIC_AUTH_TOKEN` is

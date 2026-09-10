@@ -158,6 +158,24 @@ Exit codes:
 
 Delete local branches whose PRs have been merged (squash-merge safe). Default is dry-run (preview only); `--yes` actually deletes. See `docs/RCA-*` notes for the squash-merge detection heuristic.
 
+#### Exact operator task settlement
+
+With a running daemon, preview one task, inspect the returned subject and reason,
+then explicitly apply its confirmation:
+
+```sh
+agend-terminal admin task-settlement-preview --task-id TASK_ID --target cancelled --result 'Duplicate confirmed after inspection'
+agend-terminal admin task-settlement-apply --confirmation TOKEN_FROM_PREVIEW
+```
+
+Targets are `done` or `cancelled`. An unused confirmation expires after 15 minutes;
+changed task content requires a new preview. These commands use operator authentication,
+not agent MCP authority. Output is JSON; refusal or transport failure exits nonzero.
+Settlement is exact-row, not child cancellation, and does not provide PR/CI evidence
+or perform inline worktree cleanup. `cleanup_status: not_verified` is not proof of
+completed background cleanup. A retry reports the original outcome separately from
+the current task status; it does not close a reopened task again.
+
 #### `admin task-sweep-config` (#2547)
 
 View or configure the GitHub-PR auto-close sweep daemon (polls merged PRs and emits `Done` events for `Closes t-XXX-N` markers). Moved here from the `task_sweep_config` MCP tool — operator-only setting, zero agent calls in 20 days. With no flags, prints the current config unchanged.
