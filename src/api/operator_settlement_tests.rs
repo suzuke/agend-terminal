@@ -26,6 +26,9 @@ impl Drop for Server {
         } else {
             // Preserve the isolated home if termination cannot be proven.
             eprintln!("settlement test server did not stop: {}", self.home.display());
+            if !std::thread::panicking() {
+                panic!("settlement test server cleanup was not proven");
+            }
         }
     }
 }
