@@ -55,10 +55,13 @@ impl Server {
             let externals = Arc::new(Mutex::new(HashMap::new()));
             while !shutdown.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => handle_session(
-                        stream, &registry, &home, &shutdown, &configs, &externals,
-                        None, operator, agent, RestartCapability::Unsupported, None,
-                    ),
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        handle_session(
+                            stream, &registry, &home, &shutdown, &configs, &externals,
+                            None, operator, agent, RestartCapability::Unsupported, None,
+                        );
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(10));
                     }
