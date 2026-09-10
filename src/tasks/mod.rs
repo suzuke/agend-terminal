@@ -9,6 +9,7 @@ pub(crate) mod governance;
 mod handler;
 pub mod lifecycle;
 mod orphan;
+pub(crate) mod operator_settlement;
 mod supersession;
 mod sweep;
 

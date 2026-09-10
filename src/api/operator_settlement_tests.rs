@@ -95,10 +95,11 @@ impl Server {
 fn operator_settlement_3553_real_socket_reaches_preview_not_agent() {
     let server = Server::start();
     let request = json!({"method":"task_settlement_preview", "params":{
-        "task_id":"nonexistent-3553", "target":"cancelled", "result":"operator inspected",
-        "instance":"operator"
+        "task_id":"nonexistent-3553", "target":"cancelled", "result":"operator inspected"
     }});
-    let denied = server.request(false, request.clone());
+    let mut forged = request.clone();
+    forged["params"]["instance"] = json!("operator");
+    let denied = server.request(false, forged);
     assert_eq!(denied["denied_by"], "capability");
     let response = server.request(true, request);
     assert_eq!(response["ok"], false);
