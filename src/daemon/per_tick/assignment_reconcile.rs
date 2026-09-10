@@ -196,7 +196,11 @@ fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
     reconcile_all_collect_wakes_after_snapshot(home, now, || {})
 }
 
-fn reconcile_all_collect_wakes_after_snapshot(home: &Path, now: &str, after_snapshot: impl FnOnce()) -> ReconcileWakes {
+fn reconcile_all_collect_wakes_after_snapshot(
+    home: &Path,
+    now: &str,
+    after_snapshot: impl FnOnce(),
+) -> ReconcileWakes {
     // Workset = dedup UNION of two `(repo,branch)` identity sources (codex m-…-416):
     //   (a) `store::active_branches` — branches discovered via a PARSEABLE authority
     //       record. It reads the FIRST parseable record to name a branch, so a branch
@@ -245,7 +249,10 @@ fn reconcile_all_collect_wakes_after_snapshot(home: &Path, now: &str, after_snap
                         );
                     }
                 } else if let Err(error) = store::retire_current_terminal_task_checked(
-                    home, &snapshot.board, &snapshot.task_id.0, now,
+                    home,
+                    &snapshot.board,
+                    &snapshot.task_id.0,
+                    now,
                 ) {
                     tracing::error!(task_id = %snapshot.task_id, %error,
                         "cascaded terminal assignment retirement failed");
@@ -2107,29 +2114,50 @@ mod tests {
         let created = serde_json::from_value(serde_json::json!({
             "kind":"Created", "task_id":task_id, "title":"dispatch only",
             "description":"", "priority":"normal", "owner":null
-        })).unwrap();
+        }))
+        .unwrap();
         crate::task_events::append(&home, &"fixture".into(), created).unwrap();
-        crate::dispatch_tracking::track_dispatch(&home, crate::dispatch_tracking::DispatchEntry {
-            task_id: Some(task_id.into()), from: "lead".into(), to: "reviewer".into(),
-            delegated_at: "2026-07-22T00:00:00Z".into(), status: "pending".into(),
-            ..Default::default()
-        });
-        crate::task_events::append(&home, &"operator".into(), TaskEvent::OperatorSettled {
-            task_id: task_id.into(), proof: crate::task_events::OperatorSettlement {
-                operation_id: "dispatch-only".into(), preview_digest: "digest".into(),
-                by: "operator".into(), holder_instance: None,
-                target: crate::task_events::OperatorSettlementTarget::Done, result: "done".into(),
+        crate::dispatch_tracking::track_dispatch(
+            &home,
+            crate::dispatch_tracking::DispatchEntry {
+                task_id: Some(task_id.into()),
+                from: "lead".into(),
+                to: "reviewer".into(),
+                delegated_at: "2026-07-22T00:00:00Z".into(),
+                status: "pending".into(),
+                ..Default::default()
             },
-        }).unwrap();
+        );
+        crate::task_events::append(
+            &home,
+            &"operator".into(),
+            TaskEvent::OperatorSettled {
+                task_id: task_id.into(),
+                proof: crate::task_events::OperatorSettlement {
+                    operation_id: "dispatch-only".into(),
+                    preview_digest: "digest".into(),
+                    by: "operator".into(),
+                    holder_instance: None,
+                    target: crate::task_events::OperatorSettlementTarget::Done,
+                    result: "done".into(),
+                },
+            },
+        )
+        .unwrap();
         assert!(store::active_branches(&home).is_empty());
-        assert!(crate::dispatch_tracking::has_for_instance(&home, "reviewer"));
+        assert!(crate::dispatch_tracking::has_for_instance(
+            &home, "reviewer"
+        ));
         crate::task_events::catalog::rebuild_for_test(&home);
         let before = serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap();
         reconcile_all_collect(&home, "2026-07-22T00:00:02Z");
         let residue = crate::dispatch_tracking::has_for_instance(&home, "reviewer");
         let after = serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap();
         std::fs::remove_dir_all(&home).unwrap();
-        assert!(!residue, "committed cleanup must be discovered without an assignment");
+        assert!(
+            !residue,
+            "committed cleanup must be discovered without an assignment"
+        );
         assert_eq!(before, after);
     }
 
@@ -2138,26 +2166,58 @@ mod tests {
         let home = tmp_home("3553-reconcile-race");
         let task_id = "t-3553-reconcile";
         seed_and_cancel_task(&home, task_id);
-        crate::task_events::append_batch_at(&home, &"operator".into(), vec![
-            TaskEvent::Reopened { task_id: task_id.into(), reason: "fixture".into(), source_evidence: String::new() },
-            TaskEvent::OperatorSettled { task_id: task_id.into(), proof: crate::task_events::OperatorSettlement {
-                operation_id: "reconcile-operation".into(), preview_digest: "digest".into(),
-                by: "operator".into(), holder_instance: None,
-                target: crate::task_events::OperatorSettlementTarget::Done, result: "done".into(),
-            }},
-        ]).unwrap();
+        crate::task_events::append_batch_at(
+            &home,
+            &"operator".into(),
+            vec![
+                TaskEvent::Reopened {
+                    task_id: task_id.into(),
+                    reason: "fixture".into(),
+                    source_evidence: String::new(),
+                },
+                TaskEvent::OperatorSettled {
+                    task_id: task_id.into(),
+                    proof: crate::task_events::OperatorSettlement {
+                        operation_id: "reconcile-operation".into(),
+                        preview_digest: "digest".into(),
+                        by: "operator".into(),
+                        holder_instance: None,
+                        target: crate::task_events::OperatorSettlementTarget::Done,
+                        result: "done".into(),
+                    },
+                },
+            ],
+        )
+        .unwrap();
         let rec = ActiveAssignment::new_pending(
-            "o/r", "feat/operator", "reviewer", 7, "lead", task_id,
-            ReviewClass::Single, ReviewAuthor::External("octocat".into()),
-            "Review", None, None, "2026-07-22T00:00:00Z",
+            "o/r",
+            "feat/operator",
+            "reviewer",
+            7,
+            "lead",
+            task_id,
+            ReviewClass::Single,
+            ReviewAuthor::External("octocat".into()),
+            "Review",
+            None,
+            None,
+            "2026-07-22T00:00:00Z",
         );
         store::persist(&home, &rec).unwrap();
         let mut expected = None;
         reconcile_all_collect_wakes_after_snapshot(&home, "2026-07-22T00:00:02Z", || {
-            crate::task_events::append(&home, &"fixture".into(), TaskEvent::Reopened {
-                task_id: task_id.into(), reason: "new work".into(), source_evidence: "operator".into(),
-            }).unwrap();
-            expected = Some(serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap());
+            crate::task_events::append(
+                &home,
+                &"fixture".into(),
+                TaskEvent::Reopened {
+                    task_id: task_id.into(),
+                    reason: "new work".into(),
+                    source_evidence: "operator".into(),
+                },
+            )
+            .unwrap();
+            expected =
+                Some(serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap());
         });
         let actual = serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap();
         let remaining = store::get(&home, "o/r", "feat/operator", "reviewer");
@@ -2327,13 +2387,29 @@ mod tests {
         successor.assignment_id = uuid::Uuid::new_v4();
         store::persist(&home, &successor).unwrap();
         reconcile_all_collect_wakes_after_snapshot(&home, "2026-07-22T02:00:02Z", || {
-            crate::task_events::append(&home, &"fixture".into(), TaskEvent::Reopened {
-                task_id: child.clone(), reason: "new child work".into(), source_evidence: "operator".into(),
-            }).unwrap();
+            crate::task_events::append(
+                &home,
+                &"fixture".into(),
+                TaskEvent::Reopened {
+                    task_id: child.clone(),
+                    reason: "new child work".into(),
+                    source_evidence: "operator".into(),
+                },
+            )
+            .unwrap();
         });
-        assert_eq!(store::get(&home, "o/r", "feat/cascade", "reviewer-child").unwrap().assignment_id,
-            successor.assignment_id);
-        assert_eq!(crate::task_events::replay(&home).unwrap().tasks[&child].status.to_string(), "open");
+        assert_eq!(
+            store::get(&home, "o/r", "feat/cascade", "reviewer-child")
+                .unwrap()
+                .assignment_id,
+            successor.assignment_id
+        );
+        assert_eq!(
+            crate::task_events::replay(&home).unwrap().tasks[&child]
+                .status
+                .to_string(),
+            "open"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

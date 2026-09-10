@@ -651,8 +651,7 @@ fn build_task_windows(
                     close_window(&mut result, &mut open, &mut holder, &inst, ts);
                 }
             }
-            TaskEvent::Released { task_id, .. }
-            | TaskEvent::OperatorSettled { task_id, .. } => {
+            TaskEvent::Released { task_id, .. } | TaskEvent::OperatorSettled { task_id, .. } => {
                 // Settlement's actor is the operator, not the allocation
                 // holder. Close only this task's replay-derived holder.
                 if let Some(inst) = holder.get(&task_id.0).cloned() {
@@ -1542,7 +1541,10 @@ mod tests {
     #[test]
     fn operator_settlement_3553_closes_only_actual_task_holder() {
         use crate::task_events::{OperatorSettlement, OperatorSettlementTarget};
-        for target in [OperatorSettlementTarget::Done, OperatorSettlementTarget::Cancelled] {
+        for target in [
+            OperatorSettlementTarget::Done,
+            OperatorSettlementTarget::Cancelled,
+        ] {
             let settled = TaskEvent::OperatorSettled {
                 task_id: "A".into(),
                 proof: OperatorSettlement {

@@ -115,8 +115,12 @@ pub(crate) fn remove_all_for_task_checked(home: &Path, task_id: &str) -> anyhow:
         Err(error) => return Err(error.into()),
     };
     let mut data: DispatchStore = serde_json::from_slice(&bytes)?;
-    anyhow::ensure!(data.schema_version == 1, "unsupported dispatch tracking schema");
-    data.entries.retain(|entry| entry.task_id.as_deref() != Some(task_id));
+    anyhow::ensure!(
+        data.schema_version == 1,
+        "unsupported dispatch tracking schema"
+    );
+    data.entries
+        .retain(|entry| entry.task_id.as_deref() != Some(task_id));
     crate::store::save_atomic(&path, &data)
 }
 

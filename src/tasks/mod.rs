@@ -8,8 +8,8 @@ mod board_sweep;
 pub(crate) mod governance;
 mod handler;
 pub mod lifecycle;
-mod orphan;
 pub(crate) mod operator_settlement;
+mod orphan;
 mod supersession;
 mod sweep;
 

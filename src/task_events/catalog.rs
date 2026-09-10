@@ -1008,9 +1008,7 @@ where
     for envelope in envelopes.iter().filter(|envelope| {
         matches!(
             envelope.event,
-            TaskEvent::Done { .. }
-                | TaskEvent::Cancelled { .. }
-                | TaskEvent::Superseded { .. }
+            TaskEvent::Done { .. } | TaskEvent::Cancelled { .. } | TaskEvent::Superseded { .. }
         )
     }) {
         if let Err(error) = crate::tasks::task_terminal_cleanup_event(

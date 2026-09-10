@@ -1384,19 +1384,29 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Admin { command }) => match command {
-            AdminCommands::TaskSettlementPreview { task_id, target, result } => {
-                let response = api::call(&home, &serde_json::json!({
-                    "method":"task_settlement_preview", "params":{
-                        "task_id":task_id,"target":target,"result":result
-                    }
-                }))?;
+            AdminCommands::TaskSettlementPreview {
+                task_id,
+                target,
+                result,
+            } => {
+                let response = api::call(
+                    &home,
+                    &serde_json::json!({
+                        "method":"task_settlement_preview", "params":{
+                            "task_id":task_id,"target":target,"result":result
+                        }
+                    }),
+                )?;
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 anyhow::ensure!(response["ok"] == true, "task settlement preview refused");
             }
             AdminCommands::TaskSettlementApply { confirmation } => {
-                let response = api::call(&home, &serde_json::json!({
-                    "method":"task_settlement_apply", "params":{"confirmation":confirmation}
-                }))?;
+                let response = api::call(
+                    &home,
+                    &serde_json::json!({
+                        "method":"task_settlement_apply", "params":{"confirmation":confirmation}
+                    }),
+                )?;
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 anyhow::ensure!(response["ok"] == true, "task settlement apply refused");
             }
@@ -1862,16 +1872,37 @@ mod tests {
     #[test]
     fn operator_settlement_3553_cli_commands_parse() {
         assert!(Cli::try_parse_from([
-            "agend-terminal", "admin", "task-settlement-preview", "--task-id", "t-exact",
-            "--target", "cancelled", "--result", "duplicate confirmed",
-        ]).is_ok());
+            "agend-terminal",
+            "admin",
+            "task-settlement-preview",
+            "--task-id",
+            "t-exact",
+            "--target",
+            "cancelled",
+            "--result",
+            "duplicate confirmed",
+        ])
+        .is_ok());
         assert!(Cli::try_parse_from([
-            "agend-terminal", "admin", "task-settlement-apply", "--confirmation", "opaque-token",
-        ]).is_ok());
+            "agend-terminal",
+            "admin",
+            "task-settlement-apply",
+            "--confirmation",
+            "opaque-token",
+        ])
+        .is_ok());
         assert!(Cli::try_parse_from([
-            "agend-terminal", "admin", "task-settlement-preview", "--task-id", "t-exact",
-            "--target", "claimed", "--result", "invalid target",
-        ]).is_err());
+            "agend-terminal",
+            "admin",
+            "task-settlement-preview",
+            "--task-id",
+            "t-exact",
+            "--target",
+            "claimed",
+            "--result",
+            "invalid target",
+        ])
+        .is_err());
     }
 
     #[test]

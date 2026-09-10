@@ -527,7 +527,10 @@ fn task_still_live(home: &Path, task_id: &str) -> Option<bool> {
 /// watchdog firing later on a dispatch whose work has already been
 /// reported via the task board instead of via `kind=report`. Returns
 /// the count of sidecars deleted (for callers that want to log).
-pub(crate) fn cleanup_pending_for_task_id_checked(home: &Path, task_id: &str) -> anyhow::Result<()> {
+pub(crate) fn cleanup_pending_for_task_id_checked(
+    home: &Path,
+    task_id: &str,
+) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(pending_dir(home)) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -547,7 +550,10 @@ pub(crate) fn cleanup_pending_for_task_id_checked(home: &Path, task_id: &str) ->
             Err(error) => return Err(error.into()),
         };
         let dispatch: PendingDispatch = serde_json::from_slice(&bytes)?;
-        anyhow::ensure!(dispatch.schema_version == SCHEMA_VERSION, "unsupported pending dispatch schema");
+        anyhow::ensure!(
+            dispatch.schema_version == SCHEMA_VERSION,
+            "unsupported pending dispatch schema"
+        );
         if dispatch.correlation_id.as_deref() == Some(task_id) {
             std::fs::remove_file(&path)?;
         }
