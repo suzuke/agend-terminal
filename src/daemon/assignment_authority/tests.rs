@@ -1,5 +1,261 @@
 use super::*;
 
+#[test]
+fn operator_settlement_3553_locked_cleanup_retires_without_new_task_event() {
+    use crate::task_events::{
+        append, replay, OperatorSettlement, OperatorSettlementTarget, TaskEvent,
+    };
+    let home = tmp_home("3553-locked-cleanup");
+    let task_id = "terminal-review";
+    seed_open_task_as(&home, task_id, "reviewer");
+    let mut assignment = mk_record(
+        "o/r",
+        "feat/terminal",
+        "reviewer",
+        42,
+        "2026-09-10T01:00:00Z",
+    );
+    assignment.task_id = task_id.into();
+    persist(&home, &assignment).unwrap();
+    let seq = append(
+        &home,
+        &"operator".into(),
+        TaskEvent::OperatorSettled {
+            task_id: task_id.into(),
+            proof: OperatorSettlement {
+                operation_id: "terminal-operation".into(),
+                preview_digest: "digest".into(),
+                by: "operator".into(),
+                holder_instance: Some("reviewer".into()),
+                target: OperatorSettlementTarget::Done,
+                result: "done".into(),
+            },
+        },
+    )
+    .unwrap();
+    let before = serde_json::to_value(replay(&home).unwrap()).unwrap();
+    assert_eq!(
+        retire_terminal_event_checked(
+            &home,
+            "default",
+            task_id,
+            "operator",
+            seq,
+            "2026-09-10T01:00:01Z"
+        )
+        .unwrap(),
+        1
+    );
+    assert!(list_active(&home, "o/r", "feat/terminal").is_empty());
+    assert_eq!(
+        retire_terminal_event_checked(
+            &home,
+            "default",
+            task_id,
+            "operator",
+            seq,
+            "2026-09-10T01:00:02Z"
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        before,
+        serde_json::to_value(replay(&home).unwrap()).unwrap()
+    );
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn operator_settlement_3553_reopen_after_preflight_preserves_assignment() {
+    use crate::task_events::{
+        append, replay, OperatorSettlement, OperatorSettlementTarget, TaskEvent,
+    };
+    let home = tmp_home("3553-preflight-race");
+    let task_id = "preflight-review";
+    seed_open_task_as(&home, task_id, "reviewer");
+    let seq = append(
+        &home,
+        &"operator".into(),
+        TaskEvent::OperatorSettled {
+            task_id: task_id.into(),
+            proof: OperatorSettlement {
+                operation_id: "preflight-operation".into(),
+                preview_digest: "digest".into(),
+                by: "operator".into(),
+                holder_instance: Some("reviewer".into()),
+                target: OperatorSettlementTarget::Done,
+                result: "done".into(),
+            },
+        },
+    )
+    .unwrap();
+    let mut fresh = mk_record("o/r", "feat/race", "reviewer", 42, "2026-09-10T01:00:00Z");
+    fresh.task_id = task_id.into();
+    let mut before = None;
+    let result = retire_operator_settlement_after_preflight(
+        &home,
+        "default",
+        task_id,
+        "operator",
+        seq,
+        "2026-09-10T01:00:01Z",
+        || {
+            append(
+                &home,
+                &"fixture".into(),
+                TaskEvent::Reopened {
+                    task_id: task_id.into(),
+                    reason: "new work".into(),
+                    source_evidence: "operator".into(),
+                },
+            )
+            .unwrap();
+            persist(&home, &fresh).unwrap();
+            before = Some(serde_json::to_value(replay(&home).unwrap()).unwrap());
+        },
+    );
+    let after = serde_json::to_value(replay(&home).unwrap()).unwrap();
+    let assignments = list_active(&home, "o/r", "feat/race");
+    std::fs::remove_dir_all(&home).unwrap();
+    assert_eq!(
+        before.unwrap(),
+        after,
+        "cleanup changed reopened task: {result:?}"
+    );
+    assert_eq!(
+        assignments.len(),
+        1,
+        "cleanup removed successor: {result:?}"
+    );
+    assert_eq!(assignments[0].assignment_id, fresh.assignment_id);
+}
+
+#[test]
+fn operator_settlement_3553_old_first_cleanup_preserves_reopened_assignment() {
+    use crate::task_events::{
+        append, replay, OperatorSettlement, OperatorSettlementTarget, TaskEvent,
+    };
+    let home = tmp_home("3553-old-first-cleanup");
+    let task_id = "reopened-review";
+    seed_open_task_as(&home, task_id, "reviewer");
+    // No assignment existed at commit time, so no per-branch ledger entry
+    // exists yet. A delayed first cleanup must not discover and retire new work.
+    let seq = append(
+        &home,
+        &"operator".into(),
+        TaskEvent::OperatorSettled {
+            task_id: task_id.into(),
+            proof: OperatorSettlement {
+                operation_id: "old-operation".into(),
+                preview_digest: "old-digest".into(),
+                by: "operator".into(),
+                holder_instance: Some("reviewer".into()),
+                target: OperatorSettlementTarget::Done,
+                result: "original done".into(),
+            },
+        },
+    )
+    .unwrap();
+    append(
+        &home,
+        &"fixture".into(),
+        TaskEvent::Reopened {
+            task_id: task_id.into(),
+            reason: "new work".into(),
+            source_evidence: "operator request".into(),
+        },
+    )
+    .unwrap();
+    let mut fresh = mk_record("o/r", "feat/fresh", "reviewer", 42, "2026-09-10T01:00:00Z");
+    fresh.task_id = task_id.into();
+    persist(&home, &fresh).unwrap();
+    let before = serde_json::to_value(replay(&home).unwrap()).unwrap();
+    let result = retire_for_terminal_event(
+        &home,
+        "default",
+        task_id,
+        "operator",
+        seq,
+        "2026-09-10T01:00:01Z",
+    );
+    let after = serde_json::to_value(replay(&home).unwrap()).unwrap();
+    let assignments = list_active(&home, "o/r", "feat/fresh");
+    std::fs::remove_dir_all(&home).unwrap();
+    assert_eq!(
+        before, after,
+        "old cleanup mutated reopened task: {result:?}"
+    );
+    assert_eq!(
+        assignments.len(),
+        1,
+        "old cleanup removed new authority: {result:?}"
+    );
+    assert_eq!(assignments[0].assignment_id, fresh.assignment_id);
+}
+
+#[test]
+fn operator_settlement_3553_locked_retirement_propagates_corruption() {
+    let home = tmp_home("3553-locked-corrupt");
+    let path = record_file(&home, "o/r", "feat/corrupt", "reviewer");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"not-json").unwrap();
+    let result = retire_if_id_matches(
+        &home,
+        "o/r",
+        "feat/corrupt",
+        "reviewer",
+        uuid::Uuid::new_v4(),
+        "2026-09-10T00:00:00Z",
+    );
+    let preserved = std::fs::read(&path).unwrap();
+    std::fs::remove_dir_all(&home).unwrap();
+    assert!(
+        result.is_err(),
+        "locked corruption must not be absence: {result:?}"
+    );
+    assert_eq!(preserved, b"not-json");
+}
+
+#[test]
+fn operator_settlement_3553_retirement_corruption_is_not_absence() {
+    let home = tmp_home("3553-corrupt-retirement");
+    seed_open_task(&home, "exact-task");
+    let seq = crate::task_events::append(
+        &home,
+        &"operator".into(),
+        crate::task_events::TaskEvent::Cancelled {
+            task_id: "exact-task".into(),
+            by: "operator".into(),
+            reason: "finished".into(),
+        },
+    )
+    .unwrap();
+    let dir = branch_dir(&home, "o/r", "feat/corrupt");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("reviewer.json");
+    std::fs::write(&path, b"not-json").unwrap();
+    let result = retire_for_terminal_event(
+        &home,
+        "default",
+        "exact-task",
+        "operator",
+        seq,
+        "2026-09-10T00:00:00Z",
+    );
+    let preserved = std::fs::read(&path).unwrap();
+    std::fs::remove_dir_all(&home).unwrap();
+    assert!(
+        result.is_err(),
+        "corrupt assignment was reported as successful retirement: {result:?}"
+    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("corrupt assignment"));
+    assert_eq!(preserved, b"not-json");
+}
+
 fn tmp_home(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static C: AtomicU32 = AtomicU32::new(0);
@@ -1157,17 +1413,19 @@ fn duplicate_terminal_event_key_is_a_durable_no_op() {
     )
     .unwrap();
 
-    assert_eq!(
-        retire_for_terminal_event(
-            &home,
-            "default",
-            task_id,
-            "finisher",
-            7,
-            "2026-08-27T00:00:02Z",
-        )
-        .unwrap(),
-        1
+    let seq = crate::task_events::append(
+        &home,
+        &"finisher".into(),
+        crate::task_events::TaskEvent::Cancelled {
+            task_id: task_id.into(),
+            by: "finisher".into(),
+            reason: "finished review".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        list_active(&home, "o/r", "feat/p3").is_empty(),
+        "real terminal append must retire the first assignment"
     );
 
     let mut successor = mk_record("o/r", "feat/p3", "reviewer-b", 42, "2026-08-27T00:00:03Z");
@@ -1180,7 +1438,7 @@ fn duplicate_terminal_event_key_is_a_durable_no_op() {
             "default",
             task_id,
             "finisher",
-            7,
+            seq,
             "2026-08-27T00:00:04Z",
         )
         .unwrap(),

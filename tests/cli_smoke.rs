@@ -17,6 +17,193 @@ fn cmd() -> Command {
     Command::cargo_bin("agend-terminal").expect("binary must exist")
 }
 
+#[test]
+#[cfg(unix)]
+// This fixture intentionally treats daemon/bootstrap corruption as a test
+// failure; keep the setup assertions local instead of obscuring them behind
+// fallible plumbing in this end-to-end smoke test.
+#[allow(clippy::unwrap_used)]
+fn operator_settlement_3553_cli_positive_roundtrip() {
+    use std::time::{Duration, Instant};
+    const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(45);
+    const CLI_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+    struct Fixture {
+        home: std::path::PathBuf,
+        child: Option<std::process::Child>,
+    }
+    impl Fixture {
+        fn start(&mut self) {
+            self.child = Some(
+                std::process::Command::new(assert_cmd::cargo::cargo_bin("agend-terminal"))
+                    .env("AGEND_HOME", &self.home)
+                    .current_dir(&self.home)
+                    .args(["start", "--foreground"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::fs::File::create(self.home.join("daemon.stderr")).unwrap())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+                if child.wait().is_err() {
+                    return;
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+    let mut fixture = Fixture {
+        home: std::env::temp_dir().join(format!("settlement-positive-{}", uuid::Uuid::new_v4())),
+        child: None,
+    };
+    std::fs::create_dir(&fixture.home).unwrap();
+    // A minimal shell probe keeps the fixture on the normal (non-successor)
+    // startup path: `start_with_fleet` rejects a truly empty fleet, while the
+    // settlement contract only needs one owned daemon transport.
+    std::fs::write(
+        fixture.home.join("fleet.yaml"),
+        "schema_version: 1\ndefaults:\n  backend: shell\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+    )
+    .unwrap();
+    let log = fixture.home.join("task_events.jsonl");
+    let seed = serde_json::json!({"schema_version":3,"seq":1,
+        "timestamp":"2026-01-01T00:00:00Z","instance":"fixture",
+        "event":{"kind":"Created","task_id":"cli-exact","title":"CLI fixture",
+            "description":"","priority":"normal","owner":null}});
+    std::fs::write(&log, format!("{seed}\n")).unwrap();
+    fixture.start();
+    let diagnostics = |fixture: &mut Fixture| {
+        let child_status = fixture
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok())
+            .flatten();
+        let read = |name: &str| {
+            std::fs::read_to_string(fixture.home.join(name))
+                .unwrap_or_else(|error| format!("<unavailable: {error}>"))
+        };
+        format!(
+            "child={child_status:?}; daemon.stderr={}; daemon.log={}",
+            read("daemon.stderr"),
+            read("daemon.log")
+        )
+    };
+    let deadline = Instant::now() + DAEMON_READY_TIMEOUT;
+    let preview = loop {
+        let output = cmd()
+            .env("AGEND_HOME", &fixture.home)
+            .timeout(CLI_REQUEST_TIMEOUT)
+            .args([
+                "admin",
+                "task-settlement-preview",
+                "--task-id",
+                "cli-exact",
+                "--target",
+                "done",
+                "--result",
+                "operator inspected CLI fixture",
+            ])
+            .output()
+            .unwrap();
+        if output.status.success() {
+            break serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon/preview did not become ready: {} / {}",
+            String::from_utf8_lossy(&output.stderr),
+            diagnostics(&mut fixture)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("{seed}\n"));
+    let token = preview["result"]["confirmation"].as_str().unwrap();
+    for already in [false, true] {
+        if already {
+            fixture.child.as_mut().unwrap().kill().unwrap();
+            fixture.child.as_mut().unwrap().wait().unwrap();
+            fixture.child = None;
+            fixture.start();
+        }
+        let deadline = Instant::now() + DAEMON_READY_TIMEOUT;
+        let response: serde_json::Value = loop {
+            let output = cmd()
+                .env("AGEND_HOME", &fixture.home)
+                .timeout(CLI_REQUEST_TIMEOUT)
+                .args(["admin", "task-settlement-apply", "--confirmation", token])
+                .output()
+                .unwrap();
+            if output.status.success() {
+                break serde_json::from_slice(&output.stdout).unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "apply/restart failed: {} / {} / {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                diagnostics(&mut fixture)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(response["result"]["already_applied"], already);
+        assert_eq!(response["result"]["current_status"], "done");
+        assert_eq!(response["result"]["cleanup_status"], "complete");
+    }
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"]["kind"] == "OperatorSettled")
+            .count(),
+        1
+    );
+}
+
+#[test]
+// This fixture intentionally treats daemon/bootstrap corruption as a test
+// failure; keep the setup assertion local in this end-to-end smoke test.
+#[allow(clippy::unwrap_used)]
+fn operator_settlement_3553_cli_transport_failure_is_nonzero() {
+    struct Home(std::path::PathBuf);
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let home = Home(std::env::temp_dir().join(format!("settlement-cli-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir(&home.0).unwrap();
+    for args in [
+        vec![
+            "admin",
+            "task-settlement-preview",
+            "--task-id",
+            "missing",
+            "--target",
+            "done",
+            "--result",
+            "inspected",
+        ],
+        vec!["admin", "task-settlement-apply", "--confirmation", "unused"],
+    ] {
+        cmd()
+            .env("AGEND_HOME", &home.0)
+            .timeout(std::time::Duration::from_secs(10))
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("no active daemon"));
+    }
+}
+
 /// `agend --version` must output the Cargo.toml package version.
 #[test]
 fn version_outputs_cargo_toml_version() {

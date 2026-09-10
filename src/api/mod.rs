@@ -5,6 +5,7 @@
 //! registry and loopback-binding rules.
 
 use crate::agent::{AgentRegistry, ExternalRegistry};
+use crate::tasks::operator_settlement as settlement;
 use anyhow::Context;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -774,11 +775,14 @@ fn handle_session(
         {
             json!({"ok": false, "error": denied, "denied_by": "operator_mode", "queued": true})
         } else {
+            let token_hash = crate::daemon::utils::sha256_hex(&operator_token);
             request_dedup::global().dispatch(
                 request_id,
                 request_dedup::operation_fingerprint(method, params),
                 request_dedup::method_wait_timeout(method, params),
                 || match method {
+                    "task_settlement_preview" => settlement::preview(home, params, &token_hash),
+                    "task_settlement_apply" => settlement::apply(home, params, &token_hash),
                     method::LIST => handlers::query::handle_list(params, &ctx),
                     method::INJECT => handlers::instance::handle_inject(params, &ctx),
                     method::KILL => handlers::instance::handle_kill(params, &ctx),
@@ -1044,6 +1048,9 @@ mod readiness_tests;
 
 #[cfg(test)]
 mod working_directory_smoke_tests;
+
+#[cfg(test)]
+mod operator_settlement_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

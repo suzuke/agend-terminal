@@ -104,6 +104,29 @@ pub fn remove_all_for_task(home: &Path, task_id: &str) {
     );
 }
 
+/// Settlement must retain unreadable state and report cleanup pending.
+pub(crate) fn remove_all_for_task_checked(home: &Path, task_id: &str) -> anyhow::Result<()> {
+    let path = store_path(home);
+    let Some(parent) = path.parent() else {
+        anyhow::bail!("dispatch tracking path has no parent");
+    };
+    std::fs::create_dir_all(parent)?;
+    let _lock = crate::store::acquire_file_lock(&path.with_extension("lock"))?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut data: DispatchStore = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        data.schema_version == 1,
+        "unsupported dispatch tracking schema"
+    );
+    data.entries
+        .retain(|entry| entry.task_id.as_deref() != Some(task_id));
+    crate::store::save_atomic(&path, &data)
+}
+
 /// #1923 G3: on task reassignment, re-point the dispatch-tracking entry for this
 /// `task_id` to the NEW owner so the stuck-dispatch sweep tracks the agent who
 /// now owns the task (not the stale original `to`, which the sweep would nag /

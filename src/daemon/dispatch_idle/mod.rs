@@ -527,6 +527,40 @@ fn task_still_live(home: &Path, task_id: &str) -> Option<bool> {
 /// watchdog firing later on a dispatch whose work has already been
 /// reported via the task board instead of via `kind=report`. Returns
 /// the count of sidecars deleted (for callers that want to log).
+pub(crate) fn cleanup_pending_for_task_id_checked(
+    home: &Path,
+    task_id: &str,
+) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(pending_dir(home)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        // Use the filename's lock and re-read under it; do not trust an unlocked
+        // scan or a dispatch id stored inside potentially malformed content.
+        let _lock = crate::store::acquire_file_lock(&path.with_extension("lock"))?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let dispatch: PendingDispatch = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(
+            dispatch.schema_version == SCHEMA_VERSION,
+            "unsupported pending dispatch schema"
+        );
+        if dispatch.correlation_id.as_deref() == Some(task_id) {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn cleanup_pending_for_task_id(home: &Path, task_id: &str) -> usize {
     if task_id.is_empty() || is_placeholder_correlation(Some(task_id)) {
         return 0;

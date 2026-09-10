@@ -1,24 +1,36 @@
 use std::path::{Path, PathBuf};
 
-/// A missing binding is normally an idempotent no-op. A surviving flat
-/// `repo action=checkout bind:false` worktree is the exception: preserve it
-/// and point the caller at the existing typed path-addressed release route.
-/// The candidate scan is read-only and requires only the exact marker-owned
-/// flat layout; source/linkage proofs select typed recovery guidance.
+/// A missing binding is normally an idempotent no-op. A surviving marker-owned
+/// worktree is the exception: preserve it and return an observable recovery
+/// outcome. The scan is read-only; source/linkage proofs only select typed
+/// recovery guidance and never authorize implicit deletion.
 pub(super) fn absent_release_outcome(home: &Path, agent: &str) -> super::ReleaseOutcome {
-    let Some(candidate) = find_flat_candidate(home, agent) else {
+    let Some(candidate) = find_survivor_candidate(home, agent) else {
         return super::idempotent_absent();
     };
-    let error = if let Some(source_repo) = candidate.source_repo {
+    let layout = if candidate.flat { "flat" } else { "nested" };
+    let error = if candidate.flat {
+        if let Some(source_repo) = candidate.source_repo.as_ref() {
+            format!(
+                "release refused: {layout} daemon-managed worktree for '{agent}' survives at '{}'; use repo action=release with path='{}' repository_path='{}'",
+                candidate.target.display(),
+                candidate.target.display(),
+                source_repo.display()
+            )
+        } else {
+            format!(
+                "release refused: owned {layout} daemon-managed worktree for '{agent}' survives at '{}'; repository identity is unproven — path is preserved for GC/archive recovery",
+                candidate.target.display()
+            )
+        }
+    } else if candidate.source_repo.is_some() {
         format!(
-            "release refused: flat daemon-managed worktree for '{agent}' survives at '{}'; use repo action=release with path='{}' repository_path='{}'",
-            candidate.target.display(),
-            candidate.target.display(),
-            source_repo.display()
+            "release refused: nested daemon-managed worktree for '{agent}' survives at '{}'; source identity is authenticated, but nested survivor is preserved for GC/archive recovery — use an explicit path-addressed release route",
+            candidate.target.display()
         )
     } else {
         format!(
-            "release refused: owned flat daemon-managed worktree for '{agent}' survives at '{}'; repository identity is unproven — path is preserved for GC/archive recovery",
+            "release refused: owned {layout} daemon-managed worktree for '{agent}' survives at '{}'; repository identity is unproven — path is preserved for GC/archive recovery",
             candidate.target.display()
         )
     };
@@ -28,31 +40,33 @@ pub(super) fn absent_release_outcome(home: &Path, agent: &str) -> super::Release
     }
 }
 
-struct FlatCandidate {
+struct SurvivorCandidate {
     target: PathBuf,
     source_repo: Option<PathBuf>,
+    flat: bool,
 }
 
-fn find_flat_candidate(home: &Path, agent: &str) -> Option<FlatCandidate> {
+fn find_survivor_candidate(home: &Path, agent: &str) -> Option<SurvivorCandidate> {
     let mut candidates = Vec::new();
     super::collect_managed_worktrees(
         &super::daemon_managed_worktree_root(home),
         super::MARKER_WALK_MAX_DEPTH,
         &mut candidates,
     );
+    candidates.sort();
     candidates.into_iter().find_map(|target| {
         let target = dunce::canonicalize(target).ok()?;
-        if !legacy_flat_target_path(home, &target, agent)
-            || crate::binding::managed_marker_agent(&target).as_deref() != Some(agent)
-        {
+        if crate::binding::managed_marker_agent(&target).as_deref() != Some(agent) {
             return None;
         }
         let source_repo = super::marker_source_repo(&target)
             .and_then(|path| dunce::canonicalize(path).ok())
             .filter(|source_repo| super::target_source_repo_matches(&target, source_repo));
-        Some(FlatCandidate {
+        let flat = legacy_flat_target_path(home, &target, agent);
+        Some(SurvivorCandidate {
             target,
             source_repo,
+            flat,
         })
     })
 }

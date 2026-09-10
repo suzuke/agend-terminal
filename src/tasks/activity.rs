@@ -49,6 +49,16 @@ pub(super) fn summarize_event(
         TaskEvent::Cancelled { by, reason, .. } => {
             ("cancelled", by.0.clone(), format!("cancelled: {reason}"))
         }
+        TaskEvent::OperatorSettled { proof, .. } => (
+            "operator_settled",
+            proof.by.0.clone(),
+            format!(
+                "operator settled {} [{}]: {}",
+                proof.target.status(),
+                proof.operation_id,
+                proof.result
+            ),
+        ),
         TaskEvent::Superseded {
             by, successor_id, ..
         } => (
