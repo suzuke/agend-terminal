@@ -82,6 +82,7 @@ impl Server {
                             agent,
                             RestartCapability::Unsupported,
                             None,
+                            None,
                         );
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

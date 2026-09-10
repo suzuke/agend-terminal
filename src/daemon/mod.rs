@@ -770,8 +770,9 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
         FleetSource::HandoffDeferred { .. } => None,
     };
 
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     crate::runtime_controls::reload_runtime_controls(home);
-    let ctx = init_daemon_services(home, telegram_pre)?;
+    let ctx = init_daemon_services(home, telegram_pre, shutdown_tx.clone())?;
 
     // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
     // subscribers once (the bus is the SOLE delivery path). Shared with
@@ -871,7 +872,6 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     let live = crate::agent::live_agent_names(&ctx.registry);
     crate::tasks::release_inprogress_orphans_with_live(home, &live);
 
-    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     crate::bootstrap::signals::install(Arc::clone(&ctx.shutdown), shutdown_tx);
 
     crate::event_log::log(
@@ -1077,6 +1077,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
 fn init_daemon_services(
     home: &Path,
     telegram: Option<Arc<dyn crate::channel::Channel>>,
+    shutdown_wake: crossbeam_channel::Sender<()>,
 ) -> anyhow::Result<DaemonContext> {
     const API_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     // #1487: source the operator timezone from fleet.yaml `display_timezone:`
@@ -1141,6 +1142,7 @@ fn init_daemon_services(
                 crate::api::RestartCapability::Daemon,
                 None, // #2453 R2: no app-restart channel on the headless daemon
                 api_ready_tx,
+                Some(shutdown_wake),
             )
         })?;
 

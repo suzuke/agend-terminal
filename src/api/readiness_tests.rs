@@ -43,6 +43,7 @@ fn daemon_ready_signal_follows_port_publication() {
                 RestartCapability::Daemon,
                 None,
                 ready_tx,
+                None,
             );
         })
         .unwrap();
@@ -74,6 +75,7 @@ fn daemon_ready_signal_reports_auth_startup_failure() {
         RestartCapability::Daemon,
         None,
         ready_tx,
+        None,
     );
 
     let error = ready_rx.recv().unwrap().unwrap_err();
