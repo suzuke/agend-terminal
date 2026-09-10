@@ -391,6 +391,24 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// Keep daemon fixture children on the normal operator-start path. The agent
+/// shell can carry successor/channel credentials that are meaningful only to
+/// a daemon restart, not to an isolated test home.
+#[cfg(unix)]
+fn isolate_fixture_env(command: &mut std::process::Command) {
+    for name in [
+        "AGEND_SUCCESSOR_HANDOFF",
+        "AGEND_SUCCESSOR_REQUESTER",
+        "AGEND_RESTART_HANDOFF",
+        "AGEND_TELEGRAM_BOT_TOKEN",
+        "AGEND_BOT_TOKEN",
+        "AGEND_TELEGRAM_GROUP_ID",
+        "AGEND_DISCORD_BOT_TOKEN",
+    ] {
+        command.env_remove(name);
+    }
+}
+
 /// Owns a unique fixture directory and removes only that exact path.
 #[cfg(unix)]
 struct UniqueFixtureHome {
@@ -466,7 +484,9 @@ struct OwnedForegroundDaemon {
 impl OwnedForegroundDaemon {
     fn spawn(home: &std::path::Path) -> Result<Self, String> {
         let binary = cmd().get_program().to_owned();
-        let child = std::process::Command::new(binary)
+        let mut command = std::process::Command::new(binary);
+        isolate_fixture_env(&mut command);
+        let child = command
             .args(["start", "--foreground"])
             .env("AGEND_HOME", home)
             .stdout(std::process::Stdio::null())
@@ -574,7 +594,9 @@ impl OwnedStop {
         let stderr = std::fs::File::create(&stderr_path)
             .map_err(|error| format!("create stop stderr capture: {error}"))?;
         let binary = cmd().get_program().to_owned();
-        let child = std::process::Command::new(binary)
+        let mut command = std::process::Command::new(binary);
+        isolate_fixture_env(&mut command);
+        let child = command
             .env("AGEND_HOME", home)
             .arg("stop")
             .stdout(std::process::Stdio::from(stdout))
@@ -637,7 +659,7 @@ fn stop_waits_for_daemon_exit_and_reports_residuals_untouched_3539() {
     let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances: {}\n",
+        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
@@ -722,7 +744,7 @@ fn stop_no_wait_returns_on_the_accepted_request_only_3539() {
     let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances: {}\n",
+        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
@@ -761,7 +783,7 @@ fn stop_transport_failure_is_not_reported_as_absent_3559() {
     let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances: {}\n",
+        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
