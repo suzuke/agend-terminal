@@ -5,7 +5,8 @@ use std::path::Path;
 // #2755 R3: response-mapping + marker-durability helpers live in a sibling module to
 // keep this handler under the LOC ceiling (call sites below are unchanged).
 use super::checkout_helpers::{
-    acquire_bind_lifecycle_permit, rollback_response, sync_marker_contents, validate_expected_head,
+    acquire_bind_lifecycle_permit, recover_stale_checkout_txn, rollback_response,
+    stale_worktree_dir_response, sync_marker_contents, validate_expected_head,
 };
 
 use super::checkout_disposable::CheckoutPurpose;
@@ -167,9 +168,9 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     } else {
         None
     };
+    let worktree_path_str = worktree_dir.display().to_string();
     // #2755: serialize reuse and fresh provision on the target path; journal + lock
     // remain outside the worktree so rollback cannot delete recovery state.
-    let worktree_path_str = worktree_dir.display().to_string();
     let path_lock = match super::checkout_txn::acquire_path_lock(home, &worktree_dir, &mangled) {
         Ok(g) => g,
         Err(e) => {
@@ -199,22 +200,27 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     let txn_now = chrono::Utc::now();
     // Replay a journal left by a CRASHED prior provision of this path (removes a
     // stale worktree so a fresh add — or the reuse check below — sees clean state).
-    if let Err(e) = super::checkout_txn::recover_stale(
+    if let Err(e) = recover_stale_checkout_txn(
         home,
         &journal_key,
         &worktree_dir,
-        &source_canonical.display().to_string(),
+        &source_canonical,
         txn_now,
-        || {
-            crate::git_helpers::git_bypass(
-                Path::new(&source_path),
-                &["worktree", "remove", "--force", &worktree_path_str],
-            )
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        },
     ) {
         return json!({"error": redact_paths(&e), "code": "stale_txn_rollback", "branch": branch});
+    }
+    if bind {
+        if let Some(response) = stale_worktree_dir_response(
+            home,
+            &worktree_dir,
+            Path::new(&source_path),
+            instance_name,
+            branch,
+            args["expected_head"].as_str().unwrap_or(""),
+            auto_created_branch,
+        ) {
+            return response;
+        }
     }
     if bind {
         // #1882: cross-agent P0-1.5 reject UNDER the lock — another agent holding
@@ -297,14 +303,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // lands on the named branch, #778.)
     // Bounded worktree rollback (LOCAL git via bypass), reused by every failure
     // path below so each checked-save failure leaves no orphan.
-    let remove_worktree = || {
-        crate::git_helpers::git_bypass(
-            Path::new(&source_path),
-            &["worktree", "remove", "--force", &worktree_path_str],
-        )
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    };
+    let remove_worktree =
+        || super::checkout_helpers::remove_worktree(Path::new(&source_path), &worktree_path_str);
     // Prepared: durably journal the intent BEFORE any filesystem side effect. A
     // failed save here is fatal-but-clean (no side effect yet).
     let mut journal = super::checkout_txn::Journal::prepared(
