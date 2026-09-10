@@ -188,6 +188,68 @@ fn operator_settlement_3553_ambiguous_after_preview_preserves_both_boards() {
 
 #[test]
 #[serial_test::serial]
+fn operator_settlement_3553_unreadable_after_preview_preserves_event_log() {
+    let server = Server::start();
+    let event = serde_json::from_value(json!({
+        "kind":"Created", "task_id":"unreadable-row", "title":"Keep intact",
+        "description":"original", "priority":"normal", "owner":null
+    })).unwrap();
+    crate::task_events::append(&server.home, &"fixture".into(), event).unwrap();
+    let preview = server.request(true, json!({"method":"task_settlement_preview", "params":{
+        "task_id":"unreadable-row", "target":"cancelled", "result":"operator examined"
+    }}));
+    assert_eq!(preview["ok"], true, "{preview}");
+    let log = server.home.join("task_events.jsonl");
+    let before = std::fs::read(&log).unwrap();
+    // Another unreadable board prevents proving unique ownership of this ID.
+    let bad_log = crate::task_events::board_root(&server.home, "unreadable-project")
+        .join("task_events.jsonl");
+    std::fs::create_dir_all(&bad_log).unwrap();
+    let applied = server.request(true, json!({"method":"task_settlement_apply", "params":{
+        "confirmation":preview["result"]["confirmation"]
+    }}));
+    assert_eq!(applied["ok"], false, "{applied}");
+    assert_eq!(applied["code"], "task_route_unavailable", "{applied}");
+    assert_eq!(before, std::fs::read(&log).unwrap());
+    assert!(bad_log.is_dir());
+}
+
+#[test]
+#[serial_test::serial]
+fn operator_settlement_3553_changed_owner_or_branch_invalidates_preview() {
+    use crate::task_events::{append, replay, TaskEvent};
+    let server = Server::start();
+    for kind in ["owner", "branch"] {
+        let id = format!("changed-{kind}");
+        let created = serde_json::from_value(json!({
+            "kind":"Created", "task_id":id, "title":"Exact row",
+            "description":"original", "priority":"normal", "owner":null
+        })).unwrap();
+        append(&server.home, &"fixture".into(), created).unwrap();
+        let preview = server.request(true, json!({"method":"task_settlement_preview", "params":{
+            "task_id":id, "target":"cancelled", "result":"operator examined"
+        }}));
+        assert_eq!(preview["ok"], true, "{preview}");
+        let changed = if kind == "owner" {
+            TaskEvent::OwnerAssigned { task_id:id.as_str().into(), by:"fixture".into(),
+                owner:Some("new-owner".into()), routed_to:None }
+        } else {
+            TaskEvent::BranchLinked { task_id:id.as_str().into(), by:"fixture".into(),
+                branch:"feat/new-work".into() }
+        };
+        append(&server.home, &"fixture".into(), changed).unwrap();
+        let before = serde_json::to_value(replay(&server.home).unwrap()).unwrap();
+        let applied = server.request(true, json!({"method":"task_settlement_apply", "params":{
+            "confirmation":preview["result"]["confirmation"]
+        }}));
+        assert_eq!(applied["ok"], false, "{applied}");
+        assert_eq!(applied["code"], "stale_preview", "{applied}");
+        assert_eq!(before, serde_json::to_value(replay(&server.home).unwrap()).unwrap());
+    }
+}
+
+#[test]
+#[serial_test::serial]
 fn operator_settlement_3553_apply_once_and_reject_changed_subject() {
     use crate::task_events::{append, replay, TaskEvent};
     let server = Server::start();
