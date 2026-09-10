@@ -36,6 +36,62 @@ fn sample_event(id: &str) -> TaskEvent {
     }
 }
 
+/// Storage contract only: authentication and confirmation belong to the real
+/// operator ingress tests, not to this event-level fixture.
+#[test]
+fn operator_settlement_3553_is_exact_and_keeps_replay_audit() {
+    for target in ["done", "cancelled"] {
+        let home = tempfile::tempdir().unwrap();
+        let operator = InstanceName::from("operator");
+        append(home.path(), &operator, sample_event("t-root")).unwrap();
+        let mut child = sample_event("t-child");
+        if let TaskEvent::Created { parent_id, .. } = &mut child {
+            *parent_id = Some(TaskId::from("t-root"));
+        }
+        append(home.path(), &operator, child).unwrap();
+        let event = serde_json::json!({
+            "kind": "OperatorSettled",
+            "task_id": "t-root",
+            "operation_id": "op-3553",
+            "preview_digest": "exact-preview-digest",
+            "by": "operator",
+            "holder_instance": null,
+            "target": target,
+            "result": "operator inspected this exact row"
+        });
+        let event: TaskEvent = serde_json::from_value(event).expect("audited settlement event");
+        append(home.path(), &operator, event).unwrap();
+        let state = replay(home.path()).unwrap();
+        let root = &state.tasks[&TaskId::from("t-root")];
+        assert_eq!(root.status.to_string(), target);
+        assert_eq!(
+            state.tasks[&TaskId::from("t-child")].status,
+            TaskStatus::Open
+        );
+        let row = serde_json::to_value(root).unwrap();
+        let proof = &row["operator_settlements"]["op-3553"];
+        assert_eq!(proof["preview_digest"], "exact-preview-digest");
+        assert_eq!(proof["by"], "operator");
+        assert_eq!(proof["target"], target);
+        assert_eq!(proof["result"], "operator inspected this exact row");
+        // A later reopen must retain proof so replaying an old confirmation
+        // can report its original outcome without re-settling this task.
+        append(
+            home.path(),
+            &operator,
+            TaskEvent::Reopened {
+                task_id: "t-root".into(),
+                reason: "new work".into(),
+            },
+        )
+        .unwrap();
+        let reopened = replay(home.path()).unwrap();
+        let row = serde_json::to_value(&reopened.tasks[&TaskId::from("t-root")]).unwrap();
+        assert_eq!(row["status"], "open");
+        assert_eq!(row["operator_settlements"]["op-3553"], *proof);
+    }
+}
+
 /// #3279: compile-visible terminality guard. Adding a TaskStatus variant makes
 /// this exhaustive match fail to compile until its lifecycle class is chosen.
 #[test]
