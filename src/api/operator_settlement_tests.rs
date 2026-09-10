@@ -198,3 +198,35 @@ fn operator_settlement_3553_expired_confirmation_cannot_mutate() {
     assert_eq!(response["code"], "confirmation_expired", "{response}");
     assert_eq!(before, serde_json::to_value(crate::task_events::replay(&server.home).unwrap()).unwrap());
 }
+
+#[test]
+#[serial_test::serial]
+fn operator_settlement_3553_retry_after_reopen_reports_current_state() {
+    use crate::task_events::{append, replay, TaskEvent};
+    let server = Server::start();
+    let created = serde_json::from_value(json!({
+        "kind":"Created", "task_id":"reopened-row", "title":"New work later",
+        "description":"original", "priority":"normal", "owner":null
+    })).unwrap();
+    append(&server.home, &"fixture".into(), created).unwrap();
+    let preview = server.request(true, json!({"method":"task_settlement_preview", "params":{
+        "task_id":"reopened-row", "target":"done", "result":"original outcome"
+    }}));
+    assert_eq!(preview["ok"], true, "{preview}");
+    let request = json!({"method":"task_settlement_apply", "params":{
+        "confirmation":preview["result"]["confirmation"]
+    }});
+    assert_eq!(server.request(true, request.clone())["ok"], true);
+    append(&server.home, &"fixture".into(), TaskEvent::Reopened {
+        task_id:"reopened-row".into(), reason:"new work".into(), source_evidence:String::new()
+    }).unwrap();
+    crate::task_events::compact_at_with_keep(&server.home, 1).unwrap();
+    let before = serde_json::to_value(replay(&server.home).unwrap()).unwrap();
+    let response = server.request(true, request);
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["result"]["already_applied"], true, "{response}");
+    assert_eq!(before, serde_json::to_value(replay(&server.home).unwrap()).unwrap());
+    assert_eq!(response["result"]["original_target"], "done", "{response}");
+    assert_eq!(response["result"]["original_result"], "original outcome", "{response}");
+    assert_eq!(response["result"]["current_status"], "open", "{response}");
+}
