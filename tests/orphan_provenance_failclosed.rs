@@ -58,11 +58,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use syn::visit::{self, Visit};
 
 use agend_terminal::admin::orphan_provenance::{
-    classify, ledger_stats, load_ledger, prune_observations, render_human,
-    sample_from_owner_source, sample_tool_call_shells, scope_reparented, BackendOwner,
-    BackendOwnerSource, DisplayColumns, ObservationMiss, OrphanReport, PersistOutcome, ProcFacts,
-    ProcessOracle, ProvenanceSupport, SampleOutcome, ScopeCounts, ScopeInput, ShellObservation,
-    ShellToolEvidence, ShellToolKind, UnprovenReason, MAX_OBSERVATIONS, OBSERVATION_RETENTION_MS,
+    annotate_residual_hints, classify, ledger_stats, load_ledger, prune_observations, render_human,
+    residual_hint, sample_from_owner_source, sample_tool_call_shells, scope_reparented,
+    BackendOwner, BackendOwnerSource, DisplayColumns, ObservationMiss, OrphanReport,
+    PersistOutcome, ProcFacts, ProcessOracle, ProvenanceSupport, ResidualHint, SampleOutcome,
+    ScopeCounts, ScopeInput, ShellObservation, ShellToolEvidence, ShellToolKind, UnprovenReason,
+    MAX_OBSERVATIONS, OBSERVATION_RETENTION_MS,
 };
 use agend_terminal::instructions::background_process_guidance;
 
@@ -2006,5 +2007,161 @@ fn the_report_discloses_that_owner_suggestions_expire() {
     assert!(
         rendered.contains("says nothing about the process"),
         "and must not be read as a finding: {rendered}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #3539: the residual hint is a reading aid, not a class
+// ---------------------------------------------------------------------------
+
+/// The shapes #3539 is about — a test runner's child (`…/deps/agend_terminal-<hash>`),
+/// a fixture daemon (`…/debug/agend-terminal`), a released worktree cwd — get a
+/// hint. Everything else, including the live daemon from `target/release` and
+/// the RCA census's load-bearing services, gets none. argv wins over cwd.
+#[test]
+fn residual_hint_names_the_3539_shapes_and_nothing_else() {
+    let home = Path::new("/Users/x/.agend-terminal");
+    let deps = "/Users/x/Documents/Hack/agend-terminal/target/debug/deps/agend_terminal-8f2c ambiguous_delivery_refusal_carries_truncated_thread_ids";
+    assert_eq!(
+        residual_hint(home, Some(deps), None),
+        Some(ResidualHint::TestRunnerBinary)
+    );
+    assert_eq!(
+        residual_hint(
+            home,
+            Some("/tmp/target-mut/debug/deps/agend_terminal-1 --exact"),
+            None
+        ),
+        Some(ResidualHint::TestRunnerBinary),
+        "any target dir, as long as the binary sits in deps/"
+    );
+    assert_eq!(
+        residual_hint(
+            home,
+            Some("/x/target/debug/agend-terminal start --foreground"),
+            None
+        ),
+        Some(ResidualHint::DebugDaemonBinary)
+    );
+    assert_eq!(
+        residual_hint(home, Some("/x/target/release/agend-terminal app"), None),
+        None,
+        "the live daemon is a release binary and must never carry a hint"
+    );
+    assert_eq!(
+        residual_hint(
+            home,
+            Some("/x/target/release/agend-terminal app"),
+            Some("/Users/x/.agend-terminal/worktrees/dev-1/fix")
+        ),
+        Some(ResidualHint::AgendWorktreeCwd),
+        "cwd under worktrees/ hints even when argv does not"
+    );
+    assert_eq!(
+        residual_hint(
+            home,
+            Some("/x/target/debug/deps/agend_terminal-1"),
+            Some("/Users/x/.agend-terminal/worktrees/dev-1")
+        ),
+        Some(ResidualHint::TestRunnerBinary),
+        "argv is the more specific signal and wins"
+    );
+    assert_eq!(
+        residual_hint(
+            home,
+            Some("ngrok http 8080"),
+            Some("/Users/x/.agend-terminal/workspace/podcast")
+        ),
+        None,
+        "workspace/ is not worktrees/"
+    );
+    assert_eq!(
+        residual_hint(home, Some("/x/target/debug/deps/other_crate-1"), None),
+        None,
+        "another crate's tests are not ours"
+    );
+    assert_eq!(
+        residual_hint(
+            home,
+            Some("/x/deps/agend_terminal-1"),
+            Some("/Users/x/.agend-terminal-other/worktrees/a")
+        ),
+        Some(ResidualHint::TestRunnerBinary)
+    );
+    assert_eq!(
+        residual_hint(
+            home,
+            None,
+            Some("/Users/x/.agend-terminal-other/worktrees/a")
+        ),
+        None,
+        "a sibling directory with the home as a string prefix is not the home"
+    );
+    assert_eq!(residual_hint(home, None, None), None);
+}
+
+/// A hint changes what the operator reads, never what V1 concludes: hinted and
+/// unhinted candidates are equally UNPROVEN, and the hint survives the cwd fill
+/// the doctor performs after `classify`.
+#[test]
+fn a_residual_hint_never_changes_the_class() {
+    let home = tmp_home("hint-class");
+    let world = FakeOracle::supported()
+        .with(
+            701,
+            FakeProc::inherited(7_010).orphan().display(DisplayColumns {
+                argv: Some("/x/target/debug/deps/agend_terminal-8f2c some_test".to_string()),
+                cwd: None,
+                elapsed_secs: Some(3_600),
+                cpu_percent: Some(0.0),
+            }),
+        )
+        .with(
+            702,
+            FakeProc::inherited(7_020).orphan().display(DisplayColumns {
+                argv: Some("ngrok http 8080".to_string()),
+                cwd: None,
+                elapsed_secs: Some(44 * 24 * 3_600),
+                cpu_percent: Some(0.0),
+            }),
+        );
+
+    let mut report = classify(&home, &world, HOUR_MS);
+    assert_eq!(
+        candidate(&report, 701).hint,
+        Some(ResidualHint::TestRunnerBinary)
+    );
+    assert_eq!(candidate(&report, 702).hint, None);
+    assert_eq!(reason(&report, 701), UnprovenReason::NoObservation);
+    assert_eq!(reason(&report, 702), UnprovenReason::NoObservation);
+
+    // The doctor resolves cwd after classify; the cwd-based hint appears only
+    // once that fill is annotated, and the argv-based one is unchanged.
+    for c in &mut report.candidates {
+        if c.pid == 702 {
+            c.cwd = Some(home.join("worktrees").join("dev-1").display().to_string());
+        }
+    }
+    annotate_residual_hints(&home, &mut report);
+    assert_eq!(
+        candidate(&report, 701).hint,
+        Some(ResidualHint::TestRunnerBinary)
+    );
+    assert_eq!(
+        candidate(&report, 702).hint,
+        Some(ResidualHint::AgendWorktreeCwd)
+    );
+    assert_eq!(
+        reason(&report, 702),
+        UnprovenReason::NoObservation,
+        "still UNPROVEN"
+    );
+
+    let text = render_human(&report);
+    assert!(text.contains("hint=test-runner-binary"), "{text}");
+    assert!(text.contains("hint=agend-worktree-cwd"), "{text}");
+    assert!(
+        text.contains("Disposition is an operator decision"),
+        "{text}"
     );
 }

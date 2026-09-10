@@ -447,48 +447,81 @@ fn connect_failed_spawn_deregisters_external_agent() {
     );
 }
 
-/// A second detached-default `start` must not mistake the first daemon's
-/// already-published run dir for evidence that its own child started.
+/// A detached-default `start` must reject an already-running daemon, including
+/// the first `spawn_detached` publication path. The daemon is stopped through
+/// the CLI it published, not by guessing a PID from the fixture filesystem.
 #[cfg(unix)]
 #[test]
-fn second_detached_start_rejects_existing_daemon() {
-    let stamp = std::process::id();
-    let home_guard = FixtureHome::new(&format!("agend-cli-smoke-second-start-{stamp}"));
-    let home = home_guard.path().to_path_buf();
+fn detached_start_rejects_existing_daemon() {
+    let mut cleanup = DetachedDaemonCleanup::new().expect("create unique fixture home");
+    let home = cleanup.home().to_path_buf();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+        "defaults:\n  command: /bin/true\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
-    /// Graceful teardown only. `stop` is asynchronous and its result was
-    /// already being ignored; `home_guard` drops after this and does the
-    /// verifying + escalation to SIGTERM/SIGKILL, then removes the directory.
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = Command::cargo_bin("agend-terminal")
-                .expect("binary must exist")
-                .env("AGEND_HOME", &self.0)
-                .arg("stop")
-                .output();
-        }
+    let mut first = OwnedCliCommand::spawn(&home, "detached-first", &["start"])
+        .expect("spawn first detached start");
+    let first_status = first
+        .wait(std::time::Duration::from_secs(10))
+        .expect("first detached start must settle within 10s");
+    let (first_stdout, first_stderr) = first.output().expect("read first detached start output");
+    assert!(
+        first_status.success(),
+        "first detached start must publish successfully: stdout={first_stdout} stderr={first_stderr}"
+    );
+    assert!(
+        first_stdout.contains("daemon started: pid="),
+        "first detached start must report its published daemon: {first_stdout}"
+    );
+    let daemon_pid = first_stdout
+        .split("pid=")
+        .nth(1)
+        .and_then(|fields| fields.split_whitespace().next())
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .expect("first detached start must report a numeric daemon pid");
+    cleanup.record_daemon_pid(daemon_pid);
+    let api_port = home
+        .join("run")
+        .join(daemon_pid.to_string())
+        .join("api.port");
+    let api_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !api_port.exists() {
+        assert!(
+            std::time::Instant::now() < api_deadline,
+            "detached daemon did not publish api.port within 10s: {}",
+            api_port.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let _cleanup = Cleanup(home.clone());
 
-    cmd()
-        .env("AGEND_HOME", &home)
-        .arg("start")
-        .assert()
-        .success();
-    cmd()
-        .env("AGEND_HOME", &home)
-        .arg("start")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "another agend-terminal daemon is already running",
-        ));
+    let mut second = OwnedCliCommand::spawn(&home, "detached-second", &["start"])
+        .expect("spawn second detached start");
+    let second_status = second
+        .wait(std::time::Duration::from_secs(10))
+        .expect("second detached start must settle within 10s");
+    let (second_stdout, second_stderr) =
+        second.output().expect("read second detached start output");
+    assert!(
+        !second_status.success(),
+        "second detached start must reject the published daemon: stdout={second_stdout} stderr={second_stderr}"
+    );
+    assert!(
+        second_stderr.contains("another agend-terminal daemon is already running"),
+        "second detached start must report the existing daemon: stdout={second_stdout} stderr={second_stderr}"
+    );
+
+    let (stop_status, stop_stdout, stop_stderr) = cleanup
+        .stop()
+        .expect("bounded stop must settle the detached daemon");
+    assert!(
+        stop_status.success(),
+        "detached daemon cleanup must succeed: stdout={stop_stdout} stderr={stop_stderr}"
+    );
+    cleanup
+        .cleanup_home()
+        .expect("unique fixture home must be removed after bounded CLI cleanup");
 }
 
 /// `agend app` without a TTY must fail with a clean, actionable error rather
@@ -567,4 +600,710 @@ fn attach_without_daemon_shows_daemon_hint() {
         !stderr.contains("not found"),
         "must not say 'not found' when daemon isn't running"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #3539: `stop` waits for the daemon to be gone and reports what it left behind
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 delivers nothing; it only asks whether the pid exists.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Keep daemon fixture children on the normal operator-start path. The agent
+/// shell can carry successor/channel credentials that are meaningful only to
+/// a daemon restart, not to an isolated test home.
+#[cfg(unix)]
+fn isolate_fixture_env(command: &mut std::process::Command) {
+    for name in [
+        "AGEND_SUCCESSOR_HANDOFF",
+        "AGEND_SUCCESSOR_REQUESTER",
+        "AGEND_RESTART_HANDOFF",
+        "AGEND_TELEGRAM_BOT_TOKEN",
+        "AGEND_BOT_TOKEN",
+        "AGEND_TELEGRAM_GROUP_ID",
+        "AGEND_DISCORD_BOT_TOKEN",
+    ] {
+        command.env_remove(name);
+    }
+}
+
+/// Owns a unique fixture directory and removes only that exact path.
+#[cfg(unix)]
+struct UniqueFixtureHome {
+    path: std::path::PathBuf,
+    cleaned: bool,
+    preserve_on_drop: bool,
+}
+
+#[cfg(unix)]
+impl UniqueFixtureHome {
+    fn new() -> Result<Self, String> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("read clock: {error}"))?
+            .as_nanos();
+        for attempt in 0..16 {
+            let path = std::env::temp_dir().join(format!(
+                "agend-cli-smoke-stop-transport-{}-{stamp}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        cleaned: false,
+                        preserve_on_drop: false,
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("create unique fixture home: {error}")),
+            }
+        }
+        Err("could not allocate a unique fixture home".into())
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.cleaned || self.preserve_on_drop {
+            return Ok(());
+        }
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {
+                self.cleaned = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cleaned = true;
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "remove fixture home {}: {error}",
+                self.path.display()
+            )),
+        }
+    }
+
+    fn preserve(&mut self) {
+        self.preserve_on_drop = true;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UniqueFixtureHome {
+    fn drop(&mut self) {
+        if self.preserve_on_drop {
+            eprintln!(
+                "fixture-home preserved for cleanup evidence: {}",
+                self.path.display()
+            );
+            return;
+        }
+        if let Err(error) = self.cleanup() {
+            eprintln!("fixture-home cleanup incomplete: {error}");
+        }
+    }
+}
+
+/// Owns one foreground daemon through its `Child` handle. The guard is
+/// created immediately after spawn, before readiness polling can fail.
+#[cfg(unix)]
+struct OwnedForegroundDaemon {
+    child: std::process::Child,
+    home: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+struct OwnedCliCommand {
+    child: std::process::Child,
+    stdout_path: std::path::PathBuf,
+    stderr_path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl OwnedCliCommand {
+    fn spawn(home: &std::path::Path, label: &str, args: &[&str]) -> Result<Self, String> {
+        let stdout_path = home.join(format!("{label}.stdout"));
+        let stderr_path = home.join(format!("{label}.stderr"));
+        let stdout = std::fs::File::create(&stdout_path)
+            .map_err(|error| format!("create {label} stdout capture: {error}"))?;
+        let stderr = std::fs::File::create(&stderr_path)
+            .map_err(|error| format!("create {label} stderr capture: {error}"))?;
+        let binary = cmd().get_program().to_owned();
+        let mut command = std::process::Command::new(binary);
+        isolate_fixture_env(&mut command);
+        let child = command
+            .env("AGEND_HOME", home)
+            .args(args)
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr))
+            .spawn()
+            .map_err(|error| format!("spawn {label}: {error}"))?;
+        Ok(Self {
+            child,
+            stdout_path,
+            stderr_path,
+        })
+    }
+
+    fn wait(&mut self, budget: std::time::Duration) -> Result<std::process::ExitStatus, String> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll owned CLI child: {error}"))?
+            {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                self.reap()?;
+                return Err(format!("owned CLI child exceeded {budget:?} wait bound"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn output(&self) -> Result<(String, String), String> {
+        let stdout = std::fs::read_to_string(&self.stdout_path)
+            .map_err(|error| format!("read CLI stdout capture: {error}"))?;
+        let stderr = std::fs::read_to_string(&self.stderr_path)
+            .map_err(|error| format!("read CLI stderr capture: {error}"))?;
+        Ok((stdout, stderr))
+    }
+
+    fn reap(&mut self) -> Result<(), String> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|error| format!("poll CLI child before cleanup: {error}"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let _ = self.child.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if self
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll CLI child during cleanup: {error}"))?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("owned CLI child remained alive after 3s cleanup bound".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedCliCommand {
+    fn drop(&mut self) {
+        if let Err(error) = self.reap() {
+            eprintln!("owned CLI cleanup incomplete: {error}");
+        }
+    }
+}
+
+#[cfg(unix)]
+impl OwnedForegroundDaemon {
+    fn spawn(home: &std::path::Path) -> Result<Self, String> {
+        let binary = cmd().get_program().to_owned();
+        let mut command = std::process::Command::new(binary);
+        isolate_fixture_env(&mut command);
+        let child = command
+            .args(["start", "--foreground"])
+            .env("AGEND_HOME", home)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| format!("spawn foreground daemon: {error}"))?;
+        let mut daemon = Self {
+            child,
+            home: home.to_path_buf(),
+        };
+        daemon.wait_ready()?;
+        Ok(daemon)
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn reap(&mut self) -> Result<(), String> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|error| format!("poll foreground daemon before cleanup: {error}"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.child
+            .kill()
+            .map_err(|error| format!("kill owned foreground daemon {}: {error}", self.pid()))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match self
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll owned foreground daemon {}: {error}", self.pid()))?
+            {
+                Some(_) => return Ok(()),
+                None if std::time::Instant::now() >= deadline => {
+                    return Err(format!(
+                        "owned foreground daemon {} remained alive after 3s",
+                        self.pid()
+                    ));
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    }
+
+    fn wait_ready(&mut self) -> Result<(), String> {
+        let run_dir = self.home.join("run").join(self.pid().to_string());
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_secs(30);
+        while started.elapsed() < budget {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll foreground daemon: {error}"))?
+            {
+                return Err(format!("foreground daemon exited early: {status}"));
+            }
+            if run_dir.join(".daemon").exists()
+                && run_dir.join("api.port").exists()
+                && run_dir.join(".ready").exists()
+            {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Err(format!(
+            "foreground daemon did not become ready within {budget:?}"
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedForegroundDaemon {
+    fn drop(&mut self) {
+        // The Child handle is the ownership proof; no process-table lookup or
+        // PID/argv/PPID matching is used for teardown. Panic unwinding is
+        // best-effort, while the normal test path asserts `reap()` directly.
+        if let Err(error) = self.reap() {
+            eprintln!("owned foreground daemon cleanup incomplete: {error}");
+        }
+    }
+}
+
+/// Owns a stop CLI child and captures output without leaving a joined thread
+/// behind if the test itself times out. The output files are fixture-local;
+/// the child handle is the only cleanup authority.
+#[cfg(unix)]
+struct OwnedStop {
+    child: std::process::Child,
+    stdout_path: std::path::PathBuf,
+    stderr_path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl OwnedStop {
+    fn spawn(home: &std::path::Path) -> Result<Self, String> {
+        Self::spawn_with_args(home, &["stop"])
+    }
+
+    fn spawn_with_args(home: &std::path::Path, args: &[&str]) -> Result<Self, String> {
+        let stdout_path = home.join("stop.stdout");
+        let stderr_path = home.join("stop.stderr");
+        let stdout = std::fs::File::create(&stdout_path)
+            .map_err(|error| format!("create stop stdout capture: {error}"))?;
+        let stderr = std::fs::File::create(&stderr_path)
+            .map_err(|error| format!("create stop stderr capture: {error}"))?;
+        let binary = cmd().get_program().to_owned();
+        let mut command = std::process::Command::new(binary);
+        isolate_fixture_env(&mut command);
+        let child = command
+            .env("AGEND_HOME", home)
+            .args(args)
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr))
+            .spawn()
+            .map_err(|error| format!("spawn stop: {error}"))?;
+        Ok(Self {
+            child,
+            stdout_path,
+            stderr_path,
+        })
+    }
+
+    fn wait(&mut self, budget: std::time::Duration) -> Result<std::process::ExitStatus, String> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                self.reap()?;
+                return Err(format!("owned stop child exceeded {budget:?} wait bound"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        self.child
+            .try_wait()
+            .map_err(|error| format!("poll stop child: {error}"))
+    }
+
+    fn output(&self) -> Result<(String, String), String> {
+        let stdout = std::fs::read_to_string(&self.stdout_path)
+            .map_err(|error| format!("read stop stdout capture: {error}"))?;
+        let stderr = std::fs::read_to_string(&self.stderr_path)
+            .map_err(|error| format!("read stop stderr capture: {error}"))?;
+        Ok((stdout, stderr))
+    }
+
+    fn reap(&mut self) -> Result<(), String> {
+        if self.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let _ = self.child.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if self.try_wait()?.is_some() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("stop child remained alive after 3s cleanup bound".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedStop {
+    fn drop(&mut self) {
+        if let Err(error) = self.reap() {
+            eprintln!("owned stop cleanup incomplete: {error}");
+        }
+    }
+}
+
+/// Cleanup authority for the detached daemon test. It invokes the bounded
+/// public stop protocol and never scans or signals a PID discovered on disk.
+#[cfg(unix)]
+struct DetachedDaemonCleanup {
+    home_guard: UniqueFixtureHome,
+    daemon_pid: Option<u32>,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl DetachedDaemonCleanup {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            home_guard: UniqueFixtureHome::new()?,
+            daemon_pid: None,
+            armed: true,
+        })
+    }
+
+    fn home(&self) -> &std::path::Path {
+        &self.home_guard.path
+    }
+
+    fn record_daemon_pid(&mut self, pid: u32) {
+        self.daemon_pid = Some(pid);
+    }
+
+    fn cleanup_home(&mut self) -> Result<(), String> {
+        self.home_guard.cleanup()
+    }
+
+    fn preserve_for_failed_publication(&mut self) {
+        self.armed = false;
+        self.home_guard.preserve();
+    }
+
+    fn stop(&mut self) -> Result<(std::process::ExitStatus, String, String), String> {
+        if !self.armed {
+            return Err("detached daemon cleanup was already completed".into());
+        }
+        let mut stop = OwnedStop::spawn_with_args(self.home(), &["stop", "--timeout", "30"])?;
+        let status = stop.wait(std::time::Duration::from_secs(40))?;
+        let (stdout, stderr) = stop.output()?;
+        if status.success() {
+            self.armed = false;
+        }
+        Ok((status, stdout, stderr))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DetachedDaemonCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(pid) = self.daemon_pid {
+                let api_port = self
+                    .home()
+                    .join("run")
+                    .join(pid.to_string())
+                    .join("api.port");
+                if !api_port.exists() {
+                    self.preserve_for_failed_publication();
+                    eprintln!(
+                        "detached daemon cleanup preserved pre-api publication evidence: {}",
+                        self.home().display()
+                    );
+                    return;
+                }
+            }
+            match OwnedStop::spawn_with_args(self.home(), &["stop", "--timeout", "30"])
+                .and_then(|mut stop| stop.wait(std::time::Duration::from_secs(40)))
+            {
+                Ok(status) if status.success() => self.armed = false,
+                Ok(status) => {
+                    self.armed = false;
+                    self.home_guard.preserve();
+                    eprintln!(
+                        "detached daemon cleanup received nonzero stop status {status}; home preserved: {}",
+                        self.home().display()
+                    );
+                }
+                Err(error) => {
+                    self.armed = false;
+                    self.home_guard.preserve();
+                    eprintln!("detached daemon cleanup incomplete; home preserved: {error}");
+                }
+            }
+        }
+    }
+}
+
+/// Controlled pre-API failure evidence: when publication stops after the
+/// daemon pid is known but before `api.port`, cleanup preserves the exact home
+/// rather than deleting the control evidence or attempting PID discovery.
+#[cfg(unix)]
+#[test]
+fn detached_cleanup_preserves_home_before_api_publication() {
+    let mut cleanup = DetachedDaemonCleanup::new().expect("create unique fixture home");
+    let home = cleanup.home().to_path_buf();
+    cleanup.record_daemon_pid(424_242);
+    drop(cleanup);
+    assert!(
+        home.exists(),
+        "failed publication evidence must be preserved"
+    );
+    std::fs::remove_dir_all(&home).expect("remove exact preserved evidence home");
+}
+
+/// A stop failure with no reported daemon pid must preserve the exact control
+/// home. The fake run entry uses this test process's live pid, has no API port,
+/// and therefore makes the public stop CLI fail without spawning a daemon or
+/// giving cleanup any unsafe process authority.
+#[cfg(unix)]
+#[test]
+fn detached_cleanup_preserves_home_on_nonzero_stop_without_reported_pid() {
+    let cleanup = DetachedDaemonCleanup::new().expect("create unique fixture home");
+    let home = cleanup.home().to_path_buf();
+    let run_dir = home.join("run").join(std::process::id().to_string());
+    std::fs::create_dir_all(&run_dir).expect("create controlled run evidence");
+    std::fs::write(run_dir.join(".daemon"), format!("{}:0", std::process::id()))
+        .expect("write controlled daemon identity");
+    drop(cleanup);
+    assert!(
+        home.exists(),
+        "nonzero stop without reported pid must preserve evidence"
+    );
+    std::fs::remove_dir_all(&home).expect("remove exact preserved evidence home");
+}
+
+/// #3539 (1): `stop` returns only once the daemon process is gone and says so.
+#[cfg(unix)]
+#[test]
+fn stop_waits_for_daemon_exit_and_reports_residuals_untouched_3539() {
+    let mut home_guard = UniqueFixtureHome::new().expect("create unique fixture home");
+    let home = home_guard.path.clone();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "defaults:\n  command: /bin/true\ninstances:\n  probe: {}\n",
+    )
+    .expect("write fleet.yaml");
+
+    let mut daemon = OwnedForegroundDaemon::spawn(&home).expect("foreground daemon must start");
+    let daemon_pid = daemon.pid();
+    assert!(pid_alive(daemon_pid), "daemon must be alive before stop");
+    // The foreground fixture owns the exact Child, while this test exercises
+    // the legacy PID-only identity path; start-token matching is covered by
+    // the cli_stop unit tests without making this lifecycle test platform-
+    // dependent on a readable process token.
+    std::fs::write(
+        home.join("run")
+            .join(daemon_pid.to_string())
+            .join(".daemon"),
+        daemon_pid.to_string(),
+    )
+    .expect("write legacy daemon identity");
+
+    let mut stop = OwnedStop::spawn(&home).expect("spawn owned stop child");
+    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+    let mut daemon_reaped = false;
+    let mut stop_status = None;
+    while !daemon_reaped || stop_status.is_none() {
+        if !daemon_reaped {
+            daemon_reaped = daemon
+                .child
+                .try_wait()
+                .expect("poll owned foreground daemon during stop")
+                .is_some();
+        }
+        if stop_status.is_none() {
+            stop_status = stop.try_wait().expect("poll owned stop child");
+        }
+        assert!(
+            std::time::Instant::now() < reap_deadline,
+            "owned foreground daemon and stop child did not settle within the test bound"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let status = stop_status.expect("stop child must have exited");
+    let (stdout, stderr) = stop.output().expect("read owned stop output");
+    assert!(
+        status.success(),
+        "stop must exit 0 once the daemon is gone: stdout={stdout} stderr={stderr}"
+    );
+
+    // (1) synchronous: the daemon is gone by the time `stop` has returned.
+    assert!(
+        !pid_alive(daemon_pid),
+        "daemon pid {daemon_pid} must have exited before stop returned: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Daemon shutdown initiated (pid {daemon_pid}).")),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("Daemon (pid {daemon_pid}) exited after")),
+        "stop must report the exit, not just the accepted request: stdout={stdout} stderr={stderr}"
+    );
+
+    assert!(
+        stdout.contains("Residual scan: no reparented process in scope looks agend-related"),
+        "stop must run the report-only residual scan: {stdout}"
+    );
+    assert!(
+        !stdout.contains("SIGTERM") && !stdout.contains("SIGKILL"),
+        "the residual report must not read as an action: {stdout}"
+    );
+    daemon
+        .reap()
+        .expect("owned foreground daemon must be reaped");
+    home_guard
+        .cleanup()
+        .expect("unique fixture home must be removed after child reap");
+}
+
+/// `--no-wait` is the pre-#3539 receipt: accepted request, no exit claim.
+#[cfg(unix)]
+#[test]
+fn stop_no_wait_returns_on_the_accepted_request_only_3539() {
+    let mut home_guard = UniqueFixtureHome::new().expect("create unique fixture home");
+    let home = home_guard.path.clone();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "defaults:\n  command: /bin/true\ninstances:\n  probe: {}\n",
+    )
+    .expect("write fleet.yaml");
+
+    let mut daemon = OwnedForegroundDaemon::spawn(&home).expect("foreground daemon must start");
+    let daemon_pid = daemon.pid();
+
+    let mut stop = OwnedStop::spawn_with_args(&home, &["stop", "--no-wait"])
+        .expect("spawn owned stop --no-wait child");
+    let status = stop
+        .wait(std::time::Duration::from_secs(10))
+        .expect("stop --no-wait must settle within 10s");
+    let (stdout, stderr) = stop.output().expect("read owned stop --no-wait output");
+    assert!(status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains(&format!("Daemon shutdown initiated (pid {daemon_pid}).")),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("exited after") && !stdout.contains("Residual scan"),
+        "--no-wait must not claim anything about the exit: {stdout}"
+    );
+    daemon
+        .reap()
+        .expect("owned foreground daemon must be reaped");
+    home_guard
+        .cleanup()
+        .expect("unique fixture home must be removed after child reap");
+}
+
+/// A live, owned daemon with an unreachable API is not the same as an absent
+/// daemon: stop must not report success or invite a restart.
+#[cfg(unix)]
+#[test]
+fn stop_transport_failure_is_not_reported_as_absent_3559() {
+    let mut home_guard = UniqueFixtureHome::new().expect("create unique fixture home");
+    let home = home_guard.path.clone();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "defaults:\n  command: /bin/true\ninstances:\n  probe: {}\n",
+    )
+    .expect("write fleet.yaml");
+
+    let mut daemon = OwnedForegroundDaemon::spawn(&home).expect("foreground daemon must start");
+    let daemon_pid = daemon.pid();
+    assert!(pid_alive(daemon_pid), "daemon must be alive before stop");
+
+    // Keep the daemon alive but make the published API endpoint unreachable.
+    // `daemon` owns the exact foreground child and tears it down after this
+    // assertion; `home_guard` removes the unique home after `daemon` drops.
+    std::fs::write(
+        home.join("run")
+            .join(daemon_pid.to_string())
+            .join("api.port"),
+        "1\n",
+    )
+    .expect("replace api port with a refused endpoint");
+
+    let mut stop = OwnedStop::spawn(&home).expect("spawn owned stop child");
+    let status = stop
+        .wait(std::time::Duration::from_secs(10))
+        .expect("stop must settle within 10s");
+    let (stdout, stderr) = stop.output().expect("read owned stop output");
+    assert!(
+        !status.success(),
+        "transport failure must not be reported as success: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Unable to contact daemon"),
+        "transport failure must be explicit: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        pid_alive(daemon_pid),
+        "the daemon remains live after the refused request: stdout={stdout} stderr={stderr}"
+    );
+    daemon
+        .reap()
+        .expect("owned foreground daemon must be reaped");
+    assert!(
+        !pid_alive(daemon_pid),
+        "owned foreground daemon must be gone after explicit cleanup"
+    );
+    home_guard
+        .cleanup()
+        .expect("unique fixture home must be removed after child reap");
 }
