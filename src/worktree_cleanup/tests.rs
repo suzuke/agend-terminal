@@ -1837,12 +1837,10 @@ fn registered_legacy_worktree_without_binding_reports_delete_retry_3583() {
         .iter()
         .find(|(task_key, _)| task_key == &key)
         .unwrap_or_else(|| panic!("retained delete failure must be observable: {tasks:?}"));
+    let reason = evidence["reason"].as_str().unwrap_or("");
     assert!(
-        evidence["reason"]
-            .as_str()
-            .unwrap_or("")
-            .contains("checked out"),
-        "retry reason must name Git's registration refusal: {evidence}"
+        reason.contains("used by worktree") || reason.contains("checked out"),
+        "retry reason must name Git's worktree registration refusal: {evidence}"
     );
 
     git_in(&repo, &["worktree", "prune"]);
