@@ -139,7 +139,7 @@ After three consecutive repository-level rate-limit/provider skips, subscribers 
 - Delivery skips a subscriber that is absent from both the runtime registry and fleet roster.
 - Newer branch notifications supersede older pending rows for the same delivery class where applicable.
 - `next_after_ci` produces the action handoff; ordinary subscribers receive informational CI events.
-- A terminal exact-head watch is removed after its pinned run reaches a terminal result.
+- An exact-head watch is removed on aggregate success for its pinned SHA. Failed, cancelled, and timed-out attempts remain armed for a later successful attempt of that same SHA, subject to lifetime cleanup below.
 
 The `send` field `triaged:{head,job,reason?}` currently records a durable triage ledger entry. It requires both `head` and `job`. That ledger is an audit/data-layer surface today; it does not yet promise that every duplicate notification path will be suppressed.
 
@@ -155,6 +155,17 @@ On watch creation and later polling, the daemon examines PR mergeability when th
 - Startup sweep removes watches that expired while the daemon was down.
 - Terminal PR/CI paths may remove their watch earlier.
 - Explicit `unwatch` removes only the caller; removing the final subscriber leaves a non-polled opt-out tombstone until terminal cleanup, re-watch, or its tombstone age backstop.
+
+## Recovering a cancelled post-merge run
+
+Cancellation is not success. A newer green `main` SHA does not satisfy the older merge's exact-head close gate. An unchanged cancelled result does not refresh terminal inactivity or repeatedly announce a fresh result; polling remains armed to observe an explicit rerun. The conclusion `cancelled` alone does not establish that a newer push caused it.
+
+1. Inspect `ci(action="status", repository="OWNER/REPO", branch="main")` and the merge receipt/task. Record the full target SHA and the provider run ID; status is subscriber-scoped, not a fleet-wide inventory.
+2. Before an authorized rerun, inspect `gh run view RUN_ID --repo OWNER/REPO --json headSha,status,conclusion,attempt`. Confirm `headSha` equals the recorded merge SHA. Then `gh run rerun RUN_ID --repo OWNER/REPO` requests another attempt of that run. Check every required workflow for the pinned SHA, not just one successful job. If the provider no longer permits a rerun, record the blocker rather than substitute another SHA.
+3. Keep or explicitly re-arm the exact-head watch using its original full SHA, task linkage, and authorized continuation if it expired or was disarmed. Only observed aggregate success for that SHA satisfies the post-merge CI gate; it does not independently prove current `main` is healthy or automatically mark the task done.
+4. If an authorized operator/orchestrator deliberately stops waiting, use `ci(action="unwatch", repository="OWNER/REPO", branch="main", head_sha="FULL_MERGE_SHA")`. Full-disarm authority is checked for that exact watch; a merge-receipt assignee without that authority may only drop its own subscription. Confirm the response's `disarmed`/`watching` fields. Full disarm leaves a non-polled opt-out tombstone, not a successful CI receipt.
+
+Unwatch and TTL expiry stop monitoring; neither closes the task nor validates the merge. Preserve the unresolved task, owner, reason and next recovery action. A newer main run may be recorded separately as current-main evidence, never as this merge's replacement success.
 
 ## Provider and Credential Rules
 

@@ -21,10 +21,20 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
+#[cfg(test)]
 pub(crate) fn handle_set_model(
     home: &Path,
     args: &Value,
     sender: &Option<crate::identity::Sender>,
+) -> Value {
+    handle_set_model_with_runtime(home, args, sender, None)
+}
+
+pub(crate) fn handle_set_model_with_runtime(
+    home: &Path,
+    args: &Value,
+    sender: &Option<crate::identity::Sender>,
+    runtime: Option<&super::super::dispatch::RuntimeContext>,
 ) -> Value {
     let name = match crate::mcp::handlers::require_instance(args) {
         Ok(n) => n,
@@ -274,9 +284,10 @@ pub(crate) fn handle_set_model(
     // Restart only AFTER the durable persist. A restart failure must not
     // roll back or mask the persist: persisted:true + restart_ok:false.
     if args["restart"].as_bool() == Some(true) {
-        let r = super::handle_restart_instance(
+        let r = super::handle_restart_instance_with_runtime(
             home,
             &json!({"instance": name, "mode": "resume", "reason": "set_model"}),
+            runtime,
         );
         let restart_ok = r.get("error").is_none_or(Value::is_null) && r["spawned"] == json!(true);
         resp["restart_ok"] = json!(restart_ok);

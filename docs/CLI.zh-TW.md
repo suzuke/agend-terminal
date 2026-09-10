@@ -150,6 +150,21 @@ Exit code：
 
 刪除其 PR 已被 merge 的本地分支（對 squash-merge 安全）。預設為 dry-run（僅預覽）；`--yes` 才會實際刪除。squash-merge 偵測的啟發式做法見 `docs/RCA-*` 筆記。
 
+#### 操作者精確結案
+
+daemon 執行中時，先預覽單一任務，檢查回傳的任務內容及理由，再明確套用確認碼：
+
+```sh
+agend-terminal admin task-settlement-preview --task-id TASK_ID --target cancelled --result '檢查後確認為重複任務'
+agend-terminal admin task-settlement-apply --confirmation TOKEN_FROM_PREVIEW
+```
+
+目標限 `done` 或 `cancelled`。未使用的確認碼有效 15 分鐘；任務內容改變後須重新預覽。
+命令使用 operator 認證，不提供 agent MCP 權限。輸出為 JSON；拒絕或連線失敗時退出碼非零。
+只處理指定任務，不連帶取消子任務、不產生 PR／CI 證據，也不直接清理 worktree。
+`cleanup_status: not_verified` 不代表背景清理已完成。重送會分別顯示原始結果與目前任務狀態，
+不會把重新開啟的任務再次關閉。
+
 #### `admin task-sweep-config` (#2547)
 
 檢視或設定 GitHub-PR 自動關閉的 sweep daemon（輪詢已 merge 的 PR，為 `Closes t-XXX-N` 標記發出 `Done` 事件）。從 `task_sweep_config` MCP 工具移至此處——這是 operator 專屬設定，20 天內零 agent 呼叫。不帶任何 flag 時，僅印出目前設定，不做變更。

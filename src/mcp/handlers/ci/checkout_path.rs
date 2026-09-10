@@ -1,10 +1,8 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-/// Git for Windows passes `<worktree>/.git` through child-process `GIT_DIR`.
-/// Its `mingw_getenv` path is measured in UTF-8 bytes; keep it below the
-/// observed PATH_MAX-40 safety ceiling. Non-Windows Git keeps its prior
-/// unbounded total-path behavior.
+/// Git for Windows passes `<worktree>/.git` through child-process `GIT_DIR`; keep
+/// its UTF-8 bytes below PATH_MAX-40. Non-Windows keeps unbounded total paths.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const WORKTREE_GIT_PATH_MAX_UNITS: usize = 220;
 const INSTANCE_NAME_MAX_UNITS: usize = 64; // crate::agent::validate_name contract
@@ -109,6 +107,7 @@ fn resolve_worktree_target_with_common_dir(
     let legacy_path = home.join("worktrees").join(&legacy_mangled);
     let bounded_mangled = bounded_mangled(instance_name, source_path);
     let bounded_path = home.join("worktrees").join(&bounded_mangled);
+    warn_legacy_raw_identity(home, instance_name, source_path, source_path);
     let legacy_present = legacy_identity_matches(
         home,
         &legacy_path,
@@ -186,6 +185,9 @@ fn validate_target_budget(
     Ok(())
 }
 
+mod raw_warning;
+pub(super) use raw_warning::warn_legacy_raw_identity;
+
 fn legacy_mangled(instance_name: &str, source_path: &str) -> String {
     format!(
         "{instance_name}-{}",
@@ -194,6 +196,11 @@ fn legacy_mangled(instance_name: &str, source_path: &str) -> String {
 }
 
 pub(crate) fn bounded_mangled(instance_name: &str, source_path: &str) -> String {
+    let canonical = dunce::canonicalize(source_path).unwrap_or_else(|_| PathBuf::from(source_path));
+    bounded_mangled_for_key(instance_name, &canonical.to_string_lossy())
+}
+
+fn bounded_mangled_for_key(instance_name: &str, source_path: &str) -> String {
     let label = Path::new(source_path)
         .file_name()
         .and_then(|name| name.to_str())

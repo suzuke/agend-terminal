@@ -1152,8 +1152,8 @@ fn retire_under_lock(
     cleanup_tasks: &mut Vec<String>,
 ) -> anyhow::Result<bool> {
     let path = record_file(home, repo, branch, target);
-    let record = match read_record(&path) {
-        Ok(Some(record)) if record.assignment_id == expected_id => record,
+    let record = match read_record(&path)? {
+        Some(record) if record.assignment_id == expected_id => record,
         _ => return Ok(false),
     };
 
@@ -1166,6 +1166,18 @@ fn retire_under_lock(
     if cancelled {
         cleanup_tasks.push(record.task_id.clone());
     }
+
+    retire_delivery_under_lock(home, &record, now)
+}
+
+fn retire_delivery_under_lock(
+    home: &Path,
+    record: &ActiveAssignment,
+    now: &str,
+) -> anyhow::Result<bool> {
+    let expected_id = record.assignment_id;
+    let target = &record.target;
+    let path = record_file(home, &record.repo, &record.branch, target);
 
     let successor = format!("retired-{}", expected_id);
     let outcome = crate::inbox::storage::supersede_by_nonce_strict(
@@ -1181,7 +1193,7 @@ fn retire_under_lock(
             crate::inbox::storage::enqueue(
                 home,
                 target,
-                build_revocation_notice(&record, now, &nonce),
+                build_revocation_notice(record, now, &nonce),
             )?;
         }
     }
@@ -1224,20 +1236,38 @@ pub(crate) fn retire_for_terminal_event(
     seq: u64,
     now: &str,
 ) -> anyhow::Result<usize> {
+    // A terminal event is authority for its own generation, not for whichever
+    // task/assignment currently reuses this ID. This preflight is also needed
+    // when the original cleanup found no assignments and wrote no ledger key.
+    let snapshots = crate::task_events::catalog::for_home(home)
+        .statuses(&[crate::task_events::TaskId(task_id.to_owned())])
+        .map_err(|error| anyhow::anyhow!("terminal cleanup task lookup failed: {error:?}"))?;
+    anyhow::ensure!(
+        snapshots.iter().any(|snapshot| {
+            snapshot.board == board
+                && snapshot.status.is_some_and(|status| status.is_terminal())
+                && snapshot
+                    .terminal_event
+                    .as_ref()
+                    .is_some_and(|(emitter, event_seq)| emitter.0 == instance && *event_seq == seq)
+        }),
+        "stale terminal cleanup generation for {task_id}"
+    );
     let key = TerminalRetirementKey {
         board: board.to_string(),
         task_id: task_id.to_string(),
         instance: instance.to_string(),
         seq,
     };
-    let branches = active_branches(home)
-        .into_iter()
-        .filter(|(repo, branch)| {
-            list_active(home, repo, branch)
-                .iter()
-                .any(|record| record.task_id == task_id)
-        })
-        .collect::<Vec<_>>();
+    let mut branches = Vec::new();
+    for (repo, branch) in active_branches_checked(home)? {
+        if list_active_checked(home, &repo, &branch)?
+            .iter()
+            .any(|record| record.task_id == task_id)
+        {
+            branches.push((repo, branch));
+        }
+    }
     let mut retired = 0;
     let mut cleanup_tasks = Vec::new();
     for (repo, branch) in branches {
@@ -1247,7 +1277,7 @@ pub(crate) fn retire_for_terminal_event(
         if ledger.contains(&key) {
             continue;
         }
-        let records = list_active(home, &repo, &branch)
+        let records = list_active_checked(home, &repo, &branch)?
             .into_iter()
             .filter(|record| record.task_id == task_id)
             .collect::<Vec<_>>();
@@ -1267,6 +1297,99 @@ pub(crate) fn retire_for_terminal_event(
     }
     for cleanup_task in cleanup_tasks {
         crate::tasks::task_terminal_cleanup(home, &cleanup_task);
+    }
+    Ok(retired)
+}
+
+/// Top-level cleanup (API/reconciler), never called beneath a task writer lock.
+pub(crate) fn retire_current_terminal_task_checked(
+    home: &Path,
+    board: &str,
+    task_id: &str,
+    now: &str,
+) -> anyhow::Result<usize> {
+    let mut retired = 0;
+    for (repo, branch) in active_branches_checked(home)? {
+        let _branch = lock_branch(home, &repo, &branch)?;
+        crate::tasks::operator_settlement::with_current_terminal_cleanup(
+            home,
+            board,
+            task_id,
+            None,
+            || {
+                for record in list_active_checked(home, &repo, &branch)? {
+                    if record.task_id == task_id {
+                        retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(retired)
+}
+
+pub(crate) fn retire_terminal_event_checked(
+    home: &Path,
+    board: &str,
+    task_id: &str,
+    instance: &str,
+    seq: u64,
+    now: &str,
+) -> anyhow::Result<usize> {
+    retire_operator_settlement_after_preflight(home, board, task_id, instance, seq, now, || {})
+}
+
+fn retire_operator_settlement_after_preflight(
+    home: &Path,
+    board: &str,
+    task_id: &str,
+    instance: &str,
+    seq: u64,
+    now: &str,
+    after_preflight: impl FnOnce(),
+) -> anyhow::Result<usize> {
+    crate::tasks::operator_settlement::with_terminal_cleanup(
+        home,
+        board,
+        task_id,
+        instance,
+        seq,
+        || Ok(()),
+    )?;
+    after_preflight();
+    let key = TerminalRetirementKey {
+        board: board.into(),
+        task_id: task_id.into(),
+        instance: instance.into(),
+        seq,
+    };
+    let mut retired = 0;
+    for (repo, branch) in active_branches_checked(home)? {
+        let _branch = lock_branch(home, &repo, &branch)?;
+        crate::tasks::operator_settlement::with_terminal_cleanup(
+            home,
+            board,
+            task_id,
+            instance,
+            seq,
+            || {
+                let path = terminal_retirements_file(home, &repo, &branch);
+                let mut ledger = read_terminal_retirements(&path)?;
+                if ledger.contains(&key) {
+                    return Ok(());
+                }
+                for record in list_active_checked(home, &repo, &branch)? {
+                    if record.task_id == task_id {
+                        // The task is already terminal under its writer lock. Do not
+                        // call cancellation, which would re-enter that same lock.
+                        retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
+                    }
+                }
+                ledger.insert(key.clone());
+                Ok(atomic_write_json(&path, &ledger)?)
+            },
+        )?;
     }
     Ok(retired)
 }
@@ -1734,6 +1857,34 @@ pub(crate) fn active_branches(home: &Path) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Terminal cleanup must distinguish corrupt authority from genuine absence.
+/// Keep the reconciler's best-effort enumeration separate from this strict read.
+fn active_branches_checked(home: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let entries = match std::fs::read_dir(base_dir(home)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut branches = std::collections::BTreeSet::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for record in std::fs::read_dir(entry.path())? {
+            let path = record?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") || is_metadata_json(&path)
+            {
+                continue;
+            }
+            if let Some(record) = read_record(&path)? {
+                branches.insert((record.repo, record.branch));
+            }
+        }
+    }
+    Ok(branches.into_iter().collect())
 }
 
 // ─────────────────────────── C7: 3-state evidence classifier ───────────────────────────

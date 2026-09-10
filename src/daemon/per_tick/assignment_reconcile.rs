@@ -193,6 +193,14 @@ struct ContinuationWake {
 }
 
 fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
+    reconcile_all_collect_wakes_after_snapshot(home, now, || {})
+}
+
+fn reconcile_all_collect_wakes_after_snapshot(
+    home: &Path,
+    now: &str,
+    after_snapshot: impl FnOnce(),
+) -> ReconcileWakes {
     // Workset = dedup UNION of two `(repo,branch)` identity sources (codex m-…-416):
     //   (a) `store::active_branches` — branches discovered via a PARSEABLE authority
     //       record. It reads the FIRST parseable record to name a branch, so a branch
@@ -218,13 +226,15 @@ fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let terminal_tasks = match crate::task_events::catalog::for_home(home).statuses(&task_ids) {
+    let statuses = crate::task_events::catalog::for_home(home).statuses(&task_ids);
+    after_snapshot();
+    let terminal_tasks = match statuses {
         Ok(statuses) => statuses
             .into_iter()
             .filter(|snapshot| snapshot.status.is_some_and(|status| status.is_terminal()))
             .map(|snapshot| {
                 if let Some((instance, seq)) = snapshot.terminal_event {
-                    if let Err(error) = store::retire_for_terminal_event(
+                    if let Err(error) = store::retire_terminal_event_checked(
                         home,
                         &snapshot.board,
                         &snapshot.task_id.0,
@@ -238,6 +248,14 @@ fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
                             "terminal assignment safety retirement failed"
                         );
                     }
+                } else if let Err(error) = store::retire_current_terminal_task_checked(
+                    home,
+                    &snapshot.board,
+                    &snapshot.task_id.0,
+                    now,
+                ) {
+                    tracing::error!(task_id = %snapshot.task_id, %error,
+                        "cascaded terminal assignment retirement failed");
                 }
                 snapshot.task_id.0
             })
@@ -262,6 +280,9 @@ fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
             .extend(branch_wakes.assignment_wake_details);
         wakes.continuations.extend(branch_wakes.continuations);
     }
+    if let Err(error) = crate::tasks::operator_settlement::retry_committed_cleanups(home) {
+        tracing::error!(%error, "operator settlement cleanup retry incomplete");
+    }
     wakes
 }
 
@@ -282,6 +303,12 @@ fn reconcile_branch(
     // Load PrState ONCE per branch (shared across all records on this branch).
     let raw_prstate = crate::daemon::pr_state::load(home, repo, branch);
     for record in store::list_active(home, repo, branch) {
+        // The checked terminal pass owns retirement. Its snapshot may already
+        // be stale (task reopened), or cleanup may have failed. Never fall back
+        // to unguarded cancellation or recreate its delivery here. Re-read next tick.
+        if terminal_tasks.contains(&record.task_id) {
+            continue;
+        }
         // A2: recover a Pending row (idempotent; nonce-dedup handles a crash-window
         // duplicate). Unconditional — even an acked record's row must be durable.
         if record.row == store::RowState::Pending {
@@ -320,27 +347,6 @@ fn reconcile_branch(
                 }
                 continue;
             }
-        }
-        // Task-terminal gate (#2878-16): a cancelled/done task cannot produce a
-        // valid review — retire the assignment instead of re-nudging it.
-        // Fail-closed: route error or unknown task_id → preserve.
-        if terminal_tasks.contains(&record.task_id) {
-            if let Err(error) = store::retire_if_id_matches(
-                home,
-                repo,
-                branch,
-                &record.target,
-                record.assignment_id,
-                now,
-            ) {
-                tracing::error!(
-                    assignment_id = %record.assignment_id,
-                    task_id = %record.task_id,
-                    %error,
-                    "terminal assignment safety retirement failed"
-                );
-            }
-            continue;
         }
         // Classify against the LIVE pr_state for THIS record's generation (its
         // pr_number). A pr_state for a different generation, or none, ⇒ Unengaged.
@@ -2102,6 +2108,125 @@ mod tests {
     }
 
     #[test]
+    fn operator_settlement_recovers_dispatch_without_assignment() {
+        let home = tmp_home("3553-dispatch-recovery");
+        let task_id = "t-3553-dispatch-only";
+        let created = serde_json::from_value(serde_json::json!({
+            "kind":"Created", "task_id":task_id, "title":"dispatch only",
+            "description":"", "priority":"normal", "owner":null
+        }))
+        .unwrap();
+        crate::task_events::append(&home, &"fixture".into(), created).unwrap();
+        crate::dispatch_tracking::track_dispatch(
+            &home,
+            crate::dispatch_tracking::DispatchEntry {
+                task_id: Some(task_id.into()),
+                from: "lead".into(),
+                to: "reviewer".into(),
+                delegated_at: "2026-07-22T00:00:00Z".into(),
+                status: "pending".into(),
+                ..Default::default()
+            },
+        );
+        crate::task_events::append(
+            &home,
+            &"operator".into(),
+            TaskEvent::OperatorSettled {
+                task_id: task_id.into(),
+                proof: crate::task_events::OperatorSettlement {
+                    operation_id: "dispatch-only".into(),
+                    preview_digest: "digest".into(),
+                    by: "operator".into(),
+                    holder_instance: None,
+                    target: crate::task_events::OperatorSettlementTarget::Done,
+                    result: "done".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(store::active_branches(&home).is_empty());
+        assert!(crate::dispatch_tracking::has_for_instance(
+            &home, "reviewer"
+        ));
+        crate::task_events::catalog::rebuild_for_test(&home);
+        let before = serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap();
+        reconcile_all_collect(&home, "2026-07-22T00:00:02Z");
+        let residue = crate::dispatch_tracking::has_for_instance(&home, "reviewer");
+        let after = serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(
+            !residue,
+            "committed cleanup must be discovered without an assignment"
+        );
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn operator_settlement_reconcile_stale_snapshot_preserves_reopened_assignment() {
+        let home = tmp_home("3553-reconcile-race");
+        let task_id = "t-3553-reconcile";
+        seed_and_cancel_task(&home, task_id);
+        crate::task_events::append_batch_at(
+            &home,
+            &"operator".into(),
+            vec![
+                TaskEvent::Reopened {
+                    task_id: task_id.into(),
+                    reason: "fixture".into(),
+                    source_evidence: String::new(),
+                },
+                TaskEvent::OperatorSettled {
+                    task_id: task_id.into(),
+                    proof: crate::task_events::OperatorSettlement {
+                        operation_id: "reconcile-operation".into(),
+                        preview_digest: "digest".into(),
+                        by: "operator".into(),
+                        holder_instance: None,
+                        target: crate::task_events::OperatorSettlementTarget::Done,
+                        result: "done".into(),
+                    },
+                },
+            ],
+        )
+        .unwrap();
+        let rec = ActiveAssignment::new_pending(
+            "o/r",
+            "feat/operator",
+            "reviewer",
+            7,
+            "lead",
+            task_id,
+            ReviewClass::Single,
+            ReviewAuthor::External("octocat".into()),
+            "Review",
+            None,
+            None,
+            "2026-07-22T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        let mut expected = None;
+        reconcile_all_collect_wakes_after_snapshot(&home, "2026-07-22T00:00:02Z", || {
+            crate::task_events::append(
+                &home,
+                &"fixture".into(),
+                TaskEvent::Reopened {
+                    task_id: task_id.into(),
+                    reason: "new work".into(),
+                    source_evidence: "operator".into(),
+                },
+            )
+            .unwrap();
+            expected =
+                Some(serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap());
+        });
+        let actual = serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap();
+        let remaining = store::get(&home, "o/r", "feat/operator", "reviewer");
+        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!(expected.unwrap(), actual);
+        assert_eq!(remaining.unwrap().assignment_id, rec.assignment_id);
+    }
+
+    #[test]
     fn cancelled_task_assignment_is_retired_not_nudged() {
         let home = tmp_home("cancel-retire");
         seed_and_cancel_task(&home, "t-cancel-retire-1");
@@ -2256,6 +2381,34 @@ mod tests {
         assert!(
             store::get(&home, "o/r", "feat/cascade", "reviewer-child").is_none(),
             "a child cancelled by parent cascade must not strand its assignment"
+        );
+        // A subsequent snapshot is not authority to delete a reopened child.
+        let mut successor = rec.clone();
+        successor.assignment_id = uuid::Uuid::new_v4();
+        store::persist(&home, &successor).unwrap();
+        reconcile_all_collect_wakes_after_snapshot(&home, "2026-07-22T02:00:02Z", || {
+            crate::task_events::append(
+                &home,
+                &"fixture".into(),
+                TaskEvent::Reopened {
+                    task_id: child.clone(),
+                    reason: "new child work".into(),
+                    source_evidence: "operator".into(),
+                },
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            store::get(&home, "o/r", "feat/cascade", "reviewer-child")
+                .unwrap()
+                .assignment_id,
+            successor.assignment_id
+        );
+        assert_eq!(
+            crate::task_events::replay(&home).unwrap().tasks[&child]
+                .status
+                .to_string(),
+            "open"
         );
         std::fs::remove_dir_all(&home).ok();
     }

@@ -1,6 +1,9 @@
 use serde_json::Value;
 use std::path::Path;
 
+mod reopened_notify;
+use reopened_notify::notify_reopened_owner;
+
 use super::acl::{can_mutate_record, instance_exists};
 use super::orphan::build_health_response;
 use super::{record_to_task, status_to_legacy_str, Task};
@@ -939,6 +942,8 @@ fn handle_done(
     // self-IPC or take other locks) runs AFTER the per-id flock drops (#1629). The
     // fingerprint match guarantees `routed.board()` still names the appended board,
     // so the post-lock read-back reads the right board.
+    #[cfg(test)]
+    super::fire_before_mutation_commit_hook_for_test();
     let append_result = routed.with_revalidated_board(home, |board| {
         crate::task_events::append_checked_at(board, &emitter, event, |state| {
             let tv = state
@@ -980,7 +985,11 @@ fn handle_done(
                     .as_ref()
                     .map(|o| o.0.clone())
                     .unwrap_or_else(|| caller.clone());
-                if let Some(binding) = crate::binding::read(home, &owner) {
+                // Receipt completion concerns an already released old task,
+                // never the owner's current (possibly rebound) workspace.
+                if let Some(binding) =
+                    crate::binding::read(home, &owner).filter(|_| completion_receipt.is_none())
+                {
                     // P0 cross-lease identity guard: only touch the owner's
                     // worktree / enqueue release when the binding's task_id
                     // matches the completed task. A stale task_done for an OLD
@@ -2434,57 +2443,6 @@ fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
 /// Home-agnostic — the home travels on each event.
 pub fn register_subscriber() {
     crate::daemon::event_bus::global().subscribe(handle_event);
-}
-
-/// t-20260713015904150648-15764-33: after a terminal→open `Reopened` batch has
-/// COMMITTED and the append flock has dropped, hand the preserved owner one
-/// fresh durable `task_reopened` inbox row. A team-owned task routes to the
-/// record's `routed_to` orchestrator; an ownerless task notifies no one. One
-/// row per committed reopen generation — never a reuse of the completed
-/// generation's dispatch/inbox rows, and ordinary create/dispatch semantics
-/// are untouched. Best-effort: a notify failure never fails the update (same
-/// contract as the #2305 decision-answered notify; handler context holds no
-/// registry lock, satisfying the #1492 self-IPC guard).
-fn notify_reopened_owner(
-    home: &Path,
-    project: &str,
-    id: &str,
-    reopened_from: &'static str,
-    by: &str,
-    record: &crate::task_events::TaskRecord,
-) {
-    let Some(owner) = record.owner.as_ref() else {
-        return;
-    };
-    let target = record.routed_to.as_ref().unwrap_or(owner).0.as_str();
-    let result_line = match record.result.as_deref() {
-        Some(r) if !r.is_empty() => {
-            // Results can run to hundreds of chars — excerpt, don't dump.
-            let excerpt: String = r.chars().take(200).collect();
-            let ellipsis = if r.chars().count() > 200 { "…" } else { "" };
-            format!("its recorded result was: {excerpt}{ellipsis}")
-        }
-        _ => "no result was recorded on the closed generation".to_string(),
-    };
-    let text = format!(
-        "[task_reopened] task {id} on board '{project}' was reopened ({reopened_from} → open) by '{by}'.\n\
-         Owner '{owner}' is preserved and the task needs action again:\n\
-         1. Re-claim before working (task action=claim id={id}) — reopen does not re-claim for you.\n\
-         2. Reconcile status/result: the prior {reopened_from} outcome no longer stands; {result_line}\n\
-            Update or replace the result to reflect the re-work before closing again.",
-        owner = owner.0,
-    );
-    if let Err(e) = crate::inbox::notify_system(
-        home,
-        target,
-        "system:task_board",
-        "task_reopened",
-        text,
-        Some(id),
-        Some(id),
-    ) {
-        tracing::warn!(task = id, target, error = %e, "task_reopened owner notify failed");
-    }
 }
 
 #[cfg(test)]

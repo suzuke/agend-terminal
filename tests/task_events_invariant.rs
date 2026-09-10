@@ -69,6 +69,8 @@ fn is_test_only_file(path: &Path) -> bool {
     };
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let path_needle = format!("\"{filename}\"");
+    let module_name = filename.strip_suffix(".rs").unwrap_or(filename);
+    let module_needle = format!("mod {module_name};");
     let Ok(siblings) = std::fs::read_dir(parent) else {
         return false;
     };
@@ -83,7 +85,10 @@ fn is_test_only_file(path: &Path) -> bool {
         let lines: Vec<&str> = content.lines().collect();
         for (idx, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
-            if !(trimmed.starts_with("#[path") && trimmed.contains(&path_needle)) {
+            let is_path_declaration =
+                trimmed.starts_with("#[path") && trimmed.contains(&path_needle);
+            let is_module_declaration = trimmed == module_needle;
+            if !is_path_declaration && !is_module_declaration {
                 continue;
             }
             let mut cursor = idx;

@@ -4860,3 +4860,50 @@ fn stalled_snapshot_saves_tail_and_fails_soft_3547() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// #3547 RED-3: the stalled capture must carry the gate's OWN account of what it
+/// did, not just the pane tail. Without it a dismiss-miss capture shows a frozen
+/// modal and nothing about why it was never answered — and #3548's first-Refuse
+/// log cannot fill the gap, because the first reads of every healthy generation
+/// precede the modal being painted, so `NoCompleteModal` is the first refuse on
+/// successful dismisses too.
+#[test]
+fn stalled_snapshot_carries_the_dev_modal_refuse_tally_3547() {
+    use crate::agent::dev_modal::{DevModalGate, LogicalMs};
+    let name = "snap-tally-agent";
+    let dir = std::env::temp_dir().join(format!(
+        "agend-stalled-tally-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let tally = crate::agent::dev_modal::publish_tally(name, true);
+    let mut gate = DevModalGate::with_epoch(
+        true,
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::sync::Arc::clone(&tally),
+    );
+    gate.observe("a frame with no modal in it", LogicalMs(0));
+    gate.observe("still no modal", LogicalMs(1));
+
+    let path = super::save_stalled_snapshot(&dir, name, "frozen pane tail")
+        .expect("snapshot save must succeed on a writable home");
+    let body = std::fs::read_to_string(&path).expect("snapshot file must be readable");
+    assert!(
+        body.contains("last_refuse=NoCompleteModal"),
+        "capture must name the LAST refuse reason, got: {body:?}"
+    );
+    assert!(
+        body.contains("NoCompleteModal:2"),
+        "capture must carry the refuse distribution, got: {body:?}"
+    );
+    assert!(
+        body.contains("armed=true"),
+        "capture must state whether the generation was armed at all, got: {body:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

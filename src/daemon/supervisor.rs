@@ -2380,7 +2380,16 @@ fn save_stalled_snapshot(
         crate::transport::safe_component(name),
         epoch_ms
     ));
-    let body = format!("agent: {name}\ncaptured_at_ms: {epoch_ms}\n────────\n{tail}\n");
+    // #3547: the capture is the only artefact a human reads after a stall, so
+    // it carries the gate's own account of what it did. #3548's first-Refuse log
+    // cannot answer this: the gate is consulted on every PTY read and the first
+    // reads of a healthy generation precede the modal being painted, so the
+    // FIRST refuse is `NoCompleteModal` on successful dismisses too. The LAST
+    // refuse plus the distribution is what separates a real miss from noise.
+    let dev_modal = crate::agent::dev_modal::refuse_summary(name)
+        .unwrap_or_else(|| "dev_modal: no gate published for this agent".to_string());
+    let body =
+        format!("agent: {name}\ncaptured_at_ms: {epoch_ms}\n{dev_modal}\n────────\n{tail}\n");
     std::fs::write(&path, body).ok()?;
     Some(path)
 }
