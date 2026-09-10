@@ -128,6 +128,66 @@ fn operator_settlement_3553_preview_is_nonmutating_and_exact() {
 
 #[test]
 #[serial_test::serial]
+fn operator_settlement_3553_crossboard_unassigned_done_and_cancelled() {
+    use crate::task_events::{append_batch_at, board_root, replay_at};
+    let server = Server::start();
+    for target in ["done", "cancelled"] {
+        let board = board_root(&server.home, &format!("project-{target}"));
+        let id = format!("unassigned-{target}");
+        let event = serde_json::from_value(json!({
+            "kind":"Created", "task_id":id, "title":"Crossboard",
+            "description":"Unassigned work", "priority":"normal", "owner":null
+        })).unwrap();
+        append_batch_at(&board, &"fixture".into(), vec![event]).unwrap();
+        let before = serde_json::to_value(replay_at(&board).unwrap()).unwrap();
+        let preview = server.request(true, json!({"method":"task_settlement_preview", "params":{
+            "task_id":id, "target":target, "result":"operator examined crossboard row"
+        }}));
+        assert_eq!(preview["ok"], true, "{preview}");
+        assert_eq!(preview["result"]["board"], format!("project-{target}"));
+        assert_eq!(before, serde_json::to_value(replay_at(&board).unwrap()).unwrap());
+        let applied = server.request(true, json!({"method":"task_settlement_apply", "params":{
+            "confirmation":preview["result"]["confirmation"]
+        }}));
+        assert_eq!(applied["ok"], true, "{applied}");
+        let state = replay_at(&board).unwrap();
+        let row = &state.tasks[&id.as_str().into()];
+        assert_eq!(row.status.to_string(), target);
+        assert!(row.owner.is_none());
+        assert!(!crate::task_events::replay(&server.home).unwrap().tasks.contains_key(&id.as_str().into()));
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn operator_settlement_3553_ambiguous_after_preview_preserves_both_boards() {
+    use crate::task_events::{append_batch_at, board_root, replay_at, TaskEvent};
+    let server = Server::start();
+    let first = board_root(&server.home, "project-first");
+    let second = board_root(&server.home, "project-second");
+    let event: TaskEvent = serde_json::from_value(json!({
+        "kind":"Created", "task_id":"ambiguous-row", "title":"Exact row",
+        "description":"original", "priority":"normal", "owner":null
+    })).unwrap();
+    append_batch_at(&first, &"fixture".into(), vec![event.clone()]).unwrap();
+    let preview = server.request(true, json!({"method":"task_settlement_preview", "params":{
+        "task_id":"ambiguous-row", "target":"done", "result":"operator examined"
+    }}));
+    assert_eq!(preview["ok"], true, "{preview}");
+    append_batch_at(&second, &"fixture".into(), vec![event]).unwrap();
+    let before_first = serde_json::to_value(replay_at(&first).unwrap()).unwrap();
+    let before_second = serde_json::to_value(replay_at(&second).unwrap()).unwrap();
+    let applied = server.request(true, json!({"method":"task_settlement_apply", "params":{
+        "confirmation":preview["result"]["confirmation"]
+    }}));
+    assert_eq!(applied["ok"], false, "{applied}");
+    assert_eq!(applied["code"], "task_route_unavailable");
+    assert_eq!(before_first, serde_json::to_value(replay_at(&first).unwrap()).unwrap());
+    assert_eq!(before_second, serde_json::to_value(replay_at(&second).unwrap()).unwrap());
+}
+
+#[test]
+#[serial_test::serial]
 fn operator_settlement_3553_apply_once_and_reject_changed_subject() {
     use crate::task_events::{append, replay, TaskEvent};
     let server = Server::start();
