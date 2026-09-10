@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn operator_settlement_3553_old_first_cleanup_preserves_reopened_assignment() {
+    use crate::task_events::{append, replay, OperatorSettlement, OperatorSettlementTarget, TaskEvent};
+    let home = tmp_home("3553-old-first-cleanup");
+    let task_id = "reopened-review";
+    seed_open_task_as(&home, task_id, "reviewer");
+    // No assignment existed at commit time, so no per-branch ledger entry
+    // exists yet. A delayed first cleanup must not discover and retire new work.
+    let seq = append(&home, &"operator".into(), TaskEvent::OperatorSettled {
+        task_id:task_id.into(), proof:OperatorSettlement {
+            operation_id:"old-operation".into(), preview_digest:"old-digest".into(),
+            by:"operator".into(), holder_instance:Some("reviewer".into()),
+            target:OperatorSettlementTarget::Done, result:"original done".into(),
+        },
+    }).unwrap();
+    append(&home, &"fixture".into(), TaskEvent::Reopened {
+        task_id:task_id.into(), reason:"new work".into(), source_evidence:"operator request".into(),
+    }).unwrap();
+    let mut fresh = mk_record("o/r", "feat/fresh", "reviewer", 42, "2026-09-10T01:00:00Z");
+    fresh.task_id = task_id.into();
+    persist(&home, &fresh).unwrap();
+    let before = serde_json::to_value(replay(&home).unwrap()).unwrap();
+    let result = retire_for_terminal_event(&home, "default", task_id, "operator", seq,
+        "2026-09-10T01:00:01Z");
+    let after = serde_json::to_value(replay(&home).unwrap()).unwrap();
+    let assignments = list_active(&home, "o/r", "feat/fresh");
+    std::fs::remove_dir_all(&home).unwrap();
+    assert_eq!(before, after, "old cleanup mutated reopened task: {result:?}");
+    assert_eq!(assignments.len(), 1, "old cleanup removed new authority: {result:?}");
+    assert_eq!(assignments[0].assignment_id, fresh.assignment_id);
+}
+
+#[test]
 fn operator_settlement_3553_locked_retirement_propagates_corruption() {
     let home = tmp_home("3553-locked-corrupt");
     let path = record_file(&home, "o/r", "feat/corrupt", "reviewer");
