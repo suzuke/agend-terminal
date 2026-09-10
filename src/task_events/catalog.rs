@@ -1011,7 +1011,6 @@ where
             TaskEvent::Done { .. }
                 | TaskEvent::Cancelled { .. }
                 | TaskEvent::Superseded { .. }
-                | TaskEvent::OperatorSettled { .. }
         )
     }) {
         if let Err(error) = crate::tasks::task_terminal_cleanup_event(

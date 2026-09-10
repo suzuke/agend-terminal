@@ -1167,6 +1167,14 @@ fn retire_under_lock(
         cleanup_tasks.push(record.task_id.clone());
     }
 
+    retire_delivery_under_lock(home, &record, now)
+}
+
+fn retire_delivery_under_lock(home: &Path, record: &ActiveAssignment, now: &str) -> anyhow::Result<bool> {
+    let expected_id = record.assignment_id;
+    let target = &record.target;
+    let path = record_file(home, &record.repo, &record.branch, target);
+
     let successor = format!("retired-{}", expected_id);
     let outcome = crate::inbox::storage::supersede_by_nonce_strict(
         home,
@@ -1181,7 +1189,7 @@ fn retire_under_lock(
             crate::inbox::storage::enqueue(
                 home,
                 target,
-                build_revocation_notice(&record, now, &nonce),
+                build_revocation_notice(record, now, &nonce),
             )?;
         }
     }
@@ -1277,6 +1285,55 @@ pub(crate) fn retire_for_terminal_event(
     }
     for cleanup_task in cleanup_tasks {
         crate::tasks::task_terminal_cleanup(home, &cleanup_task);
+    }
+    Ok(retired)
+}
+
+/// Top-level cleanup (API/reconciler), never called beneath a task writer lock.
+pub(crate) fn retire_current_terminal_task_checked(home: &Path, board: &str, task_id: &str,
+    now: &str) -> anyhow::Result<usize> {
+    let mut retired = 0;
+    for (repo, branch) in active_branches_checked(home)? {
+        let _branch = lock_branch(home, &repo, &branch)?;
+        crate::tasks::operator_settlement::with_current_terminal_cleanup(home, board, task_id, None, || {
+            for record in list_active_checked(home, &repo, &branch)? {
+                if record.task_id == task_id {
+                    retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(retired)
+}
+
+pub(crate) fn retire_terminal_event_checked(home: &Path, board: &str, task_id: &str,
+    instance: &str, seq: u64, now: &str) -> anyhow::Result<usize> {
+    retire_operator_settlement_after_preflight(home, board, task_id, instance, seq, now, || {})
+}
+
+fn retire_operator_settlement_after_preflight(home: &Path, board: &str, task_id: &str,
+    instance: &str, seq: u64, now: &str, after_preflight: impl FnOnce()) -> anyhow::Result<usize> {
+    crate::tasks::operator_settlement::with_terminal_cleanup(home, board, task_id, instance, seq, || Ok(()))?;
+    after_preflight();
+    let key = TerminalRetirementKey { board: board.into(), task_id: task_id.into(), instance: instance.into(), seq };
+    let mut retired = 0;
+    for (repo, branch) in active_branches_checked(home)? {
+        let _branch = lock_branch(home, &repo, &branch)?;
+        crate::tasks::operator_settlement::with_terminal_cleanup(home, board, task_id, instance, seq, || {
+            let path = terminal_retirements_file(home, &repo, &branch);
+            let mut ledger = read_terminal_retirements(&path)?;
+            if ledger.contains(&key) { return Ok(()); }
+            for record in list_active_checked(home, &repo, &branch)? {
+                if record.task_id == task_id {
+                    // The task is already terminal under its writer lock. Do not
+                    // call cancellation, which would re-enter that same lock.
+                    retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
+                }
+            }
+            ledger.insert(key.clone());
+            Ok(atomic_write_json(&path, &ledger)?)
+        })?;
     }
     Ok(retired)
 }

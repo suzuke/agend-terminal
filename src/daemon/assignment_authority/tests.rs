@@ -1,6 +1,64 @@
 use super::*;
 
 #[test]
+fn operator_settlement_3553_locked_cleanup_retires_without_new_task_event() {
+    use crate::task_events::{append, replay, OperatorSettlement, OperatorSettlementTarget, TaskEvent};
+    let home = tmp_home("3553-locked-cleanup");
+    let task_id = "terminal-review";
+    seed_open_task_as(&home, task_id, "reviewer");
+    let mut assignment = mk_record("o/r", "feat/terminal", "reviewer", 42, "2026-09-10T01:00:00Z");
+    assignment.task_id = task_id.into();
+    persist(&home, &assignment).unwrap();
+    let seq = append(&home, &"operator".into(), TaskEvent::OperatorSettled {
+        task_id: task_id.into(), proof: OperatorSettlement {
+            operation_id: "terminal-operation".into(), preview_digest: "digest".into(),
+            by: "operator".into(), holder_instance: Some("reviewer".into()),
+            target: OperatorSettlementTarget::Done, result: "done".into(),
+        },
+    }).unwrap();
+    let before = serde_json::to_value(replay(&home).unwrap()).unwrap();
+    assert_eq!(retire_terminal_event_checked(&home, "default", task_id, "operator", seq,
+        "2026-09-10T01:00:01Z").unwrap(), 1);
+    assert!(list_active(&home, "o/r", "feat/terminal").is_empty());
+    assert_eq!(retire_terminal_event_checked(&home, "default", task_id, "operator", seq,
+        "2026-09-10T01:00:02Z").unwrap(), 0);
+    assert_eq!(before, serde_json::to_value(replay(&home).unwrap()).unwrap());
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn operator_settlement_3553_reopen_after_preflight_preserves_assignment() {
+    use crate::task_events::{append, replay, OperatorSettlement, OperatorSettlementTarget, TaskEvent};
+    let home = tmp_home("3553-preflight-race");
+    let task_id = "preflight-review";
+    seed_open_task_as(&home, task_id, "reviewer");
+    let seq = append(&home, &"operator".into(), TaskEvent::OperatorSettled {
+        task_id: task_id.into(), proof: OperatorSettlement {
+            operation_id: "preflight-operation".into(), preview_digest: "digest".into(),
+            by: "operator".into(), holder_instance: Some("reviewer".into()),
+            target: OperatorSettlementTarget::Done, result: "done".into(),
+        },
+    }).unwrap();
+    let mut fresh = mk_record("o/r", "feat/race", "reviewer", 42, "2026-09-10T01:00:00Z");
+    fresh.task_id = task_id.into();
+    let mut before = None;
+    let result = retire_operator_settlement_after_preflight(&home, "default", task_id,
+        "operator", seq, "2026-09-10T01:00:01Z", || {
+            append(&home, &"fixture".into(), TaskEvent::Reopened {
+                task_id: task_id.into(), reason: "new work".into(), source_evidence: "operator".into(),
+            }).unwrap();
+            persist(&home, &fresh).unwrap();
+            before = Some(serde_json::to_value(replay(&home).unwrap()).unwrap());
+        });
+    let after = serde_json::to_value(replay(&home).unwrap()).unwrap();
+    let assignments = list_active(&home, "o/r", "feat/race");
+    std::fs::remove_dir_all(&home).unwrap();
+    assert_eq!(before.unwrap(), after, "cleanup changed reopened task: {result:?}");
+    assert_eq!(assignments.len(), 1, "cleanup removed successor: {result:?}");
+    assert_eq!(assignments[0].assignment_id, fresh.assignment_id);
+}
+
+#[test]
 fn operator_settlement_3553_old_first_cleanup_preserves_reopened_assignment() {
     use crate::task_events::{append, replay, OperatorSettlement, OperatorSettlementTarget, TaskEvent};
     let home = tmp_home("3553-old-first-cleanup");

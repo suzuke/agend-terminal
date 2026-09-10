@@ -33,6 +33,78 @@ struct ApplyRequest {
     confirmation: String,
 }
 
+/// Run cleanup only while the exact terminal event remains authoritative.
+/// Caller may hold an assignment branch lock; this acquires task-id then board.
+/// Cleanup must not append task events or perform daemon IPC under these locks.
+pub(crate) fn with_terminal_cleanup<T>(
+    home: &Path, board: &str, task_id: &str, instance: &str, seq: u64,
+    cleanup: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_current_terminal_cleanup(home, board, task_id, Some((instance, seq)), cleanup)
+}
+
+/// Background reconciliation may use current terminal state for a cascaded
+/// child, which has no independent terminal event. Operator retries always
+/// provide their exact event and cannot take this current-state path.
+pub(crate) fn with_current_terminal_cleanup<T>(
+    home: &Path, board: &str, task_id: &str, expected_event: Option<(&str, u64)>,
+    cleanup: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let routed = super::load_routed(home, task_id).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    anyhow::ensure!(routed.board().project() == board, "cleanup board changed");
+    let mut result = None;
+    let checked = routed.with_revalidated_computed(home, &"system:terminal-cleanup".into(), |state| {
+        let task = state.tasks.get(&task_id.into()).ok_or("cleanup task missing")?;
+        let terminal = task.history.iter().rev().find(|entry| matches!(entry.kind,
+            "done" | "cancelled" | "superseded" | "operator_settled"));
+        if !task.status.is_terminal() || expected_event.is_some_and(|(instance, seq)|
+            !terminal.is_some_and(|entry| entry.instance.0 == instance && entry.seq == seq)) {
+            return Err("stale terminal cleanup generation".into());
+        }
+        result = Some(cleanup());
+        Ok(Vec::new())
+    }).map_err(|e| anyhow::anyhow!("{e:?}"))??;
+    checked.map_err(anyhow::Error::msg)?;
+    result.ok_or_else(|| anyhow::anyhow!("cleanup was not executed"))?
+}
+
+fn cleanup_committed(home: &Path, task_id: &str, operation: &str, digest: &str, expected_board: Option<&str>) -> anyhow::Result<()> {
+    use crate::task_events::TaskEvent;
+    let routed = super::load_routed(home, task_id).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let board = routed.board();
+    anyhow::ensure!(expected_board.is_none_or(|expected| board.project() == expected), "cleanup board changed");
+    let history = crate::task_events::envelopes_for_task_at(board.path(), task_id)?;
+    let event = history.iter().find(|envelope| matches!(&envelope.event,
+        TaskEvent::OperatorSettled { proof, .. }
+        if proof.operation_id == operation && proof.preview_digest == digest))
+        .ok_or_else(|| anyhow::anyhow!("settlement cleanup event unavailable"))?;
+    crate::daemon::assignment_authority::retire_terminal_event_checked(
+        home, board.project(), task_id, &event.instance.0, event.seq, &event.timestamp,
+    )?;
+    with_terminal_cleanup(home, board.project(), task_id, &event.instance.0, event.seq, || {
+        crate::daemon::dispatch_idle::cleanup_pending_for_task_id_checked(home, task_id)?;
+        crate::dispatch_tracking::remove_all_for_task_checked(home, task_id)
+    })
+}
+
+/// Committed event proof, not preview files or surviving assignments, drives
+/// recovery. Reopened tasks are excluded and the final locks recheck identity.
+pub(crate) fn retry_committed_cleanups(home: &Path) -> anyhow::Result<()> {
+    let tasks = crate::task_events::catalog::for_home(home).all_tasks()
+        .map_err(|e| anyhow::anyhow!("cleanup catalog unavailable: {e:?}"))?;
+    let mut failures = Vec::new();
+    for task in tasks {
+        if !task.status.is_terminal() { continue; }
+        if let Some(proof) = &task.last_operator_settlement {
+            if let Err(error) = cleanup_committed(home, &task.id.0, &proof.operation_id, &proof.preview_digest, None) {
+                failures.push(format!("{}: {error}", task.id.0));
+            }
+        }
+    }
+    anyhow::ensure!(failures.is_empty(), "operator cleanup pending: {}", failures.join("; "));
+    Ok(())
+}
+
 pub(crate) fn apply(home: &Path, params: &Value, actor_digest: &str) -> Value {
     use crate::task_events::{OperatorSettlement, TaskEvent, TaskId};
     let request: ApplyRequest = match serde_json::from_value(params.clone()) {
@@ -51,7 +123,7 @@ pub(crate) fn apply(home: &Path, params: &Value, actor_digest: &str) -> Value {
         Ok(value) => value,
         Err(error) => return json!({"ok":false,"code":"confirmation_invalid","error":error.to_string()}),
     };
-    if confirmation.schema_version != 1 || confirmation.actor_digest != actor_digest {
+    if confirmation.schema_version != 1 {
         return json!({"ok":false,"code":"confirmation_authority_mismatch"});
     }
     let routed = match super::load_routed(home, &confirmation.task_id) {
@@ -81,6 +153,13 @@ pub(crate) fn apply(home: &Path, params: &Value, actor_digest: &str) -> Value {
                 }
             }
         }
+        // A committed operation is recoverable after daemon restart: the new
+        // daemon has a fresh operator credential, but the durable proof binds
+        // this exact confirmation and no new mutation is possible here.  For
+        // an uncommitted confirmation, retain the actor-bound authority check.
+        if confirmation.actor_digest != actor_digest {
+            return Err("confirmation_authority_mismatch".into());
+        }
         let created = chrono::DateTime::parse_from_rfc3339(&confirmation.created_at)
             .map_err(|_| "confirmation_invalid".to_owned())?;
         let age = chrono::Utc::now().signed_duration_since(created);
@@ -102,12 +181,19 @@ pub(crate) fn apply(home: &Path, params: &Value, actor_digest: &str) -> Value {
         }])
     });
     match outcome {
-        Ok(Ok(Ok(seqs))) => json!({"ok":true,"result":{
+        Ok(Ok(Ok(seqs))) => {
+            // The task-id closure has returned. Never take the assignment
+            // branch lock from the catalog callback under that outer lock.
+            // The event itself is durable retry intent, including after replay.
+            let cleanup = cleanup_committed(home, &confirmation.task_id, &request.confirmation, &digest, Some(&confirmation.board));
+            json!({"ok":true,"result":{
             "task_id":confirmation.task_id,"already_applied":seqs.is_empty(),
             "original_target":confirmation.target,"original_result":confirmation.result,
             "current_status":current_status,
-            "worktree_cleanup":false,"cleanup_status":"not_verified"
-        }}),
+            "worktree_cleanup":false,
+            "cleanup_status":if cleanup.is_ok() {"complete"} else {"pending"},
+            "cleanup_error":cleanup.err().map(|error| error.to_string())
+        }})},
         Ok(Ok(Err(code))) => json!({"ok":false,"code":code}),
         Ok(Err(error)) => json!({"ok":false,"code":"settlement_write_failed","error":error.to_string()}),
         Err(error) => json!({"ok":false,"code":"stale_preview","error":error.to_string()}),
