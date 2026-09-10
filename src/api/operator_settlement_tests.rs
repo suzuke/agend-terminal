@@ -125,3 +125,49 @@ fn operator_settlement_3553_preview_is_nonmutating_and_exact() {
     assert!(response["result"]["confirmation"].as_str().is_some_and(|s| !s.is_empty()));
     assert_eq!(before, serde_json::to_value(crate::task_events::replay(&server.home).unwrap()).unwrap());
 }
+
+#[test]
+#[serial_test::serial]
+fn operator_settlement_3553_apply_once_and_reject_changed_subject() {
+    use crate::task_events::{append, replay, TaskEvent};
+    let server = Server::start();
+    for id in ["settle-row", "stale-row", "child-row"] {
+        let created = serde_json::from_value(json!({
+            "kind":"Created", "task_id":id, "title":"Exact row",
+            "description":"original", "priority":"normal", "owner":null,
+            "parent_id": if id == "child-row" {Some("settle-row")} else {None}
+        })).unwrap();
+        append(&server.home, &"fixture".into(), created).unwrap();
+    }
+    for id in ["settle-row", "stale-row"] {
+        let preview = server.request(true, json!({"method":"task_settlement_preview", "params":{
+            "task_id":id, "target":"cancelled", "result":"operator confirmed"
+        }}));
+        assert_eq!(preview["ok"], true, "{preview}");
+        if id == "stale-row" {
+            append(&server.home, &"fixture".into(), TaskEvent::DescriptionUpdated {
+                task_id:id.into(), description:"changed after preview".into()
+            }).unwrap();
+        }
+        let request = json!({"method":"task_settlement_apply", "params":{
+            "confirmation":preview["result"]["confirmation"]
+        }});
+        let response = server.request(true, request.clone());
+        if id == "stale-row" {
+            assert_eq!(response["ok"], false);
+            assert_eq!(response["code"], "stale_preview", "{response}");
+        } else {
+            assert_eq!(response["ok"], true, "{response}");
+            let before_retry = serde_json::to_value(replay(&server.home).unwrap()).unwrap();
+            let repeated = server.request(true, request);
+            assert_eq!(repeated["ok"], true, "{repeated}");
+            assert_eq!(repeated["result"]["already_applied"], true);
+            assert_eq!(before_retry, serde_json::to_value(replay(&server.home).unwrap()).unwrap());
+        }
+    }
+    let state = replay(&server.home).unwrap();
+    assert_eq!(state.tasks[&"settle-row".into()].status.to_string(), "cancelled");
+    for id in ["stale-row", "child-row"] {
+        assert_eq!(state.tasks[&id.into()].status.to_string(), "open");
+    }
+}
