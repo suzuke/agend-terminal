@@ -42,19 +42,30 @@ impl Server {
         let mut server = Self { home, shutdown: Arc::new(AtomicBool::new(false)), thread: None, port: 0 };
         let home = server.home.clone();
         let shutdown = server.shutdown.clone();
-        server.thread = Some(std::thread::spawn(move || serve(
-            &home, Arc::new(Mutex::new(HashMap::new())), shutdown,
-            Arc::new(Mutex::new(HashMap::new())), Arc::new(Mutex::new(HashMap::new())),
-            None, RestartCapability::Unsupported, None,
-        )));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if let Ok(port) = std::fs::read_to_string(run.join("api.port")) {
-                if let Ok(port) = port.trim().parse::<u16>() { server.port = port; break; }
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        server.port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let operator = crate::auth_cookie::read_operator_token(&run).unwrap();
+        let agent = crate::auth_cookie::read_cookie(&run).unwrap();
+        // Own the accept loop but use the production authentication/dispatch
+        // path unchanged. No daemon agents or detached handler threads.
+        server.thread = Some(std::thread::spawn(move || {
+            let registry = Arc::new(Mutex::new(HashMap::new()));
+            let configs = Arc::new(Mutex::new(HashMap::new()));
+            let externals = Arc::new(Mutex::new(HashMap::new()));
+            while !shutdown.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => handle_session(
+                        stream, &registry, &home, &shutdown, &configs, &externals,
+                        None, operator, agent, RestartCapability::Unsupported, None,
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test accept: {error}"),
+                }
             }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_ne!(server.port, 0, "API did not start");
+        }));
         server
     }
 
