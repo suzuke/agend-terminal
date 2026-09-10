@@ -1257,6 +1257,56 @@ fn apply_skipped_surfaces_active_binding_blocker() {
     std::fs::remove_dir_all(repo.parent().unwrap()).ok();
 }
 
+/// #3583 RED: a registered worktree with no live binding is stale lifecycle
+/// metadata, not an active holder. The apply path must attempt the eligible
+/// cleanup and report any Git refusal as a retained retry reason instead of
+/// classifying the branch as owned merely because it is registered.
+#[test]
+fn apply_distinguishes_registered_worktree_from_active_binding_3583() {
+    let repo = setup_repo("3583-registered-no-binding");
+    let home = repo.parent().unwrap().to_path_buf();
+    let branch = "feat-registered-no-binding";
+    create_branch_with_commit(&repo, branch, "registered stale worktree");
+    git_run(&repo, &["merge", "--no-ff", "-m", "merge", branch]);
+
+    let wt = repo.parent().unwrap().join("legacy-registered");
+    git_run(&repo, &["worktree", "add", wt.to_str().unwrap(), branch]);
+    let tip_sha = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", branch]).stdout)
+        .trim()
+        .to_string();
+    let categories = Categories {
+        clean_merged: vec![Candidate {
+            name: branch.into(),
+            tip_sha,
+            reason: "merged".into(),
+        }],
+        ..Categories::default()
+    };
+    let confirm_ids = [branch.to_string()].into_iter().collect();
+
+    let (deleted, skipped) = emit_delete_batch_with_context(
+        Some(&home),
+        &repo,
+        "main",
+        &categories,
+        &confirm_ids,
+        "RED: registered metadata is not active ownership",
+    )
+    .expect("apply");
+
+    assert_eq!(deleted, 0, "the checked-out branch must remain preserved");
+    assert_eq!(skipped.len(), 1, "Git refusal must be observable: {skipped:?}");
+    assert_eq!(skipped[0]["branch"], branch);
+    assert_eq!(skipped[0]["blocker"], "branch_delete_failed");
+    assert!(
+        skipped[0]["reason"].as_str().unwrap_or("").contains("checked out"),
+        "retained reason must expose the registration refusal: {skipped:?}"
+    );
+    assert!(wt.exists(), "the unbound registered worktree must be preserved");
+
+    std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+}
+
 /// Bug 3 RED: dry_run_observability must not abort when a reviewer_checkout
 /// branch from the categories no longer exists in a fresh branch enumeration.
 /// This can happen when a concurrent cleanup or manual deletion removes the

@@ -788,6 +788,41 @@ fn flat_unbound_registered_fixture(
     flat_unbound_fixture(tag, agent, branch, true)
 }
 
+fn nested_unbound_registered_fixture(
+    tag: &str,
+    agent: &str,
+    branch: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let home = tmp_home(&format!("{tag}-home"));
+    let repo = tmp_repo(&format!("{tag}-repo"));
+    let target = daemon_managed_worktree_root(&home).join(agent).join(branch);
+    std::fs::create_dir_all(target.parent().expect("nested target parent")).unwrap();
+    let branch_result = crate::git_helpers::git_bypass(&repo, &["branch", branch]);
+    assert!(
+        branch_result.as_ref().is_ok_and(|out| out.status.success()),
+        "fixture branch creation failed: {branch_result:?}"
+    );
+    let target_str = target.to_str().expect("UTF-8 target");
+    let add_result = crate::git_helpers::git_bypass(
+        &repo,
+        &["worktree", "add", "--detach", target_str, branch],
+    );
+    assert!(
+        add_result.as_ref().is_ok_and(|out| out.status.success()),
+        "fixture worktree add failed: {add_result:?}"
+    );
+    std::fs::write(
+        target.join(MANAGED_MARKER),
+        format!(
+            "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    assert!(crate::binding::read(&home, agent).is_none());
+    (home, repo, target)
+}
+
 fn flat_unbound_fixture(
     tag: &str,
     agent: &str,
@@ -1547,6 +1582,46 @@ fn release_full_flat_unbound_registered_fails_closed() {
         after.lines().filter(|l| l.starts_with("worktree ")).count(),
         2,
         "failed-closed release must preserve Git registration: {after}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #3583 RED: an authenticated nested survivor must be observable through the
+/// absent-binding release route, rather than being mistaken for an idempotent
+/// no-op. The target and Git registration must remain untouched for recovery.
+#[test]
+fn release_full_nested_unbound_registered_fails_closed_3583() {
+    let agent = "agent-3583-nested";
+    let branch = "feat/3583-nested";
+    let (home, repo, target) = nested_unbound_registered_fixture("3583-nested", agent, branch);
+    let before = worktree_list(&repo);
+    assert_eq!(
+        before
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
+        2,
+        "fixture must be Git-registered before release: {before}"
+    );
+
+    let outcome = release_full(&home, agent, false);
+
+    assert!(
+        !outcome.released,
+        "nested survivor must not be reported released: {outcome:?}"
+    );
+    let error = outcome.error.as_deref().unwrap_or("");
+    assert!(
+        error.contains("nested") && error.contains("preserved"),
+        "refusal must identify the nested survivor and preservation route: {outcome:?}"
+    );
+    assert!(target.exists(), "failed-closed release must preserve target");
+    assert_eq!(
+        worktree_list(&repo),
+        before,
+        "failed-closed release must preserve Git registration"
     );
 
     std::fs::remove_dir_all(&home).ok();
