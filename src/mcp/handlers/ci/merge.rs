@@ -340,9 +340,25 @@ fn load_exact_merge_state(
 }
 
 fn review_deficit_response(deficit: crate::daemon::pr_state::MergeDeficit) -> Value {
+    use crate::daemon::pr_state::MergeDeficit as D;
     let code = deficit.code();
+    // #3588: error text follows the deficit kind so a caller reading only the
+    // text takes the right action (retro #739: `ci_not_green` was misread as a
+    // review problem). `code` is unchanged — callers key on it.
+    let error = match deficit {
+        D::NoLinkage => "no merge-authority record for this head — merge refused",
+        D::AuthorityUnknown => "reviewer assignment authority unreadable — merge refused",
+        D::ReservedAssignments { .. } => "reviewer assignment still pending — merge refused",
+        D::UnresolvedClass => "review class unresolved — merge refused",
+        D::Draft => "PR is still a draft — merge refused",
+        D::CiNotGreen => "CI has not reported green for this head — merge refused",
+        D::CiHeadMismatch => "CI green is for a different head — merge refused",
+        D::NonVerifiedReceipt { .. } => "review receipt is not VERIFIED — merge refused",
+        D::InsufficientVerified { .. } => "review threshold not satisfied — merge refused",
+        D::StaleHead { .. } => "review receipt pinned to an older head — merge refused",
+    };
     let mut response = json!({
-        "error": "review threshold not satisfied — merge refused",
+        "error": error,
         "code": code,
     });
     if let Some(object) = response.as_object_mut() {
