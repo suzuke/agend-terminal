@@ -1829,6 +1829,21 @@ mod tests {
     }
 
     #[test]
+    fn operator_settlement_3553_cli_commands_parse() {
+        assert!(Cli::try_parse_from([
+            "agend-terminal", "admin", "task-settlement-preview", "--task-id", "t-exact",
+            "--target", "cancelled", "--result", "duplicate confirmed",
+        ]).is_ok());
+        assert!(Cli::try_parse_from([
+            "agend-terminal", "admin", "task-settlement-apply", "--confirmation", "opaque-token",
+        ]).is_ok());
+        assert!(Cli::try_parse_from([
+            "agend-terminal", "admin", "task-settlement-preview", "--task-id", "t-exact",
+            "--target", "claimed", "--result", "invalid target",
+        ]).is_err());
+    }
+
+    #[test]
     fn app_restart_requester_cli_arg_is_optional_and_exact() {
         let id = crate::types::InstanceId::new();
         let cold = Cli::try_parse_from(["agend-terminal", "app"]).expect("cold app parse");
