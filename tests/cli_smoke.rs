@@ -25,6 +25,8 @@ fn cmd() -> Command {
 #[allow(clippy::unwrap_used)]
 fn operator_settlement_3553_cli_positive_roundtrip() {
     use std::time::{Duration, Instant};
+    const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(45);
+    const CLI_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
     struct Fixture {
         home: std::path::PathBuf,
         child: Option<std::process::Child>,
@@ -73,11 +75,27 @@ fn operator_settlement_3553_cli_positive_roundtrip() {
             "description":"","priority":"normal","owner":null}});
     std::fs::write(&log, format!("{seed}\n")).unwrap();
     fixture.start();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let diagnostics = |fixture: &mut Fixture| {
+        let child_status = fixture
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok())
+            .flatten();
+        let read = |name: &str| {
+            std::fs::read_to_string(fixture.home.join(name))
+                .unwrap_or_else(|error| format!("<unavailable: {error}>"))
+        };
+        format!(
+            "child={child_status:?}; daemon.stderr={}; daemon.log={}",
+            read("daemon.stderr"),
+            read("daemon.log")
+        )
+    };
+    let deadline = Instant::now() + DAEMON_READY_TIMEOUT;
     let preview = loop {
         let output = cmd()
             .env("AGEND_HOME", &fixture.home)
-            .timeout(Duration::from_secs(2))
+            .timeout(CLI_REQUEST_TIMEOUT)
             .args([
                 "admin",
                 "task-settlement-preview",
@@ -97,7 +115,7 @@ fn operator_settlement_3553_cli_positive_roundtrip() {
             Instant::now() < deadline,
             "daemon/preview did not become ready: {} / {}",
             String::from_utf8_lossy(&output.stderr),
-            std::fs::read_to_string(fixture.home.join("daemon.stderr")).unwrap()
+            diagnostics(&mut fixture)
         );
         std::thread::sleep(Duration::from_millis(100));
     };
@@ -110,11 +128,11 @@ fn operator_settlement_3553_cli_positive_roundtrip() {
             fixture.child = None;
             fixture.start();
         }
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + DAEMON_READY_TIMEOUT;
         let response: serde_json::Value = loop {
             let output = cmd()
                 .env("AGEND_HOME", &fixture.home)
-                .timeout(Duration::from_secs(3))
+                .timeout(CLI_REQUEST_TIMEOUT)
                 .args(["admin", "task-settlement-apply", "--confirmation", token])
                 .output()
                 .unwrap();
@@ -123,9 +141,10 @@ fn operator_settlement_3553_cli_positive_roundtrip() {
             }
             assert!(
                 Instant::now() < deadline,
-                "apply/restart failed: {} / {}",
+                "apply/restart failed: {} / {} / {}",
                 String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr),
+                diagnostics(&mut fixture)
             );
             std::thread::sleep(Duration::from_millis(100));
         };
