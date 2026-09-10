@@ -1032,8 +1032,8 @@ fn prune_orphaned_branches_with_home(
     // can't be determined, the occupancy dimension would collapse to "nothing
     // occupied" and a branch whose worktree is merely un-enumerable could be
     // reaped — skip ALL branch pruning this tick instead (mirrors :382).
-    let wt_branches: HashSet<String> = match list_worktrees(repo_root) {
-        Ok(entries) => entries.into_iter().map(|e| e.branch).collect(),
+    let registered_worktrees: Vec<WorktreeEntry> = match list_worktrees(repo_root) {
+        Ok(entries) => entries,
         Err(()) => {
             tracing::warn!(
                 repo = %repo_root.display(),
@@ -1043,6 +1043,13 @@ fn prune_orphaned_branches_with_home(
             return Vec::new();
         }
     };
+    // A registered path that no longer exists is stale metadata, not an occupied
+    // worktree; only existing paths contribute to the active-holder set.
+    let registered_worktree_branches: HashSet<String> = registered_worktrees
+        .into_iter()
+        .filter(|entry| Path::new(&entry.path).exists())
+        .map(|entry| entry.branch)
+        .collect();
 
     // W1.2: git_cmd → trimmed stdout on success; spawn-error + non-zero collapse to `Err → []`.
     let branches: Vec<String> =
@@ -1062,7 +1069,7 @@ fn prune_orphaned_branches_with_home(
 
     let mut pruned = Vec::new();
     for branch in &branches {
-        if wt_branches.contains(branch) {
+        if registered_worktree_branches.contains(branch) {
             continue;
         }
         let merged = is_branch_merged(repo_root, branch);
@@ -1123,7 +1130,10 @@ fn prune_orphaned_branches_with_home(
         } else {
             (None, None)
         };
-        let active_holder = match (wt_branches.contains(branch), binding_active) {
+        let active_holder = match (
+            registered_worktree_branches.contains(branch),
+            binding_active,
+        ) {
             (true, _) | (_, Some(true)) => Some(true),
             (false, Some(false)) => Some(false),
             _ => None,
