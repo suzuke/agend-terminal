@@ -2157,6 +2157,11 @@ fn compact_at_with_keep(board: &Path, keep: usize) -> anyhow::Result<()> {
     catalog::compact_at_with_keep(board, keep)
 }
 
+#[cfg(test)]
+pub(crate) fn compact_with_keep_for_test(board: &Path, keep: usize) -> anyhow::Result<()> {
+    compact_at_with_keep(board, keep)
+}
+
 /// Opportunistic, non-fatal hot-log compaction after an append (mirrors
 /// `tasks::board_router::maybe_compact_index`). [`compact_at`] ARCHIVES — never
 /// drops — the older slice, so replay (archive + hot) is unaffected. A failure

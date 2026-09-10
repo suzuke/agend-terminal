@@ -220,7 +220,7 @@ fn operator_settlement_3553_retry_after_reopen_reports_current_state() {
     append(&server.home, &"fixture".into(), TaskEvent::Reopened {
         task_id:"reopened-row".into(), reason:"new work".into(), source_evidence:String::new()
     }).unwrap();
-    crate::task_events::compact_at_with_keep(&server.home, 1).unwrap();
+    crate::task_events::compact_with_keep_for_test(&server.home, 1).unwrap();
     let before = serde_json::to_value(replay(&server.home).unwrap()).unwrap();
     let response = server.request(true, request);
     assert_eq!(response["ok"], true, "{response}");
