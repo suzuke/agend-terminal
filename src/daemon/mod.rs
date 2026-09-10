@@ -2739,7 +2739,7 @@ mod tests {
             .expect("initial spawn barrier");
         let sweep_pos = prod.find(sweep).expect("post-spawn orphan sweep");
         let signal_setup = prod
-            .find("let (shutdown_tx, shutdown_rx)")
+            .find("crate::bootstrap::signals::install(Arc::clone(&ctx.shutdown), shutdown_tx);")
             .expect("post-boot signal setup");
         assert!(
             initial_spawn < sweep_pos && sweep_pos < signal_setup,
