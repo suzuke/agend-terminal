@@ -266,8 +266,8 @@ fn connect_failed_spawn_deregisters_external_agent() {
 #[cfg(unix)]
 #[test]
 fn detached_start_rejects_existing_daemon() {
-    let mut home_guard = UniqueFixtureHome::new().expect("create unique fixture home");
-    let home = home_guard.path.clone();
+    let mut cleanup = DetachedDaemonCleanup::new().expect("create unique fixture home");
+    let home = cleanup.home().to_path_buf();
     std::fs::write(
         home.join("fleet.yaml"),
         "defaults:\n  command: /bin/true\ninstances:\n  probe: {}\n",
@@ -294,6 +294,7 @@ fn detached_start_rejects_existing_daemon() {
         .and_then(|fields| fields.split_whitespace().next())
         .and_then(|pid| pid.parse::<u32>().ok())
         .expect("first detached start must report a numeric daemon pid");
+    cleanup.record_daemon_pid(daemon_pid);
     let api_port = home
         .join("run")
         .join(daemon_pid.to_string())
@@ -308,7 +309,6 @@ fn detached_start_rejects_existing_daemon() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    let mut cleanup = DetachedDaemonCleanup::new(home.clone());
     let mut second = OwnedCliCommand::spawn(&home, "detached-second", &["start"])
         .expect("spawn second detached start");
     let second_status = second
@@ -332,8 +332,8 @@ fn detached_start_rejects_existing_daemon() {
         stop_status.success(),
         "detached daemon cleanup must succeed: stdout={stop_stdout} stderr={stop_stderr}"
     );
-    home_guard
-        .cleanup()
+    cleanup
+        .cleanup_home()
         .expect("unique fixture home must be removed after bounded CLI cleanup");
 }
 
@@ -448,6 +448,7 @@ fn isolate_fixture_env(command: &mut std::process::Command) {
 struct UniqueFixtureHome {
     path: std::path::PathBuf,
     cleaned: bool,
+    preserve_on_drop: bool,
 }
 
 #[cfg(unix)]
@@ -467,6 +468,7 @@ impl UniqueFixtureHome {
                     return Ok(Self {
                         path,
                         cleaned: false,
+                        preserve_on_drop: false,
                     })
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -477,7 +479,7 @@ impl UniqueFixtureHome {
     }
 
     fn cleanup(&mut self) -> Result<(), String> {
-        if self.cleaned {
+        if self.cleaned || self.preserve_on_drop {
             return Ok(());
         }
         match std::fs::remove_dir_all(&self.path) {
@@ -495,11 +497,22 @@ impl UniqueFixtureHome {
             )),
         }
     }
+
+    fn preserve(&mut self) {
+        self.preserve_on_drop = true;
+    }
 }
 
 #[cfg(unix)]
 impl Drop for UniqueFixtureHome {
     fn drop(&mut self) {
+        if self.preserve_on_drop {
+            eprintln!(
+                "fixture-home preserved for cleanup evidence: {}",
+                self.path.display()
+            );
+            return;
+        }
         if let Err(error) = self.cleanup() {
             eprintln!("fixture-home cleanup incomplete: {error}");
         }
@@ -803,21 +816,43 @@ impl Drop for OwnedStop {
 /// public stop protocol and never scans or signals a PID discovered on disk.
 #[cfg(unix)]
 struct DetachedDaemonCleanup {
-    home: std::path::PathBuf,
+    home_guard: UniqueFixtureHome,
+    daemon_pid: Option<u32>,
     armed: bool,
 }
 
 #[cfg(unix)]
 impl DetachedDaemonCleanup {
-    fn new(home: std::path::PathBuf) -> Self {
-        Self { home, armed: true }
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            home_guard: UniqueFixtureHome::new()?,
+            daemon_pid: None,
+            armed: true,
+        })
+    }
+
+    fn home(&self) -> &std::path::Path {
+        &self.home_guard.path
+    }
+
+    fn record_daemon_pid(&mut self, pid: u32) {
+        self.daemon_pid = Some(pid);
+    }
+
+    fn cleanup_home(&mut self) -> Result<(), String> {
+        self.home_guard.cleanup()
+    }
+
+    fn preserve_for_failed_publication(&mut self) {
+        self.armed = false;
+        self.home_guard.preserve();
     }
 
     fn stop(&mut self) -> Result<(std::process::ExitStatus, String, String), String> {
         if !self.armed {
             return Err("detached daemon cleanup was already completed".into());
         }
-        let mut stop = OwnedStop::spawn_with_args(&self.home, &["stop", "--timeout", "30"])?;
+        let mut stop = OwnedStop::spawn_with_args(self.home(), &["stop", "--timeout", "30"])?;
         let status = stop.wait(std::time::Duration::from_secs(40))?;
         let (stdout, stderr) = stop.output()?;
         if status.success() {
@@ -831,14 +866,50 @@ impl DetachedDaemonCleanup {
 impl Drop for DetachedDaemonCleanup {
     fn drop(&mut self) {
         if self.armed {
-            match OwnedStop::spawn_with_args(&self.home, &["stop", "--timeout", "30"])
+            if let Some(pid) = self.daemon_pid {
+                let api_port = self
+                    .home()
+                    .join("run")
+                    .join(pid.to_string())
+                    .join("api.port");
+                if !api_port.exists() {
+                    self.preserve_for_failed_publication();
+                    eprintln!(
+                        "detached daemon cleanup preserved pre-api publication evidence: {}",
+                        self.home().display()
+                    );
+                    return;
+                }
+            }
+            match OwnedStop::spawn_with_args(self.home(), &["stop", "--timeout", "30"])
                 .and_then(|mut stop| stop.wait(std::time::Duration::from_secs(40)))
             {
                 Ok(_) => self.armed = false,
-                Err(error) => eprintln!("detached daemon cleanup incomplete: {error}"),
+                Err(error) => {
+                    self.home_guard.preserve();
+                    eprintln!("detached daemon cleanup incomplete; home preserved: {error}");
+                }
             }
         }
     }
+}
+
+/// Controlled pre-API failure evidence: when publication stops after the
+/// daemon pid is known but before `api.port`, cleanup preserves the exact home
+/// rather than deleting the control evidence or attempting PID discovery.
+#[cfg(unix)]
+#[test]
+fn detached_cleanup_preserves_home_before_api_publication() {
+    let mut cleanup = DetachedDaemonCleanup::new().expect("create unique fixture home");
+    let home = cleanup.home().to_path_buf();
+    cleanup.record_daemon_pid(424_242);
+    cleanup.preserve_for_failed_publication();
+    drop(cleanup);
+    assert!(
+        home.exists(),
+        "failed publication evidence must be preserved"
+    );
+    std::fs::remove_dir_all(&home).expect("remove exact preserved evidence home");
 }
 
 /// #3539 (1): `stop` returns only once the daemon process is gone and says so.
