@@ -250,6 +250,37 @@ fn operator_settlement_3553_changed_owner_or_branch_invalidates_preview() {
 
 #[test]
 #[serial_test::serial]
+fn operator_settlement_3553_other_operator_credential_cannot_reuse_confirmation() {
+    let original = Server::start();
+    let other = Server::start();
+    for server in [&original, &other] {
+        let event = serde_json::from_value(json!({
+            "kind":"Created", "task_id":"credential-row", "title":"Exact row",
+            "description":"original", "priority":"normal", "owner":null
+        })).unwrap();
+        crate::task_events::append(&server.home, &"fixture".into(), event).unwrap();
+    }
+    let preview = original.request(true, json!({"method":"task_settlement_preview", "params":{
+        "task_id":"credential-row", "target":"done", "result":"original operator examined"
+    }}));
+    assert_eq!(preview["ok"], true, "{preview}");
+    let token = preview["result"]["confirmation"].as_str().unwrap();
+    let relative = format!("operator-task-confirmations/{token}.json");
+    std::fs::create_dir_all(other.home.join("operator-task-confirmations")).unwrap();
+    std::fs::copy(original.home.join(&relative), other.home.join(&relative)).unwrap();
+    let before = serde_json::to_value(crate::task_events::replay(&other.home).unwrap()).unwrap();
+    let request = json!({"method":"task_settlement_apply", "params":{"confirmation":token}});
+    let denied = other.request(true, request.clone());
+    assert_eq!(denied["ok"], false, "{denied}");
+    assert_eq!(denied["code"], "confirmation_authority_mismatch", "{denied}");
+    assert_eq!(before, serde_json::to_value(crate::task_events::replay(&other.home).unwrap()).unwrap());
+    // Positive control: the original credential can still consume its token.
+    let accepted = original.request(true, request);
+    assert_eq!(accepted["ok"], true, "{accepted}");
+}
+
+#[test]
+#[serial_test::serial]
 fn operator_settlement_3553_apply_once_and_reject_changed_subject() {
     use crate::task_events::{append, replay, TaskEvent};
     let server = Server::start();
