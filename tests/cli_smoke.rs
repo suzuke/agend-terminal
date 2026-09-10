@@ -62,10 +62,12 @@ fn operator_settlement_3553_cli_positive_roundtrip() {
         child: None,
     };
     std::fs::create_dir(&fixture.home).unwrap();
-    // Empty fleet: this fixture owns one foreground daemon, no agent processes.
+    // A minimal shell probe keeps the fixture on the normal (non-successor)
+    // startup path: `start_with_fleet` rejects a truly empty fleet, while the
+    // settlement contract only needs one owned daemon transport.
     std::fs::write(
         fixture.home.join("fleet.yaml"),
-        "schema_version: 1\ninstances: {}\n",
+        "schema_version: 1\ndefaults:\n  backend: shell\n  command: /bin/cat\ninstances:\n  probe: {}\n",
     )
     .unwrap();
     let log = fixture.home.join("task_events.jsonl");
