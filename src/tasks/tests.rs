@@ -292,6 +292,24 @@ fn build_health_response_reports_status_counts_correctly() {
     assert_eq!(resp["by_status"]["superseded"], 1);
 }
 
+#[test]
+fn build_health_response_age_excludes_superseded_but_includes_verified() {
+    use crate::task_events::TaskStatus;
+    let state = make_state(vec![
+        make_record_with_age_days("old-superseded", TaskStatus::Superseded, None, 120),
+        make_record_with_age_days("pending-verified", TaskStatus::Verified, None, 45),
+    ]);
+    let fleet = make_set(&[]);
+    let resp = build_health_response(&state, Some(&fleet), &fleet);
+
+    assert_eq!(resp["totals"]["terminal"], 1);
+    assert_eq!(resp["totals"]["non_terminal"], 1);
+    assert_eq!(resp["age"]["oldest_non_terminal_days"], 45);
+    assert_eq!(resp["age"]["median_non_terminal_days"], 45);
+    assert_eq!(resp["age"]["over_30d_count"], 1);
+    assert_eq!(resp["age"]["over_90d_count"], 0);
+}
+
 /// #830: a clean board (no ghosts, no stale claims, low age,
 /// blocked count under threshold) must produce an EMPTY
 /// `recommendations` array. Positive signal for operators —
