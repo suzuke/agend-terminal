@@ -782,6 +782,9 @@ fn handle_session(
                     "task_settlement_preview" => crate::tasks::operator_settlement::preview(
                         home, params, &crate::daemon::utils::sha256_hex(&operator_token),
                     ),
+                    "task_settlement_apply" => crate::tasks::operator_settlement::apply(
+                        home, params, &crate::daemon::utils::sha256_hex(&operator_token),
+                    ),
                     method::LIST => handlers::query::handle_list(params, &ctx),
                     method::INJECT => handlers::instance::handle_inject(params, &ctx),
                     method::KILL => handlers::instance::handle_kill(params, &ctx),
