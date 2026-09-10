@@ -76,7 +76,8 @@ fn operator_settlement_3553_is_exact_and_keeps_replay_audit() {
             TaskStatus::Open
         );
         let row = serde_json::to_value(root).unwrap();
-        let proof = &row["operator_settlements"]["op-3553"];
+        let proof = &row["last_operator_settlement"];
+        assert_eq!(proof["operation_id"], "op-3553");
         assert_eq!(proof["preview_digest"], "exact-preview-digest");
         assert_eq!(proof["by"], "operator");
         assert_eq!(proof["target"], target);
@@ -89,14 +90,14 @@ fn operator_settlement_3553_is_exact_and_keeps_replay_audit() {
             TaskEvent::Reopened {
                 task_id: "t-root".into(),
                 reason: "new work".into(),
-                source_evidence: None,
+                source_evidence: String::new(),
             },
         )
         .unwrap();
         let reopened = replay(home).unwrap();
         let row = serde_json::to_value(&reopened.tasks[&TaskId::from("t-root")]).unwrap();
         assert_eq!(row["status"], "open");
-        assert_eq!(row["operator_settlements"]["op-3553"], *proof);
+        assert_eq!(row["last_operator_settlement"], *proof);
     }
 }
 
