@@ -80,12 +80,9 @@ pub(super) fn recover_stale_checkout_txn(
 }
 
 pub(super) fn remove_worktree(source: &Path, worktree_path: &str) -> bool {
-    crate::git_helpers::git_bypass(
-        source,
-        &["worktree", "remove", "--force", worktree_path],
-    )
-    .map(|output| output.status.success())
-    .unwrap_or(false)
+    crate::git_helpers::git_bypass(source, &["worktree", "remove", "--force", worktree_path])
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 /// Classify a marker-bearing, unbound checkout target before invoking Git.

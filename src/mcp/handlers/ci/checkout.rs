@@ -303,9 +303,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // lands on the named branch, #778.)
     // Bounded worktree rollback (LOCAL git via bypass), reused by every failure
     // path below so each checked-save failure leaves no orphan.
-    let remove_worktree = || {
-        super::checkout_helpers::remove_worktree(Path::new(&source_path), &worktree_path_str)
-    };
+    let remove_worktree =
+        || super::checkout_helpers::remove_worktree(Path::new(&source_path), &worktree_path_str);
     // Prepared: durably journal the intent BEFORE any filesystem side effect. A
     // failed save here is fatal-but-clean (no side effect yet).
     let mut journal = super::checkout_txn::Journal::prepared(
