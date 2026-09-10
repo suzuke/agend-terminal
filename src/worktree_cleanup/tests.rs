@@ -240,6 +240,35 @@ fn test_sweep_noop_when_flag_disabled() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// t-…-315 Step 2: workspace/review clones are not branch-sweep roots, while
+/// a formal repository outside the daemon home keeps the existing path.
+#[test]
+fn sweep_root_scope_excludes_daemon_workspace_and_worktrees() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("sweep-root-scope");
+    let workspace = crate::paths::workspace_dir(&home).join("agent");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let managed_worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+        .join("agent")
+        .join("review");
+    std::fs::create_dir_all(&managed_worktree).unwrap();
+
+    assert_eq!(
+        super::sweep_root_exclusion(&home, &workspace),
+        Some("agent_workspace_or_review_clone")
+    );
+    assert_eq!(
+        super::sweep_root_exclusion(&home, &managed_worktree),
+        Some("daemon_managed_review_worktree")
+    );
+
+    let formal_repo = setup_test_repo("sweep-root-formal");
+    assert_eq!(super::sweep_root_exclusion(&home, &formal_repo), None);
+
+    std::fs::remove_dir_all(&formal_repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// PR-D6 re-target of `test_sweep_dry_run_by_default_identifies_but_does_not_delete`
 /// (a #2695 prune_live-gate test). Old contract: `PRUNE_LIVE=0` forced dry-run,
 /// so the merged worktree was REPORTED but NOT removed. New contract: the
