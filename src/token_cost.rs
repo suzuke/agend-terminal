@@ -651,8 +651,10 @@ fn build_task_windows(
                     close_window(&mut result, &mut open, &mut holder, &inst, ts);
                 }
             }
-            TaskEvent::Released { task_id, .. } => {
-                // No `by` — close whichever instance currently holds it open.
+            TaskEvent::Released { task_id, .. }
+            | TaskEvent::OperatorSettled { task_id, .. } => {
+                // Settlement's actor is the operator, not the allocation
+                // holder. Close only this task's replay-derived holder.
                 if let Some(inst) = holder.get(&task_id.0).cloned() {
                     close_window(&mut result, &mut open, &mut holder, &inst, ts);
                 }
