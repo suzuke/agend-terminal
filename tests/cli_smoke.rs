@@ -19,6 +19,10 @@ fn cmd() -> Command {
 
 #[test]
 #[cfg(unix)]
+// This fixture intentionally treats daemon/bootstrap corruption as a test
+// failure; keep the setup assertions local instead of obscuring them behind
+// fallible plumbing in this end-to-end smoke test.
+#[allow(clippy::unwrap_used)]
 fn operator_settlement_3553_cli_positive_roundtrip() {
     use std::time::{Duration, Instant};
     struct Fixture {
@@ -144,6 +148,9 @@ fn operator_settlement_3553_cli_positive_roundtrip() {
 }
 
 #[test]
+// This fixture intentionally treats daemon/bootstrap corruption as a test
+// failure; keep the setup assertion local in this end-to-end smoke test.
+#[allow(clippy::unwrap_used)]
 fn operator_settlement_3553_cli_transport_failure_is_nonzero() {
     struct Home(std::path::PathBuf);
     impl Drop for Home {

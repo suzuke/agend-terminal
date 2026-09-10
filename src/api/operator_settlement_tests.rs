@@ -1,4 +1,8 @@
 //! Real socket entry contract, using an isolated home and no agent processes.
+// Test fixtures intentionally fail fast on impossible setup/fixture corruption;
+// keep this allowance scoped to this integration-test module only.
+#![allow(clippy::unwrap_used)]
+
 use super::*;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};

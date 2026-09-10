@@ -107,7 +107,10 @@ pub fn remove_all_for_task(home: &Path, task_id: &str) {
 /// Settlement must retain unreadable state and report cleanup pending.
 pub(crate) fn remove_all_for_task_checked(home: &Path, task_id: &str) -> anyhow::Result<()> {
     let path = store_path(home);
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let Some(parent) = path.parent() else {
+        anyhow::bail!("dispatch tracking path has no parent");
+    };
+    std::fs::create_dir_all(parent)?;
     let _lock = crate::store::acquire_file_lock(&path.with_extension("lock"))?;
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
