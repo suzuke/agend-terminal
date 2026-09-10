@@ -1230,14 +1230,12 @@ pub(crate) fn retire_for_terminal_event(
         instance: instance.to_string(),
         seq,
     };
-    let branches = active_branches(home)
-        .into_iter()
-        .filter(|(repo, branch)| {
-            list_active(home, repo, branch)
-                .iter()
-                .any(|record| record.task_id == task_id)
-        })
-        .collect::<Vec<_>>();
+    let mut branches = Vec::new();
+    for (repo, branch) in active_branches_checked(home)? {
+        if list_active_checked(home, &repo, &branch)?.iter().any(|record| record.task_id == task_id) {
+            branches.push((repo, branch));
+        }
+    }
     let mut retired = 0;
     let mut cleanup_tasks = Vec::new();
     for (repo, branch) in branches {
@@ -1247,7 +1245,7 @@ pub(crate) fn retire_for_terminal_event(
         if ledger.contains(&key) {
             continue;
         }
-        let records = list_active(home, &repo, &branch)
+        let records = list_active_checked(home, &repo, &branch)?
             .into_iter()
             .filter(|record| record.task_id == task_id)
             .collect::<Vec<_>>();
@@ -1734,6 +1732,33 @@ pub(crate) fn active_branches(home: &Path) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Terminal cleanup must distinguish corrupt authority from genuine absence.
+/// Keep the reconciler's best-effort enumeration separate from this strict read.
+fn active_branches_checked(home: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let entries = match std::fs::read_dir(base_dir(home)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut branches = std::collections::BTreeSet::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for record in std::fs::read_dir(entry.path())? {
+            let path = record?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") || is_metadata_json(&path) {
+                continue;
+            }
+            if let Some(record) = read_record(&path)? {
+                branches.insert((record.repo, record.branch));
+            }
+        }
+    }
+    Ok(branches.into_iter().collect())
 }
 
 // ─────────────────────────── C7: 3-state evidence classifier ───────────────────────────
