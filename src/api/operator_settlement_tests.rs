@@ -104,3 +104,23 @@ fn operator_settlement_3553_real_socket_reaches_preview_not_agent() {
     assert_eq!(response["ok"], false);
     assert_eq!(response["code"], "task_not_found", "operator must reach strict task lookup: {response}");
 }
+
+#[test]
+#[serial_test::serial]
+fn operator_settlement_3553_preview_is_nonmutating_and_exact() {
+    let server = Server::start();
+    let created = serde_json::from_value(json!({
+        "kind":"Created", "task_id":"preview-row", "title":"Exact row",
+        "description":"Keep this work", "priority":"normal", "owner":null
+    })).unwrap();
+    crate::task_events::append(&server.home, &"fixture".into(), created).unwrap();
+    let before = serde_json::to_value(crate::task_events::replay(&server.home).unwrap()).unwrap();
+    let response = server.request(true, json!({"method":"task_settlement_preview", "params":{
+        "task_id":"preview-row", "target":"cancelled", "result":"duplicate confirmed by operator"
+    }}));
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["result"]["task_id"], "preview-row");
+    assert_eq!(response["result"]["target"], "cancelled");
+    assert!(response["result"]["confirmation"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(before, serde_json::to_value(crate::task_events::replay(&server.home).unwrap()).unwrap());
+}
