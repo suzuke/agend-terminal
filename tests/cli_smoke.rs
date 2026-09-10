@@ -17,6 +17,28 @@ fn cmd() -> Command {
     Command::cargo_bin("agend-terminal").expect("binary must exist")
 }
 
+#[test]
+fn operator_settlement_3553_cli_transport_failure_is_nonzero() {
+    struct Home(std::path::PathBuf);
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let home = Home(std::env::temp_dir().join(format!("settlement-cli-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir(&home.0).unwrap();
+    for args in [
+        vec!["admin", "task-settlement-preview", "--task-id", "missing",
+             "--target", "done", "--result", "inspected"],
+        vec!["admin", "task-settlement-apply", "--confirmation", "unused"],
+    ] {
+        cmd().env("AGEND_HOME", &home.0)
+            .timeout(std::time::Duration::from_secs(10))
+            .args(args).assert().failure()
+            .stderr(predicate::str::contains("no active daemon"));
+    }
+}
+
 /// `agend --version` must output the Cargo.toml package version.
 #[test]
 fn version_outputs_cargo_toml_version() {
