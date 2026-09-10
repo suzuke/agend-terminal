@@ -40,15 +40,22 @@ fn sample_event(id: &str) -> TaskEvent {
 /// operator ingress tests, not to this event-level fixture.
 #[test]
 fn operator_settlement_3553_is_exact_and_keeps_replay_audit() {
+    struct TestHome(PathBuf);
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
     for target in ["done", "cancelled"] {
-        let home = tempfile::tempdir().unwrap();
+        let guard = TestHome(tmp_home("operator-settlement-3553"));
+        let home = guard.0.as_path();
         let operator = InstanceName::from("operator");
-        append(home.path(), &operator, sample_event("t-root")).unwrap();
+        append(home, &operator, sample_event("t-root")).unwrap();
         let mut child = sample_event("t-child");
         if let TaskEvent::Created { parent_id, .. } = &mut child {
             *parent_id = Some(TaskId::from("t-root"));
         }
-        append(home.path(), &operator, child).unwrap();
+        append(home, &operator, child).unwrap();
         let event = serde_json::json!({
             "kind": "OperatorSettled",
             "task_id": "t-root",
@@ -60,8 +67,8 @@ fn operator_settlement_3553_is_exact_and_keeps_replay_audit() {
             "result": "operator inspected this exact row"
         });
         let event: TaskEvent = serde_json::from_value(event).expect("audited settlement event");
-        append(home.path(), &operator, event).unwrap();
-        let state = replay(home.path()).unwrap();
+        append(home, &operator, event).unwrap();
+        let state = replay(home).unwrap();
         let root = &state.tasks[&TaskId::from("t-root")];
         assert_eq!(root.status.to_string(), target);
         assert_eq!(
@@ -77,15 +84,16 @@ fn operator_settlement_3553_is_exact_and_keeps_replay_audit() {
         // A later reopen must retain proof so replaying an old confirmation
         // can report its original outcome without re-settling this task.
         append(
-            home.path(),
+            home,
             &operator,
             TaskEvent::Reopened {
                 task_id: "t-root".into(),
                 reason: "new work".into(),
+                source_evidence: None,
             },
         )
         .unwrap();
-        let reopened = replay(home.path()).unwrap();
+        let reopened = replay(home).unwrap();
         let row = serde_json::to_value(&reopened.tasks[&TaskId::from("t-root")]).unwrap();
         assert_eq!(row["status"], "open");
         assert_eq!(row["operator_settlements"]["op-3553"], *proof);
