@@ -1,5 +1,19 @@
 use super::*;
 
+#[test]
+fn operator_settlement_3553_retirement_corruption_is_not_absence() {
+    let home = tmp_home("3553-corrupt-retirement");
+    let dir = branch_dir(&home, "o/r", "feat/corrupt");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("reviewer.json");
+    std::fs::write(&path, b"not-json").unwrap();
+    let result = retire_for_terminal_event(&home, "default", "exact-task", "operator", 1, "2026-09-10T00:00:00Z");
+    let preserved = std::fs::read(&path).unwrap();
+    std::fs::remove_dir_all(&home).unwrap();
+    assert!(result.is_err(), "corrupt assignment was reported as successful retirement: {result:?}");
+    assert_eq!(preserved, b"not-json");
+}
+
 fn tmp_home(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static C: AtomicU32 = AtomicU32::new(0);
