@@ -1538,6 +1538,31 @@ mod tests {
     }
 
     #[test]
+    fn operator_settlement_3553_closes_only_actual_task_holder() {
+        use crate::task_events::{OperatorSettlement, OperatorSettlementTarget};
+        for target in [OperatorSettlementTarget::Done, OperatorSettlementTarget::Cancelled] {
+            let settled = TaskEvent::OperatorSettled {
+                task_id: "A".into(),
+                proof: OperatorSettlement {
+                    operation_id: "op-window".into(),
+                    preview_digest: "exact".into(),
+                    by: "operator".into(),
+                    holder_instance: Some("dev-a".into()),
+                    target,
+                    result: "exact settlement".into(),
+                },
+            };
+            let windows = build_task_windows(&[
+                env(100, "dev-a", claimed("A", "dev-a")),
+                env(110, "operator", claimed("unrelated", "operator")),
+                env(150, "operator", settled),
+            ]);
+            assert_eq!(windows["dev-a"][0].end_ms, Some(150_000));
+            assert_eq!(windows["operator"][0].end_ms, None);
+        }
+    }
+
+    #[test]
     fn windows_reclaim_yields_disjoint_windows() {
         // A → B → A on one instance: two disjoint A windows.
         let w = build_task_windows(&[
