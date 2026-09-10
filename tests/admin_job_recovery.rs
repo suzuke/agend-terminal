@@ -232,7 +232,11 @@ fn recovery_admin_cli_resolves_seeded_run_against_isolated_daemon() {
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(home.join("fleet.yaml"), "instances: {}\n").unwrap();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "schema_version: 1\ndefaults:\n  backend: shell\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(home.join("artifacts")).unwrap();
     std::fs::write(
         home.join("schedule-jobs.json"),
