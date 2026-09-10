@@ -152,6 +152,7 @@ fn make_record(
         routed_to: None,
         result: None,
         superseded_by: None,
+        last_operator_settlement: None,
         branch: None,
         bind: None,
         started_at: None,

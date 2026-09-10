@@ -115,8 +115,14 @@ fn operator_settlement_3553_is_exact_and_keeps_replay_audit() {
         compact_at_with_keep(home, 1).unwrap();
         let compacted = replay(home).unwrap();
         let row = serde_json::to_value(&compacted.tasks[&TaskId::from("t-root")]).unwrap();
-        assert_eq!(row["last_operator_settlement"]["operation_id"], "op-3553-second");
-        assert_eq!(compacted.tasks[&TaskId::from("t-child")].status, TaskStatus::Open);
+        assert_eq!(
+            row["last_operator_settlement"]["operation_id"],
+            "op-3553-second"
+        );
+        assert_eq!(
+            compacted.tasks[&TaskId::from("t-child")].status,
+            TaskStatus::Open
+        );
         let operations: Vec<_> = envelopes_for_task_at(home, "t-root")
             .unwrap()
             .into_iter()
