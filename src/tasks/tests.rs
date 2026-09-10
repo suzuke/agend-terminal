@@ -253,8 +253,8 @@ fn make_record_with_age_days(
     r
 }
 
-/// #830: status counts roll up across all 4 active states +
-/// Done/Cancelled terminals. Totals stay consistent
+/// #3584: status counts cover all statuses, including Superseded as
+/// terminal and Verified as non-terminal. Totals stay consistent
 /// (`all = non_terminal + terminal`).
 #[test]
 fn build_health_response_reports_status_counts_correctly() {
@@ -267,21 +267,29 @@ fn build_health_response_reports_status_counts_correctly() {
         make_record("t-5", TaskStatus::Blocked, None),
         make_record("t-6", TaskStatus::Done, Some("alpha")),
         make_record("t-7", TaskStatus::Cancelled, None),
+        make_record("t-8", TaskStatus::Backlog, None),
+        make_record("t-9", TaskStatus::InReview, None),
+        make_record("t-10", TaskStatus::Verified, None),
+        make_record("t-11", TaskStatus::Superseded, None),
     ]);
     let live = make_set(&["alpha"]);
     let fleet = make_set(&["alpha"]);
 
     let resp = build_health_response(&state, Some(&live), &fleet);
 
-    assert_eq!(resp["totals"]["all"], 7);
-    assert_eq!(resp["totals"]["non_terminal"], 5);
-    assert_eq!(resp["totals"]["terminal"], 2);
+    assert_eq!(resp["totals"]["all"], 11);
+    assert_eq!(resp["totals"]["non_terminal"], 8);
+    assert_eq!(resp["totals"]["terminal"], 3);
     assert_eq!(resp["by_status"]["open"], 2);
     assert_eq!(resp["by_status"]["claimed"], 1);
     assert_eq!(resp["by_status"]["in_progress"], 1);
     assert_eq!(resp["by_status"]["blocked"], 1);
     assert_eq!(resp["by_status"]["done"], 1);
     assert_eq!(resp["by_status"]["cancelled"], 1);
+    assert_eq!(resp["by_status"]["backlog"], 1);
+    assert_eq!(resp["by_status"]["in_review"], 1);
+    assert_eq!(resp["by_status"]["verified"], 1);
+    assert_eq!(resp["by_status"]["superseded"], 1);
 }
 
 /// #830: a clean board (no ghosts, no stale claims, low age,
