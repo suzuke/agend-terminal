@@ -20,7 +20,7 @@
 //! no sweep). `AGEND_WORKTREE_PRUNE_LIVE` is ignored — a boot-time check
 //! (`warn_if_prune_live_retired`) fails LOUD if an operator still has it set.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -448,6 +448,36 @@ fn surface_aged_preserved_review_intents(
     }
 }
 
+/// Return the semantic reason a repository root is owned by the daemon's
+/// workspace/review lifecycle rather than the branch-sweep lifecycle.
+///
+/// The roots are canonicalized before containment checks so a symlinked home
+/// or a relative binding cannot evade (or accidentally trigger) the boundary.
+/// A failed canonicalization is deliberately treated as "not excluded": the
+/// sweep remains fail-closed and preserves the existing formal-repository
+/// behavior instead of guessing from a path string.
+fn sweep_root_exclusion(home: &Path, repo_root: &Path) -> Option<&'static str> {
+    let repo_root = dunce::canonicalize(repo_root).ok()?;
+    let workspace_root = dunce::canonicalize(crate::paths::workspace_dir(home)).ok();
+    if workspace_root
+        .as_ref()
+        .is_some_and(|root| repo_root.starts_with(root))
+    {
+        return Some("agent_workspace_or_review_clone");
+    }
+
+    let managed_worktree_root =
+        dunce::canonicalize(crate::worktree_pool::daemon_managed_worktree_root(home)).ok();
+    if managed_worktree_root
+        .as_ref()
+        .is_some_and(|root| repo_root.starts_with(root))
+    {
+        return Some("daemon_managed_review_worktree");
+    }
+
+    None
+}
+
 pub fn sweep_from_registry(
     home: &Path,
     configs: &HashMap<String, Option<PathBuf>>,
@@ -457,9 +487,26 @@ pub fn sweep_from_registry(
         return Vec::new();
     }
 
+    let mut skipped_roots = BTreeMap::<&'static str, usize>::new();
     let repos: HashSet<PathBuf> = crate::binding::all_managed_repos(home)
         .into_iter()
+        .filter(|repo| {
+            if let Some(reason) = sweep_root_exclusion(home, repo) {
+                *skipped_roots.entry(reason).or_default() += 1;
+                false
+            } else {
+                true
+            }
+        })
         .collect();
+    if !skipped_roots.is_empty() {
+        let skipped_count: usize = skipped_roots.values().sum();
+        tracing::info!(
+            skipped_count,
+            reasons = ?skipped_roots,
+            "branch sweep skipped agent workspace/review clone roots"
+        );
+    }
     let mut active_dirs: Vec<PathBuf> = configs.values().flatten().cloned().collect();
     // Add fleet.yaml dirs as fallback for stopped agents
     active_dirs.extend(fleet_dirs.iter().cloned());
