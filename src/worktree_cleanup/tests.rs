@@ -1795,6 +1795,73 @@ fn terminal_candidate_still_probes_freshly_3011() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3583: a legacy worktree registration left behind after an agent
+/// rebind must not be mistaken for a live binding. The branch remains
+/// preserved while Git still reports it checked out, but the attempted delete
+/// must produce the explicit retained/retry hygiene reason.
+#[test]
+fn registered_legacy_worktree_without_binding_reports_delete_retry_3583() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("3583-rebind-legacy");
+    let branch = "feat/rebind-legacy";
+    make_old_dated_branch(&repo, branch, "2024-01-01T00:00:00 +0000");
+    git_in(&repo, &["merge", branch]);
+
+    let legacy = repo
+        .parent()
+        .unwrap()
+        .join(format!("legacy-rebind-{}", std::process::id()));
+    git_in(
+        &repo,
+        &["worktree", "add", legacy.to_str().unwrap(), branch],
+    );
+    let stale_registration = repo
+        .parent()
+        .unwrap()
+        .join(format!("legacy-rebind-gone-{}", std::process::id()));
+    std::fs::rename(&legacy, &stale_registration).expect("simulate stale registered path");
+
+    let home = tmp_home("3583-rebind-legacy");
+    let rebound = home.join("workspace").join("new-agent");
+    write_full_binding(&home, "new-agent", "feat/new", &repo, &rebound);
+    let pruned = prune_orphaned_branches_with_home(Some(&home), &repo, false);
+
+    assert!(
+        pruned.iter().all(|(name, _)| name != branch),
+        "stale registered branch must remain for retry: {pruned:?}"
+    );
+    assert!(branch_exists(&repo, branch), "branch must remain for retry");
+    let key = format!("residue-delete-failed:{}:{branch}", repo.display());
+    let tasks = hygiene_tasks(&home);
+    let (_, evidence) = tasks
+        .iter()
+        .find(|(task_key, _)| task_key == &key)
+        .unwrap_or_else(|| panic!("retained delete failure must be observable: {tasks:?}"));
+    assert!(
+        evidence["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("checked out"),
+        "retry reason must name Git's registration refusal: {evidence}"
+    );
+
+    git_in(&repo, &["worktree", "prune"]);
+    let retried = prune_orphaned_branches_with_home(Some(&home), &repo, false);
+    assert!(
+        retried
+            .iter()
+            .any(|(name, reason)| { name == branch && *reason == "merged" }),
+        "the next bounded retry must converge after metadata prune: {retried:?}"
+    );
+    assert!(
+        !branch_exists(&repo, branch),
+        "retry must delete the merged branch"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ---------------------------------------------------------------------------
 // t-…-241: an episode is re-observed every sweep tick forever, so the sweep
 // must first ask whether its subject still exists. Measured on the fleet board

@@ -803,10 +803,8 @@ fn nested_unbound_registered_fixture(
         "fixture branch creation failed: {branch_result:?}"
     );
     let target_str = target.to_str().expect("UTF-8 target");
-    let add_result = crate::git_helpers::git_bypass(
-        &repo,
-        &["worktree", "add", "--detach", target_str, branch],
-    );
+    let add_result =
+        crate::git_helpers::git_bypass(&repo, &["worktree", "add", "--detach", target_str, branch]);
     assert!(
         add_result.as_ref().is_ok_and(|out| out.status.success()),
         "fixture worktree add failed: {add_result:?}"
@@ -1617,7 +1615,10 @@ fn release_full_nested_unbound_registered_fails_closed_3583() {
         error.contains("nested") && error.contains("preserved"),
         "refusal must identify the nested survivor and preservation route: {outcome:?}"
     );
-    assert!(target.exists(), "failed-closed release must preserve target");
+    assert!(
+        target.exists(),
+        "failed-closed release must preserve target"
+    );
     assert_eq!(
         worktree_list(&repo),
         before,
