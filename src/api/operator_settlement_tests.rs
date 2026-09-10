@@ -201,6 +201,42 @@ fn operator_settlement_3553_expired_confirmation_cannot_mutate() {
 
 #[test]
 #[serial_test::serial]
+fn operator_settlement_3553_corrupt_assignment_reports_pending_then_retries() {
+    let server = Server::start();
+    let created = serde_json::from_value(json!({
+        "kind":"Created", "task_id":"cleanup-row", "title":"Exact row",
+        "description":"original", "priority":"normal", "owner":null
+    })).unwrap();
+    crate::task_events::append(&server.home, &"fixture".into(), created).unwrap();
+    let preview = server.request(true, json!({"method":"task_settlement_preview", "params":{
+        "task_id":"cleanup-row", "target":"cancelled", "result":"operator confirmed"
+    }}));
+    assert_eq!(preview["ok"], true, "{preview}");
+    // A malformed authority row must not be silently skipped as an empty store.
+    let directory = server.home.join("reviewer-assignments").join("corrupt-fixture");
+    std::fs::create_dir_all(&directory).unwrap();
+    let corrupt = directory.join("reviewer.json");
+    std::fs::write(&corrupt, b"not-json").unwrap();
+    let request = json!({"method":"task_settlement_apply", "params":{
+        "confirmation":preview["result"]["confirmation"]
+    }});
+    let response = server.request(true, request.clone());
+    assert_eq!(response["ok"], true, "settlement itself must commit: {response}");
+    let before = serde_json::to_value(crate::task_events::replay(&server.home).unwrap()).unwrap();
+    assert_eq!(crate::task_events::replay(&server.home).unwrap().tasks[&"cleanup-row".into()].status.to_string(), "cancelled");
+    assert_eq!(response["result"]["cleanup_status"], "pending", "{response}");
+    assert_eq!(std::fs::read(&corrupt).unwrap(), b"not-json");
+    // Repair only the test-owned corrupt artifact, then retry the same operation.
+    std::fs::remove_file(&corrupt).unwrap();
+    let retry = server.request(true, request);
+    assert_eq!(retry["ok"], true, "{retry}");
+    assert_eq!(retry["result"]["already_applied"], true);
+    assert_eq!(retry["result"]["cleanup_status"], "complete", "{retry}");
+    assert_eq!(before, serde_json::to_value(crate::task_events::replay(&server.home).unwrap()).unwrap());
+}
+
+#[test]
+#[serial_test::serial]
 fn operator_settlement_3553_retry_after_reopen_reports_current_state() {
     use crate::task_events::{append, replay, TaskEvent};
     let server = Server::start();
