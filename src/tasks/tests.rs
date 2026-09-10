@@ -1,7 +1,8 @@
 use super::acl::{can_mutate_task, is_system_identity};
 use super::orphan::{
-    build_health_response, classify_owner, release_inprogress_orphans_with_live,
-    scan_inprogress_orphans, scan_orphan_candidates, OwnerClassification,
+    build_health_response, classify_owner, plan_strict_in_review_ghosts,
+    release_inprogress_orphans_with_live, scan_inprogress_orphans, scan_orphan_candidates,
+    OwnerClassification,
 };
 use super::sweep;
 use super::*;
@@ -405,6 +406,52 @@ fn build_health_response_includes_stale_claims_via_due_at() {
 /// ghost_owners scan effectively treats all owners as ghosts (live
 /// set is empty), which is the worst case but at least operator
 /// can see the snapshot.
+#[test]
+fn strict_in_review_ghost_planner_is_report_only_and_exact_confirmed() {
+    use crate::task_events::TaskStatus;
+    let state = make_state(vec![
+        make_record("t-review", TaskStatus::InReview, Some("ghost-h2")),
+        make_record("t-open", TaskStatus::Open, Some("ghost-h2")),
+    ]);
+    let live = make_set(&[]);
+    let fleet = make_set(&[]);
+    let none = std::collections::HashSet::new();
+    let report = plan_strict_in_review_ghosts(&state, &live, &fleet, false, &none, "");
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["candidate_ids"], serde_json::json!(["t-review"]));
+
+    let mut confirmed = std::collections::HashSet::new();
+    confirmed.insert("t-review".to_string());
+    let applied =
+        plan_strict_in_review_ghosts(&state, &live, &fleet, true, &confirmed, "operator review");
+    assert_eq!(applied["mutation"], "none");
+    assert_eq!(applied["approved_ids"], serde_json::json!(["t-review"]));
+}
+
+#[test]
+fn strict_in_review_ghost_planner_rejects_unknown_confirm_id_or_reason() {
+    use crate::task_events::TaskStatus;
+    let state = make_state(vec![make_record(
+        "t-review",
+        TaskStatus::InReview,
+        Some("ghost-h2"),
+    )]);
+    let live = make_set(&[]);
+    let fleet = make_set(&[]);
+    let mut confirmed = std::collections::HashSet::new();
+    confirmed.insert("t-other".to_string());
+    assert!(
+        plan_strict_in_review_ghosts(&state, &live, &fleet, true, &confirmed, "why")["error"]
+            .is_string()
+    );
+    confirmed.clear();
+    confirmed.insert("t-review".to_string());
+    assert!(
+        plan_strict_in_review_ghosts(&state, &live, &fleet, true, &confirmed, " ")["error"]
+            .is_string()
+    );
+}
+
 #[test]
 fn build_health_response_handles_daemon_offline_gracefully() {
     use crate::task_events::TaskStatus;

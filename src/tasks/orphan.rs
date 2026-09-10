@@ -321,6 +321,71 @@ pub struct OrphanScanResult {
     pub soft: std::collections::BTreeMap<String, Vec<crate::task_events::TaskId>>,
 }
 
+/// Read-only policy planner for strict ghost owners on InReview tasks.
+/// InReview is never auto-orphaned; an apply request only acknowledges an
+/// exact subset of freshly verified candidates and emits no board mutation.
+pub fn plan_strict_in_review_ghosts(
+    state: &crate::task_events::TaskBoardState,
+    live: &std::collections::HashSet<String>,
+    fleet_instances: &std::collections::HashSet<String>,
+    apply: bool,
+    confirm_ids: &std::collections::HashSet<String>,
+    audit_reason: &str,
+) -> Value {
+    let mut candidates = std::collections::BTreeMap::<String, Value>::new();
+    for record in state.tasks.values() {
+        let Some(owner) = record.owner.as_ref() else {
+            continue;
+        };
+        if record.status == TaskStatus::InReview
+            && classify_owner(owner.0.as_str(), live, fleet_instances)
+                == OwnerClassification::Strict
+        {
+            candidates.insert(
+                record.id.0.clone(),
+                serde_json::json!({"id": record.id, "owner": owner.0, "status": "in_review"}),
+            );
+        }
+    }
+    let candidate_ids: std::collections::BTreeSet<String> = candidates.keys().cloned().collect();
+    if !apply {
+        return serde_json::json!({
+            "dry_run": true,
+            "policy": "strict_ghost_owner_in_review",
+            "candidates": candidates.values().collect::<Vec<_>>(),
+            "candidate_ids": candidate_ids,
+            "total_candidates": candidates.len(),
+            "to_apply_hint": "apply=true confirm_ids=<exact subset> audit_reason=<...>",
+        });
+    }
+    if confirm_ids.is_empty() {
+        return serde_json::json!({"error": "apply=true requires non-empty confirm_ids"});
+    }
+    let reason = audit_reason.trim();
+    if reason.is_empty() {
+        return serde_json::json!({"error": "apply=true requires non-empty audit_reason"});
+    }
+    let unknown: Vec<String> = confirm_ids
+        .iter()
+        .filter(|id| !candidate_ids.contains(*id))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        return serde_json::json!({
+            "error": "confirm_ids are not an exact subset of fresh candidates",
+            "unknown": unknown,
+            "hint": "re-run the report-only planner",
+        });
+    }
+    serde_json::json!({
+        "dry_run": false,
+        "policy": "strict_ghost_owner_in_review",
+        "approved_ids": confirm_ids,
+        "audit_reason": reason,
+        "mutation": "none",
+    })
+}
+
 /// #829 pure scan. Walks `state.tasks` and classifies each non-
 /// terminal task's owner via [`classify_owner`]. Terminal-status tasks
 /// (Done / Cancelled) are skipped — their ACL is already disabled at
@@ -408,6 +473,28 @@ pub fn reconcile_orphan_owners_with_live(home: &Path, live: &std::collections::H
         }
     };
 
+    let empty_confirm_ids = std::collections::HashSet::new();
+    let in_review_plan = plan_strict_in_review_ghosts(
+        &state,
+        live,
+        &fleet_instances,
+        false,
+        &empty_confirm_ids,
+        "",
+    );
+    if in_review_plan["total_candidates"]
+        .as_u64()
+        .unwrap_or_default()
+        > 0
+    {
+        tracing::warn!(
+            candidates = in_review_plan["total_candidates"]
+                .as_u64()
+                .unwrap_or_default(),
+            "#829: strict ghost owners on InReview tasks are report-only; no mutation applied"
+        );
+    }
+
     let result = scan_orphan_candidates(&state, live, &fleet_instances);
     if result.strict.is_empty() && result.soft.is_empty() {
         tracing::debug!("#829: orphan-owner sweep clean — no ghost owners detected");
@@ -416,10 +503,27 @@ pub fn reconcile_orphan_owners_with_live(home: &Path, live: &std::collections::H
 
     // Strict bucket → auto-apply via orphan_tasks_for_owner.
     for (owner, task_ids) in &result.strict {
+        let actionable_count = task_ids
+            .iter()
+            .filter(|id| {
+                state
+                    .tasks
+                    .get(*id)
+                    .is_some_and(|record| record.status != TaskStatus::InReview)
+            })
+            .count();
+        if actionable_count == 0 {
+            tracing::info!(
+                owner = %owner,
+                tasks = task_ids.len(),
+                "#829: strict InReview ghost-owner candidates remain report-only"
+            );
+            continue;
+        }
         match orphan_tasks_for_owner(home, owner) {
             Ok(n) => tracing::info!(
                 owner = %owner,
-                tasks = task_ids.len(),
+                tasks = actionable_count,
                 orphaned = n,
                 "#829: orphan-owner sweep applied (strict — owner fully gone)"
             ),
