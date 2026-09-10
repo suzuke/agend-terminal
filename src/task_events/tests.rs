@@ -120,7 +120,7 @@ fn operator_settlement_3553_is_exact_and_keeps_replay_audit() {
         let operations: Vec<_> = envelopes_for_task_at(home, "t-root")
             .unwrap()
             .into_iter()
-            .filter(|env| env.event.kind_str() == "OperatorSettled")
+            .filter(|env| env.event.kind_str() == "operator_settled")
             .map(|env| serde_json::to_value(env.event).unwrap())
             .collect();
         assert_eq!(operations.len(), 2);
