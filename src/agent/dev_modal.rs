@@ -124,6 +124,10 @@ pub(crate) const RELAXED_AFTER_INCOMPLETE_FRAMES: u32 = 24;
 /// `anchor_reaches_bottom` also checks the option text and order.
 pub(crate) const ANCHOR_TAIL_MAX_LINES: usize = 4;
 
+/// Keep the relaxed anchor itself local to one rendered modal block. A quoted
+/// or replayed warning can otherwise satisfy the five literals across an
+/// arbitrarily long transcript before the bounded tail check is reached.
+
 /// Hard ceiling on answers per generation, across all fingerprints.
 ///
 /// #3547 D(i) replaces the per-generation one-shot with a per-fingerprint one,
@@ -1185,6 +1189,14 @@ mod resilience_3547_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn anchor_block_span_is_bounded_3561() {
+        let mut screen = String::from("WARNING: Loading development channels");
+        screen.push_str(&"\n".repeat(ANCHOR_BLOCK_MAX_LINES + 1));
+        screen.push_str("is for local channel development\nDo not use this option to run channels\nPlease use --channels to run a list of approved channels\nChannels:\n");
+        assert!(anchored_modal_digest(&screen).is_none());
     }
 
     /// #3547 observability: the tally reports the LAST refuse, not the first.
