@@ -274,28 +274,27 @@ fn second_detached_start_rejects_existing_daemon() {
     )
     .expect("write fleet.yaml");
 
-    /// Graceful teardown only. `stop` is asynchronous and its result was
-    /// already being ignored; `home_guard` drops after this and does the
-    /// verifying + escalation to SIGTERM/SIGKILL, then removes the directory.
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = Command::cargo_bin("agend-terminal")
-                .expect("binary must exist")
-                .env("AGEND_HOME", &self.0)
-                .arg("stop")
-                .output();
-        }
-    }
-    let _cleanup = Cleanup(home.clone());
-
     cmd()
         .env("AGEND_HOME", &home)
+        .env_remove("AGEND_SUCCESSOR_HANDOFF")
+        .env_remove("AGEND_SUCCESSOR_REQUESTER")
+        .env_remove("AGEND_RESTART_HANDOFF")
+        .env_remove("AGEND_TELEGRAM_BOT_TOKEN")
+        .env_remove("AGEND_BOT_TOKEN")
+        .env_remove("AGEND_TELEGRAM_GROUP_ID")
+        .env_remove("AGEND_DISCORD_BOT_TOKEN")
         .arg("start")
         .assert()
         .success();
     cmd()
         .env("AGEND_HOME", &home)
+        .env_remove("AGEND_SUCCESSOR_HANDOFF")
+        .env_remove("AGEND_SUCCESSOR_REQUESTER")
+        .env_remove("AGEND_RESTART_HANDOFF")
+        .env_remove("AGEND_TELEGRAM_BOT_TOKEN")
+        .env_remove("AGEND_BOT_TOKEN")
+        .env_remove("AGEND_TELEGRAM_GROUP_ID")
+        .env_remove("AGEND_DISCORD_BOT_TOKEN")
         .arg("start")
         .assert()
         .failure()
