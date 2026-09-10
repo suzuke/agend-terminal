@@ -230,3 +230,35 @@ fn operator_settlement_3553_retry_after_reopen_reports_current_state() {
     assert_eq!(response["result"]["original_result"], "original outcome", "{response}");
     assert_eq!(response["result"]["current_status"], "open", "{response}");
 }
+
+#[test]
+#[serial_test::serial]
+fn operator_settlement_3553_agent_cannot_apply_valid_operator_token() {
+    let server = Server::start();
+    let created = serde_json::from_value(json!({
+        "kind":"Created", "task_id":"authority-row", "title":"Protected",
+        "description":"original", "priority":"normal", "owner":null
+    })).unwrap();
+    crate::task_events::append(&server.home, &"fixture".into(), created).unwrap();
+    let preview = server.request(true, json!({"method":"task_settlement_preview", "params":{
+        "task_id":"authority-row", "target":"done", "result":"operator inspected"
+    }}));
+    assert_eq!(preview["ok"], true, "{preview}");
+    let request = json!({"method":"task_settlement_apply", "params":{
+        "confirmation":preview["result"]["confirmation"]
+    }});
+    let before = serde_json::to_value(crate::task_events::replay(&server.home).unwrap()).unwrap();
+    for forged in [false, true] {
+        let mut attempt = request.clone();
+        if forged {
+            attempt["params"]["instance"] = json!("operator");
+            attempt["params"]["role"] = json!("orchestrator");
+        }
+        let denied = server.request(false, attempt);
+        assert_eq!(denied["ok"], false, "{denied}");
+        assert_eq!(denied["denied_by"], "capability", "{denied}");
+        assert_eq!(before, serde_json::to_value(crate::task_events::replay(&server.home).unwrap()).unwrap());
+    }
+    // A denied attempt must not consume the genuine operator's confirmation.
+    assert_eq!(server.request(true, request)["ok"], true);
+}
