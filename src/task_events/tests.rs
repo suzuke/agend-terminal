@@ -98,6 +98,35 @@ fn operator_settlement_3553_is_exact_and_keeps_replay_audit() {
         let row = serde_json::to_value(&reopened.tasks[&TaskId::from("t-root")]).unwrap();
         assert_eq!(row["status"], "open");
         assert_eq!(row["last_operator_settlement"], *proof);
+        // Projection stays bounded after another settlement. The original
+        // operation remains durable evidence even after it leaves the hot log.
+        let second: TaskEvent = serde_json::from_value(serde_json::json!({
+            "kind": "OperatorSettled",
+            "task_id": "t-root",
+            "operation_id": "op-3553-second",
+            "preview_digest": "second-preview-digest",
+            "by": "operator",
+            "holder_instance": null,
+            "target": target,
+            "result": "second exact confirmation"
+        }))
+        .unwrap();
+        append(home, &operator, second).unwrap();
+        compact_at_with_keep(home, 1).unwrap();
+        let compacted = replay(home).unwrap();
+        let row = serde_json::to_value(&compacted.tasks[&TaskId::from("t-root")]).unwrap();
+        assert_eq!(row["last_operator_settlement"]["operation_id"], "op-3553-second");
+        assert_eq!(compacted.tasks[&TaskId::from("t-child")].status, TaskStatus::Open);
+        let operations: Vec<_> = envelopes_for_task_at(home, "t-root")
+            .unwrap()
+            .into_iter()
+            .filter(|env| env.event.kind_str() == "OperatorSettled")
+            .map(|env| serde_json::to_value(env.event).unwrap())
+            .collect();
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0]["operation_id"], "op-3553");
+        assert_eq!(operations[0]["preview_digest"], "exact-preview-digest");
+        assert_eq!(operations[1]["operation_id"], "op-3553-second");
     }
 }
 
