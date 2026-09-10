@@ -49,14 +49,20 @@ fn operator_settlement_3553_locked_retirement_propagates_corruption() {
 #[test]
 fn operator_settlement_3553_retirement_corruption_is_not_absence() {
     let home = tmp_home("3553-corrupt-retirement");
+    seed_open_task(&home, "exact-task");
+    let seq = crate::task_events::append(&home, &"operator".into(),
+        crate::task_events::TaskEvent::Cancelled {
+            task_id:"exact-task".into(), by:"operator".into(), reason:"finished".into(),
+        }).unwrap();
     let dir = branch_dir(&home, "o/r", "feat/corrupt");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("reviewer.json");
     std::fs::write(&path, b"not-json").unwrap();
-    let result = retire_for_terminal_event(&home, "default", "exact-task", "operator", 1, "2026-09-10T00:00:00Z");
+    let result = retire_for_terminal_event(&home, "default", "exact-task", "operator", seq, "2026-09-10T00:00:00Z");
     let preserved = std::fs::read(&path).unwrap();
     std::fs::remove_dir_all(&home).unwrap();
     assert!(result.is_err(), "corrupt assignment was reported as successful retirement: {result:?}");
+    assert!(result.unwrap_err().to_string().contains("corrupt assignment"));
     assert_eq!(preserved, b"not-json");
 }
 
@@ -1217,18 +1223,12 @@ fn duplicate_terminal_event_key_is_a_durable_no_op() {
     )
     .unwrap();
 
-    assert_eq!(
-        retire_for_terminal_event(
-            &home,
-            "default",
-            task_id,
-            "finisher",
-            7,
-            "2026-08-27T00:00:02Z",
-        )
-        .unwrap(),
-        1
-    );
+    let seq = crate::task_events::append(&home, &"finisher".into(),
+        crate::task_events::TaskEvent::Cancelled {
+            task_id:task_id.into(), by:"finisher".into(), reason:"finished review".into(),
+        }).unwrap();
+    assert!(list_active(&home, "o/r", "feat/p3").is_empty(),
+        "real terminal append must retire the first assignment");
 
     let mut successor = mk_record("o/r", "feat/p3", "reviewer-b", 42, "2026-08-27T00:00:03Z");
     successor.task_id = task_id.to_string();
@@ -1240,7 +1240,7 @@ fn duplicate_terminal_event_key_is_a_durable_no_op() {
             "default",
             task_id,
             "finisher",
-            7,
+            seq,
             "2026-08-27T00:00:04Z",
         )
         .unwrap(),

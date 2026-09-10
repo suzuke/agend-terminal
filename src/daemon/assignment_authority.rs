@@ -1224,6 +1224,18 @@ pub(crate) fn retire_for_terminal_event(
     seq: u64,
     now: &str,
 ) -> anyhow::Result<usize> {
+    // A terminal event is authority for its own generation, not for whichever
+    // task/assignment currently reuses this ID. This preflight is also needed
+    // when the original cleanup found no assignments and wrote no ledger key.
+    let snapshots = crate::task_events::catalog::for_home(home)
+        .statuses(&[crate::task_events::TaskId(task_id.to_owned())])
+        .map_err(|error| anyhow::anyhow!("terminal cleanup task lookup failed: {error:?}"))?;
+    anyhow::ensure!(snapshots.iter().any(|snapshot| {
+        snapshot.board == board
+            && snapshot.status.is_some_and(|status| status.is_terminal())
+            && snapshot.terminal_event.as_ref()
+                .is_some_and(|(emitter, event_seq)| emitter.0 == instance && *event_seq == seq)
+    }), "stale terminal cleanup generation for {task_id}");
     let key = TerminalRetirementKey {
         board: board.to_string(),
         task_id: task_id.to_string(),
