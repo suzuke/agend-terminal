@@ -9,6 +9,11 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+mod common;
+#[cfg(unix)]
+use common::daemon_reaper::FixtureHome;
+
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_GRACE: Duration = Duration::from_secs(3);
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -227,10 +232,10 @@ fn recovery_admin_cli_refuses_agent_environment_before_connecting() {
 
 #[test]
 fn recovery_admin_cli_resolves_seeded_run_against_isolated_daemon() {
-    let home = std::env::temp_dir().join(format!(
-        "agend-admin-job-recovery-success-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let home_name = format!("agend-admin-job-recovery-success-{}", uuid::Uuid::new_v4());
+    #[cfg(unix)]
+    let _home_guard = FixtureHome::new(&home_name);
+    let home = std::env::temp_dir().join(&home_name);
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(
         home.join("fleet.yaml"),
@@ -348,15 +353,18 @@ fn recovery_admin_cli_resolves_seeded_run_against_isolated_daemon() {
         daemon.wait_bounded(DAEMON_STOP_TIMEOUT),
         "isolated daemon did not stop within bounded timeout"
     );
+    #[cfg(unix)]
+    drop(_home_guard);
+    #[cfg(not(unix))]
     std::fs::remove_dir_all(&home).unwrap();
 }
 
 #[test]
 fn recovery_fixture_reaps_daemon_when_observation_panics() {
-    let home = std::env::temp_dir().join(format!(
-        "agend-admin-job-recovery-failure-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let home_name = format!("agend-admin-job-recovery-failure-{}", uuid::Uuid::new_v4());
+    #[cfg(unix)]
+    let _home_guard = FixtureHome::new(&home_name);
+    let home = std::env::temp_dir().join(&home_name);
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("fleet.yaml"), "instances: {}\n").unwrap();
 
@@ -373,6 +381,9 @@ fn recovery_fixture_reaps_daemon_when_observation_panics() {
         reap_receipt.lock().unwrap().is_some(),
         "ChildGuard must observe an owned daemon exit status during unwinding"
     );
+    #[cfg(unix)]
+    drop(_home_guard);
+    #[cfg(not(unix))]
     std::fs::remove_dir_all(&home).unwrap();
 }
 
