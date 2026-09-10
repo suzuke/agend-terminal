@@ -270,7 +270,7 @@ fn second_detached_start_rejects_existing_daemon() {
     let home = home_guard.path().to_path_buf();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+        "defaults:\n  command: /bin/cat\ninstances: {}\n",
     )
     .expect("write fleet.yaml");
 
@@ -555,6 +555,81 @@ impl Drop for OwnedForegroundDaemon {
     }
 }
 
+/// Owns a stop CLI child and captures output without leaving a joined thread
+/// behind if the test itself times out. The output files are fixture-local;
+/// the child handle is the only cleanup authority.
+#[cfg(unix)]
+struct OwnedStop {
+    child: std::process::Child,
+    stdout_path: std::path::PathBuf,
+    stderr_path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl OwnedStop {
+    fn spawn(home: &std::path::Path) -> Result<Self, String> {
+        let stdout_path = home.join("stop.stdout");
+        let stderr_path = home.join("stop.stderr");
+        let stdout = std::fs::File::create(&stdout_path)
+            .map_err(|error| format!("create stop stdout capture: {error}"))?;
+        let stderr = std::fs::File::create(&stderr_path)
+            .map_err(|error| format!("create stop stderr capture: {error}"))?;
+        let binary = cmd().get_program().to_owned();
+        let child = std::process::Command::new(binary)
+            .env("AGEND_HOME", home)
+            .arg("stop")
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr))
+            .spawn()
+            .map_err(|error| format!("spawn stop: {error}"))?;
+        Ok(Self {
+            child,
+            stdout_path,
+            stderr_path,
+        })
+    }
+
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        self.child
+            .try_wait()
+            .map_err(|error| format!("poll stop child: {error}"))
+    }
+
+    fn output(&self) -> Result<(String, String), String> {
+        let stdout = std::fs::read_to_string(&self.stdout_path)
+            .map_err(|error| format!("read stop stdout capture: {error}"))?;
+        let stderr = std::fs::read_to_string(&self.stderr_path)
+            .map_err(|error| format!("read stop stderr capture: {error}"))?;
+        Ok((stdout, stderr))
+    }
+
+    fn reap(&mut self) -> Result<(), String> {
+        if self.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let _ = self.child.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if self.try_wait()?.is_some() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("stop child remained alive after 3s cleanup bound".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedStop {
+    fn drop(&mut self) {
+        if let Err(error) = self.reap() {
+            eprintln!("owned stop cleanup incomplete: {error}");
+        }
+    }
+}
+
 /// #3539 (1): `stop` returns only once the daemon process is gone and says so.
 #[cfg(unix)]
 #[test]
@@ -582,37 +657,32 @@ fn stop_waits_for_daemon_exit_and_reports_residuals_untouched_3539() {
     )
     .expect("write legacy daemon identity");
 
-    let stop_thread = std::thread::spawn({
-        let home = home.clone();
-        move || {
-            cmd()
-                .env("AGEND_HOME", &home)
-                .arg("stop")
-                .output()
-                .expect("run stop")
-        }
-    });
+    let mut stop = OwnedStop::spawn(&home).expect("spawn owned stop child");
     let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
-    loop {
-        if daemon
-            .child
-            .try_wait()
-            .expect("poll owned foreground daemon during stop")
-            .is_some()
-        {
-            break;
+    let mut daemon_reaped = false;
+    let mut stop_status = None;
+    while !daemon_reaped || stop_status.is_none() {
+        if !daemon_reaped {
+            daemon_reaped = daemon
+                .child
+                .try_wait()
+                .expect("poll owned foreground daemon during stop")
+                .is_some();
+        }
+        if stop_status.is_none() {
+            stop_status = stop.try_wait().expect("poll owned stop child");
         }
         assert!(
             std::time::Instant::now() < reap_deadline,
-            "owned foreground daemon did not exit while stop was waiting"
+            "owned foreground daemon and stop child did not settle within the test bound"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let output = stop_thread.join().expect("stop thread must join");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let status = stop_status.expect("stop child must have exited");
+    let (stdout, stderr) = stop.output().expect("read owned stop output");
     assert!(
-        output.status.success(),
-        "stop must exit 0 once the daemon is gone: {stdout}"
+        status.success(),
+        "stop must exit 0 once the daemon is gone: stdout={stdout} stderr={stderr}"
     );
 
     // (1) synchronous: the daemon is gone by the time `stop` has returned.
@@ -622,11 +692,11 @@ fn stop_waits_for_daemon_exit_and_reports_residuals_untouched_3539() {
     );
     assert!(
         stdout.contains(&format!("Daemon shutdown initiated (pid {daemon_pid}).")),
-        "{stdout}"
+        "stdout={stdout} stderr={stderr}"
     );
     assert!(
         stdout.contains(&format!("Daemon (pid {daemon_pid}) exited after")),
-        "stop must report the exit, not just the accepted request: {stdout}"
+        "stop must report the exit, not just the accepted request: stdout={stdout} stderr={stderr}"
     );
 
     assert!(
@@ -653,7 +723,7 @@ fn stop_no_wait_returns_on_the_accepted_request_only_3539() {
     let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+        "defaults:\n  command: /bin/cat\ninstances: {}\n",
     )
     .expect("write fleet.yaml");
 
