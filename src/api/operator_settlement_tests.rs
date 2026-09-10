@@ -171,3 +171,30 @@ fn operator_settlement_3553_apply_once_and_reject_changed_subject() {
         assert_eq!(state.tasks[&id.into()].status.to_string(), "open");
     }
 }
+
+#[test]
+#[serial_test::serial]
+fn operator_settlement_3553_expired_confirmation_cannot_mutate() {
+    let server = Server::start();
+    let created = serde_json::from_value(json!({
+        "kind":"Created", "task_id":"expired-row", "title":"Keep open",
+        "description":"original", "priority":"normal", "owner":null
+    })).unwrap();
+    crate::task_events::append(&server.home, &"fixture".into(), created).unwrap();
+    let preview = server.request(true, json!({"method":"task_settlement_preview", "params":{
+        "task_id":"expired-row", "target":"done", "result":"operator inspected"
+    }}));
+    assert_eq!(preview["ok"], true, "{preview}");
+    let token = preview["result"]["confirmation"].as_str().unwrap();
+    let path = server.home.join("operator-task-confirmations").join(format!("{token}.json"));
+    let mut confirmation: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    confirmation["created_at"] = json!("2000-01-01T00:00:00Z");
+    crate::store::save_atomic(&path, &confirmation).unwrap();
+    let before = serde_json::to_value(crate::task_events::replay(&server.home).unwrap()).unwrap();
+    let response = server.request(true, json!({"method":"task_settlement_apply", "params":{
+        "confirmation":token
+    }}));
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["code"], "confirmation_expired", "{response}");
+    assert_eq!(before, serde_json::to_value(crate::task_events::replay(&server.home).unwrap()).unwrap());
+}
