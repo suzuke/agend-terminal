@@ -146,7 +146,7 @@ fn operator_settlement_3553_apply_once_and_reject_changed_subject() {
         assert_eq!(preview["ok"], true, "{preview}");
         if id == "stale-row" {
             append(&server.home, &"fixture".into(), TaskEvent::DescriptionUpdated {
-                task_id:id.into(), description:"changed after preview".into()
+                task_id:id.into(), description:"changed after preview".into(), by:"fixture".into()
             }).unwrap();
         }
         let request = json!({"method":"task_settlement_apply", "params":{
