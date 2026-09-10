@@ -1,6 +1,20 @@
 use super::*;
 
 #[test]
+fn operator_settlement_3553_locked_retirement_propagates_corruption() {
+    let home = tmp_home("3553-locked-corrupt");
+    let path = record_file(&home, "o/r", "feat/corrupt", "reviewer");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"not-json").unwrap();
+    let result = retire_if_id_matches(&home, "o/r", "feat/corrupt", "reviewer",
+        uuid::Uuid::new_v4(), "2026-09-10T00:00:00Z");
+    let preserved = std::fs::read(&path).unwrap();
+    std::fs::remove_dir_all(&home).unwrap();
+    assert!(result.is_err(), "locked corruption must not be absence: {result:?}");
+    assert_eq!(preserved, b"not-json");
+}
+
+#[test]
 fn operator_settlement_3553_retirement_corruption_is_not_absence() {
     let home = tmp_home("3553-corrupt-retirement");
     let dir = branch_dir(&home, "o/r", "feat/corrupt");
