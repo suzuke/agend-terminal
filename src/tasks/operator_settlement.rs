@@ -65,7 +65,10 @@ pub(crate) fn apply(home: &Path, params: &Value, actor_digest: &str) -> Value {
     let tid = TaskId(confirmation.task_id.clone());
     let emitter = "operator".into();
     let digest = crate::daemon::utils::sha256_hex(&bytes);
+    let mut current_status = None;
     let outcome = routed.with_revalidated_computed(home, &emitter, |state| {
+        let record = state.tasks.get(&tid).ok_or("stale_preview")?;
+        current_status = Some(record.status.to_string());
         // Read durable event proof before checking the current row: retry must
         // not close a row that was reopened after this operation completed.
         let history = crate::task_events::envelopes_for_task_at(&board, &confirmation.task_id)
@@ -84,11 +87,11 @@ pub(crate) fn apply(home: &Path, params: &Value, actor_digest: &str) -> Value {
         if age < chrono::Duration::zero() || age >= chrono::Duration::seconds(CONFIRMATION_TTL_SECS) {
             return Err("confirmation_expired".into());
         }
-        let record = state.tasks.get(&tid).ok_or("stale_preview")?;
         if record.status.is_terminal()
             || serde_json::to_value(record).map_err(|e| e.to_string())? != confirmation.subject {
             return Err("stale_preview".into());
         }
+        current_status = Some(confirmation.target.status().to_string());
         Ok(vec![TaskEvent::OperatorSettled {
             task_id: tid.clone(),
             proof: OperatorSettlement {
@@ -101,6 +104,8 @@ pub(crate) fn apply(home: &Path, params: &Value, actor_digest: &str) -> Value {
     match outcome {
         Ok(Ok(Ok(seqs))) => json!({"ok":true,"result":{
             "task_id":confirmation.task_id,"already_applied":seqs.is_empty(),
+            "original_target":confirmation.target,"original_result":confirmation.result,
+            "current_status":current_status,
             "worktree_cleanup":false,"cleanup_status":"not_verified"
         }}),
         Ok(Ok(Err(code))) => json!({"ok":false,"code":code}),
