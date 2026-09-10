@@ -884,8 +884,17 @@ impl Drop for DetachedDaemonCleanup {
             match OwnedStop::spawn_with_args(self.home(), &["stop", "--timeout", "30"])
                 .and_then(|mut stop| stop.wait(std::time::Duration::from_secs(40)))
             {
-                Ok(_) => self.armed = false,
+                Ok(status) if status.success() => self.armed = false,
+                Ok(status) => {
+                    self.armed = false;
+                    self.home_guard.preserve();
+                    eprintln!(
+                        "detached daemon cleanup received nonzero stop status {status}; home preserved: {}",
+                        self.home().display()
+                    );
+                }
                 Err(error) => {
+                    self.armed = false;
                     self.home_guard.preserve();
                     eprintln!("detached daemon cleanup incomplete; home preserved: {error}");
                 }
@@ -903,11 +912,31 @@ fn detached_cleanup_preserves_home_before_api_publication() {
     let mut cleanup = DetachedDaemonCleanup::new().expect("create unique fixture home");
     let home = cleanup.home().to_path_buf();
     cleanup.record_daemon_pid(424_242);
-    cleanup.preserve_for_failed_publication();
     drop(cleanup);
     assert!(
         home.exists(),
         "failed publication evidence must be preserved"
+    );
+    std::fs::remove_dir_all(&home).expect("remove exact preserved evidence home");
+}
+
+/// A stop failure with no reported daemon pid must preserve the exact control
+/// home. The fake run entry uses this test process's live pid, has no API port,
+/// and therefore makes the public stop CLI fail without spawning a daemon or
+/// giving cleanup any unsafe process authority.
+#[cfg(unix)]
+#[test]
+fn detached_cleanup_preserves_home_on_nonzero_stop_without_reported_pid() {
+    let cleanup = DetachedDaemonCleanup::new().expect("create unique fixture home");
+    let home = cleanup.home().to_path_buf();
+    let run_dir = home.join("run").join(std::process::id().to_string());
+    std::fs::create_dir_all(&run_dir).expect("create controlled run evidence");
+    std::fs::write(run_dir.join(".daemon"), format!("{}:0", std::process::id()))
+        .expect("write controlled daemon identity");
+    drop(cleanup);
+    assert!(
+        home.exists(),
+        "nonzero stop without reported pid must preserve evidence"
     );
     std::fs::remove_dir_all(&home).expect("remove exact preserved evidence home");
 }
