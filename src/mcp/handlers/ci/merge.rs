@@ -470,6 +470,19 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         }
     };
 
+    if crate::mcp::handlers::review_class_correction::is_incomplete(
+        home,
+        &repo,
+        &pr_branch,
+        pr,
+        &gated_head,
+    ) {
+        return json!({
+            "error": "review-class correction is incomplete for this exact PR subject — merge refused",
+            "code": "review_class_correction_incomplete",
+        });
+    }
+
     if !force {
         // #PR-D site 2: `gh pr checks` via ScmProvider. argv byte-identical
         // (`pr checks <pr> --repo R --json name,state`). The client-side
@@ -635,6 +648,23 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
             "current_base": base_now,
             "hint": "rebase onto current main and re-run: git fetch && git rebase origin/main && git push --force-with-lease. (Residual: a base advance within the recheck→merge window is uncovered — no GitHub base-pin primitive; true base atomicity awaits a merge-queue.)",
             "code": "exact_base_moved",
+        });
+    }
+
+    // Re-check the durable correction fence after the final provider snapshot
+    // and immediately before the sole provider write. This closes the
+    // correction/merge interval without holding a filesystem lock across the
+    // arbitrary network call below.
+    if crate::mcp::handlers::review_class_correction::is_incomplete(
+        home,
+        &repo,
+        &pr_branch,
+        pr,
+        &head_now,
+    ) {
+        return json!({
+            "error": "review-class correction became incomplete for this exact PR subject — merge refused",
+            "code": "review_class_correction_incomplete",
         });
     }
 

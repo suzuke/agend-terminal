@@ -265,6 +265,15 @@ pub(crate) fn authorize_report(
     if matches!(assignment.review_class, ReviewClass::Unresolved) {
         return Err("assignment review class is unresolved".into());
     }
+    if crate::mcp::handlers::review_class_correction::is_incomplete(
+        home,
+        &assignment.repo,
+        &assignment.branch,
+        assignment.pr_number,
+        &reviewed_head,
+    ) {
+        return Err("review-class correction is incomplete for this exact PR subject".into());
+    }
 
     let state = load_pr_state_strict(home, &assignment.repo, &assignment.branch)?;
     if state.repo != assignment.repo
@@ -357,6 +366,15 @@ pub(crate) fn is_full_head(head: &str) -> bool {
 /// Recheck the active assignment immediately before a PR-side effect or buffered
 /// replay. A validation that raced revoke/transfer/terminal must become inert.
 pub(crate) fn assignment_still_authorizes(home: &Path, summary: &ReviewReceiptSummary) -> bool {
+    if crate::mcp::handlers::review_class_correction::is_incomplete(
+        home,
+        &summary.repo,
+        &summary.branch,
+        summary.pr_number,
+        &summary.reviewed_head,
+    ) {
+        return false;
+    }
     let Ok(assignment) = crate::daemon::assignment_authority::lookup_by_assignment_id_strict(
         home,
         summary.assignment_id,

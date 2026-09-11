@@ -1519,6 +1519,28 @@ pub fn record_ci_result(
     subscribers: Vec<String>,
     review_class: ReviewClass,
 ) {
+    // A correction intent is a durable fence: a poll already in flight must
+    // not reconcile the stale watch class back into the exact PR generation.
+    if let Some(state) = load(home, repo, branch) {
+        if state.head_sha == head_sha
+            && state.pr_number > 0
+            && crate::mcp::handlers::review_class_correction::is_incomplete(
+                home,
+                repo,
+                branch,
+                state.pr_number,
+                head_sha,
+            )
+        {
+            tracing::info!(
+                repo = %repo,
+                branch = %branch,
+                head = %head_sha,
+                "review-class correction incomplete; CI observation deferred"
+            );
+            return;
+        }
+    }
     // t-…-17 A6 (I11/I15/I16): hold the reviewer-assignment branch lock as the OUTER
     // lock of the replay below (the pr_state flock `with_pr_state_or_create` takes is
     // the INNER lock — the mandated assignment-OUTER / pr_state-INNER order), so the

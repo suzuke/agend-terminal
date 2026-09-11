@@ -468,6 +468,21 @@ pub(crate) fn def_revoke_review_assignment() -> Value {
         }, "required": ["assignment_id"]}})
 }
 
+pub(crate) fn def_correct_review_class() -> Value {
+    json!({"name": "correct_review_class", "description": "Decision45 operator-only audited correction for one exact PR generation. Preview or apply requires canonical repository, PR number, subject branch, full current head, expected old class, new class, stable operation_id, and nonempty reason. Apply persists intent before invalidating exact assignments/receipts and preserves all CI/exact-head/base/non-force merge gates. Agents and orchestrators are denied; no wildcard reset or raw state edit.",
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["preview", "apply"]},
+            "repository": {"type": "string"},
+            "pr_number": {"type": "integer", "minimum": 1},
+            "branch": {"type": "string"},
+            "head_sha": {"type": "string", "description": "Exact full 40/64-hex current PR head."},
+            "expected_old_class": {"type": "string", "enum": ["single", "dual"]},
+            "new_class": {"type": "string", "enum": ["single", "dual"]},
+            "operation_id": {"type": "string"},
+            "reason": {"type": "string"}
+        }, "required": ["action", "repository", "pr_number", "branch", "head_sha", "expected_old_class", "new_class", "operation_id", "reason"]}})
+}
+
 pub(crate) fn def_usage_limit_takeover() -> Value {
     json!({"name": "usage_limit_takeover", "description": "Operator-only Architecture-14 item 5 Slice 2A seam. Validate a persisted CandidateReady usage-limit episode and durably PREPARE, without executing takeover or changing the source binding/task/process.",
         "inputSchema": {"type": "object", "properties": {
