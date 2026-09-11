@@ -277,6 +277,138 @@ fn config_tool_round_trip() {
     fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn manual_unmapped_ack_dry_run_is_read_only_and_does_not_guess_repo_3316() {
+    let home = tmp_home("manual-unmapped-dry-run");
+    let created = crate::tasks::handle(
+        &home,
+        "devA",
+        &serde_json::json!({
+            "action": "create",
+            "title": "named board task",
+            "project": "manual-board"
+        }),
+    );
+    let task_id = created["id"].as_str().unwrap().to_string();
+    let board = crate::task_events::board_root(&home, "manual-board");
+    let before_tasks = crate::tasks::list_all_at(&home, &board);
+    let before_health = fs::read(health_path(&home)).unwrap();
+
+    let result = handle_task_sweep_config(
+        &home,
+        &serde_json::json!({
+            "acknowledge_manual_unmapped": {
+                "project_id": "manual-board",
+                "actor": "operator@example",
+                "audit_reason": "confirmed named board ownership",
+            },
+            "provenance_dry_run": true,
+        }),
+    );
+    assert_eq!(result["outcome"], "would_acknowledge");
+    assert_eq!(result["repo"], serde_json::Value::Null);
+    assert_eq!(result["board_mutation"], "none");
+    assert_eq!(result["task_mutation"], "none");
+    assert!(!provenance_path(&home).exists());
+    assert_eq!(fs::read(health_path(&home)).unwrap(), before_health);
+    assert_eq!(crate::tasks::list_all_at(&home, &board), before_tasks);
+    assert_eq!(
+        crate::tasks::list_all_at(&home, &board)
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .unwrap()
+            .status,
+        crate::task_events::TaskStatus::Open
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn manual_unmapped_ack_save_failure_is_rollback_safe_3316() {
+    let home = tmp_home("manual-unmapped-rollback");
+    let created = crate::tasks::handle(
+        &home,
+        "devA",
+        &serde_json::json!({
+            "action": "create",
+            "title": "rollback-safe named board task",
+            "project": "manual-rollback"
+        }),
+    );
+    let task_id = created["id"].as_str().unwrap().to_string();
+    let board = crate::task_events::board_root(&home, "manual-rollback");
+    let before_tasks = crate::tasks::list_all_at(&home, &board);
+    crate::store::fail_next_atomic_write_for_test(&provenance_path(&home));
+
+    let result = acknowledge_manual_unmapped_provenance(
+        &home,
+        "manual-rollback",
+        "operator@example",
+        "confirmed named board ownership",
+        false,
+    );
+    assert_eq!(result["outcome"], "not_acknowledged");
+    assert!(result["error"].as_str().unwrap().contains("save failed"));
+    assert!(load_provenance(&home)
+        .manual_unmapped_acknowledgements
+        .is_empty());
+    assert_eq!(crate::tasks::list_all_at(&home, &board), before_tasks);
+    assert_eq!(
+        crate::tasks::list_all_at(&home, &board)
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .unwrap()
+            .status,
+        crate::task_events::TaskStatus::Open
+    );
+    assert!(!home.join("event-log.jsonl").exists());
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn manual_unmapped_ack_is_audited_without_authorizing_sweep_mapping_3316() {
+    let home = tmp_home("manual-unmapped-ack");
+    let created = crate::tasks::handle(
+        &home,
+        "devA",
+        &serde_json::json!({
+            "action": "create",
+            "title": "audited named board task",
+            "project": "manual-audited"
+        }),
+    );
+    assert!(created["id"].as_str().is_some());
+
+    let result = acknowledge_manual_unmapped_provenance(
+        &home,
+        "manual-audited",
+        "operator@example",
+        "confirmed named board ownership",
+        false,
+    );
+    assert_eq!(result["outcome"], "acknowledged");
+    let store = load_provenance(&home);
+    assert_eq!(store.manual_unmapped_acknowledgements.len(), 1);
+    let ack = &store.manual_unmapped_acknowledgements[0];
+    assert_eq!(ack.project_id, "manual-audited");
+    assert_eq!(ack.actor, "operator@example");
+    assert_eq!(ack.audit_reason, "confirmed named board ownership");
+    assert!(ack.total_tasks > 0);
+    assert!(ack.non_terminal_tasks > 0);
+
+    let plan = resolve_sweep_plan(&home, &load_config(&home)).unwrap();
+    assert!(plan.boards.is_empty());
+    assert!(task_sweep_health(&home)["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["code"] == "MANUAL_UNMAPPED"));
+    let audit = fs::read_to_string(home.join("event-log.jsonl")).unwrap();
+    assert!(audit.contains("manual_unmapped_provenance_acknowledged"));
+    assert!(audit.contains("operator@example"));
+    fs::remove_dir_all(&home).ok();
+}
+
 #[cfg(unix)]
 #[test]
 fn board_a_close_path_failure_does_not_block_board_b_scan_3316() {

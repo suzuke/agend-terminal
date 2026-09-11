@@ -415,8 +415,9 @@ pub use handler::register_subscriber as register_cascade_subscriber;
 // seams) are no longer re-exported — every per-id authority path routes through
 // the strict `load_routed` / `caller_can_mutate_task` above instead.
 pub(crate) use board_router::{
-    list_all_boards, list_all_boards_checked, list_all_strict, project_id_from_source_repo,
-    resolve_repository_project, resolve_target_project, stable_project_id_from_source_repo,
+    explicit_project_ids, list_all_boards, list_all_boards_checked, list_all_strict,
+    project_id_from_source_repo, resolve_repository_project, resolve_target_project,
+    stable_project_id_from_source_repo,
 };
 // #2760: the per-board mutation ACL is no longer re-exported for external callers
 // (reclaim now routes through the strict `caller_can_mutate_task` above). It stays
