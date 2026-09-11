@@ -25,6 +25,14 @@ use std::path::Path;
 /// matched), or an `Err` carrying the underlying replay / append
 /// failure detail for the caller to surface into its audit chain.
 pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, String> {
+    orphan_task_ids_for_owner(home, owner_name, None)
+}
+
+fn orphan_task_ids_for_owner(
+    home: &Path,
+    owner_name: &str,
+    allowed_ids: Option<&std::collections::HashSet<crate::task_events::TaskId>>,
+) -> Result<usize, String> {
     use crate::task_events::{InstanceName, TaskEvent, TaskStatus};
 
     let state = crate::task_events::projected_state(home).map_err(|e| e.to_string())?;
@@ -32,6 +40,7 @@ pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, St
         .tasks
         .values()
         .filter(|r| r.owner.as_ref().map(|o| o.0 == owner_name).unwrap_or(false))
+        .filter(|r| allowed_ids.is_none_or(|ids| ids.contains(&r.id)))
         .filter(|r| {
             matches!(
                 r.status,
@@ -520,7 +529,17 @@ pub fn reconcile_orphan_owners_with_live(home: &Path, live: &std::collections::H
             );
             continue;
         }
-        match orphan_tasks_for_owner(home, owner) {
+        let actionable_ids: std::collections::HashSet<_> = task_ids
+            .iter()
+            .filter(|id| {
+                state
+                    .tasks
+                    .get(*id)
+                    .is_some_and(|record| record.status != TaskStatus::InReview)
+            })
+            .cloned()
+            .collect();
+        match orphan_task_ids_for_owner(home, owner, Some(&actionable_ids)) {
             Ok(n) => tracing::info!(
                 owner = %owner,
                 tasks = actionable_count,
