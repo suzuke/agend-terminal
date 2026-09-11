@@ -656,11 +656,7 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     // correction/merge interval without holding a filesystem lock across the
     // arbitrary network call below.
     if crate::mcp::handlers::review_class_correction::is_incomplete(
-        home,
-        &repo,
-        &pr_branch,
-        pr,
-        &head_now,
+        home, &repo, &pr_branch, pr, &head_now,
     ) {
         return json!({
             "error": "review-class correction became incomplete for this exact PR subject — merge refused",
