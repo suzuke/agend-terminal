@@ -5346,6 +5346,44 @@ fn test_sweep_scan_reports_stale_nonterminal_residue_without_apply_ids() {
 }
 
 #[test]
+fn test_sweep_in_review_closed_pr_stays_report_only_on_nondefault_route() {
+    let home = tmp_home("sweep_in_review_closed_pr_nondefault");
+    cross_board_fleet(&home);
+    let task_id = create_on(&home, "devA", "review residue PR #998", &[]);
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": task_id}),
+    );
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "update", "id": task_id, "status": "in_review"}),
+    );
+    let live: std::collections::HashSet<String> = ["devA".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let cats = sweep::scan_categories(
+        &home,
+        &live,
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        now,
+    )
+    .expect("scan categories");
+
+    assert!(cats.superseded.is_empty());
+    assert_eq!(cats.stale_nonterminal.len(), 1);
+    assert_eq!(cats.stale_nonterminal[0].id, task_id);
+    assert_eq!(
+        cats.stale_nonterminal[0].project_route.as_deref(),
+        Some("orgA_projA")
+    );
+    assert!(cats.all_ids().is_empty());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_sweep_scan_identifies_shipped_via_pr_lookup_stub() {
     // GREEN 2a: a task whose title carries `PR #999` and whose
     // stubbed PR state is Merged lands in the shipped bucket
