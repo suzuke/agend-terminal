@@ -680,11 +680,14 @@ struct OwnedForegroundDaemon {
 impl OwnedForegroundDaemon {
     fn spawn(home: &std::path::Path) -> Result<Self, String> {
         let binary = cmd().get_program().to_owned();
+        let stderr_path = home.join("foreground-daemon.stderr");
+        let stderr = std::fs::File::create(&stderr_path)
+            .map_err(|error| format!("create foreground daemon stderr capture: {error}"))?;
         let child = std::process::Command::new(binary)
             .args(["start", "--foreground"])
             .env("AGEND_HOME", home)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(stderr))
             .spawn()
             .map_err(|error| format!("spawn foreground daemon: {error}"))?;
         let mut daemon = Self {
@@ -740,7 +743,13 @@ impl OwnedForegroundDaemon {
                 .try_wait()
                 .map_err(|error| format!("poll foreground daemon: {error}"))?
             {
-                return Err(format!("foreground daemon exited early: {status}"));
+                let stderr = std::fs::read_to_string(self.home.join("foreground-daemon.stderr"))
+                    .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+                let log = std::fs::read_to_string(self.home.join("daemon.log"))
+                    .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+                return Err(format!(
+                    "foreground daemon exited early: {status}; stderr: {stderr}; daemon.log: {log}"
+                ));
             }
             if run_dir.join(".daemon").exists()
                 && run_dir.join("api.port").exists()
