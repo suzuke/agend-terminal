@@ -864,6 +864,7 @@ mod tests {
         struct Cleanup<'a> {
             runtime: &'a ManagedRuntime,
             name: String,
+            expected_uuid: Option<String>,
             cleaned: bool,
         }
         impl Cleanup<'_> {
@@ -871,11 +872,19 @@ mod tests {
                 if self.cleaned {
                     return Ok(());
                 }
-                let result = crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
-                    &self.runtime.home, &self.name, Some(&crate::agent_ops::DeleteContext {
-                        registry: &self.runtime.registry, configs: &self.runtime.configs,
-                        externals: &self.runtime.externals, notifier: None,
+                let Some(expected_uuid) = self.expected_uuid.as_deref() else {
+                    return Ok(());
+                };
+                let result = crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_expected_identity(
+                    &self.runtime.home,
+                    &self.name,
+                    Some(&crate::agent_ops::DeleteContext {
+                        registry: &self.runtime.registry,
+                        configs: &self.runtime.configs,
+                        externals: &self.runtime.externals,
+                        notifier: None,
                     }),
+                    Some((OWNER, Some(expected_uuid))),
                 );
                 if result.is_ok() {
                     self.cleaned = true;
@@ -893,9 +902,11 @@ mod tests {
         let mut _cleanup = Cleanup {
             runtime: &runtime,
             name: attempt.name.clone(),
+            expected_uuid: None,
             cleaned: false,
         };
         let id = runtime.start(&run, &attempt).unwrap();
+        _cleanup.expected_uuid = Some(id.clone());
         attempt.uuid = Some(id.clone());
         let parsed = crate::types::InstanceId::parse(&id).unwrap();
         let child = Arc::clone(&crate::agent::lock_registry(&runtime.registry)[&parsed].child);
