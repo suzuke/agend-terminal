@@ -874,7 +874,7 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            33,
+            34,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
@@ -886,7 +886,7 @@ mod tests {
              + instance (#2550 P1, folded read-only alias for list_instances/pane_snapshot) = 29; \
              + set_model (#2744 PR-A, typed fleet model intent) = 30; \
              + revoke_review_assignment (#2782 slice 1) = 31; + usage_limit_takeover (Architecture-14 item 5 Slice 2A) = 32; \
-             + operator_page (#3480 orchestrator-only operator page) = 33. \
+             + operator_page (#3480 orchestrator-only operator page) = 33; + correct_review_class (Decision45) = 34. \
              Current tools: {:?}",
             tools
                 .iter()

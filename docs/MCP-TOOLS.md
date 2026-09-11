@@ -50,7 +50,7 @@ Manage batch deployments. Actions: `deploy`, `teardown`, `list`.
 
 Manage CI watches. Actions: `watch`, `unwatch`, `status`.
 
-- Fields: `repository`, `branch`, `interval_secs`, `next_after_ci`, `review_class`, `ci_provider`, `ci_provider_url`, `task_id`, `head_sha`.
+- Fields: `repository`, `branch`, `interval_secs`, `next_after_ci`, `review_class`, `ci_provider`, `ci_provider_url`, `task_id`, `head_sha`, `subject_head_sha`.
 - Use `repository` (GitHub `owner/repo`), not `repo`. `watch` may derive it from the caller's binding; `unwatch` requires it explicitly.
 - Generic `main`/`master` watches are rejected. A protected-ref exact-head watch requires a full 40/64-hex `head_sha`, `task_id`, explicit `next_after_ci`, GitHub, and an authorized orchestrator/operator caller.
 

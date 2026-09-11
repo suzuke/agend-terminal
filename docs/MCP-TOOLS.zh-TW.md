@@ -50,7 +50,7 @@ Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance 
 
 管理 CI watch。動作：`watch`、`unwatch`、`status`。
 
-- 欄位：`repository`、`branch`、`interval_secs`、`next_after_ci`、`review_class`、`ci_provider`、`ci_provider_url`、`task_id`、`head_sha`。
+- 欄位：`repository`、`branch`、`interval_secs`、`next_after_ci`、`review_class`、`ci_provider`、`ci_provider_url`、`task_id`、`head_sha`、`subject_head_sha`。
 - 使用 `repository`（GitHub `owner/repo`），不是 `repo`。`watch` 可從 caller binding 推導；`unwatch` 必須明確提供。
 - 一般 `main`／`master` watch 會被拒絕。Protected ref exact-head watch 需要完整 40/64-hex `head_sha`、`task_id`、明確 `next_after_ci`、GitHub，以及已授權的 orchestrator/operator caller。
 
