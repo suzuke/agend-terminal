@@ -331,15 +331,17 @@ pub struct OrphanScanResult {
 }
 
 /// Read-only policy planner for strict ghost owners on InReview tasks.
-/// InReview is never auto-orphaned; an apply request only acknowledges an
-/// exact subset of freshly verified candidates and emits no board mutation.
+/// InReview is never auto-orphaned. The public planner is report-only; an
+/// apply request is rejected before any approval or mutation claim because no
+/// caller supplies the fresh owner/binding proof and durable audit boundary
+/// required for a destructive policy.
 pub fn plan_strict_in_review_ghosts(
     state: &crate::task_events::TaskBoardState,
     live: &std::collections::HashSet<String>,
     fleet_instances: &std::collections::HashSet<String>,
     apply: bool,
-    confirm_ids: &std::collections::HashSet<String>,
-    audit_reason: &str,
+    _confirm_ids: &std::collections::HashSet<String>,
+    _audit_reason: &str,
 ) -> Value {
     let mut candidates = std::collections::BTreeMap::<String, Value>::new();
     for record in state.tasks.values() {
@@ -357,41 +359,22 @@ pub fn plan_strict_in_review_ghosts(
         }
     }
     let candidate_ids: std::collections::BTreeSet<String> = candidates.keys().cloned().collect();
-    if !apply {
+    if apply {
         return serde_json::json!({
-            "dry_run": true,
+            "error": "apply=true is unsupported for the report-only InReview ghost-owner policy",
+            "code": "report_only_policy",
             "policy": "strict_ghost_owner_in_review",
-            "candidates": candidates.values().collect::<Vec<_>>(),
-            "candidate_ids": candidate_ids,
-            "total_candidates": candidates.len(),
-            "to_apply_hint": "apply=true confirm_ids=<exact subset> audit_reason=<...>",
-        });
-    }
-    if confirm_ids.is_empty() {
-        return serde_json::json!({"error": "apply=true requires non-empty confirm_ids"});
-    }
-    let reason = audit_reason.trim();
-    if reason.is_empty() {
-        return serde_json::json!({"error": "apply=true requires non-empty audit_reason"});
-    }
-    let unknown: Vec<String> = confirm_ids
-        .iter()
-        .filter(|id| !candidate_ids.contains(*id))
-        .cloned()
-        .collect();
-    if !unknown.is_empty() {
-        return serde_json::json!({
-            "error": "confirm_ids are not an exact subset of fresh candidates",
-            "unknown": unknown,
-            "hint": "re-run the report-only planner",
+            "mutation": "none",
+            "hint": "use apply=false to inspect candidates",
         });
     }
     serde_json::json!({
-        "dry_run": false,
+        "dry_run": true,
         "policy": "strict_ghost_owner_in_review",
-        "approved_ids": confirm_ids,
-        "audit_reason": reason,
-        "mutation": "none",
+        "candidates": candidates.values().collect::<Vec<_>>(),
+        "candidate_ids": candidate_ids,
+        "total_candidates": candidates.len(),
+        "to_apply_hint": "apply=true is unsupported for this report-only policy",
     })
 }
 
