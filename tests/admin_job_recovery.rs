@@ -341,7 +341,7 @@ fn recovery_admin_cli_resolves_seeded_run_against_isolated_daemon() {
     assert_eq!(state["runs"][0]["phase"], "failed");
 
     let mut stop = Command::new(env!("CARGO_BIN_EXE_agend-terminal"));
-    stop.arg("stop").env("AGEND_HOME", &home);
+    stop.args(["stop", "--no-wait"]).env("AGEND_HOME", &home);
     let stop_output = run_cli_bounded(stop).unwrap();
     assert!(
         stop_output.status.success(),
