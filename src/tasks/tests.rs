@@ -1,7 +1,8 @@
 use super::acl::{can_mutate_task, is_system_identity};
 use super::orphan::{
-    build_health_response, classify_owner, release_inprogress_orphans_with_live,
-    scan_inprogress_orphans, scan_orphan_candidates, OwnerClassification,
+    build_health_response, classify_owner, plan_strict_in_review_ghosts,
+    release_inprogress_orphans_with_live, scan_inprogress_orphans, scan_orphan_candidates,
+    OwnerClassification,
 };
 use super::sweep;
 use super::*;
@@ -536,6 +537,87 @@ fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
     );
 
     std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reconcile_mixed_owner_does_not_orphan_in_review_task() {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let home = tmp_home("reconcile_mixed_owner_in_review");
+    let owner = InstanceName::from("ghost-mixed");
+    let review_id = TaskId("t-review-mixed".into());
+    let open_id = TaskId("t-open-mixed".into());
+    let created = |task_id: TaskId| TaskEvent::Created {
+        task_id,
+        title: "mixed owner task".into(),
+        description: String::new(),
+        priority: "normal".into(),
+        owner: Some(owner.clone()),
+        due_at: None,
+        depends_on: Vec::new(),
+        routed_to: None,
+        branch: None,
+        bind: None,
+        eta_secs: None,
+        tags: vec![],
+        parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
+    };
+    crate::task_events::append_batch(
+        &home,
+        &InstanceName::from("test:mixed_owner"),
+        vec![
+            created(review_id.clone()),
+            created(open_id.clone()),
+            TaskEvent::MovedToReview {
+                task_id: review_id.clone(),
+            },
+        ],
+    )
+    .expect("seed mixed-owner tasks");
+
+    let state = crate::task_events::replay(&home).expect("replay mixed-owner tasks");
+    let scan = scan_orphan_candidates(
+        &state,
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(
+        scan.strict.get(owner.0.as_str()),
+        Some(&vec![open_id.clone()]),
+        "InReview ghost-owner candidates must stay report-only and out of auto-orphan input"
+    );
+
+    reconcile_orphan_owners_with_live(&home, &std::collections::HashSet::new());
+
+    let state = crate::task_events::replay(&home).expect("replay mixed-owner tasks");
+    assert!(state.tasks[&review_id].owner.is_some());
+    assert!(state.tasks[&open_id].owner.is_none());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn strict_in_review_ghost_planner_is_report_only_and_fresh() {
+    use crate::task_events::TaskStatus;
+    let state = make_state(vec![
+        make_record("t-review", TaskStatus::InReview, Some("ghost-h2")),
+        make_record("t-open", TaskStatus::Open, Some("ghost-h2")),
+    ]);
+    let live = make_set(&[]);
+    let fleet = make_set(&[]);
+    let none = std::collections::HashSet::new();
+
+    let report = plan_strict_in_review_ghosts(&state, &live, &fleet, false, &none, "");
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["candidate_ids"], serde_json::json!(["t-review"]));
+    assert_eq!(report["total_candidates"], 1);
+
+    let mut confirmed = std::collections::HashSet::new();
+    confirmed.insert("t-review".to_string());
+    let rejected =
+        plan_strict_in_review_ghosts(&state, &live, &fleet, true, &confirmed, "operator review");
+    assert_eq!(rejected["code"], "report_only_policy");
+    assert_eq!(rejected["mutation"], "none");
 }
 
 // ── Boot orphan sweep (task t-20260526155509233515-8) ──

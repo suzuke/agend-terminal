@@ -321,10 +321,61 @@ pub struct OrphanScanResult {
     pub soft: std::collections::BTreeMap<String, Vec<crate::task_events::TaskId>>,
 }
 
-/// #829 pure scan. Walks `state.tasks` and classifies each non-
-/// terminal task's owner via [`classify_owner`]. Terminal-status tasks
-/// (Done / Cancelled) are skipped — their ACL is already disabled at
-/// the event-log layer, so re-orphaning would be noise.
+/// Read-only policy planner for strict ghost owners on InReview tasks.
+/// InReview is never auto-orphaned; an apply request is rejected explicitly
+/// so callers cannot mistake an approval-shaped response for a mutation.
+pub fn plan_strict_in_review_ghosts(
+    state: &crate::task_events::TaskBoardState,
+    live: &std::collections::HashSet<String>,
+    fleet_instances: &std::collections::HashSet<String>,
+    apply: bool,
+    _confirm_ids: &std::collections::HashSet<String>,
+    _audit_reason: &str,
+) -> Value {
+    let mut candidates = std::collections::BTreeMap::<String, Value>::new();
+    for record in state.tasks.values() {
+        let Some(owner) = record.owner.as_ref() else {
+            continue;
+        };
+        if record.status == TaskStatus::InReview
+            && classify_owner(owner.0.as_str(), live, fleet_instances)
+                == OwnerClassification::Strict
+        {
+            candidates.insert(
+                record.id.0.clone(),
+                serde_json::json!({
+                    "id": record.id,
+                    "owner": owner.0,
+                    "status": "in_review"
+                }),
+            );
+        }
+    }
+    let candidate_ids: std::collections::BTreeSet<String> = candidates.keys().cloned().collect();
+    if apply {
+        return serde_json::json!({
+            "error": "apply=true is unsupported for the report-only InReview ghost-owner policy",
+            "code": "report_only_policy",
+            "policy": "strict_ghost_owner_in_review",
+            "mutation": "none",
+            "hint": "use apply=false to inspect candidates",
+        });
+    }
+    serde_json::json!({
+        "dry_run": true,
+        "policy": "strict_ghost_owner_in_review",
+        "candidates": candidates.values().collect::<Vec<_>>(),
+        "candidate_ids": candidate_ids,
+        "total_candidates": candidates.len(),
+        "to_apply_hint": "apply=true is unsupported; this policy is report-only",
+    })
+}
+
+/// #829 pure scan. Walks `state.tasks` and classifies each auto-actionable
+/// task's owner via [`classify_owner`]. Terminal-status tasks (Done /
+/// Cancelled) are skipped — their ACL is already disabled at the event-log
+/// layer, so re-orphaning would be noise. InReview tasks are also excluded:
+/// [`plan_strict_in_review_ghosts`] owns their report-only policy surface.
 ///
 /// `live` MUST come from `crate::api::call(LIST)` — the canonical
 /// runtime registry. `fleet_instances` MUST come from
@@ -408,6 +459,28 @@ pub fn reconcile_orphan_owners_with_live(home: &Path, live: &std::collections::H
         }
     };
 
+    let empty_confirm_ids = std::collections::HashSet::new();
+    let in_review_plan = plan_strict_in_review_ghosts(
+        &state,
+        live,
+        &fleet_instances,
+        false,
+        &empty_confirm_ids,
+        "",
+    );
+    if in_review_plan["total_candidates"]
+        .as_u64()
+        .unwrap_or_default()
+        > 0
+    {
+        tracing::warn!(
+            candidates = in_review_plan["total_candidates"]
+                .as_u64()
+                .unwrap_or_default(),
+            "#829: strict ghost owners on InReview tasks are report-only; no mutation applied"
+        );
+    }
+
     let result = scan_orphan_candidates(&state, live, &fleet_instances);
     if result.strict.is_empty() && result.soft.is_empty() {
         tracing::debug!("#829: orphan-owner sweep clean — no ghost owners detected");
@@ -454,7 +527,7 @@ pub fn scan_orphan_candidates(
 ) -> OrphanScanResult {
     let mut result = OrphanScanResult::default();
     for record in state.tasks.values() {
-        if record.status.is_terminal() {
+        if record.status.is_terminal() || record.status == TaskStatus::InReview {
             continue;
         }
         let Some(owner) = record.owner.as_ref() else {
