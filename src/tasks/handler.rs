@@ -1769,14 +1769,22 @@ fn handle_sweep_with_live_instances(
     let now = chrono::Utc::now();
     let pr_lookup: super::sweep::PrLookup = &super::sweep::gh_pr_lookup;
     let issue_lookup: super::sweep::IssueLookup = &super::sweep::gh_issue_lookup;
-    let categories = super::sweep::scan_categories(
+    let categories = match super::sweep::scan_categories(
         home,
         live_instances,
         pr_lookup,
         issue_lookup,
         repo_owned.as_deref(),
         now,
-    );
+    ) {
+        Ok(categories) => categories,
+        Err(error) => {
+            return serde_json::json!({
+                "error": format!("task catalog unreadable: {error}"),
+                "code": "task_catalog_unreadable",
+            })
+        }
+    };
     if !apply {
         return serde_json::json!({
             "dry_run": true,

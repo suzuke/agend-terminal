@@ -1,4 +1,3 @@
-use super::list_all;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -82,6 +81,29 @@ pub(super) struct Candidate {
     pub reason: String,
     pub owner: Option<String>,
     pub pr: Option<u32>,
+    pub due_at: Option<String>,
+    pub refs: Vec<String>,
+    pub branch: Option<String>,
+    pub project_route: Option<String>,
+    pub last_activity: String,
+}
+
+fn candidate(task: &super::Task, reason: String, pr: Option<u32>, refs: Vec<String>) -> Candidate {
+    Candidate {
+        id: task.id.clone(),
+        reason,
+        owner: task.assignee.clone(),
+        pr,
+        due_at: task.due_at.clone(),
+        refs,
+        branch: task.branch.clone(),
+        project_route: task
+            .metadata
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        last_activity: task.updated_at.clone(),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +115,10 @@ pub(super) struct Categories {
     /// #2061: open/backlog tasks whose referenced issue/PR are ALL terminal,
     /// or which carry no ref and are >14d stale.
     pub stale_open: Vec<Candidate>,
+    /// H3: stale nonterminal tasks are report-only residue candidates. They
+    /// are intentionally excluded from `all_ids()` and therefore cannot enter
+    /// the cancellation apply path.
+    pub stale_nonterminal: Vec<Candidate>,
 }
 
 impl Categories {
@@ -122,6 +148,7 @@ impl Categories {
             "team_disbanded": self.team_disbanded,
             "validation_leftovers": self.validation_leftovers,
             "stale_open": self.stale_open,
+            "stale_nonterminal": self.stale_nonterminal,
         })
     }
 }
@@ -131,7 +158,7 @@ impl Categories {
 /// `verified` are skipped — they're already cleaned up. Each task
 /// lands in at most one category (first match wins, order:
 /// validation_leftovers → team_disbanded → shipped/superseded →
-/// stale_open).
+/// stale_nonterminal → stale_open).
 ///
 /// `now` is parameterized so tests can fast-forward age thresholds
 /// without forging event-log timestamps.
@@ -142,8 +169,17 @@ pub(super) fn scan_categories(
     issue_lookup: IssueLookup,
     repo: Option<&str>,
     now: DateTime<Utc>,
-) -> Categories {
-    let tasks = list_all(home);
+) -> Result<Categories, super::TaskRouteError> {
+    let tasks = crate::tasks::board_router::list_all_boards_checked(home)?
+        .into_iter()
+        .flat_map(|(project, tasks)| {
+            tasks.into_iter().map(move |mut task| {
+                task.metadata
+                    .insert("project".to_string(), serde_json::json!(project));
+                task
+            })
+        })
+        .collect::<Vec<_>>();
     let mut cats = Categories::default();
     let mut pr_cache: HashMap<u32, PrState> = HashMap::new();
     let mut issue_cache: HashMap<u32, IssueState> = HashMap::new();
@@ -167,12 +203,12 @@ pub(super) fn scan_categories(
         if is_validation {
             if let Some(a) = age {
                 if a > Duration::days(1) {
-                    cats.validation_leftovers.push(Candidate {
-                        id: t.id.clone(),
-                        reason: format!("validation/canary title prefix, {}d stale", a.num_days()),
-                        owner: t.assignee.clone(),
-                        pr: None,
-                    });
+                    cats.validation_leftovers.push(candidate(
+                        t,
+                        format!("validation/canary title prefix, {}d stale", a.num_days()),
+                        None,
+                        vec![],
+                    ));
                     continue;
                 }
             }
@@ -180,12 +216,12 @@ pub(super) fn scan_categories(
         // (2) team_disbanded — owner not in live fleet + 30d stale.
         if let (Some(owner), Some(a)) = (t.assignee.as_ref(), age) {
             if !live_instances.contains(owner) && a > Duration::days(30) {
-                cats.team_disbanded.push(Candidate {
-                    id: t.id.clone(),
-                    reason: format!("owner '{owner}' not in live fleet, {}d stale", a.num_days()),
-                    owner: Some(owner.clone()),
-                    pr: None,
-                });
+                cats.team_disbanded.push(candidate(
+                    t,
+                    format!("owner '{owner}' not in live fleet, {}d stale", a.num_days()),
+                    None,
+                    vec![],
+                ));
                 continue;
             }
         }
@@ -204,31 +240,55 @@ pub(super) fn scan_categories(
                     PrState::Merged { merged_at } => {
                         if let Some(a) = age {
                             if a > Duration::days(7) {
-                                cats.shipped.push(Candidate {
-                                    id: t.id.clone(),
-                                    reason: format!(
+                                cats.shipped.push(candidate(
+                                    t,
+                                    format!(
                                         "PR #{pr_num} merged at {merged_at}, task {}d stale",
                                         a.num_days()
                                     ),
-                                    owner: t.assignee.clone(),
-                                    pr: Some(pr_num),
-                                });
+                                    Some(pr_num),
+                                    vec![format!("PR #{pr_num}")],
+                                ));
                                 continue;
                             }
                         }
                     }
                     PrState::Closed => {
-                        cats.superseded.push(Candidate {
-                            id: t.id.clone(),
-                            reason: format!("PR #{pr_num} closed without merge"),
-                            owner: t.assignee.clone(),
-                            pr: Some(pr_num),
-                        });
+                        cats.superseded.push(candidate(
+                            t,
+                            format!("PR #{pr_num} closed without merge"),
+                            Some(pr_num),
+                            vec![format!("PR #{pr_num}")],
+                        ));
                         continue;
                     }
                     PrState::Open | PrState::Unknown => {}
                 }
             }
+        }
+        if matches!(
+            t.status,
+            crate::task_events::TaskStatus::Claimed
+                | crate::task_events::TaskStatus::InProgress
+                | crate::task_events::TaskStatus::InReview
+                | crate::task_events::TaskStatus::Blocked
+        ) {
+            let Some(a) = age.filter(|a| *a > Duration::days(14)) else {
+                continue;
+            };
+            let refs = extract_refs(&search_text);
+            let ref_labels = refs
+                .pr_nums
+                .iter()
+                .map(|n| format!("PR #{n}"))
+                .chain(refs.issue_nums.iter().map(|n| format!("issue #{n}")))
+                .collect();
+            cats.stale_nonterminal.push(candidate(
+                t,
+                format!("{} task {}d stale", t.status, a.num_days()),
+                refs.pr_nums.first().copied(),
+                ref_labels,
+            ));
         }
         // (5) stale_open (#2061) — OPEN/Backlog tasks the shipped/superseded
         // arms didn't claim. Conservative (under-report): flag ONLY when EVERY
@@ -254,12 +314,12 @@ pub(super) fn scan_categories(
             if !refs.saw_token {
                 if let Some(a) = age {
                     if a > Duration::days(14) {
-                        cats.stale_open.push(Candidate {
-                            id: t.id.clone(),
-                            reason: format!("no PR/issue ref, open {}d stale", a.num_days()),
-                            owner: t.assignee.clone(),
-                            pr: None,
-                        });
+                        cats.stale_open.push(candidate(
+                            t,
+                            format!("no PR/issue ref, open {}d stale", a.num_days()),
+                            None,
+                            vec![],
+                        ));
                     }
                 }
             }
@@ -284,18 +344,24 @@ pub(super) fn scan_categories(
                 == IssueState::Closed
         });
         if all_terminal {
-            cats.stale_open.push(Candidate {
-                id: t.id.clone(),
-                reason: format!(
+            let ref_labels = refs
+                .pr_nums
+                .iter()
+                .map(|n| format!("PR #{n}"))
+                .chain(refs.issue_nums.iter().map(|n| format!("issue #{n}")))
+                .collect();
+            cats.stale_open.push(candidate(
+                t,
+                format!(
                     "all referenced issue/PR terminal (PR {:?}, issue {:?})",
                     refs.pr_nums, refs.issue_nums
                 ),
-                owner: t.assignee.clone(),
-                pr: refs.pr_nums.first().copied(),
-            });
+                refs.pr_nums.first().copied(),
+                ref_labels,
+            ));
         }
     }
-    cats
+    Ok(cats)
 }
 
 /// Extract the first `PR #<digits>` (or `PR <digits>`) reference

@@ -231,11 +231,15 @@ agend-terminal kill <name>
 ```
 
 ### `stop`
-Stop the daemon (also terminates all managed agents).
+Stop the daemon (also terminates all managed agents). By default `stop` waits, with a bound, for the daemon process to exit and then prints the outcome, so `stop && start` no longer races the exiting daemon (#3539).
 
 ```
-agend-terminal stop
+agend-terminal stop                 # wait up to 30 s for the daemon to exit
+agend-terminal stop --timeout 60    # longer bound; exits non-zero if still running
+agend-terminal stop --no-wait       # return on the accepted request only (old behaviour)
 ```
+
+After the daemon has exited, `stop` lists reparented processes that *look* agend-related — a cargo test binary of this crate, a debug-profile daemon, a cwd under `worktrees/` — as `hint=…` rows. They are not daemon-owned and the daemon does not touch them; the same hint column appears in `doctor`, and `doctor orphans preview` starts a manual cleanup.
 
 ### `agend-mcp-bridge` (separate binary)
 
