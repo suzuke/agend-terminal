@@ -86,7 +86,6 @@ fn seed_with_class(home: &Path, review_class: ReviewClass) {
             "repo": REPO,
             "branch": BRANCH,
             "pr_number": 42,
-            "subject_head_sha": HEAD,
             "review_class": review_class.as_token(),
         }))
         .unwrap()
@@ -157,6 +156,8 @@ fn real_entry_preview_apply_and_same_operation_retry_are_audited() {
     let watch_path = watch_dir.join(crate::daemon::ci_watch::watch_filename(REPO, BRANCH));
     let watch: Value = serde_json::from_slice(&std::fs::read(watch_path).unwrap()).unwrap();
     assert_eq!(watch["review_class"], "single", "{watch}");
+    assert_eq!(watch["subject_head_sha"], HEAD, "{watch}");
+    assert_eq!(watch["pr_number"], 42, "{watch}");
     let mismatched: Value =
         serde_json::from_slice(&std::fs::read(mismatched_watch).unwrap()).unwrap();
     assert_eq!(mismatched["review_class"], "dual", "{mismatched}");

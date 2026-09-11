@@ -271,6 +271,7 @@ fn update_watch_class(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error.into()),
     };
+    let generic_filename = crate::daemon::ci_watch::watch_filename(repository, branch);
     let mut updated = 0;
     for entry in entries {
         let path = entry?.path();
@@ -292,9 +293,11 @@ fn update_watch_class(
             .get("target_head_sha")
             .or_else(|| watch.get("subject_head_sha"))
             .and_then(Value::as_str);
+        let legacy_generic = watch_head.is_none()
+            && path.file_name().and_then(|name| name.to_str()) == Some(generic_filename.as_str());
         if watch.get("repo").and_then(Value::as_str) != Some(repository)
             || watch.get("branch").and_then(Value::as_str) != Some(branch)
-            || watch_head != Some(head_sha)
+            || (watch_head != Some(head_sha) && !legacy_generic)
             || watch
                 .get("pr_number")
                 .and_then(Value::as_u64)
@@ -302,6 +305,10 @@ fn update_watch_class(
         {
             drop(lock);
             continue;
+        }
+        if legacy_generic {
+            watch["subject_head_sha"] = json!(head_sha);
+            watch["pr_number"] = json!(pr_number);
         }
         watch["review_class"] = json!(new_class.as_token());
         crate::store::atomic_write(&path, serde_json::to_string_pretty(&watch)?.as_bytes())?;
@@ -566,6 +573,12 @@ pub(crate) fn handle_correct_review_class(
             return json!({"error": format!("review-class correction watch update failed: {error}"), "code": "review_class_correction_watch_failed"});
         }
     };
+    if updated_watch_records == 0 {
+        return json!({
+            "error": "review-class correction refused: no exact CI watch could be fenced",
+            "code": "review_class_correction_watch_missing",
+        });
+    }
     intent.updated_watch_records = updated_watch_records;
     if let Err(error) = crate::store::save_atomic(&journal_path(home, operation_id), &intent) {
         return json!({"error": format!("review-class correction watch effect persistence failed: {error}"), "code": "review_class_correction_effect_persistence_failed"});
