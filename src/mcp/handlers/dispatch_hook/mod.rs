@@ -13,6 +13,7 @@ mod lifecycle_permit;
 mod live_binding;
 mod provider_neutral_slug;
 mod rebase_dispatch;
+mod stale_dir;
 mod types;
 pub(crate) use branch_start_point::BranchProvision;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
@@ -21,7 +22,8 @@ pub(crate) use rebase_dispatch::dispatch_auto_bind_lease_with_source_and_chain_p
 // t-…-17: the lockstep source→slug normalizer shared by the reviewer-assignment
 // repo resolve and the team-authority ACL (teams::resolve_team_by_source_repo).
 pub(crate) use lifecycle_permit::{
-    is_active as lifecycle_is_active, BindGuard, LifecycleOperation, LifecyclePermit,
+    active_operation as lifecycle_active_operation, is_active as lifecycle_is_active, BindGuard,
+    LifecycleOperation, LifecyclePermit,
 };
 pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
 pub(crate) use types::{
@@ -415,6 +417,15 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         )
     };
 
+    stale_dir::preflight(
+        home,
+        target,
+        branch,
+        &source_repo,
+        reused,
+        auto_created_branch,
+        fetch_attempted,
+    )?;
     // #2234 cure-(B): under the flag the agent's WORKSPACE dir IS its worktree
     // (cwd == worktree) — switch it to `branch` IN PLACE instead of leasing a
     // fresh per-branch worktree. Default OFF → legacy lease → byte-identical. The

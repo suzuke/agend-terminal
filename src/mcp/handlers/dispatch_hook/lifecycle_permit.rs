@@ -19,8 +19,15 @@ pub(crate) enum LifecycleOperation {
     Delete,
 }
 
-fn active_permits() -> &'static Mutex<HashMap<(String, String), u64>> {
-    static ACTIVE: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
+#[derive(Clone, Copy)]
+struct ActivePermit {
+    token: u64,
+    operation: LifecycleOperation,
+    stage: &'static str,
+}
+
+fn active_permits() -> &'static Mutex<HashMap<(String, String), ActivePermit>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<(String, String), ActivePermit>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -62,7 +69,7 @@ impl std::fmt::Debug for LifecyclePermit {
 impl Drop for LifecyclePermit {
     fn drop(&mut self) {
         let mut active = active_permits().lock();
-        if active.get(&self.key) == Some(&self.token) {
+        if active.get(&self.key).map(|entry| entry.token) == Some(self.token) {
             active.remove(&self.key);
         }
     }
@@ -82,7 +89,14 @@ impl LifecyclePermit {
                 "lifecycle transaction already in flight for agent '{agent}'"
             ));
         }
-        active.insert(key.clone(), token);
+        active.insert(
+            key.clone(),
+            ActivePermit {
+                token,
+                operation,
+                stage: "acquired",
+            },
+        );
         Ok(Self {
             key,
             token,
@@ -92,7 +106,15 @@ impl LifecyclePermit {
 
     pub(crate) fn authorizes(&self, home: &Path, agent: &str) -> bool {
         let key = (lifecycle_home_key(home), agent.to_string());
-        active_permits().lock().get(&key) == Some(&self.token)
+        active_permits().lock().get(&key).map(|entry| entry.token) == Some(self.token)
+    }
+
+    pub(crate) fn set_stage(&self, stage: &'static str) {
+        if let Some(entry) = active_permits().lock().get_mut(&self.key) {
+            if entry.token == self.token {
+                entry.stage = stage;
+            }
+        }
     }
 }
 
@@ -127,4 +149,15 @@ impl BindGuard {
 pub(crate) fn is_active(home: &Path, agent: &str) -> bool {
     let key = (lifecycle_home_key(home), agent.to_string());
     active_permits().lock().contains_key(&key)
+}
+
+pub(crate) fn active_operation(
+    home: &Path,
+    agent: &str,
+) -> Option<(LifecycleOperation, &'static str)> {
+    let key = (lifecycle_home_key(home), agent.to_string());
+    active_permits()
+        .lock()
+        .get(&key)
+        .map(|entry| (entry.operation, entry.stage))
 }

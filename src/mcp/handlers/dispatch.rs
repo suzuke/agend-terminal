@@ -2030,6 +2030,8 @@ mod tests {
             "src/connect.rs"
                 | "src/bugreport.rs"
                 | "src/main.rs"
+                // #3539: `stop` moved out of main.rs; same class (operator CLI client).
+                | "src/cli_stop.rs"
                 | "src/tray/mod.rs"
                 | "src/verify.rs"
         ) {

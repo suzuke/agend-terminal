@@ -1811,10 +1811,8 @@ fn p0x_release_full_missing_worktree_path_clears_binding_anyway() {
 fn p0x_release_full_unmanaged_worktree_skipped_safely() {
     // R14 safety: if the binding points at a worktree that lacks the
     // .agend-managed marker (operator-created, not daemon-leased), the
-    // release MUST NOT remove the worktree. #1879 (WT-LEAK-2): the stale
-    // binding IS cleared, though — leaving it leaked the binding and blocked
-    // a same-agent re-bind. The worktree (operator data) survives for
-    // investigation; the daemon's binding to it does not.
+    // release MUST NOT remove the worktree. A refused removal is an incomplete
+    // release transaction, so the binding stays as durable recovery evidence.
     let home = tmp_home("p0x-unmanaged");
     let unmanaged_wt = tmp_home("p0x-unmanaged-wt-target");
     // Hand-craft a binding pointing at an unmanaged path.
@@ -1844,9 +1842,11 @@ fn p0x_release_full_unmanaged_worktree_skipped_safely() {
         outcome
     );
     assert!(
-        outcome.binding_removed,
-        "#1879 WT-LEAK-2: the stale binding must be CLEARED even when the unmanaged worktree removal is refused"
+        !outcome.binding_removed,
+        "failed removal must retain binding"
     );
+    assert_eq!(outcome.code, Some("release_incomplete"));
+    assert_eq!(outcome.stage, Some("worktree_remove"));
     assert!(
         outcome
             .error
@@ -1858,8 +1858,8 @@ fn p0x_release_full_unmanaged_worktree_skipped_safely() {
     );
     assert!(unmanaged_wt.exists(), "operator-created dir must survive");
     assert!(
-        crate::binding::read(&home, "agent-u").is_none(),
-        "#1879 WT-LEAK-2: the binding must be cleared (no leak / re-bind block)"
+        crate::binding::read(&home, "agent-u").is_some(),
+        "failed removal must preserve the binding for retry/recovery"
     );
 
     std::fs::remove_dir_all(&home).ok();
@@ -4861,6 +4861,120 @@ fn release_full_preserves_dirty_wip_to_recovery_ref() {
 
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn release_recovery_snapshot_excludes_gitignored_build_cache() {
+    let home = tmp_home("release-ignored-cache");
+    let repo = tmp_repo("release-ignored-cache-repo");
+    let lease = lease_bound(&home, &repo, "agent-ignored", "feat/ignored-cache");
+    std::fs::write(lease.path.join(".gitignore"), b"target/\n").unwrap();
+    git_in(&lease.path, &["add", ".gitignore"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "ignore build cache",
+        ],
+    );
+    std::fs::write(lease.path.join("precious.txt"), b"preserve me").unwrap();
+    std::fs::create_dir_all(lease.path.join("target/debug")).unwrap();
+    std::fs::write(lease.path.join("target/debug/artifact"), b"do not snapshot").unwrap();
+
+    let outcome = release_full(&home, "agent-ignored", false);
+    assert!(outcome.released, "{outcome:?}");
+    let refs = recovery_refs(&repo, "feat/ignored-cache");
+    assert_eq!(refs.len(), 1, "{refs:?}");
+    let files = ls_tree_names(&repo, &refs[0]);
+    assert!(files.contains("precious.txt"), "{files}");
+    assert!(!files.contains("target/"), "{files}");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn release_cleans_ignored_target_before_git_worktree_remove() {
+    let home = tmp_home("release-target-order");
+    let repo = tmp_repo("release-target-order-repo");
+    let lease = lease_bound(&home, &repo, "agent-target", "feat/target-order");
+    std::fs::write(lease.path.join(".gitignore"), b"target/\n").unwrap();
+    git_in(&lease.path, &["add", ".gitignore"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "ignore target",
+        ],
+    );
+    let target = lease.path.join("target/debug");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("large-artifact"), vec![b'x'; 1024 * 1024]).unwrap();
+    let target_existed_at_remove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = std::sync::Arc::clone(&target_existed_at_remove);
+    let target_root = lease.path.join("target");
+    let outcome = {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+                observed.store(target_root.exists(), std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        release_full(&home, "agent-target", false)
+    };
+
+    assert!(outcome.released, "{outcome:?}");
+    assert!(
+        !target_existed_at_remove.load(std::sync::atomic::Ordering::SeqCst),
+        "ignored target cache must be gone before git worktree remove starts"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn release_remove_failure_retains_binding_with_structured_stage() {
+    let home = tmp_home("release-remove-failure");
+    let repo = tmp_repo("release-remove-failure-repo");
+    let lease = lease_bound(&home, &repo, "agent-fail", "feat/remove-fail");
+    let doomed_repo = repo.clone();
+    let response = {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+                std::fs::remove_dir_all(&doomed_repo).expect("remove fixture source repo");
+            }
+        });
+        crate::mcp::handlers::worktree_test_release(
+            &home,
+            &serde_json::json!({"instance": "agent-fail"}),
+        )
+    };
+
+    assert_eq!(response["released"], false, "{response}");
+    assert_eq!(response["code"], "release_incomplete", "{response}");
+    assert_eq!(response["stage"], "worktree_remove", "{response}");
+    assert_eq!(
+        response["path"],
+        lease.path.display().to_string(),
+        "{response}"
+    );
+    assert!(response["bytes_remaining"].as_u64().is_some(), "{response}");
+    assert!(
+        crate::binding::read(&home, "agent-fail").is_some(),
+        "a failed worktree removal must retain binding authority"
+    );
+    assert!(lease.path.exists(), "failed target must remain inspectable");
+
+    std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]

@@ -4518,6 +4518,7 @@ fn generation_guard_ends_the_generation_on_unwind_3315() {
         &writer,
         true,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        "generation-guard-3315",
     );
     // The snapshot a queued keystroke carries into its 300ms sleep.
     let barrier = gate.write_barrier();

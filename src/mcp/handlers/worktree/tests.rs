@@ -49,6 +49,21 @@ fn handler_idempotent_no_binding_returns_success_noop() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn release_completion_notifies_the_calling_agent() {
+    let home = tmp_home("release-completed-notice");
+    let sender = crate::identity::Sender::new("release-caller");
+    let result = handle_release_worktree(&home, &json!({"instance": "already-released"}), &sender);
+    assert_eq!(result["released"], true, "{result}");
+
+    let messages = crate::inbox::drain(&home, "release-caller");
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0].from, "system:release_completed");
+    assert!(messages[0].text.contains("instance=already-released"));
+    assert!(messages[0].text.contains("completed"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ── #2548 PR-2: release_worktree(force:true) tests ──────────────────
 //
 // Absorbed from the former standalone `force_release_worktree` tool

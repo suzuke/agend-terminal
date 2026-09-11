@@ -123,11 +123,17 @@ provenance、未知 task state，或無法證明 remote branch 狀態時一律 f
 2. 快照 guarded binding；
 3. 重新取得 branch、agent 與 binding locks；
 4. 確認最新 binding fingerprint 仍與快照一致；
-5. 移除前保存 dirty work；
+5. 移除前保存 dirty work（recovery snapshot 不包含 ignored 內容）；
 6. 驗證 managed marker 與精確目標；
-7. 移除 linked worktree、prune Git metadata，並清除相符的 binding。
+7. 刪除已驗證、位於 worktree 內且被忽略的 `target/` build cache；
+8. 移除 linked worktree 並 prune Git metadata；
+9. 只有在移除成功後才清除相符的 binding。
 
-若保存失敗，釋放會 fail closed 並保留 binding。Lease fingerprint 已變更也會停止操作。成功釋放後再次呼叫會得到 idempotent success。
+若保存、快取清理或 worktree 移除失敗，釋放會 fail closed 並保留 binding。執行失敗使用 `code: release_incomplete`，並帶 `stage`、`path`、`bytes_remaining`。Lease fingerprint 已變更也會停止操作。成功釋放後再次呼叫會得到 idempotent success。
+
+Proxy 最多等待 release 五秒；若刪除仍在執行，會回 `accepted:true` 與 `release_in_flight:true`，即使 client 斷線，daemon worker 仍會繼續。`binding_state` 會顯示目前 release 階段，worker 完成時 caller 會收到 `release_completed` 通知。
+
+Checkout／typed dispatch 若遇到帶 marker、但沒有 binding 的目標，會回 `stale_worktree_dir`，並附路徑與 marker 內容。請用下方精確的 guarded `release_worktree(force:true)` 形式復原，不要重試 raw Git provisioning。
 
 可使用 `dry_run:true` 預覽，不產生破壞性效果。
 
@@ -152,6 +158,7 @@ provenance、未知 task state，或無法證明 remote branch 狀態時一律 f
 - 目標必須解析到 daemon worktree pool 之下。
 - 對 markerless、opaque、ambiguous、ownerless 或不相符的狀態會保留，而不是猜測後刪除。
 - `repository_path` 是可選的 Git metadata 清理提示。
+- Absent binding 搭配精確 marker 與 owning repository 時可被回收；同一交易會移除目錄並 prune 精確的 `.git/worktrees` entry。
 
 Force 用於陳舊狀態復原，不是繞過正常釋放檢查的捷徑。
 

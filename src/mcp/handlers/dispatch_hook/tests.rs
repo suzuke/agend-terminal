@@ -4745,13 +4745,11 @@ fn dispatch_skip_lease_preserves_uncommitted_on_live_same_branch_2158() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// (b) #2115 PRESERVED: the skip is gated on a PRESENT binding. With binding.json CLEARED
-/// (what `release_worktree` does) but the worktree dir surviving as dirty residue (the
-/// #869-ref-advance / prior-lease shape), a re-dispatch must NOT skip — it re-leases, and
-/// `worktree::create`'s reuse-path `sync_worktree_to_head` STILL scrubs the residue. Proves
-/// the #2158 skip does not over-fire onto a released binding.
+/// #3613: an unbound, marker-bearing directory is preserved release evidence.
+/// Dispatch must return the typed force-release route instead of reusing and
+/// scrubbing it as though a prior release had completed successfully.
 #[test]
-fn dispatch_reuse_after_binding_cleared_still_resets_dirty_2115_preserved_2158() {
+fn dispatch_after_binding_cleared_reports_stale_worktree_dir_3613() {
     let home = std::env::temp_dir().join(format!("agend-2158-reuse-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
     setup_test_repo(&home, "agent-reuse");
@@ -4777,15 +4775,24 @@ fn dispatch_reuse_after_binding_cleared_still_resets_dirty_2115_preserved_2158()
         "unbind must clear the binding (file + index) so binding::read returns None"
     );
 
-    // Re-dispatch same branch → binding::read None → #2158 skip does NOT fire → lease →
-    // worktree::create reuses the surviving dir → sync_worktree_to_head resets + cleans it.
-    let r2 = super::dispatch_auto_bind_lease(&home, "agent-reuse", "T-2", "feat/reuse", None);
-    assert!(r2.is_ok(), "reuse re-dispatch must succeed: {r2:?}");
-
+    let error = super::dispatch_auto_bind_lease(&home, "agent-reuse", "T-2", "feat/reuse", None)
+        .expect_err("stale managed target must refuse dispatch");
+    assert_eq!(error.code, super::ErrorCode::StaleWorktreeDir, "{error:?}");
+    assert_eq!(
+        error.stage,
+        super::Stage::StaleWorktreePreflight,
+        "{error:?}"
+    );
+    let context: serde_json::Value =
+        serde_json::from_str(error.raw.as_deref().expect("stale context")).unwrap();
+    assert_eq!(context["path"], wt.display().to_string(), "{context}");
+    assert!(context["marker"].as_str().is_some_and(|m| !m.is_empty()));
+    assert!(context["hint"]
+        .as_str()
+        .is_some_and(|hint| { hint.contains("release_worktree") && hint.contains("force=true") }));
     assert!(
-        !pollution.exists(),
-        "#2115 preserved: a true REUSE (binding released + dirty residue) MUST still reset — \
-         the #2158 skip must not over-fire on an absent binding"
+        pollution.exists(),
+        "typed refusal must preserve stale worktree evidence"
     );
     std::fs::remove_dir_all(&home).ok();
 }

@@ -250,10 +250,13 @@ Guardedly release the exact daemon-managed worktree and binding. The normal path
 
 - Required: `instance`; optional `dry_run` and `force`.
 - `force:true` additionally requires `branch`; `repository_path` is an optional cleanup hint. Markerless, opaque, ambiguous, or mismatched state is preserved.
+- Before removing a verified managed worktree, release deletes its ignored `target/` cache, removes the Git worktree, and only then clears the binding. A failed phase returns `code: release_incomplete` with `stage`, `path`, and `bytes_remaining`; the binding remains authoritative.
+- Slow releases continue in the daemon worker after the proxy returns `accepted:true, release_in_flight:true`. `binding_state` reports `release_in_flight` and `release_progress`; completion is delivered as `release_completed`.
+- Checkout/typed dispatch reports a marker-bearing unbound target as `code: stale_worktree_dir` with the marker and guarded force-release advice.
 
 ### `binding_state`
 
-Non-destructively report binding content, worktree/marker state, signature diagnostics, CI subscriptions, in-flight guard, and branch holders.
+Non-destructively report binding content, worktree/marker state, signature diagnostics, CI subscriptions, bind/release in-flight progress, and branch holders.
 
 - Required: `instance`.
 

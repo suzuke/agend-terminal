@@ -4,6 +4,81 @@
 // path. Same module path (agent::dismiss::tests); no content change.
 use super::*;
 
+#[test]
+fn reviewer_3561_short_quote_real_patterns_write_nothing() {
+    let _inline = InlineWrite::arm();
+    let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
+    let quoted: String = live
+        .lines()
+        .take_while(|line| !line.contains("I am using this for local development"))
+        .map(|line| format!("> {line}\n"))
+        .collect();
+    let screen = format!("{quoted}  Continue? [y/N]\n");
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    let mut tracker = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+    tracker.feed(&screen);
+    gate.set_prompt_blocked(is_dismissible_prompt_state(tracker.get_state()));
+    let mut spent = false;
+    for frame in 0..30 {
+        try_prepared_dismiss_dialog_once_per_spawn(
+            "reviewer-3561-short-quote",
+            &screen,
+            &writer,
+            &patterns,
+            DismissScanScope::Startup,
+            &mut gate,
+            LogicalMs(frame * 400),
+            &mut spent,
+        );
+    }
+    assert!(
+        bytes.lock().is_empty(),
+        "quoted warning must not answer a different prompt: {:?}",
+        *bytes.lock()
+    );
+}
+
+#[test]
+fn real_patterns_only_recover_a_recognized_modal_tail_3561() {
+    let _inline = InlineWrite::arm();
+    let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
+    let anchor = live.split("  ❯ 1.").next().expect("modal anchor");
+    for (label, tail, expected) in [
+        ("unknown-prompt", "  Continue? [y/N]\n", vec![]),
+        ("unknown-text", "  Confirm deletion\n", vec![]),
+        (
+            "complete-modal",
+            "  ❯ 1. I am using this for local development\n    2. Exit\n\n  Enter to confirm · Esc to cancel\n",
+            vec![13],
+        ),
+    ] {
+        let screen = format!("{anchor}{tail}");
+        let patterns = claude_prepared_patterns_3314();
+        let (writer, bytes) = recording_writer_3314();
+        let mut gate = DevModalGate::new(true);
+        let mut tracker =
+            crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+        tracker.feed(&screen);
+        gate.set_prompt_blocked(is_dismissible_prompt_state(tracker.get_state()));
+        let mut spent = false;
+        for frame in 0..30 {
+            try_prepared_dismiss_dialog_once_per_spawn(
+                &format!("real-tail-3561-{label}"),
+                &screen,
+                &writer,
+                &patterns,
+                DismissScanScope::Startup,
+                &mut gate,
+                LogicalMs(frame * 400),
+                &mut spent,
+            );
+        }
+        assert_eq!(*bytes.lock(), expected, "{label}");
+    }
+}
+
 /// Pre-#3314-r1 tests exercise the MATCHER, not the generation gate. Give
 /// them a permanently-armed gate already past the stability window so their
 /// meaning is unchanged by the new parameters.
@@ -1802,6 +1877,7 @@ fn generation_teardown_cancels_a_queued_keystroke_3314() {
         std::sync::Arc::clone(&epoch),
         std::sync::Arc::clone(&generation_over),
         std::sync::Arc::clone(&deleted),
+        std::sync::Arc::new(crate::agent::dev_modal::RefuseTally::default()),
     );
     let barrier = gate.write_barrier();
     assert!(barrier.still_valid(), "valid while the generation is live");
@@ -1826,6 +1902,7 @@ fn instance_deletion_cancels_a_queued_keystroke_3314() {
         std::sync::Arc::clone(&epoch),
         std::sync::Arc::clone(&generation_over),
         std::sync::Arc::clone(&deleted),
+        std::sync::Arc::new(crate::agent::dev_modal::RefuseTally::default()),
     );
     let barrier = gate.write_barrier();
     deleted.store(true, Ordering::SeqCst);
