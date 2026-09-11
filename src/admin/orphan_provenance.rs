@@ -683,6 +683,80 @@ pub struct OrphanCandidate {
     /// never a claim.
     pub suggested_instance: Option<String>,
     pub unproven_reason: UnprovenReason,
+    /// #3539: what the display columns LOOK like (a cargo test binary of this
+    /// crate, a debug-profile daemon, a cwd under the agend worktrees). A
+    /// reading aid for the operator, derived from argv/cwd only; it never
+    /// changes the class and never grants authority. `None` = no hint.
+    pub hint: Option<ResidualHint>,
+}
+
+/// #3539 display-only classification of a reparented process by what its
+/// argv/cwd resemble. Motivated by test-runner children that outlive the
+/// `cargo nextest` that spawned them and the daemon that hosted that shell:
+/// they are NOT daemon-owned (the daemon never spawned them), so
+/// `shutdown_sequence` has nothing to reclaim and — per consensus
+/// `d-20260814214253501210-22` — nothing here authorises a signal. The hint
+/// tells the operator what they are looking at; disposition stays with
+/// `doctor orphans preview|apply`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidualHint {
+    /// argv[0] is a cargo test binary of this crate: `<dir>/deps/agend_terminal-<hash>`.
+    TestRunnerBinary,
+    /// argv[0] is a debug-profile `agend-terminal` binary (`<dir>/debug/agend-terminal`),
+    /// the shape of a fixture daemon a test booted. The live daemon runs from
+    /// `target/release`, which deliberately does not match.
+    DebugDaemonBinary,
+    /// cwd is under `<home>/worktrees/` — an agent worktree, possibly already released.
+    AgendWorktreeCwd,
+}
+
+impl ResidualHint {
+    pub fn label(self) -> &'static str {
+        match self {
+            ResidualHint::TestRunnerBinary => "test-runner-binary",
+            ResidualHint::DebugDaemonBinary => "debug-daemon-binary",
+            ResidualHint::AgendWorktreeCwd => "agend-worktree-cwd",
+        }
+    }
+}
+
+/// Classify by argv[0] first, then cwd. Pure string/path logic; no process is
+/// touched. `argv` is the `ps args=` column (space-joined), so argv[0] is its
+/// first whitespace token — the shapes this matches carry no spaces.
+pub fn residual_hint(home: &Path, argv: Option<&str>, cwd: Option<&str>) -> Option<ResidualHint> {
+    if let Some(first) = argv.and_then(|a| a.split_whitespace().next()) {
+        let exe = Path::new(first);
+        let file = exe.file_name().and_then(|f| f.to_str()).unwrap_or("");
+        let parent = exe
+            .parent()
+            .and_then(|d| d.file_name())
+            .and_then(|d| d.to_str())
+            .unwrap_or("");
+        if parent == "deps" && file.starts_with("agend_terminal-") {
+            return Some(ResidualHint::TestRunnerBinary);
+        }
+        let stem = file
+            .strip_suffix(std::env::consts::EXE_SUFFIX)
+            .unwrap_or(file);
+        if parent == "debug" && stem == "agend-terminal" {
+            return Some(ResidualHint::DebugDaemonBinary);
+        }
+    }
+    if let Some(cwd) = cwd {
+        if Path::new(cwd).starts_with(home.join("worktrees")) {
+            return Some(ResidualHint::AgendWorktreeCwd);
+        }
+    }
+    None
+}
+
+/// Recompute every candidate's hint from its current display columns. Call
+/// after filling in `cwd` (the oracle leaves it `None`; `doctor` resolves it
+/// per candidate) so the cwd-based hint can fire.
+pub fn annotate_residual_hints(home: &Path, report: &mut OrphanReport) {
+    for c in &mut report.candidates {
+        c.hint = residual_hint(home, c.argv.as_deref(), c.cwd.as_deref());
+    }
 }
 
 #[derive(Debug)]
@@ -755,6 +829,11 @@ pub fn classify(home: &Path, oracle: &dyn ProcessOracle, _now_ms: i64) -> Orphan
                 Some(_) => UnprovenReason::ObservedButNotAuthoritative,
                 None => UnprovenReason::NoObservation,
             },
+            hint: residual_hint(
+                home,
+                facts.display.argv.as_deref(),
+                facts.display.cwd.as_deref(),
+            ),
         });
     }
 
@@ -825,12 +904,13 @@ pub fn render_human(report: &OrphanReport) -> String {
             c.suggested_instance.as_deref().unwrap_or("unknown"),
         ));
         out.push_str(&format!(
-            "      why={} elapsed_secs={} cpu_percent={} argv={} cwd={}\n",
+            "      why={} hint={} elapsed_secs={} cpu_percent={} argv={} cwd={}\n",
             match c.unproven_reason {
                 UnprovenReason::NoObservation => "no observation relates to it",
                 UnprovenReason::ObservedButNotAuthoritative =>
                     "an observation relates to it, which is not proof of ownership",
             },
+            c.hint.map(ResidualHint::label).unwrap_or("none"),
             opt(c.elapsed_secs),
             opt(c.cpu_percent),
             c.argv.as_deref().unwrap_or("unknown"),

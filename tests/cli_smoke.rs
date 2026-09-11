@@ -605,13 +605,229 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// Owns a unique fixture directory and removes only that exact path.
+#[cfg(unix)]
+struct UniqueFixtureHome {
+    path: std::path::PathBuf,
+    cleaned: bool,
+}
+
+#[cfg(unix)]
+impl UniqueFixtureHome {
+    fn new() -> Result<Self, String> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("read clock: {error}"))?
+            .as_nanos();
+        for attempt in 0..16 {
+            let path = std::env::temp_dir().join(format!(
+                "agend-cli-smoke-stop-transport-{}-{stamp}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        cleaned: false,
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("create unique fixture home: {error}")),
+            }
+        }
+        Err("could not allocate a unique fixture home".into())
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.cleaned {
+            return Ok(());
+        }
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {
+                self.cleaned = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cleaned = true;
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "remove fixture home {}: {error}",
+                self.path.display()
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UniqueFixtureHome {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!("fixture-home cleanup incomplete: {error}");
+        }
+    }
+}
+
+/// Owns one foreground daemon through its `Child` handle. The guard is
+/// created immediately after spawn, before readiness polling can fail.
+#[cfg(unix)]
+struct OwnedForegroundDaemon {
+    child: std::process::Child,
+    home: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl OwnedForegroundDaemon {
+    fn spawn(home: &std::path::Path) -> Result<Self, String> {
+        let binary = cmd().get_program().to_owned();
+        let stderr_path = home.join("foreground-daemon.stderr");
+        let stderr = std::fs::File::create(&stderr_path)
+            .map_err(|error| format!("create foreground daemon stderr capture: {error}"))?;
+        let child = std::process::Command::new(binary)
+            .args(["start", "--foreground"])
+            .env("AGEND_HOME", home)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(stderr))
+            .spawn()
+            .map_err(|error| format!("spawn foreground daemon: {error}"))?;
+        let mut daemon = Self {
+            child,
+            home: home.to_path_buf(),
+        };
+        daemon.wait_ready()?;
+        Ok(daemon)
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn reap(&mut self) -> Result<(), String> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|error| format!("poll foreground daemon before cleanup: {error}"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.child
+            .kill()
+            .map_err(|error| format!("kill owned foreground daemon {}: {error}", self.pid()))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match self
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll owned foreground daemon {}: {error}", self.pid()))?
+            {
+                Some(_) => return Ok(()),
+                None if std::time::Instant::now() >= deadline => {
+                    return Err(format!(
+                        "owned foreground daemon {} remained alive after 3s",
+                        self.pid()
+                    ));
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    }
+
+    fn wait_ready(&mut self) -> Result<(), String> {
+        let run_dir = self.home.join("run").join(self.pid().to_string());
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_secs(30);
+        while started.elapsed() < budget {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll foreground daemon: {error}"))?
+            {
+                let stderr = std::fs::read_to_string(self.home.join("foreground-daemon.stderr"))
+                    .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+                let log = std::fs::read_to_string(self.home.join("daemon.log"))
+                    .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+                return Err(format!(
+                    "foreground daemon exited early: {status}; stderr: {stderr}; daemon.log: {log}"
+                ));
+            }
+            if run_dir.join(".daemon").exists()
+                && run_dir.join("api.port").exists()
+                && run_dir.join(".ready").exists()
+            {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Err(format!(
+            "foreground daemon did not become ready within {budget:?}"
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedForegroundDaemon {
+    fn drop(&mut self) {
+        // The Child handle is the ownership proof; no process-table lookup or
+        // PID/argv/PPID matching is used for teardown. Panic unwinding is
+        // best-effort, while the normal test path asserts `reap()` directly.
+        if let Err(error) = self.reap() {
+            eprintln!("owned foreground daemon cleanup incomplete: {error}");
+        }
+    }
+}
+
+/// The session id the V1 orphan scope reads (`getsid`), or -1 when unreadable.
+#[cfg(unix)]
+fn session_of(pid: u32) -> i32 {
+    // SAFETY: getsid on any pid returns -1/ESRCH rather than misbehaving.
+    unsafe { libc::getsid(pid as libc::pid_t) }
+}
+
+/// What a reader needs when the residual scan does not list a planted pid:
+/// the kernel's view of each pid and the full V1 report.
+#[cfg(unix)]
+fn residue_diagnostics(home: &std::path::Path, pids: &[u32]) -> String {
+    let list: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
+    let ps = std::process::Command::new("ps")
+        .args(["-o", "pid,ppid,uid,sess,command", "-p", &list.join(",")])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_else(|e| format!("ps failed: {e}"));
+    let sids: Vec<String> = pids
+        .iter()
+        .map(|p| format!("getsid({p})={}", session_of(*p)))
+        .collect();
+    let doctor = cmd()
+        .env("AGEND_HOME", home)
+        .arg("doctor")
+        .output()
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout).to_string();
+            out.split("Reparented processes in scope")
+                .nth(1)
+                .map(|tail| format!("Reparented processes in scope{tail}"))
+                .unwrap_or(out)
+        })
+        .unwrap_or_else(|e| format!("doctor failed: {e}"));
+    format!(
+        "--- diagnostics ---\nself pid={} getsid={}\n{ps}{}\n--- doctor V1 report ---\n{doctor}",
+        std::process::id(),
+        session_of(std::process::id()),
+        sids.join(" ")
+    )
+}
+
 /// Processes planted as if a test runner had died and left them behind:
 /// `sleep` invoked through a symlink at `…/target/debug/deps/agend_terminal-<hash>`
 /// (the #3539 residue shape — `ps` reports argv[0] as invoked, and a symlink
 /// keeps the real `/bin/sleep`, which macOS would SIGKILL if copied out of its
-/// signed location) and a plain one elsewhere (the control). Both are started
-/// through a throw-away `sh` so they reparent to init, which is the only scope
-/// the V1 report looks at. `Drop` kills them — test-only authority.
+/// signed location) and a plain one elsewhere (the control).
+///
+/// The V1 scope is `ppid == 1`, same uid, `sid != 1`, and not a session leader.
+/// Start the throw-away shell with `setsid()` so the sleep inherits a fresh
+/// session whose leader exits; this makes the fixture shape deterministic.
+/// `Drop` kills the exact pids it spawned — test-only authority.
 #[cfg(unix)]
 struct PlantedResidue {
     hinted_pid: u32,
@@ -636,18 +852,29 @@ impl PlantedResidue {
     }
 
     fn spawn_reparented(exe: &std::path::Path, cwd: &std::path::Path) -> u32 {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
+        use std::os::unix::process::CommandExt;
+        let mut sh = std::process::Command::new("sh");
+        sh.arg("-c")
             .arg("\"$0\" 300 >/dev/null 2>&1 & echo $!")
             .arg(exe)
-            .current_dir(cwd)
-            .output()
-            .expect("spawn via sh");
+            .current_dir(cwd);
+        // SAFETY: `setsid` is async-signal-safe and touches only the child's
+        // own session/group.
+        unsafe {
+            sh.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = sh.output().expect("spawn via sh");
         let pid: u32 = String::from_utf8_lossy(&out.stdout)
             .trim()
             .parse()
             .expect("sh must echo the background pid");
-        // `sh` has exited, so the child now belongs to init.
+        // `sh` has exited, so the child belongs to init and holds its dead
+        // parent's session.
         let started = std::time::Instant::now();
         while pid_alive(pid) && started.elapsed() < std::time::Duration::from_secs(5) {
             let ppid = std::process::Command::new("ps")
@@ -656,12 +883,17 @@ impl PlantedResidue {
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
-            if ppid == "1" {
+            let sid = session_of(pid);
+            if ppid == "1" && sid > 1 && sid != pid as i32 {
                 return pid;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        panic!("planted pid {pid} did not reparent to init");
+        panic!(
+            "planted pid {pid} never reached V1 scope shape: alive={} getsid={}",
+            pid_alive(pid),
+            session_of(pid)
+        );
     }
 }
 
@@ -735,16 +967,19 @@ fn stop_waits_for_daemon_exit_and_lists_hinted_residue_untouched_3539() {
     );
 
     // (2) residue: listed with its hint, not acted on; control not listed.
+    let planted = [residue.hinted_pid, residue.control_pid];
     assert!(
         stdout.contains(&format!(
             "pid={} hint=test-runner-binary",
             residue.hinted_pid
         )),
-        "the test-runner-shaped residue must be listed with its hint: {stdout}"
+        "the test-runner-shaped residue must be listed with its hint: {stdout}\n{}",
+        residue_diagnostics(&home, &planted)
     );
     assert!(
         !stdout.contains(&format!("pid={} ", residue.control_pid)),
-        "a reparented process without a hint is not stop's business: {stdout}"
+        "a reparented process without a hint is not stop's business: {stdout}\n{}",
+        residue_diagnostics(&home, &planted)
     );
     assert!(
         pid_alive(residue.hinted_pid) && pid_alive(residue.control_pid),
@@ -800,25 +1035,21 @@ fn stop_no_wait_returns_on_the_accepted_request_only_3539() {
 #[cfg(unix)]
 #[test]
 fn stop_transport_failure_is_not_reported_as_absent_3559() {
-    let stamp = std::process::id();
-    let home_guard = FixtureHome::new(&format!("agend-cli-smoke-stop-transport-{stamp}"));
-    let home = home_guard.path().to_path_buf();
+    let mut home_guard = UniqueFixtureHome::new().expect("create unique fixture home");
+    let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
         "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
-    cmd()
-        .env("AGEND_HOME", &home)
-        .arg("start")
-        .assert()
-        .success();
-    let daemon_pid = wait_for_daemon_identity(&home, std::time::Duration::from_secs(30));
+    let mut daemon = OwnedForegroundDaemon::spawn(&home).expect("foreground daemon must start");
+    let daemon_pid = daemon.pid();
     assert!(pid_alive(daemon_pid), "daemon must be alive before stop");
 
     // Keep the daemon alive but make the published API endpoint unreachable.
-    // `home_guard` owns the daemon and reaps it after this assertion.
+    // `daemon` owns the exact foreground child and tears it down after this
+    // assertion; `home_guard` removes the unique home after `daemon` drops.
     std::fs::write(
         home.join("run")
             .join(daemon_pid.to_string())
@@ -846,4 +1077,14 @@ fn stop_transport_failure_is_not_reported_as_absent_3559() {
         pid_alive(daemon_pid),
         "the daemon remains live after the refused request: stdout={stdout} stderr={stderr}"
     );
+    daemon
+        .reap()
+        .expect("owned foreground daemon must be reaped");
+    assert!(
+        !pid_alive(daemon_pid),
+        "owned foreground daemon must be gone after explicit cleanup"
+    );
+    home_guard
+        .cleanup()
+        .expect("unique fixture home must be removed after child reap");
 }

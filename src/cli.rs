@@ -332,6 +332,8 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     for candidate in &mut report.candidates {
         candidate.cwd = cwds.get(&candidate.pid).cloned();
     }
+    // #3539: cwd is known only now, so the display-only hint is recomputed.
+    crate::admin::orphan_provenance::annotate_residual_hints(home, &mut report);
     for line in crate::admin::orphan_provenance::render_human(&report).lines() {
         println!("  {line}");
     }
