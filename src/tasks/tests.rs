@@ -5146,6 +5146,33 @@ fn test_sweep_scan_identifies_team_disbanded_category() {
 }
 
 #[test]
+fn test_sweep_nondefault_route_residue_is_reported() {
+    let home = tmp_home("sweep_replacement_nondefault_route");
+    cross_board_fleet(&home);
+    let task_id = create_on(&home, "devA", "route residue", &[]);
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": task_id}),
+    );
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "update", "id": task_id, "status": "in_review"}),
+    );
+    let live: std::collections::HashSet<String> = ["devA".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let report = cats.as_json();
+    let residue = report["stale_nonterminal"]
+        .as_array()
+        .expect("stale_nonterminal report bucket");
+    assert_eq!(residue.len(), 1);
+    assert_eq!(residue[0]["project_route"], "orgA_projA");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_sweep_scan_identifies_shipped_via_pr_lookup_stub() {
     // GREEN 2a: a task whose title carries `PR #999` and whose
     // stubbed PR state is Merged lands in the shipped bucket
