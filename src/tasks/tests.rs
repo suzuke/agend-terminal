@@ -538,6 +538,63 @@ fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn reconcile_mixed_owner_does_not_orphan_in_review_task() {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let home = tmp_home("reconcile_mixed_owner_in_review");
+    let owner = InstanceName::from("ghost-mixed");
+    let review_id = TaskId("t-review-mixed".into());
+    let open_id = TaskId("t-open-mixed".into());
+    let created = |task_id: TaskId| TaskEvent::Created {
+        task_id,
+        title: "mixed owner task".into(),
+        description: String::new(),
+        priority: "normal".into(),
+        owner: Some(owner.clone()),
+        due_at: None,
+        depends_on: Vec::new(),
+        routed_to: None,
+        branch: None,
+        bind: None,
+        eta_secs: None,
+        tags: vec![],
+        parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
+    };
+    crate::task_events::append_batch(
+        &home,
+        &InstanceName::from("test:mixed_owner"),
+        vec![
+            created(review_id.clone()),
+            created(open_id.clone()),
+            TaskEvent::MovedToReview {
+                task_id: review_id.clone(),
+            },
+        ],
+    )
+    .expect("seed mixed-owner tasks");
+
+    let state = crate::task_events::replay(&home).expect("replay mixed-owner tasks");
+    let scan = scan_orphan_candidates(
+        &state,
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(
+        scan.strict.get(owner.0.as_str()),
+        Some(&vec![open_id.clone()]),
+        "InReview ghost-owner candidates must stay report-only and out of auto-orphan input"
+    );
+
+    reconcile_orphan_owners_with_live(&home, &std::collections::HashSet::new());
+
+    let state = crate::task_events::replay(&home).expect("replay mixed-owner tasks");
+    assert!(state.tasks[&review_id].owner.is_some());
+    assert!(state.tasks[&open_id].owner.is_none());
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ── Boot orphan sweep (task t-20260526155509233515-8) ──
 // STATUS-orphan sweep: at boot, `live = ∅` (auto_start runs after
 // bootstrap), so every in_progress task is a prev-session orphan and is
