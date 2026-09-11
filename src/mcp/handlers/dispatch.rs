@@ -620,6 +620,11 @@ pub(crate) fn dispatch_revoke_review_assignment(ctx: &HandlerCtx<'_>) -> Value {
     review_assignment::handle_revoke_review_assignment(ctx.home, ctx.args, ctx.sender)
 }
 
+/// Decision45: operator-only exact-PR audited review-class correction.
+pub(crate) fn dispatch_correct_review_class(ctx: &HandlerCtx<'_>) -> Value {
+    super::review_class_correction::handle_correct_review_class(ctx.home, ctx.args, ctx.sender)
+}
+
 pub(crate) fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
         "get" => {
@@ -823,10 +828,11 @@ mod tests {
                 "release_worktree",
                 "binding_state",
                 "revoke_review_assignment",
+                "correct_review_class",
                 "usage_limit_takeover",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 33);
+        assert_eq!(crate::mcp::registry::all().len(), 34);
     }
 
     #[test]

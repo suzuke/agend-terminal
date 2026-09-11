@@ -14,6 +14,7 @@ pub(crate) mod comms_gates;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_hook;
 mod force_release;
+pub(crate) mod review_class_correction;
 pub(crate) use force_release::{
     classify_target, prune_exact_git_metadata, ExactMetadataState, TargetState,
 };

@@ -251,6 +251,27 @@ pub(crate) fn validate_review_assignment_marker(
             "code": "review_assignment_subject_mismatch",
         }));
     }
+    match crate::mcp::handlers::review_class_correction::is_incomplete(
+        home,
+        &repo_slug,
+        branch,
+        pr_number,
+        reviewed_head,
+    ) {
+        Ok(true) => {
+            return Err(json!({
+                "error": "review-class correction is incomplete for this exact PR subject",
+                "code": "review_class_correction_incomplete",
+            }));
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return Err(json!({
+                "error": format!("review-class correction fence unavailable: {error}"),
+                "code": "review_class_correction_fence_unavailable",
+            }));
+        }
+    }
     // The validated, canonical `owner/repo` slug is returned so the store dispatch
     // (A1) keys the record on the SAME lockstep form the ACL matched (I25) — no
     // second resolve (which could redrift or re-run a git subprocess).

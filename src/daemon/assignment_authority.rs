@@ -1228,6 +1228,59 @@ pub(crate) fn retire_if_id_matches(
     result
 }
 
+/// Retire every active reviewer assignment for one exact PR generation. This
+/// is the correction-only bulk operation: the caller supplies the full PR
+/// number and head, so a reused branch or newer generation is never touched.
+/// The branch lock serializes the scan and all CAS removals; task cleanup runs
+/// only after the lock is released. Typed receipt invalidation stays inside
+/// the same branch lock so CI replay cannot select a row while correction is
+/// retiring its matching assignments.
+pub(crate) fn retire_for_review_class_correction(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    pr_number: u64,
+    reviewed_head: &str,
+    now: &str,
+) -> anyhow::Result<(usize, usize)> {
+    let mut cleanup_tasks = Vec::new();
+    let result = (|| {
+        let _lock = lock_branch(home, repo, branch)?;
+        let records = list_active_checked(home, repo, branch)?
+            .into_iter()
+            .filter(|record| {
+                record.pr_number == pr_number
+                    && record.reviewed_head.as_deref() == Some(reviewed_head)
+            })
+            .collect::<Vec<_>>();
+        let mut retired = 0;
+        for record in records {
+            retired += usize::from(retire_under_lock(
+                home,
+                repo,
+                branch,
+                &record.target,
+                record.assignment_id,
+                now,
+                &mut cleanup_tasks,
+            )?);
+        }
+        let invalidated_receipts =
+            crate::daemon::pr_state::verdict_buffer::invalidate_validated_for_subject(
+                home,
+                repo,
+                branch,
+                pr_number,
+                reviewed_head,
+            )?;
+        Ok((retired, invalidated_receipts))
+    })();
+    for task_id in cleanup_tasks {
+        crate::tasks::task_terminal_cleanup(home, &task_id);
+    }
+    result
+}
+
 pub(crate) fn retire_for_terminal_event(
     home: &Path,
     board: &str,

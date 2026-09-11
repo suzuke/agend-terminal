@@ -1,8 +1,8 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（33 個工具）
+# AgEnD MCP Tools Reference — 工具參考（34 個工具）
 
-Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance role 不同，實際顯示的工具可能是這 32 個已註冊工具的子集。
+Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance role 不同，實際顯示的工具可能是這 34 個已註冊工具的子集。
 
 ## 動作型工具（Action-based Tools）
 
@@ -50,9 +50,17 @@ Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance 
 
 管理 CI watch。動作：`watch`、`unwatch`、`status`。
 
-- 欄位：`repository`、`branch`、`interval_secs`、`next_after_ci`、`review_class`、`ci_provider`、`ci_provider_url`、`task_id`、`head_sha`。
+- 欄位：`repository`、`branch`、`interval_secs`、`next_after_ci`、`review_class`、`ci_provider`、`ci_provider_url`、`task_id`、`head_sha`、`subject_head_sha`。
 - 使用 `repository`（GitHub `owner/repo`），不是 `repo`。`watch` 可從 caller binding 推導；`unwatch` 必須明確提供。
 - 一般 `main`／`master` watch 會被拒絕。Protected ref exact-head watch 需要完整 40/64-hex `head_sha`、`task_id`、明確 `next_after_ci`、GitHub，以及已授權的 orchestrator/operator caller。
+
+### `correct_review_class`
+
+Decision45 僅限 operator、具稽核紀錄的單一 PR generation review class 修正。
+
+- 欄位：`action`（`preview` 或 `apply`）、canonical `repository`、`pr_number`、subject `branch`、完整目前 `head_sha`、`expected_old_class`、`new_class`、穩定的 `operation_id` 與非空 `reason`。
+- `preview` 只驗證 provider/local 的 exact-PR snapshot，不修改狀態；`apply` 先持久化 intent，再失效精確 assignment/receipt，在未完成時 fence dispatch、receipt replay 與 merge，並保留可稽核 effect snapshot，讓同 operation retry 具冪等性。
+- Agent 與 orchestrator 皆拒絕；snapshot drift、journal 不確定、operation 重用不一致及非精確 watch identity 都 fail closed；CI、exact-head、base 與 non-force merge gate 不變。
 
 ### `repo`
 

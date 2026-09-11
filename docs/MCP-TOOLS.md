@@ -1,8 +1,8 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (33 tools)
+# AgEnD MCP Tools Reference (34 tools)
 
-The daemon registry and live `tools/list` schema are authoritative. Role filtering can expose a subset of these 32 registered tools to an instance.
+The daemon registry and live `tools/list` schema are authoritative. Role filtering can expose a subset of these 34 registered tools to an instance.
 
 ## Action-based Tools
 
@@ -50,9 +50,17 @@ Manage batch deployments. Actions: `deploy`, `teardown`, `list`.
 
 Manage CI watches. Actions: `watch`, `unwatch`, `status`.
 
-- Fields: `repository`, `branch`, `interval_secs`, `next_after_ci`, `review_class`, `ci_provider`, `ci_provider_url`, `task_id`, `head_sha`.
+- Fields: `repository`, `branch`, `interval_secs`, `next_after_ci`, `review_class`, `ci_provider`, `ci_provider_url`, `task_id`, `head_sha`, `subject_head_sha`.
 - Use `repository` (GitHub `owner/repo`), not `repo`. `watch` may derive it from the caller's binding; `unwatch` requires it explicitly.
 - Generic `main`/`master` watches are rejected. A protected-ref exact-head watch requires a full 40/64-hex `head_sha`, `task_id`, explicit `next_after_ci`, GitHub, and an authorized orchestrator/operator caller.
+
+### `correct_review_class`
+
+Decision45 operator-only audited correction for one exact PR generation.
+
+- Fields: `action` (`preview` or `apply`), canonical `repository`, `pr_number`, subject `branch`, full current `head_sha`, `expected_old_class`, `new_class`, stable `operation_id`, and nonempty `reason`.
+- `preview` validates the provider/local exact-PR snapshot without changing state. `apply` persists intent before invalidating exact assignments and receipts, fences dispatch/receipt replay/merge while incomplete, and records an auditable effect snapshot for idempotent same-operation retry.
+- Agents and orchestrators are denied. Snapshot drift, journal uncertainty, mismatched operation reuse, and non-exact watch identity fail closed; CI, exact-head, base, and non-force merge gates remain unchanged.
 
 ### `repo`
 

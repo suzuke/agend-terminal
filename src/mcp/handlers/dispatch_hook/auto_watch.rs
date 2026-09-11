@@ -15,11 +15,13 @@ use std::path::Path;
 /// Arm the dispatch ci-watch for `target` on `repo`+`branch`. Best-effort: a failed
 /// arm is logged (never fatal — the dispatch + lease already succeeded).
 /// Returns `true` when the arm failed (caller surfaces degraded warning).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn arm(
     home: &Path,
     target: &str,
     repo: &str,
     branch: &str,
+    subject_head_sha: Option<&str>,
     next_after_ci: &[String],
     review_class: Option<&str>,
     task_id: &str,
@@ -30,6 +32,10 @@ pub(super) fn arm(
     // name-derive; unset → no chain target (subscribers still get the informational
     // `[ci-pass]`, #1796).
     let mut watch_args = json!({"repository": repo, "branch": branch});
+    if let Some(head_sha) = subject_head_sha.filter(|sha| crate::review_receipt::is_full_head(sha))
+    {
+        watch_args["subject_head_sha"] = json!(head_sha);
+    }
     if let Some(next_json) = crate::daemon::ci_watch::watch_state::next_after_ci_json(next_after_ci)
     {
         watch_args["next_after_ci"] = next_json;
