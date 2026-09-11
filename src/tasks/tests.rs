@@ -5114,6 +5114,42 @@ fn stub_issue_lookup(repo: &str, num: u32) -> Result<sweep::IssueState, String> 
 }
 
 #[test]
+fn task_sweep_fails_closed_for_incomplete_board_enumeration() {
+    let home = tmp_home("sweep-incomplete-board-enumeration");
+    // A path occupying `boards/` makes the authoritative board enumeration
+    // fail before any board can be proven absent. The checked route must
+    // expose that error; the sweep must not turn it into an empty plan.
+    std::fs::write(home.join("boards"), "not a directory").unwrap();
+    assert!(
+        crate::tasks::board_router::list_all_boards_checked(&home).is_err(),
+        "fixture must make checked board enumeration fail"
+    );
+
+    let live = std::collections::HashSet::new();
+    for args in [
+        serde_json::json!({"action": "sweep"}),
+        serde_json::json!({
+            "action": "sweep",
+            "apply": true,
+            "confirm_ids": ["t-not-proven"],
+            "audit_reason": "fail-closed board enumeration regression",
+        }),
+    ] {
+        let response = handle_with_live_instances(&home, "agent", &args, &live);
+        assert_eq!(
+            response["code"], "task_catalog_unreadable",
+            "incomplete board enumeration must fail closed for {args}, got {response}"
+        );
+        assert_ne!(
+            response["dry_run"], true,
+            "unreadable board enumeration must never produce a successful dry-run"
+        );
+    }
+    std::fs::remove_file(home.join("boards")).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_sweep_scan_identifies_team_disbanded_category() {
     // GREEN 2: scan_categories puts tasks owned by instances NOT
     // in live_instances AND aged > 30d into the team_disbanded
