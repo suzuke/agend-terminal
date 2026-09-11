@@ -648,6 +648,20 @@ enum AdminCommands {
         /// Repeat the flag to acknowledge multiple `project|repo|api` keys.
         #[arg(long = "acknowledge-provenance")]
         acknowledge_provenance: Vec<String>,
+        /// Acknowledge an explicitly named project board whose provenance is
+        /// intentionally unmapped. This records only the project id; it does
+        /// not infer a repository or change task-board routing.
+        #[arg(long = "acknowledge-manual-unmapped")]
+        acknowledge_manual_unmapped: Option<String>,
+        /// Operator identity for a manual-unmapped acknowledgement.
+        #[arg(long = "provenance-actor")]
+        provenance_actor: Option<String>,
+        /// Audited reason for a manual-unmapped acknowledgement.
+        #[arg(long = "provenance-reason")]
+        provenance_reason: Option<String>,
+        /// Preview a manual-unmapped acknowledgement without writing state.
+        #[arg(long = "provenance-dry-run")]
+        provenance_dry_run: bool,
     },
     /// #2548: list Phase 4 GC candidates (released, past-grace, daemon-managed
     /// worktrees) without deleting them. Non-destructive. Moved from the
@@ -1602,8 +1616,22 @@ fn main() -> anyhow::Result<()> {
                 no_dry_run,
                 api_base_url,
                 acknowledge_provenance,
+                acknowledge_manual_unmapped,
+                provenance_actor,
+                provenance_reason,
+                provenance_dry_run,
             } => {
                 let mut args = serde_json::json!({});
+                if let Some(project_id) = acknowledge_manual_unmapped {
+                    args["acknowledge_manual_unmapped"] = serde_json::json!(project_id);
+                    if let Some(actor) = provenance_actor {
+                        args["provenance_actor"] = serde_json::json!(actor);
+                    }
+                    if let Some(reason) = provenance_reason {
+                        args["provenance_reason"] = serde_json::json!(reason);
+                    }
+                    args["provenance_dry_run"] = serde_json::json!(provenance_dry_run);
+                }
                 if let Some(repo) = repository {
                     args["repository"] = serde_json::json!(repo);
                 }

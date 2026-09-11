@@ -196,6 +196,22 @@ pub(super) fn enumerate_projects(home: &Path) -> Result<Vec<String>, TaskRouteEr
     Ok(out)
 }
 
+/// Return only explicitly materialized project-board names.
+///
+/// The caller supplies the project id; this helper deliberately does not
+/// derive one from a checkout path, git remote, or team membership.  That
+/// distinction is important for operator acknowledgement of a
+/// `MANUAL_UNMAPPED` board: acknowledgement records what is present, but
+/// never turns an explicit board name into a guessed repository mapping.
+pub(crate) fn explicit_project_ids(home: &Path) -> Result<Vec<String>, TaskRouteError> {
+    enumerate_projects(home).map(|projects| {
+        projects
+            .into_iter()
+            .filter(|project| project != DEFAULT_PROJECT)
+            .collect()
+    })
+}
+
 // ── board handles + cross-board listing ────────────────────────────
 
 // ── #2760 item 2: per-task-ID router lock ──────────────────────────
