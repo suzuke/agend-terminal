@@ -5193,7 +5193,7 @@ fn test_sweep_scan_reports_stale_nonterminal_residue_without_apply_ids() {
     let candidate = &cats.stale_nonterminal[0];
     assert_eq!(candidate.owner.as_deref(), Some("alive"));
     assert_eq!(candidate.branch.as_deref(), Some("feature/residue"));
-    assert_eq!(candidate.project_route, None);
+    assert_eq!(candidate.project_route.as_deref(), Some("default"));
     assert_eq!(
         candidate.due_at.as_deref(),
         Some("2026-01-01T00:00:00+00:00")
