@@ -226,6 +226,31 @@ pub(super) fn scan_categories(
             }
         }
         let search_text = format!("{}\n{}", t.title, t.description);
+        if matches!(
+            t.status,
+            crate::task_events::TaskStatus::Claimed
+                | crate::task_events::TaskStatus::InProgress
+                | crate::task_events::TaskStatus::InReview
+                | crate::task_events::TaskStatus::Blocked
+        ) {
+            let Some(a) = age.filter(|a| *a > Duration::days(14)) else {
+                continue;
+            };
+            let refs = extract_refs(&search_text);
+            let ref_labels = refs
+                .pr_nums
+                .iter()
+                .map(|n| format!("PR #{n}"))
+                .chain(refs.issue_nums.iter().map(|n| format!("issue #{n}")))
+                .collect();
+            cats.stale_nonterminal.push(candidate(
+                t,
+                format!("{} task {}d stale", t.status, a.num_days()),
+                refs.pr_nums.first().copied(),
+                ref_labels,
+            ));
+            continue;
+        }
         // (3) shipped / (4) superseded — first PR ref + query. Unchanged
         // predicates; only a `continue` is added after each push so an
         // already-bucketed task is not re-examined by the new stale_open arm
@@ -265,30 +290,6 @@ pub(super) fn scan_categories(
                     PrState::Open | PrState::Unknown => {}
                 }
             }
-        }
-        if matches!(
-            t.status,
-            crate::task_events::TaskStatus::Claimed
-                | crate::task_events::TaskStatus::InProgress
-                | crate::task_events::TaskStatus::InReview
-                | crate::task_events::TaskStatus::Blocked
-        ) {
-            let Some(a) = age.filter(|a| *a > Duration::days(14)) else {
-                continue;
-            };
-            let refs = extract_refs(&search_text);
-            let ref_labels = refs
-                .pr_nums
-                .iter()
-                .map(|n| format!("PR #{n}"))
-                .chain(refs.issue_nums.iter().map(|n| format!("issue #{n}")))
-                .collect();
-            cats.stale_nonterminal.push(candidate(
-                t,
-                format!("{} task {}d stale", t.status, a.num_days()),
-                refs.pr_nums.first().copied(),
-                ref_labels,
-            ));
         }
         // (5) stale_open (#2061) — OPEN/Backlog tasks the shipped/superseded
         // arms didn't claim. Conservative (under-report): flag ONLY when EVERY
