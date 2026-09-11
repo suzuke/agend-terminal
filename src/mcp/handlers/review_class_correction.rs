@@ -288,9 +288,13 @@ fn update_watch_class(
         };
         let mut watch: Value = serde_json::from_slice(&bytes)
             .map_err(|error| anyhow::anyhow!("invalid CI watch {}: {error}", path.display()))?;
+        let watch_head = watch
+            .get("target_head_sha")
+            .or_else(|| watch.get("subject_head_sha"))
+            .and_then(Value::as_str);
         if watch.get("repo").and_then(Value::as_str) != Some(repository)
             || watch.get("branch").and_then(Value::as_str) != Some(branch)
-            || watch.get("target_head_sha").and_then(Value::as_str) != Some(head_sha)
+            || watch_head != Some(head_sha)
             || watch
                 .get("pr_number")
                 .and_then(Value::as_u64)
