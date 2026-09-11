@@ -1,4 +1,3 @@
-use super::list_all;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -171,7 +170,17 @@ pub(super) fn scan_categories(
     repo: Option<&str>,
     now: DateTime<Utc>,
 ) -> Categories {
-    let tasks = list_all(home);
+    let tasks = crate::tasks::board_router::list_all_boards_checked(home)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|(project, tasks)| {
+            tasks.into_iter().map(move |mut task| {
+                task.metadata
+                    .insert("project".to_string(), serde_json::json!(project));
+                task
+            })
+        })
+        .collect::<Vec<_>>();
     let mut cats = Categories::default();
     let mut pr_cache: HashMap<u32, PrState> = HashMap::new();
     let mut issue_cache: HashMap<u32, IssueState> = HashMap::new();
