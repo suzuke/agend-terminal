@@ -598,8 +598,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // #2158 GR1: auto-arm the dispatch ci-watch ONLY on an explicit dispatch intent
     // (`arm_ci_watch`), NOT on task_id presence — a single-target `send kind=task`
     // (auto-create-exempt) reaches here with task_id="" and MUST still arm. bind_self
-    // self-claims pass `arm_ci_watch=false` and skip the silent arm (#2158 GR1). The
-    // arming body lives in `auto_watch.rs` (file-size split).
+    // self-claims pass `arm_ci_watch=false` and skip the silent arm (#2158 GR1).
     let mut ci_watch_arm_failed = false;
     let mut ci_watch = None;
     if arm_ci_watch {
@@ -609,6 +608,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 target,
                 &r,
                 branch,
+                exact_head::branch_tip(&source_repo, branch).as_deref(),
                 next_after_ci,
                 review_class,
                 task_id,

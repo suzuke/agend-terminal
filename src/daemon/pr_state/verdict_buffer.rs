@@ -150,6 +150,49 @@ pub(crate) fn select_validated_for_subject(
     out
 }
 
+/// Remove buffered typed receipts for one exact PR generation. The caller must
+/// hold the matching assignment branch lock; correction uses the same lock
+/// order as the normal replay path and leaves malformed rows in place so a
+/// failed correction remains fail-closed and retryable.
+pub(crate) fn invalidate_validated_for_subject(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    pr_number: u64,
+    head: &str,
+) -> anyhow::Result<usize> {
+    let dir = validated_buffer_dir(home);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let path = entry?.path();
+        if !is_buffer_file(&path) {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        let buffered: BufferedValidatedReceipt =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid validated receipt buffer {}: {error}",
+                    path.display()
+                )
+            })?;
+        if buffered.receipt.repo == repo
+            && buffered.receipt.branch == branch
+            && buffered.receipt.pr_number == pr_number
+            && buffered.receipt.reviewed_head == head
+        {
+            std::fs::remove_file(path)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Commit candidates only after the PR-state save succeeds. Re-read and compare
 /// the entire durable row before unlinking: a failed save leaves every candidate
 /// retryable, while same-path content replacement cannot be mistaken for the

@@ -443,12 +443,16 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     if let Some(rc) = requested_review_class.as_deref() {
         watch["review_class"] = json!(rc);
     }
-    // S1: persist the (validated, lowercased) exact-head pin. Its PRESENCE marks
-    // this as a protected post-merge watch the poller resolves by target SHA and
-    // `gc_stale_watches` preserves across restart. Only reachable here after the
-    // exact-head gate above, so a non-protected watch never carries it.
+    // S1: persist the validated exact-head pin for protected post-merge watches.
     if let Some(sha) = exact_head_sha.as_deref() {
         watch["target_head_sha"] = json!(sha);
+    }
+    // Preserve the immutable dispatch generation for Decision45 fencing.
+    if let Some(sha) = args["subject_head_sha"]
+        .as_str()
+        .filter(|sha| crate::review_receipt::is_full_head(sha))
+    {
+        watch["subject_head_sha"] = json!(sha);
     }
     // #2812: notification-only watch — short TTL (1h), persisted flag.
     // Only valid on protected refs (the gate above validates all guards).
