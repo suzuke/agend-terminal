@@ -5166,7 +5166,8 @@ fn test_sweep_scan_identifies_team_disbanded_category() {
     let task_id = r["id"].as_str().expect("id").to_string();
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(60);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert_eq!(
         cats.team_disbanded.len(),
         1,
@@ -5178,6 +5179,87 @@ fn test_sweep_scan_identifies_team_disbanded_category() {
     assert!(cats.shipped.is_empty());
     assert!(cats.superseded.is_empty());
     assert!(cats.validation_leftovers.is_empty());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_nondefault_route_residue_is_reported() {
+    let home = tmp_home("sweep_replacement_nondefault_route");
+    cross_board_fleet(&home);
+    let task_id = create_on(&home, "devA", "route residue", &[]);
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": task_id}),
+    );
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "update", "id": task_id, "status": "in_review"}),
+    );
+    let live: std::collections::HashSet<String> = ["devA".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
+    let report = cats.as_json();
+    let residue = report["stale_nonterminal"]
+        .as_array()
+        .expect("stale_nonterminal report bucket");
+    assert_eq!(residue.len(), 1);
+    assert_eq!(residue[0]["project_route"], "orgA_projA");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_scan_reports_stale_nonterminal_residue_without_apply_ids() {
+    let home = tmp_home("sweep_nonterminal_residue");
+    write_fleet_yaml(&home, &["alive"]);
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let statuses = ["claimed", "in_progress", "in_review", "blocked"];
+    for status in statuses {
+        let created = handle(
+            &home,
+            "alive",
+            &serde_json::json!({
+                "action": "create",
+                "title": format!("residue {status} PR #101"),
+                "assignee": "alive",
+                "branch": "feature/residue",
+                "due_at": "2026-01-01T00:00:00Z"
+            }),
+        );
+        let id = created["id"].as_str().expect("id");
+        handle(
+            &home,
+            "alive",
+            &serde_json::json!({"action":"claim", "id":id}),
+        );
+        if status != "claimed" {
+            handle(
+                &home,
+                "alive",
+                &serde_json::json!({"action":"update", "id":id, "status":status}),
+            );
+        }
+    }
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
+    assert_eq!(cats.stale_nonterminal.len(), statuses.len());
+    assert!(
+        cats.all_ids().is_empty(),
+        "residue must not enter cancellation IDs"
+    );
+    let candidate = &cats.stale_nonterminal[0];
+    assert_eq!(candidate.owner.as_deref(), Some("alive"));
+    assert_eq!(candidate.branch.as_deref(), Some("feature/residue"));
+    assert_eq!(candidate.project_route.as_deref(), Some("default"));
+    assert_eq!(
+        candidate.due_at.as_deref(),
+        Some("2026-01-01T00:00:00+00:00")
+    );
+    assert_eq!(candidate.refs, vec!["PR #101"]);
+    assert!(!candidate.last_activity.is_empty());
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -5211,7 +5293,8 @@ fn test_sweep_scan_identifies_shipped_via_pr_lookup_stub() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert_eq!(
         cats.shipped.len(),
         1,
@@ -5312,7 +5395,8 @@ fn test_sweep_apply_emits_cancelled_and_logs_audit() {
     let task_id = r["id"].as_str().expect("id").to_string();
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(60);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert_eq!(cats.team_disbanded.len(), 1);
     let confirm: std::collections::HashSet<String> = [task_id.clone()].into_iter().collect();
     let count = sweep::emit_cancelled_batch(&home, &cats, &confirm, "post-#806 sweep test fixture")
@@ -5574,7 +5658,8 @@ fn test_sweep_stale_open_all_refs_terminal_flagged() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert!(
         cats.stale_open.iter().any(|c| c.id == id),
         "task with an all-terminal issue ref must be flagged stale_open, got {cats:?}"
@@ -5598,7 +5683,8 @@ fn test_sweep_stale_open_open_ref_not_flagged() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "task with an OPEN issue ref must NOT be flagged (in flight), got {cats:?}"
@@ -5615,7 +5701,8 @@ fn test_sweep_stale_open_no_ref_old_flagged() {
     let id = create_open_task(&home, "plain stale task no refs");
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(15);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert!(
         cats.stale_open.iter().any(|c| c.id == id),
         "ref-less open task >14d must be flagged stale_open (no repo needed), got {cats:?}"
@@ -5631,7 +5718,8 @@ fn test_sweep_stale_open_no_ref_fresh_not_flagged() {
     let id = create_open_task(&home, "plain fresh task no refs");
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(13);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "ref-less open task <14d must NOT be flagged, got {cats:?}"
@@ -5656,7 +5744,8 @@ fn test_sweep_stale_open_mixed_ref_not_flagged() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "ANY non-terminal ref must disqualify the whole task, got {cats:?}"
@@ -5680,7 +5769,8 @@ fn test_sweep_stale_open_unknown_ref_not_flagged() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "an Unknown (unresolvable) ref must NOT be flagged (fail safe), got {cats:?}"
@@ -5698,7 +5788,8 @@ fn test_sweep_stale_open_apply_labels_category() {
     let id = create_open_task(&home, "ref-less stale task to cancel");
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(20);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert!(
         cats.stale_open.iter().any(|c| c.id == id),
         "precondition: task must be a stale_open candidate, got {cats:?}"
@@ -5743,7 +5834,8 @@ fn sweep_cancel_settles_dispatch_tracking_78445_2() {
     }
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(20);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     let confirm: std::collections::HashSet<String> = [id.clone()].into_iter().collect();
     sweep::emit_cancelled_batch(&home, &cats, &confirm, "sweep settle test").expect("emit");
 
@@ -5769,7 +5861,8 @@ fn test_sweep_stale_open_overflow_ref_token_not_flagged() {
     let id = create_open_task(&home, "tracking upstream #99999999999999999999");
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(20);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "an unparseable (overflow) #N ref must NOT be age-flagged as ref-less, got {cats:?}"
@@ -5790,7 +5883,8 @@ fn test_sweep_stale_open_url_ref_not_flagged() {
     );
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(20);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "an issue referenced only by URL must NOT be age-flagged as ref-less, got {cats:?}"
@@ -5816,7 +5910,8 @@ fn test_sweep_stale_open_merged_pr_fresh_flagged() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert!(
         cats.shipped.is_empty(),
         "shipped must NOT fire under its 7d grace, got {cats:?}"
