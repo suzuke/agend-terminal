@@ -330,10 +330,27 @@ pub(crate) fn def_team() -> Value {
 }
 
 pub(crate) fn def_schedule() -> Value {
-    json!({"name": "schedule", "description": "Manage schedules. Actions: create, list, update, delete.",
+    json!({"name": "schedule", "description": "Manage schedules. Instance reminders or daemon-owned jobs. Actions: create, list, update, delete, runs, complete, resolve_recovery.",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["create", "list", "update", "delete"]},
+            "action": {"type": "string", "enum": ["create", "list", "update", "delete", "runs", "complete", "resolve_recovery"]},
             "id": {"type": "string"},
+            "run_id": {"type": "string", "description": "Job run to complete or resolve recovery."},
+            "cleanup_confirmed": {"type": "boolean", "description": "resolve_recovery only: operator confirms worker/tools stopped, delivery reconciled, and worker deleted. Never authorizes automatic retry."},
+            "attempt_id": {"type": "integer", "minimum": 1, "description": "Current attempt number required for complete."},
+            "result": {"type": "string", "description": "Completion result and artifact locations."},
+            "job": {"type": "object", "additionalProperties": false, "description": "Create a daemon-owned job instead of targeting an instance. Mode is immutable; updates affect future runs. No automatic replacement after spawn intent; manual recovery is required even after successful execution when descendant cleanup cannot be proven.", "properties": {
+                "backends": {"type": "array", "minItems": 1, "uniqueItems": true, "description": "Ordered candidates for failures before spawn intent only; never fallback after an attempt may have launched.", "items": {"type": "string", "enum": ["claude", "codex", "kiro-cli", "opencode", "antigravity-cli", "grok"]}},
+                "artifact_directory": {"type": "string", "description": "Absolute persistent artifact directory, separate from worker workspaces preserved while recovery is required."},
+                "timeout_secs": {"type": "integer", "minimum": 60, "maximum": 86400, "default": 3600, "description": "Run deadline; a launched attempt requires manual recovery when exceeded."},
+                "max_attempts": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3, "description": "Attempt limit for pre-launch failures only."},
+                "retry_delay_secs": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 60, "description": "Delay between retries before spawn intent; no post-launch retries."},
+                "output_context": {"type": "string", "description": "Stable delivery instructions; do not include credentials."},
+                "notification": {"type": "object", "additionalProperties": false, "description": "Optional completion or recovery-required notice to an explicit endpoint. No automatic retries after an ambiguous send.", "properties": {
+                    "channel": {"type": "string", "enum": ["telegram"]},
+                    "chat_id": {"type": "integer", "description": "Must match the configured fleet Telegram group."},
+                    "topic_id": {"type": "integer", "minimum": 1, "description": "Existing topic; omitted means the configured group without a thread."}
+                }, "required": ["channel", "chat_id"]}
+            }, "required": ["backends", "artifact_directory"]},
             "cron": {"type": "string", "description": "5- or 6-field cron expression (recurring). 5-field layout: `min hour day-of-month month day-of-week`; 6-field prepends seconds. Day-of-week uses Quartz convention: 1=Sun, 2=Mon, 3=Tue, 4=Wed, 5=Thu, 6=Fri, 7=Sat (NOT Unix 0-6). Example: every Wed+Sat at 15:00 → `0 15 * * 4,7`."},
             "run_at": {"type": "string", "description": "ISO 8601 one-shot instant."},
             "message": {"type": "string"}, "instance": {"type": "string", "description": "Name of the existing instance to deliver the scheduled message to."},
@@ -1282,6 +1299,11 @@ mod tests {
             // ── schedule ──
             ("schedule", "action", "schedules.rs routing"),
             ("schedule", "id", "schedules.rs update/delete target"),
+            ("schedule", "job", "schedules.rs job_from_args create/update"),
+            ("schedule", "cleanup_confirmed", "schedule_jobs resolve_recovery explicit acknowledgement"),
+            ("schedule", "run_id", "schedule_jobs runs/complete routing"),
+            ("schedule", "attempt_id", "schedule_jobs complete attempt fence"),
+            ("schedule", "result", "schedule_jobs complete receipt"),
             ("schedule", "cron", "schedules.rs trigger_from_args"),
             ("schedule", "run_at", "schedules.rs trigger_from_args one-shot"),
             ("schedule", "message", "schedules.rs create/update"),

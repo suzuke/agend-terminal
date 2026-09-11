@@ -51,6 +51,11 @@ fn register_external_with_seam(
     // external lock here, so this is NOT the registry→external nesting #2197
     // removed.
     let mut ext = agent::lock_external(ctx.externals);
+    // DeleteFence marks the name before its precondition reads this registry.
+    // Under this lock, registration either precedes that read or is refused.
+    if agent::deleting::is_deleting(ctx.home, name) {
+        return json!({"ok": false, "error": format!("agent '{name}' is being deleted")});
+    }
     if ext.contains_key(name) {
         return json!({"ok": false, "error": format!("agent '{name}' already exists (external)")});
     }
@@ -158,6 +163,24 @@ mod tests {
         );
         assert_eq!(resp["ok"], json!(false), "pid 0 must be rejected");
         assert!(agent::lock_external(ctx.externals).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn register_external_refuses_name_while_delete_fence_is_active() {
+        let (ctx, home) = test_ctx();
+        let name = "job-prelaunch-fence";
+        let mark = crate::agent::deleting::mark_deleting(&home, name);
+        let params = json!({"name": name, "backend": "claude", "pid": 4242});
+        let rejected = handle_register_external(&params, &ctx);
+        assert_eq!(
+            rejected["ok"],
+            json!(false),
+            "external registration ignored active deletion fence"
+        );
+        assert!(agent::lock_external(ctx.externals).is_empty());
+        drop(mark);
+        assert_eq!(handle_register_external(&params, &ctx)["ok"], json!(true));
         std::fs::remove_dir_all(&home).ok();
     }
 

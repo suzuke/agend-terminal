@@ -2512,6 +2512,16 @@ fn handle_pty_close(
         return;
     }
 
+    // Job reconciliation owns recovery and cleanup. Retain the original child
+    // handle as exit evidence; interactive shell fallback or crash cleanup would
+    // replace/remove it before the controller can reconcile the attempt.
+    if home
+        .as_deref()
+        .is_some_and(|home| crate::schedule_jobs::owns_worker(home, name))
+    {
+        return;
+    }
+
     match classify_exit(exit_code) {
         ExitKind::UserExit => {
             if is_startup_failure(name, id, registry) {

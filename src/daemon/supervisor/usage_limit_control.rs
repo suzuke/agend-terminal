@@ -695,6 +695,9 @@ pub(crate) fn observe_supervisor_tick(
     backend_command: &str,
     pane_tail: &str,
 ) -> anyhow::Result<TickOutcome> {
+    if crate::schedule_jobs::owns_worker(home, source) {
+        return Ok(TickOutcome::NoEpisode);
+    }
     let mut effects = FsEffects::load(home, source)?;
     if raw_state != AgentState::UsageLimit {
         let Some(episode) = effects.episode.as_ref() else {

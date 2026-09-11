@@ -189,7 +189,7 @@ fn task_id_has_process_unique_component_tasks() {
     }
 
     for (rel, needle) in [
-        ("src/tasks/handler.rs", "fn handle_create("),
+        ("src/tasks/handler/create.rs", "fn handle_create_with_id("),
         (
             "src/agent_ops/messaging.rs",
             "fn auto_create_task_if_needed(",

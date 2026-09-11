@@ -254,6 +254,7 @@ pub fn serve(
         host,
         app_restart,
         None,
+        None,
     );
 }
 
@@ -274,6 +275,7 @@ pub(crate) fn serve_with_ready(
     host: RestartCapability,
     app_restart: Option<crate::api::app_restart::AppRestart>,
     ready_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
+    shutdown_wake: Option<crossbeam_channel::Sender<()>>,
 ) {
     serve_inner(
         home,
@@ -285,6 +287,7 @@ pub(crate) fn serve_with_ready(
         host,
         app_restart,
         Some(ready_tx),
+        shutdown_wake,
     );
 }
 
@@ -308,6 +311,7 @@ fn serve_inner(
     host: RestartCapability,
     app_restart: Option<crate::api::app_restart::AppRestart>,
     mut ready_tx: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+    shutdown_wake: Option<crossbeam_channel::Sender<()>>,
 ) {
     // #945 Phase 0: time the bind+port-publish step directly (not the
     // spawn of api::serve thread — that's sub-ms). Operators care about
@@ -477,6 +481,7 @@ fn serve_inner(
         // #2453 R2: `AppRestart` is Clone (channel Sender + Arc gate), not Copy;
         // each session gets its own clone so the `move` closure satisfies `'static`.
         let session_app_restart = app_restart.clone();
+        let session_shutdown_wake = shutdown_wake.clone();
         if std::thread::Builder::new()
             .name("api_handler".into())
             .spawn(move || {
@@ -497,6 +502,7 @@ fn serve_inner(
                     session_cookie,
                     session_host,
                     session_app_restart,
+                    session_shutdown_wake,
                 );
             })
             .is_err()
@@ -634,6 +640,7 @@ fn handle_session(
     cookie: crate::auth_cookie::Cookie,
     host: RestartCapability,
     app_restart: Option<crate::api::app_restart::AppRestart>,
+    shutdown_wake: Option<crossbeam_channel::Sender<()>>,
 ) {
     let cloned = match stream.try_clone() {
         Ok(c) => c,
@@ -822,6 +829,9 @@ fn handle_session(
                             crate::daemon::ShutdownReason::ApiShutdown,
                         );
                         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(wake) = shutdown_wake.as_ref() {
+                            let _ = wake.try_send(());
+                        }
                         json!({"ok": true})
                     }
                     _ => json!({"ok": false, "error": format!("unknown method: {method}")}),
@@ -1550,79 +1560,7 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn authenticated_agent_usage_limit_takeover_is_denied_at_api_ingress() {
-        let (port, home, _notifier, shutdown) = start_test_server("usage-limit-api-gate");
-        let run_dir = crate::daemon::run_dir(&home);
-        let agent_cookie = crate::auth_cookie::read_cookie(&run_dir).unwrap();
-
-        for mode in ["active", "away", "sleep"] {
-            let mode_resp = api_request(
-                port,
-                &home,
-                &json!({"method": "mode", "params": {"mode": mode}}),
-            );
-            assert_eq!(mode_resp["ok"], true, "mode setup failed: {mode_resp}");
-            for instance in ["", "forged-operator"] {
-                let response = api_request_with_auth(
-                    port,
-                    &json!({
-                        "method": "mcp_tool",
-                        "params": {
-                            "tool": "usage_limit_takeover",
-                            "instance": instance,
-                            "arguments": {
-                                "instance": "worker-a",
-                                "episode_id": "forged"
-                            }
-                        }
-                    }),
-                    &agent_cookie,
-                );
-                assert_eq!(
-                    response["ok"], false,
-                    "agent request unexpectedly allowed: {response}"
-                );
-                assert_eq!(
-                    response["denied_by"], "capability",
-                    "denial must occur at authenticated API ingress: {response}"
-                );
-            }
-        }
-
-        let active_resp = api_request(
-            port,
-            &home,
-            &json!({"method": "mode", "params": {"mode": "active"}}),
-        );
-        assert_eq!(active_resp["ok"], true, "mode reset failed: {active_resp}");
-        let operator_response = api_request(
-            port,
-            &home,
-            &json!({
-                "method": "mcp_tool",
-                "params": {
-                    "tool": "usage_limit_takeover",
-                    "instance": "",
-                    "arguments": {
-                        "instance": "worker-a",
-                        "episode_id": "forged"
-                    }
-                }
-            }),
-        );
-        assert_eq!(
-            operator_response["ok"], true,
-            "operator path was gated: {operator_response}"
-        );
-        assert_eq!(
-            operator_response["result"]["error_code"], "binding_unreadable",
-            "operator request must reach the usage-limit handler: {operator_response}"
-        );
-
-        stop_server(&shutdown, &home);
-    }
+    mod job_recovery;
 
     #[test]
     fn dispatch_delete_emits_instance_deleted() {

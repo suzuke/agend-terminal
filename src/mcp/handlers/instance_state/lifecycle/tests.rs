@@ -1026,3 +1026,61 @@ fn full_delete_survivor_canonicalization_ambiguity_preserves_and_errors_2764_sli
     );
     std::fs::remove_dir_all(home).ok();
 }
+
+fn rejected_delete_preserves_transport(identity_rejection: bool) {
+    use std::sync::Arc;
+    let home = tmp_home("refused-transport");
+    let name = format!("refused-{}", crate::types::InstanceId::new().short());
+    crate::fleet::add_instance_to_yaml(
+        &home,
+        &name,
+        &crate::fleet::InstanceYamlEntry {
+            created_by: Some("owner".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let registry = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let externals = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let context = crate::agent_ops::DeleteContext {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+    crate::daemon::hook_shadow::record_event(&name, "UserPromptSubmit", None);
+    crate::daemon::inject_delivery::arm(&name, "pending legitimate task wake");
+    assert!(crate::daemon::inject_delivery::is_armed_for_test(&name));
+    let epoch = crate::daemon::delivery_worker::current_transport_epoch(&home, &name);
+    let reject = || Err("precondition rejected".to_string());
+    let result = super::full_delete_instance_with_precondition(
+        &home,
+        &name,
+        Some(&context),
+        identity_rejection.then_some(("different-owner", None)),
+        if identity_rejection {
+            None
+        } else {
+            Some(&reject)
+        },
+    );
+    assert!(result.is_err());
+    let same_epoch = crate::daemon::delivery_worker::current_transport_epoch(&home, &name) == epoch;
+    let still_armed = crate::daemon::inject_delivery::is_armed_for_test(&name);
+    crate::daemon::inject_delivery::forget(&name);
+    crate::daemon::hook_shadow::forget(&name);
+    std::fs::remove_dir_all(home).ok();
+    assert!(same_epoch && still_armed,
+        "refused deletion mutated delivery state: same_epoch={same_epoch}, still_armed={still_armed}");
+}
+
+#[test]
+fn rejected_delete_identity_preserves_epoch_and_pending_verification() {
+    rejected_delete_preserves_transport(true);
+}
+
+#[test]
+fn rejected_delete_precondition_preserves_epoch_and_pending_verification() {
+    rejected_delete_preserves_transport(false);
+}

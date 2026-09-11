@@ -124,6 +124,27 @@ pub(crate) fn full_delete_instance_with_runtime(
     name: &str,
     delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
 ) -> Result<(), String> {
+    full_delete_instance_with_expected_identity(home, name, delete_context, None)
+}
+
+/// Job teardown validates its durable identity while holding the lifecycle permit.
+pub(crate) fn full_delete_instance_with_expected_identity(
+    home: &Path,
+    name: &str,
+    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+    expected: Option<(&str, Option<&str>)>,
+) -> Result<(), String> {
+    full_delete_instance_with_precondition(home, name, delete_context, expected, None)
+}
+
+/// Recheck a caller's deletion precondition after all spawn/delete fences admit.
+pub(crate) fn full_delete_instance_with_precondition(
+    home: &Path,
+    name: &str,
+    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+    expected: Option<(&str, Option<&str>)>,
+    precondition: Option<&dyn Fn() -> Result<(), String>>,
+) -> Result<(), String> {
     // #2855: reject an invalid (traversal) name BEFORE the lifecycle permit,
     // the deleting-mark, and every name-derived path removal below — this fn
     // joins the raw name into workspace/runtime/backend-data paths.
@@ -142,7 +163,30 @@ pub(crate) fn full_delete_instance_with_runtime(
     // early `Err`, panic), so the name is always re-creatable afterwards — a
     // leaked mark would make it un-spawnable for the daemon's lifetime.
     let mut delete_fence =
-        crate::daemon::lifecycle::DeleteFence::new(home, name, delete_context.is_some());
+        crate::daemon::lifecycle::DeleteFence::admit(home, name, delete_context.is_some());
+    if let Some((creator, expected_uuid)) = expected {
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .map_err(|error| format!("identity lookup refused: {error}"))?;
+        if let Some(entry) = fleet.instances.get(name) {
+            if entry.created_by.as_deref() != Some(creator)
+                || expected_uuid.is_some_and(|id| entry.id.as_deref() != Some(id))
+            {
+                return Err("delete refused: worker identity changed".into());
+            }
+        } else if let Some(context) = delete_context {
+            let managed = crate::agent::lock_registry(context.registry)
+                .values()
+                .any(|h| h.name.as_str() == name);
+            let external = crate::agent::lock_external(context.externals).contains_key(name);
+            if managed || external {
+                return Err("delete refused: live worker has no durable identity".into());
+            }
+        }
+    }
+    if let Some(check) = precondition {
+        check()?;
+    }
+    delete_fence.commit_cleanup(name);
     // Fence transport delivery before any teardown side effect. The keyed
     // guard invalidates queued epochs and excludes same-agent I/O for the full
     // delete transaction, including removal of the receipt files below.

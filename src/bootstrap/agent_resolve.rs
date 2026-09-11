@@ -54,6 +54,10 @@ pub(super) fn resolve(config: &FleetConfig, fleet_dir: &Path, home: &Path) -> Ve
 /// [`resolve`] so hot-reload-added agents are set up identically to ones
 /// materialized at startup.
 fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Option<AgentDef> {
+    // Job recovery belongs to the durable run controller, including hot reload.
+    if crate::schedule_jobs::owns_worker(ctx.home, name) {
+        return None;
+    }
     let mut resolved = match config.resolve_instance_checked(name) {
         Ok(resolved) => resolved?,
         Err(error) => {

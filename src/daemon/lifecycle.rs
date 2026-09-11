@@ -177,9 +177,11 @@ pub(crate) mod test_support {
 /// still active; the transport guard then performs its final epoch bump and
 /// releases the lane. This prevents an enqueue from observing a fresh epoch
 /// after the marker disappears but before transport invalidation completes.
+/// A refused admission instead releases its lane without invalidating delivery.
 pub(crate) struct DeleteFence {
     deleting: Option<crate::agent::deleting::DeletingGuard>,
     transport: Option<crate::daemon::delivery_worker::TransportGenerationGuard>,
+    admission: Option<crate::daemon::delivery_worker::TransportAdmissionGuard>,
 }
 
 impl DeleteFence {
@@ -196,11 +198,34 @@ impl DeleteFence {
         Self {
             deleting,
             transport,
+            admission: None,
+        }
+    }
+
+    /// Block competing spawns while validation can still refuse without
+    /// invalidating queued delivery or erasing pending inject verification.
+    pub(crate) fn admit(home: &Path, name: &str, hold_transport: bool) -> Self {
+        // Earlier queued deliveries must finish before a provisional deleting
+        // mark can make them stale. Validation may still refuse this cleanup.
+        let admission = hold_transport
+            .then(|| crate::daemon::delivery_worker::begin_transport_admission(home, name));
+        let deleting = Some(crate::agent::deleting::mark_deleting(home, name));
+        Self {
+            deleting,
+            admission,
+            transport: None,
+        }
+    }
+
+    pub(crate) fn commit_cleanup(&mut self, name: &str) {
+        if let Some(admission) = self.admission.take() {
+            self.transport = Some(admission.into_cleanup());
+            crate::daemon::inject_delivery::forget(name);
         }
     }
 
     pub(crate) fn attach_transport_cleanup(&mut self, home: &Path, name: &str) {
-        debug_assert!(self.transport.is_none());
+        debug_assert!(self.transport.is_none() && self.admission.is_none());
         self.transport = Some(crate::daemon::delivery_worker::begin_transport_cleanup(
             home, name,
         ));
@@ -212,6 +237,7 @@ impl Drop for DeleteFence {
     fn drop(&mut self) {
         drop(self.deleting.take());
         drop(self.transport.take());
+        drop(self.admission.take());
     }
 }
 
@@ -586,6 +612,92 @@ mod tests {
             !crate::transport::delivery_path_for_instance(&home, agent).exists(),
             "outer rollback must remove receipts and reject queued stale work"
         );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn refused_admission_does_not_drop_delivery_before_lane_acquisition() {
+        let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _delivery = crate::transport::test_support::delivery_hook_guard();
+        let _before_lane =
+            crate::daemon::delivery_worker::test_support::cleanup_before_lane_acquire_hook_guard();
+        let home = tmp_home("refused-admission-queue");
+        let agent = "refused-admission-queue-agent";
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), format!(
+            "instances:\n  {agent}:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n"
+        )).expect("write fixture fleet");
+        let (delivered_tx, delivered_rx) = std::sync::mpsc::channel();
+        let hook_home = home.clone();
+        crate::transport::test_support::set_delivery_hook(Some(Arc::new(
+            move |home, name, body| {
+                if home != hook_home.as_path() || name != agent {
+                    return None;
+                }
+                delivered_tx.send(()).expect("record transport delivery");
+                let envelope = crate::transport::DeliveryEnvelope::new(
+                    name,
+                    crate::transport::SessionLocator::codex(
+                        std::path::PathBuf::from("/tmp/admission-fixture.sock"),
+                        Some("admission-fixture".into()),
+                    ),
+                    crate::transport::DeliveryKind::Notification,
+                    body,
+                    None,
+                );
+                Some(Ok(crate::transport::DeliveryReceipt::for_state(
+                    &envelope,
+                    crate::transport::DeliveryState::ProtocolAccepted,
+                )))
+            },
+        )));
+        let hook_home = home.clone();
+        crate::daemon::delivery_worker::test_support::set_cleanup_before_lane_acquire_hook(Some(
+            Arc::new(move |home, name| {
+                if home != hook_home.as_path() || name != agent {
+                    return;
+                }
+                crate::daemon::delivery_worker::enqueue_transport_delivery(
+                    home,
+                    name,
+                    "legitimate queued task",
+                )
+                .expect("enqueue accepted delivery");
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while crate::daemon::delivery_worker::test_support::transport_dispatch_count(
+                    home, name,
+                ) == 0
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "queued dispatcher must run before admission continues"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }),
+        ));
+        let registry = empty_registry();
+        let configs = Arc::new(Mutex::new(HashMap::new()));
+        let externals = Arc::new(Mutex::new(HashMap::new()));
+        let reject = || Err("refused admission fixture".to_string());
+        let result =
+            crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_precondition(
+                &home,
+                agent,
+                Some(&crate::agent_ops::DeleteContext {
+                    registry: &registry,
+                    configs: &configs,
+                    externals: &externals,
+                    notifier: None,
+                }),
+                None,
+                Some(&reject),
+            );
+        assert!(result
+            .expect_err("cleanup must refuse")
+            .contains("refused admission fixture"));
+        assert!(delivered_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "provisional deletion marker discarded a legitimate queued delivery before cleanup was refused");
         let _ = std::fs::remove_dir_all(home);
     }
 

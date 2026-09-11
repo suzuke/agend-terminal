@@ -339,6 +339,16 @@ impl PerTickHandler for RespawnWatchdogHandler {
             (stuck, auth, live)
         };
 
+        // Read durable ownership only after dropping the registry lock.
+        let stuck: Vec<_> = stuck
+            .into_iter()
+            .filter(|name| !crate::schedule_jobs::owns_worker(ctx.home, name))
+            .collect();
+        let auth: HashSet<_> = auth
+            .into_iter()
+            .filter(|name| !crate::schedule_jobs::owns_worker(ctx.home, name))
+            .collect();
+
         // Forgive/evict stale retry records (agent recovered or left).
         self.gc_records(&stuck, &live);
 

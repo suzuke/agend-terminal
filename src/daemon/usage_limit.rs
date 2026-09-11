@@ -48,10 +48,19 @@ pub fn propagate_usage_limit(
     source_backend: &crate::backend::Backend,
     registry: &crate::agent::AgentRegistry,
 ) -> Vec<String> {
+    let names: Vec<_> = crate::agent::lock_registry(registry)
+        .values()
+        .map(|handle| handle.name.to_string())
+        .collect();
+    // Job quota handling belongs to its controller, not a peer's observation.
+    let job_workers: std::collections::HashSet<_> = names
+        .into_iter()
+        .filter(|name| crate::schedule_jobs::owns_worker(home, name))
+        .collect();
     let mut affected = Vec::new();
     let reg = crate::agent::lock_registry(registry);
     for handle in reg.values() {
-        if handle.name.as_str() == source_agent {
+        if handle.name.as_str() == source_agent || job_workers.contains(handle.name.as_str()) {
             continue;
         }
         let their_backend = handle

@@ -405,6 +405,7 @@ pub(crate) fn cancel_review_assignment_task(
     }
 }
 
+pub(crate) use handler::create_schedule_task;
 pub use handler::handle;
 pub(crate) use handler::handle_with_live_instances;
 pub use handler::register_subscriber as register_cascade_subscriber;
