@@ -424,8 +424,8 @@ fn strict_in_review_ghost_planner_is_report_only_and_exact_confirmed() {
     confirmed.insert("t-review".to_string());
     let applied =
         plan_strict_in_review_ghosts(&state, &live, &fleet, true, &confirmed, "operator review");
+    assert_eq!(applied["code"], "report_only_policy");
     assert_eq!(applied["mutation"], "none");
-    assert_eq!(applied["approved_ids"], serde_json::json!(["t-review"]));
 }
 
 #[test]
@@ -627,6 +627,17 @@ fn reconcile_mixed_owner_does_not_orphan_in_review_task() {
     let state = crate::task_events::replay(&home).expect("replay mixed-owner tasks");
     assert!(state.tasks[&review_id].owner.is_some());
     assert!(state.tasks[&open_id].owner.is_none());
+    let mut confirmed = std::collections::HashSet::new();
+    confirmed.insert(review_id.0.clone());
+    let report_only = plan_strict_in_review_ghosts(
+        &state,
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+        true,
+        &confirmed,
+        "operator review",
+    );
+    assert_eq!(report_only["code"], "report_only_policy");
     std::fs::remove_dir_all(&home).ok();
 }
 
