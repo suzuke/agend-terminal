@@ -264,8 +264,10 @@ pub(super) fn scan_categories(
                 | crate::task_events::TaskStatus::InProgress
                 | crate::task_events::TaskStatus::InReview
                 | crate::task_events::TaskStatus::Blocked
-        ) && age.is_some_and(|a| a > Duration::days(14))
-        {
+        ) {
+            let Some(a) = age.filter(|a| *a > Duration::days(14)) else {
+                continue;
+            };
             let refs = extract_refs(&search_text);
             let ref_labels = refs
                 .pr_nums
@@ -275,7 +277,7 @@ pub(super) fn scan_categories(
                 .collect();
             cats.stale_nonterminal.push(candidate(
                 t,
-                format!("{} task {}d stale", t.status, age.unwrap().num_days()),
+                format!("{} task {}d stale", t.status, a.num_days()),
                 refs.pr_nums.first().copied(),
                 ref_labels,
             ));
