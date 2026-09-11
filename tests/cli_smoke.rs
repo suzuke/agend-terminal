@@ -1049,7 +1049,7 @@ fn stop_transport_failure_is_not_reported_as_absent_3559() {
     let home = home_guard.path.clone();
     std::fs::write(
         home.join("fleet.yaml"),
-        "defaults:\n  command: /bin/cat\ninstances: {}\n",
+        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
     )
     .expect("write fleet.yaml");
 
