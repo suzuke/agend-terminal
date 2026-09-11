@@ -372,6 +372,7 @@ pub(crate) fn def_ci() -> Value {
             "ci_provider_url": {"type": "string", "description": "watch: base URL for a self-hosted CI provider, persisted on the watch sidecar alongside `ci_provider`."},
             "task_id": {"type": "string", "description": "watch: optional task id to bind this watch to. Persisted on the watch sidecar as a back-link so the `[ci-ready-for-action]` the daemon emits on CI pass carries a structured reference to the originating task. Normally injected by the dispatch auto-watch (dispatch_auto_bind_lease); a manual `ci action=watch` caller may also pass it to bind the watch to a specific task (#1031)."},
             "head_sha": {"type": "string", "description": "watch: full immutable commit SHA (40- or 64-hex) for an EXACT-HEAD post-merge watch on a protected ref (`main`/`master`). Generic protected-branch watches stay E4.5-rejected; a protected watch is accepted ONLY with `head_sha` PLUS `task_id` and explicit `next_after_ci` (orchestrator/operator), OR with `notification_only=true` (task assignee with merge receipt). The poller resolves runs for THIS SHA only (GitHub `?head_sha=` fetch), ignoring newer main runs, so a later push can't falsely complete the post-merge check. Ignored on non-protected branches. GitHub-only this wave. unwatch (#3159): addresses ONE exact-head watch by that immutable identity — authority is no weaker than the arm (operator, the merge-receipt task assignee for notification_only, or the orchestrator of every next_after_ci target); a malformed/unknown/mismatched SHA fails closed and NEVER falls back to the generic branch watch."},
+            "subject_head_sha": {"type": "string", "description": "watch: full immutable commit SHA for the dispatch subject generation; persisted on feature-branch watches so Decision45 corrections can fence the exact PR head."},
             "notification_only": {"type": "boolean", "description": "#2812: when true on a protected watch, arms a notification-only exact-head watch for the task assignee — requires head_sha + task_id + matching merge receipt; forbids next_after_ci. No privileged continuation."},
             "episode": {"type": "string", "description": "defer/ack_handoff: exact episode identity for CAS. For ack_handoff, use the episode surfaced by `ci action=status`; the action settles only the caller's matching pickup without removing the watch."},
             "wake_task_id": {"type": "string", "description": "defer: task_id whose terminal state (Done|Cancelled) will reactivate the track."},
@@ -1309,6 +1310,7 @@ mod tests {
             ("ci", "ci_provider_url", "ci/mod.rs self-hosted base URL"),
             ("ci", "task_id", "ci/watch.rs:163 handle_watch_ci watch back-link (#1031)"),
             ("ci", "head_sha", "ci/watch.rs handle_watch_ci exact-head protected-branch pin (S1)"),
+            ("ci", "subject_head_sha", "ci/watch.rs handle_watch_ci immutable dispatch-generation pin (Decision45)"),
             ("ci", "episode", "ci/watch.rs:595 handle_defer_ci exact-episode CAS identity"),
             ("ci", "wake_task_id", "ci/watch.rs:599 handle_defer_ci task-wake predicate"),
             ("ci", "reason", "ci/watch.rs:605 handle_defer_ci deferral reason"),
@@ -1390,6 +1392,16 @@ mod tests {
             // ── usage_limit_takeover (Architecture-14 item 5 Slice 2A) ──
             ("usage_limit_takeover", "instance", "mcp/handlers/usage_limit_takeover.rs source-scoped lock and persisted binding validation"),
             ("usage_limit_takeover", "episode_id", "mcp/handlers/usage_limit_takeover.rs persisted CandidateReady episode identity validation"),
+            // ── correct_review_class (Decision45) ──
+            ("correct_review_class", "action", "review_class_correction.rs handle_correct_review_class operation routing"),
+            ("correct_review_class", "repository", "review_class_correction.rs exact repository validation"),
+            ("correct_review_class", "pr_number", "review_class_correction.rs exact PR-generation validation"),
+            ("correct_review_class", "branch", "review_class_correction.rs exact subject-branch validation"),
+            ("correct_review_class", "head_sha", "review_class_correction.rs immutable current-head fence"),
+            ("correct_review_class", "expected_old_class", "review_class_correction.rs stale-class fence"),
+            ("correct_review_class", "new_class", "review_class_correction.rs requested class validation"),
+            ("correct_review_class", "operation_id", "review_class_correction.rs durable idempotency journal key"),
+            ("correct_review_class", "reason", "review_class_correction.rs operator audit reason persistence"),
         ];
 
         // Intentionally-deferred passthrough: advertised by design, Phase-2
@@ -1427,6 +1439,7 @@ mod tests {
             "config",
             "revoke_review_assignment",
             "usage_limit_takeover",
+            "correct_review_class",
         ];
 
         // Simple query/display/control tools — not directive-bearing, so their
