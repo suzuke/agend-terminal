@@ -114,6 +114,11 @@ struct SweepProvenanceStore {
     entries: Vec<SweepProvenance>,
     #[serde(default)]
     next_generation: u64,
+    /// Operator acknowledgements for explicitly named boards which have no
+    /// deterministic team/repository mapping.  These records intentionally
+    /// contain no repository or path-derived identity.
+    #[serde(default)]
+    manual_unmapped_acknowledgements: Vec<ManualUnmappedAcknowledgement>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -130,6 +135,16 @@ struct SweepProvenance {
     retired_at: Option<String>,
     #[serde(default)]
     retirement_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ManualUnmappedAcknowledgement {
+    project_id: String,
+    actor: String,
+    audit_reason: String,
+    acknowledged_at: String,
+    total_tasks: usize,
+    non_terminal_tasks: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -528,6 +543,146 @@ pub fn note_explicit_project(home: &Path, project_id: &str) {
         tracing::warn!(%error, project = %project_id, "task_sweep: failed to persist MANUAL_UNMAPPED evidence");
     }
     tracing::warn!(project = %project_id, "task_sweep: MANUAL_UNMAPPED explicit project board");
+}
+
+fn manual_unmapped_candidate(
+    home: &Path,
+    project_id: &str,
+) -> anyhow::Result<(String, usize, usize)> {
+    let project_id = canonical_project_id(project_id);
+    anyhow::ensure!(
+        !project_id.is_empty(),
+        "manual provenance acknowledgement requires a project id"
+    );
+
+    let cfg = load_config(home);
+    let claims = active_team_claims(home, &cfg)?;
+    anyhow::ensure!(
+        !claims.contains_key(&project_id),
+        "project '{project_id}' has a deterministic team/repository mapping; use the mapped provenance acknowledgement"
+    );
+
+    // Only acknowledge a materialized, explicitly named board.  In
+    // particular, do not accept a path or source repository and do not create
+    // a board as a side effect of this read-only inspection.
+    let explicit_projects = crate::tasks::explicit_project_ids(home)
+        .map_err(|error| anyhow::anyhow!("enumerate explicit project boards: {error}"))?;
+    anyhow::ensure!(
+        explicit_projects
+            .iter()
+            .any(|candidate| canonical_project_id(candidate) == project_id),
+        "project '{project_id}' is not an explicit materialized board"
+    );
+    let (total_tasks, non_terminal_tasks) = board_counts(home, &project_id);
+    anyhow::ensure!(
+        total_tasks > 0,
+        "project '{project_id}' has no tasks to acknowledge"
+    );
+    Ok((project_id, total_tasks, non_terminal_tasks))
+}
+
+/// Explicitly acknowledge the provenance of a `MANUAL_UNMAPPED` board.
+///
+/// The acknowledgement is deliberately narrower than a sweep mapping: it
+/// records only the named project and operator evidence.  It never supplies a
+/// repository, never changes the sweep plan, and never mutates task events.
+/// With `dry_run`, all checks and counts are performed but no file or audit
+/// log is written.
+pub fn acknowledge_manual_unmapped_provenance(
+    home: &Path,
+    project_id: &str,
+    actor: &str,
+    audit_reason: &str,
+    dry_run: bool,
+) -> serde_json::Value {
+    let actor = actor.trim();
+    let audit_reason = audit_reason.trim();
+    if actor.is_empty() {
+        return serde_json::json!({"error": "manual provenance acknowledgement requires a non-empty actor"});
+    }
+    if audit_reason.is_empty() {
+        return serde_json::json!({"error": "manual provenance acknowledgement requires a non-empty audit reason"});
+    }
+
+    let (project_id, total_tasks, non_terminal_tasks) =
+        match manual_unmapped_candidate(home, project_id) {
+            Ok(candidate) => candidate,
+            Err(error) => return serde_json::json!({"error": error.to_string()}),
+        };
+    let store = load_provenance(home);
+    if let Some(existing) = store
+        .manual_unmapped_acknowledgements
+        .iter()
+        .find(|ack| ack.project_id == project_id)
+    {
+        return serde_json::json!({
+            "project_id": project_id,
+            "outcome": "already_acknowledged",
+            "acknowledged_at": existing.acknowledged_at,
+            "actor": existing.actor,
+            "audit_reason": existing.audit_reason,
+            "total_tasks": existing.total_tasks,
+            "non_terminal_tasks": existing.non_terminal_tasks,
+            "board_mutation": "none",
+            "task_mutation": "none",
+        });
+    }
+
+    let response = serde_json::json!({
+        "project_id": project_id,
+        "outcome": if dry_run { "would_acknowledge" } else { "acknowledged" },
+        "actor": actor,
+        "audit_reason": audit_reason,
+        "total_tasks": total_tasks,
+        "non_terminal_tasks": non_terminal_tasks,
+        "repo": serde_json::Value::Null,
+        "board_mutation": "none",
+        "task_mutation": "none",
+        "dry_run": dry_run,
+    });
+    if dry_run {
+        return response;
+    }
+
+    let acknowledged_at = chrono::Utc::now().to_rfc3339();
+    let mut updated = store;
+    updated
+        .manual_unmapped_acknowledgements
+        .push(ManualUnmappedAcknowledgement {
+            project_id: project_id.clone(),
+            actor: actor.to_string(),
+            audit_reason: audit_reason.to_string(),
+            acknowledged_at: acknowledged_at.clone(),
+            total_tasks,
+            non_terminal_tasks,
+        });
+    if let Err(error) = save_provenance(home, &updated) {
+        return serde_json::json!({
+            "error": format!("manual provenance acknowledgement save failed: {error}"),
+            "project_id": project_id,
+            "outcome": "not_acknowledged",
+            "board_mutation": "none",
+            "task_mutation": "none",
+        });
+    }
+
+    // The provenance store is the durable audit record.  This event makes the
+    // operator action visible in the normal daemon audit stream as well.
+    crate::event_log::log(
+        home,
+        "manual_unmapped_provenance_acknowledged",
+        actor,
+        &serde_json::json!({
+            "project_id": project_id,
+            "audit_reason": audit_reason,
+            "acknowledged_at": acknowledged_at,
+            "total_tasks": total_tasks,
+            "non_terminal_tasks": non_terminal_tasks,
+            "repo": null,
+        })
+        .to_string(),
+    );
+    response
 }
 
 /// Holding-handle for the spawned sweep ticker. Drop is the existing
@@ -1071,6 +1226,72 @@ fn parse_pr_meta(v: &serde_json::Value, api_response_hash: String) -> Option<PrM
 /// Returns the resulting [`SweepConfig`] state as JSON so the operator
 /// can verify the change without a follow-up read.
 pub fn handle_task_sweep_config(home: &Path, args: &serde_json::Value) -> serde_json::Value {
+    // Manual provenance acknowledgement is a separate, read-only-by-default
+    // operator flow.  Keep it out of the normal sweep-config mutation path so
+    // `provenance_dry_run` cannot accidentally persist a config change.
+    if let Some(request) = args.get("acknowledge_manual_unmapped") {
+        let (project_id, actor, audit_reason, request_dry_run) = match request {
+            serde_json::Value::String(project_id) => (
+                project_id.as_str(),
+                args.get("provenance_actor")
+                    .or_else(|| args.get("actor"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                args.get("provenance_reason")
+                    .or_else(|| args.get("audit_reason"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                None,
+            ),
+            serde_json::Value::Object(request) => (
+                request
+                    .get("project_id")
+                    .or_else(|| request.get("project"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                request
+                    .get("actor")
+                    .or_else(|| request.get("provenance_actor"))
+                    .and_then(|value| value.as_str())
+                    .or_else(|| {
+                        args.get("provenance_actor")
+                            .or_else(|| args.get("actor"))
+                            .and_then(|value| value.as_str())
+                    })
+                    .unwrap_or(""),
+                request
+                    .get("audit_reason")
+                    .or_else(|| request.get("reason"))
+                    .and_then(|value| value.as_str())
+                    .or_else(|| {
+                        args.get("provenance_reason")
+                            .or_else(|| args.get("audit_reason"))
+                            .and_then(|value| value.as_str())
+                    })
+                    .unwrap_or(""),
+                request.get("dry_run").and_then(|value| value.as_bool()),
+            ),
+            _ => {
+                return serde_json::json!({
+                    "error": "acknowledge_manual_unmapped must be a project id or request object"
+                })
+            }
+        };
+        let dry_run = args
+            .get("provenance_dry_run")
+            .and_then(|value| value.as_bool())
+            .or_else(|| args.get("dry_run").and_then(|value| value.as_bool()))
+            .or(request_dry_run)
+            .unwrap_or(false);
+        return acknowledge_manual_unmapped_provenance(
+            home,
+            project_id,
+            actor,
+            audit_reason,
+            dry_run,
+        );
+    }
+
     let mut cfg = load_config(home);
     if let Some(repo) = args.get("repository").and_then(|v| v.as_str()) {
         cfg.repo = if repo.is_empty() {
