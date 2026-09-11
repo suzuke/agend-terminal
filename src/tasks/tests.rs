@@ -5224,7 +5224,7 @@ fn test_sweep_reports_nondefault_authoritative_project_route() {
     assert_eq!(cats.stale_nonterminal.len(), 1);
     assert_eq!(
         cats.stale_nonterminal[0].project_route.as_deref(),
-        Some("repos_orgA_projA")
+        Some("orgA_projA")
     );
     std::fs::remove_dir_all(&home).ok();
 }
