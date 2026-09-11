@@ -5173,6 +5173,64 @@ fn test_sweep_nondefault_route_residue_is_reported() {
 }
 
 #[test]
+fn test_sweep_scan_reports_stale_nonterminal_residue_without_apply_ids() {
+    let home = tmp_home("sweep_nonterminal_residue");
+    write_fleet_yaml(&home, &["alive"]);
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let statuses = ["claimed", "in_progress", "in_review", "blocked"];
+    for status in statuses {
+        let created = handle(
+            &home,
+            "alive",
+            &serde_json::json!({
+                "action": "create",
+                "title": format!("residue {status} PR #101"),
+                "assignee": "alive",
+                "branch": "feature/residue",
+                "due_at": "2026-01-01T00:00:00Z"
+            }),
+        );
+        let id = created["id"].as_str().expect("id");
+        if status == "claimed" {
+            handle(
+                &home,
+                "alive",
+                &serde_json::json!({"action":"claim", "id":id}),
+            );
+        } else {
+            handle(
+                &home,
+                "alive",
+                &serde_json::json!({"action":"claim", "id":id}),
+            );
+            handle(
+                &home,
+                "alive",
+                &serde_json::json!({"action":"update", "id":id, "status":status}),
+            );
+        }
+    }
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    assert_eq!(cats.stale_nonterminal.len(), statuses.len());
+    assert!(
+        cats.all_ids().is_empty(),
+        "residue must not enter cancellation IDs"
+    );
+    let candidate = &cats.stale_nonterminal[0];
+    assert_eq!(candidate.owner.as_deref(), Some("alive"));
+    assert_eq!(candidate.branch.as_deref(), Some("feature/residue"));
+    assert_eq!(candidate.project_route.as_deref(), Some("default"));
+    assert_eq!(
+        candidate.due_at.as_deref(),
+        Some("2026-01-01T00:00:00+00:00")
+    );
+    assert_eq!(candidate.refs, vec!["PR #101"]);
+    assert!(!candidate.last_activity.is_empty());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_sweep_scan_identifies_shipped_via_pr_lookup_stub() {
     // GREEN 2a: a task whose title carries `PR #999` and whose
     // stubbed PR state is Merged lands in the shipped bucket
