@@ -12,6 +12,7 @@ use std::sync::Arc;
 const REPO: &str = "owner/repo";
 const BRANCH: &str = "fix/review-class";
 const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+const OTHER_HEAD: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
 struct ExactPrProvider {
     summary: PrSummary,
@@ -78,12 +79,16 @@ fn seed_with_class(home: &Path, review_class: ReviewClass) {
     crate::daemon::pr_state::save(home, &state).unwrap();
     let watch_dir = crate::daemon::ci_watch::ci_watches_dir(home);
     std::fs::create_dir_all(&watch_dir).unwrap();
-    let watch_path = watch_dir.join(crate::daemon::ci_watch::watch_filename(REPO, BRANCH));
+    let watch_path = watch_dir.join(crate::daemon::ci_watch::watch_filename_exact_head(
+        REPO, BRANCH, HEAD,
+    ));
     crate::store::atomic_write(
         &watch_path,
         serde_json::to_string_pretty(&json!({
             "repo": REPO,
             "branch": BRANCH,
+            "pr_number": 42,
+            "target_head_sha": HEAD,
             "review_class": review_class.as_token(),
         }))
         .unwrap()
@@ -134,10 +139,31 @@ fn real_entry_preview_apply_and_same_operation_retry_are_audited() {
             .review_class,
         ReviewClass::Single
     );
-    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home)
-        .join(crate::daemon::ci_watch::watch_filename(REPO, BRANCH));
+    let watch_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    let mismatched_watch = watch_dir.join(crate::daemon::ci_watch::watch_filename_exact_head(
+        REPO, BRANCH, OTHER_HEAD,
+    ));
+    crate::store::atomic_write(
+        &mismatched_watch,
+        serde_json::to_string(&json!({
+            "repo": REPO,
+            "branch": BRANCH,
+            "pr_number": 42,
+            "target_head_sha": OTHER_HEAD,
+            "review_class": "dual",
+        }))
+        .unwrap()
+        .as_bytes(),
+    )
+    .unwrap();
+    let watch_path = watch_dir.join(crate::daemon::ci_watch::watch_filename_exact_head(
+        REPO, BRANCH, HEAD,
+    ));
     let watch: Value = serde_json::from_slice(&std::fs::read(watch_path).unwrap()).unwrap();
     assert_eq!(watch["review_class"], "single", "{watch}");
+    let mismatched: Value =
+        serde_json::from_slice(&std::fs::read(mismatched_watch).unwrap()).unwrap();
+    assert_eq!(mismatched["review_class"], "dual", "{mismatched}");
 
     let retry = handle_correct_review_class(&home, &args("apply", "op-1"), &None);
     assert_eq!(retry["already_applied"], true, "{retry}");
@@ -210,9 +236,20 @@ fn incomplete_journal_fences_exact_subject_only() {
         completed_at: None,
     };
     crate::store::save_atomic(&journal_path(&home, "fence-1"), &journal).unwrap();
-    assert!(is_incomplete(&home, REPO, BRANCH, 42, HEAD));
-    assert!(!is_incomplete(&home, REPO, BRANCH, 43, HEAD));
-    assert!(!is_incomplete(&home, REPO, BRANCH, 42, &"f".repeat(40)));
+    assert!(is_incomplete(&home, REPO, BRANCH, 42, HEAD).unwrap());
+    assert!(!is_incomplete(&home, REPO, BRANCH, 43, HEAD).unwrap());
+    assert!(!is_incomplete(&home, REPO, BRANCH, 42, &"f".repeat(40)).unwrap());
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn corrupt_journal_fence_fails_closed() {
+    let home = home("corrupt-journal");
+    let dir = journal_dir(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("corrupt.json"), b"not-json").unwrap();
+    let error = is_incomplete(&home, REPO, BRANCH, 42, HEAD).unwrap_err();
+    assert!(error.contains("corrupt"), "{error}");
     let _ = std::fs::remove_dir_all(home);
 }
 

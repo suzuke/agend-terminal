@@ -124,30 +124,77 @@ pub(crate) fn is_incomplete(
     branch: &str,
     pr_number: u64,
     head_sha: &str,
-) -> bool {
-    let Ok(entries) = std::fs::read_dir(journal_dir(home)) else {
-        return false;
+) -> Result<bool, String> {
+    let entries = match std::fs::read_dir(journal_dir(home)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "review-class correction journal directory unreadable: {error}"
+            ));
+        }
     };
-    entries.flatten().any(|entry| {
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!("review-class correction journal directory scan failed: {error}")
+        })?;
         let path = entry.path();
-        path.extension().and_then(|ext| ext.to_str()) == Some("json")
-            && std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<CorrectionJournal>(&bytes).ok())
-                .is_some_and(|journal| {
-                    journal.phase != "completed"
-                        && same_request(
-                            &journal,
-                            repository,
-                            branch,
-                            pr_number,
-                            head_sha,
-                            journal.expected_old_class,
-                            journal.new_class,
-                            &journal.reason,
-                        )
-                })
-    })
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|error| {
+            format!(
+                "review-class correction journal {} unreadable: {error}",
+                path.display()
+            )
+        })?;
+        let journal: CorrectionJournal = serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "review-class correction journal {} corrupt: {error}",
+                path.display()
+            )
+        })?;
+        if journal.phase != "completed"
+            && same_request(
+                &journal,
+                repository,
+                branch,
+                pr_number,
+                head_sha,
+                journal.expected_old_class,
+                journal.new_class,
+                &journal.reason,
+            )
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn merge_fence_response(
+    home: &Path,
+    repository: &str,
+    branch: &str,
+    pr_number: u64,
+    head_sha: &str,
+    became_incomplete: bool,
+) -> Option<Value> {
+    match is_incomplete(home, repository, branch, pr_number, head_sha) {
+        Ok(false) => None,
+        Ok(true) => Some(json!({
+            "error": if became_incomplete {
+                "review-class correction became incomplete for this exact PR subject — merge refused"
+            } else {
+                "review-class correction is incomplete for this exact PR subject — merge refused"
+            },
+            "code": "review_class_correction_incomplete",
+        })),
+        Err(error) => Some(json!({
+            "error": format!("review-class correction fence unavailable — merge refused: {error}"),
+            "code": "review_class_correction_fence_unavailable",
+        })),
+    }
 }
 
 fn validate_snapshot(
@@ -214,6 +261,8 @@ fn update_watch_class(
     home: &Path,
     repository: &str,
     branch: &str,
+    pr_number: u64,
+    head_sha: &str,
     new_class: ReviewClass,
 ) -> anyhow::Result<usize> {
     let dir = crate::daemon::ci_watch::ci_watches_dir(home);
@@ -241,6 +290,11 @@ fn update_watch_class(
             .map_err(|error| anyhow::anyhow!("invalid CI watch {}: {error}", path.display()))?;
         if watch.get("repo").and_then(Value::as_str) != Some(repository)
             || watch.get("branch").and_then(Value::as_str) != Some(branch)
+            || watch.get("target_head_sha").and_then(Value::as_str) != Some(head_sha)
+            || watch
+                .get("pr_number")
+                .and_then(Value::as_u64)
+                .is_some_and(|watch_pr| watch_pr != pr_number)
         {
             drop(lock);
             continue;
@@ -495,7 +549,14 @@ pub(crate) fn handle_correct_review_class(
         return json!({"error": format!("review-class correction intent persistence failed: {error}"), "code": "review_class_correction_intent_failed"});
     }
 
-    let updated_watch_records = match update_watch_class(home, &repository, branch, new_class) {
+    let updated_watch_records = match update_watch_class(
+        home,
+        &repository,
+        branch,
+        pr_number,
+        head_sha,
+        new_class,
+    ) {
         Ok(count) => count,
         Err(error) => {
             return json!({"error": format!("review-class correction watch update failed: {error}"), "code": "review_class_correction_watch_failed"});

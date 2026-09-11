@@ -470,17 +470,15 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         }
     };
 
-    if crate::mcp::handlers::review_class_correction::is_incomplete(
+    if let Some(response) = crate::mcp::handlers::review_class_correction::merge_fence_response(
         home,
         &repo,
         &pr_branch,
         pr,
         &gated_head,
+        false,
     ) {
-        return json!({
-            "error": "review-class correction is incomplete for this exact PR subject — merge refused",
-            "code": "review_class_correction_incomplete",
-        });
+        return response;
     }
 
     if !force {
@@ -655,13 +653,10 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     // and immediately before the sole provider write. This closes the
     // correction/merge interval without holding a filesystem lock across the
     // arbitrary network call below.
-    if crate::mcp::handlers::review_class_correction::is_incomplete(
-        home, &repo, &pr_branch, pr, &head_now,
+    if let Some(response) = crate::mcp::handlers::review_class_correction::merge_fence_response(
+        home, &repo, &pr_branch, pr, &head_now, true,
     ) {
-        return json!({
-            "error": "review-class correction became incomplete for this exact PR subject — merge refused",
-            "code": "review_class_correction_incomplete",
-        });
+        return response;
     }
 
     // #PR-Z site 3: the ONLY write — `gh pr merge` via ScmProvider. argv now adds
