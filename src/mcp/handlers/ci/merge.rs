@@ -656,9 +656,10 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
 
     if !force {
         // #3589: provider-confirmed checks are the recovery source for an exact
-        // linked state that never had a CI watch. Hydrate only after the final
-        // identity and correction fences, then reload before the unchanged gate.
-        let Some(state) = initial_review_state.as_ref() else {
+        // linked state that never had a CI watch. Reload after the final
+        // identity and correction fences, hydrate from that snapshot, then
+        // reload again before the unchanged gate.
+        let Some(state) = load_exact_merge_state(home, &repo, pr, &pr_branch, &gated_head) else {
             return review_deficit_response(crate::daemon::pr_state::MergeDeficit::NoLinkage);
         };
         if !matches!(
