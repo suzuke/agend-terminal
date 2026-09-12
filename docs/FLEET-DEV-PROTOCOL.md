@@ -810,6 +810,12 @@ The allowed scopes are narrow:
 
 Raw worktree lifecycle, switching protected branches, and pushing to main are not agent bypass scopes. Use `repo`, `bind_self`, `release_worktree`, and the PR/merge workflow.
 
+An agent's standing authorization also does not authorize mutating protected
+canonical local refs. In particular, `git merge --ff-only @{u}` from a
+canonical checkout remains protected-branch mutation even when it neither
+switches branches nor pushes. Canonical sync must use the daemon-managed
+repo/release/merge workflow or a separately authorized daemon-managed action.
+
 ### 13.3 Why bypass is costly
 
 Skipping the shim skips the safety net:
