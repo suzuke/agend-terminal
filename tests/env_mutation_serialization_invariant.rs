@@ -107,6 +107,11 @@ const SERIALIZED_PAIRS: &[(&str, &str, &str)] = &[
         "ci_env_test_guard serializes the force-chain fixture",
     ),
     (
+        "src/mcp/handlers/ci/review_threshold_merge_tests.rs",
+        "AGEND_HOME",
+        "fleet_test_guard serializes the real merge-entry fixture",
+    ),
+    (
         "src/mcp/handlers/tests.rs",
         "AGEND_HOME",
         "fleet_test_guard serializes MCP fixtures",
