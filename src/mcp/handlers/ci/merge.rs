@@ -1,5 +1,5 @@
 use super::watch::handle_watch_ci;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::path::Path;
 
 /// Post-merge receipt persistence + actionable exact-head watch auto-arm.
