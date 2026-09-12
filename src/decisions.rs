@@ -361,6 +361,10 @@ fn with_decision_locks<R>(
 }
 
 fn read_decision_for_update(home: &Path, id: &str) -> anyhow::Result<Decision> {
+    anyhow::ensure!(
+        is_safe_decision_id(id),
+        "decision id is not a safe exact identifier"
+    );
     let path = decision_path(home, id);
     let content = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("decision '{id}' not found: {e}"))?;

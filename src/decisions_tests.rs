@@ -379,6 +379,43 @@ fn retroactive_supersession_rejects_existing_cycle_3507() {
 }
 
 #[test]
+fn retroactive_supersession_rejects_malformed_chain_3507() {
+    let home = tmp_home("retroactive-malformed-chain-3507");
+    let predecessor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "old", "content": "v1"}),
+    );
+    let predecessor_id = predecessor["id"]
+        .as_str()
+        .expect("predecessor id")
+        .to_string();
+    let successor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "new", "content": "v2"}),
+    );
+    let successor_id = successor["id"].as_str().expect("successor id").to_string();
+
+    let mut malformed_predecessor = make_test_decision("author");
+    malformed_predecessor.id = predecessor_id.clone();
+    malformed_predecessor.supersedes = Some("../outside".into());
+    write_named_decision(
+        &home,
+        &format!("{predecessor_id}.json"),
+        &malformed_predecessor,
+    );
+
+    let result = update(
+        &home,
+        "author",
+        &serde_json::json!({"id": successor_id, "supersedes": predecessor_id}),
+    );
+    assert_eq!(result["code"], "invalid_decision_supersession", "{result}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn supersede_new_save_failure_leaves_old_unmarked_3506() {
     let home = tmp_home("supersede-new-save-failure-3506");
     let posted = post(
