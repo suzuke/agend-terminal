@@ -254,17 +254,19 @@ fn each_deficit_returns_actionable_error_text() {
         "PR is still a draft — merge refused",
     );
 
-    // CI has not reported green for this head.
+    // Provider-confirmed green recovers Pending CI before readiness; with no
+    // receipts remaining, the next actionable deficit is the review threshold.
     let mut s = single_green();
     s.ci_state = crate::daemon::pr_state::CiState::Pending;
     check(
         "ci-not-green",
         Some(s),
-        "ci_not_green",
-        "CI has not reported green for this head — merge refused",
+        "insufficient_verified",
+        "review threshold not satisfied — merge refused",
     );
 
-    // CI green belongs to another head.
+    // Provider-confirmed green replaces a stale CI head; with no receipts, the
+    // next actionable deficit is the review threshold.
     let mut s = single_green();
     s.ci_state = crate::daemon::pr_state::CiState::Green {
         sha: OTHER_HEAD.into(),
@@ -273,8 +275,8 @@ fn each_deficit_returns_actionable_error_text() {
     check(
         "ci-head-mismatch",
         Some(s),
-        "ci_head_mismatch",
-        "CI green is for a different head — merge refused",
+        "insufficient_verified",
+        "review threshold not satisfied — merge refused",
     );
 
     // A current-head receipt that is not VERIFIED.

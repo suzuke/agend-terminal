@@ -1,5 +1,5 @@
 use super::watch::handle_watch_ci;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 /// Post-merge receipt persistence + actionable exact-head watch auto-arm.
@@ -562,18 +562,13 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     // PrState subject and its typed review evidence to match that same head.
     // Force is the explicit policy bypass below; exact head/base acquisition
     // and recheck remain non-bypassable.
-    let review_state = load_exact_merge_state(home, &repo, pr, &pr_branch, &gated_head);
-    if !force {
-        let Some(state) = review_state.as_ref() else {
-            return review_deficit_response(crate::daemon::pr_state::MergeDeficit::NoLinkage);
-        };
-        if let Err(deficit) = crate::daemon::pr_state::merge_readiness(state) {
-            return review_deficit_response(deficit);
-        }
+    let initial_review_state = load_exact_merge_state(home, &repo, pr, &pr_branch, &gated_head);
+    if !force && initial_review_state.is_none() {
+        return review_deficit_response(crate::daemon::pr_state::MergeDeficit::NoLinkage);
     }
 
     if force {
-        let review_evidence = review_audit_fields(review_state.as_ref());
+        let review_evidence = review_audit_fields(initial_review_state.as_ref());
         let mut event = serde_json::json!({
             "kind": "merge_force_bypass",
             "agent": instance_name,
@@ -657,6 +652,35 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         home, &repo, &pr_branch, pr, &head_now, true,
     ) {
         return response;
+    }
+
+    if !force {
+        // #3589: provider-confirmed checks are the recovery source for an exact
+        // linked state that never had a CI watch. Hydrate only after the final
+        // identity and correction fences, then reload before the unchanged gate.
+        let Some(state) = initial_review_state.as_ref() else {
+            return review_deficit_response(crate::daemon::pr_state::MergeDeficit::NoLinkage);
+        };
+        if !matches!(
+            &state.ci_state,
+            crate::daemon::pr_state::CiState::Green { sha, .. } if sha == &gated_head
+        ) {
+            crate::daemon::pr_state::record_ci_result(
+                home,
+                &repo,
+                &pr_branch,
+                &gated_head,
+                crate::daemon::pr_state::CiConclusion::Green,
+                state.subscribers.clone(),
+                state.review_class,
+            );
+        }
+        let Some(state) = load_exact_merge_state(home, &repo, pr, &pr_branch, &gated_head) else {
+            return review_deficit_response(crate::daemon::pr_state::MergeDeficit::NoLinkage);
+        };
+        if let Err(deficit) = crate::daemon::pr_state::merge_readiness(&state) {
+            return review_deficit_response(deficit);
+        }
     }
 
     // #PR-Z site 3: the ONLY write — `gh pr merge` via ScmProvider. argv now adds
