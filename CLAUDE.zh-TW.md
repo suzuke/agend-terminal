@@ -38,7 +38,9 @@ cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc
 Pre-push hook（`scripts/hooks/pre-push`）會執行**兩道 gate**：
 
 1. **CI-parity**（#t-ci-parity-prepush-guard）——若 push range 觸及 `src/` / `tests/` / `Cargo.*` / `build.rs`，便執行 `scripts/preflight.sh --quick`（與 CI `check` 完全相同的命令：`cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo nextest run --features tray`），並在失敗時**阻擋 push**。這可防止一再發生的遺漏：agent 只執行 `cargo test --bin`——會略過 `tests/` integration target——便宣稱 CI-ready，接著被 CI 拒絕（#1734 stale-string integration test、#1735 block_on invariant）。Docs-only push 會略過 build。`--quick` 不執行 Windows cross-check（由 CI 的 `windows-latest` 後援）。
-2. **claim-verify**——依實際 diff 驗證 `Claim:` trailer。
+2. **claim-verify**——這是 best-effort 的本機提醒：每個 push ref 僅檢查
+   最新 commit 的 `Claim:` trailer 是否符合實際 diff。它不是權威的 trust
+   boundary；權威仍是 CI、daemon-side review 與 canonical merge gate。
 
 緊急情況可用 `git push --no-verify` 覆寫任一 gate（daemon-side gate 與 CI 仍會套用，所以 `--no-verify` 不是免死金牌）。
 
@@ -52,7 +54,9 @@ Hook 是 per-clone 的。Fresh `git clone` 後請安裝：
 scripts/install-hooks.sh   # idempotent——可安全重複執行
 ```
 
-**與 fleet agent 共存，以及其中未決的一半**：daemon 會將每個 managed worktree 的 `core.hooksPath` 設為 `$AGEND_HOME/hooks`（`src/binding.rs::install_hooks`），並只在其中寫入 daemon 自有的 hook——它*不會*清空目錄。因此 `install-hooks.sh` 也會把 tracked `pre-push` *複製*到 `$AGEND_HOME/hooks/pre-push`，讓它與那些 hook 共存（因所有目前與未來的 worktree 共用該目錄，一份 copy 即可涵蓋全部）。Agent push 確實會走到真正的 `git`，而 git 會遵守 `core.hooksPath`——所以該 hook 會不會執行，只取決於此刻那個目錄裡有什麼。若 `pre-push` 不存在、或被改名擱置（例如 `pre-push.disabled-*`），它就不會執行，也不會自動重新安裝；請用 `ls "$AGEND_HOME/hooks"` 確認，不要用猜的。至於 agent push 究竟該不該由這個 hook 把關，是尚未決定的 fleet policy 問題（t-20260712073154879622-40783-31）：本文件只記錄機制，不做決定。絕不可在該目錄中靜默啟用會產生變更的 mutation hook。
+**fleet agent 共存與已接受的 trust boundary（#3593）**：daemon 會將每個 managed worktree 的 `core.hooksPath` 設為 `$AGEND_HOME/hooks`（`src/binding.rs::install_hooks`），並只在其中寫入 daemon 自有的 provenance hook——它*不會*清空、安裝或 reconcile tracked `pre-push`。這個共享目錄對 pre-push **不是 daemon 的 trust boundary**。其中若存在 `install-hooks.sh` 複製的 `pre-push`，它只是**由 operator 安裝的便利功能**，不是完整性保證。若檔案不存在或被改名擱置（例如 `pre-push.disabled-*`），這是已接受並明載的限制，不會自動修復；依賴前請用 `ls "$AGEND_HOME/hooks"` 確認。fleet policy 問題（t-20260712073154879622-40783-31）已保守定案：agent push 不要求通過這個本機 hook，且絕不可在共享目錄中靜默啟用會產生變更的 mutation hook。
+
+claim check 同樣只是本機提醒：每個 push ref **僅檢查最新 commit** 的 `Claim:` trailer，且 `git push --no-verify` 可以繞過它。這個 latest-commit 範圍與本機 bypass 都不改變權威的 CI、daemon-side review 或 canonical merge gate。
 
 ## 測試忠實度：將 producer 的真實輸出餵給 consumer（#1493）
 
