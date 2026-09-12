@@ -85,7 +85,10 @@ The pre-push hook (`scripts/hooks/pre-push`) runs **two gates**:
    (#1734 stale-string integration test, #1735 block_on invariant). Docs-only
    pushes skip the build. `--quick` omits the Windows cross-check (CI's
    `windows-latest` is the backstop for that).
-2. **claim-verify** — verifies `Claim:` trailers against the actual diff.
+2. **claim-verify** — a best-effort local nudge: it checks the latest commit's
+   `Claim:` trailer against the actual diff for each pushed ref. It is not the
+   authoritative trust boundary; CI, daemon-side review, and the canonical
+   merge gate remain authoritative.
 
 Override either with `git push --no-verify` in emergencies (the daemon-side gate
 and CI still apply, so `--no-verify` is not a free pass).
@@ -108,20 +111,23 @@ Hooks are per-clone. After a fresh `git clone`, install with:
 scripts/install-hooks.sh   # idempotent — safe to re-run
 ```
 
-**Fleet-agent coexistence, and its unresolved half**: the daemon sets each
-managed worktree's `core.hooksPath` to `$AGEND_HOME/hooks`
-(`src/binding.rs::install_hooks`) and writes only the daemon-owned hooks there —
-it does *not* clear the directory. `install-hooks.sh` therefore also *copies* the
-tracked `pre-push` into `$AGEND_HOME/hooks/pre-push` so it can coexist with them
-(one copy covers every current and future worktree, since they share that dir).
-Agent pushes do reach real `git`, which honours `core.hooksPath` — so whether
-that hook runs depends only on what is in that directory right now. A `pre-push`
-that is absent, or renamed aside (e.g. `pre-push.disabled-*`), does not run, and
-nothing automatically re-installs it; verify with `ls "$AGEND_HOME/hooks"` rather than
-assuming. Whether agent pushes should be gated by this hook at all is an
-unresolved fleet policy question (t-20260712073154879622-40783-31): this document
-records the mechanism, not a decision. Mutation hooks must never be silently
-enabled in that directory.
+**Fleet-agent coexistence and the accepted trust boundary (#3593)**: the daemon
+sets each managed worktree's `core.hooksPath` to `$AGEND_HOME/hooks`
+(`src/binding.rs::install_hooks`) and writes only the daemon-owned provenance
+hooks there — it does *not* clear, install, or reconcile the tracked `pre-push`.
+That shared directory is **not a daemon trust boundary** for pre-push. The
+`install-hooks.sh` copy of `pre-push`, when present there, is an
+**operator-installed convenience**, not an integrity guarantee. A missing or
+renamed copy (for example `pre-push.disabled-*`) is an accepted limitation and
+does not automatically repair; use `ls "$AGEND_HOME/hooks"` before relying on
+it. The fleet policy question (t-20260712073154879622-40783-31) is therefore
+resolved conservatively: agent pushes are not required to pass this local hook,
+and no mutation-capable hook is silently enabled in the shared directory.
+
+The claim check is likewise only a local nudge: it examines the latest commit's
+`Claim:` trailer, and `git push --no-verify` bypasses it. Neither the latest-
+commit scope nor that local bypass changes the authoritative CI, daemon-side
+review, or canonical merge gates.
 
 ## Test fidelity: feed consumers the producer's real output (#1493)
 
