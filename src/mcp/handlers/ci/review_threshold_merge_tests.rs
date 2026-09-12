@@ -95,6 +95,11 @@ fn home(tag: &str) -> std::path::PathBuf {
     home
 }
 
+fn ci_env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn args() -> serde_json::Value {
     json!({"pr": PR, "repository": REPO})
 }
@@ -335,6 +340,46 @@ fn merge_without_pr_state_linkage_refuses() {
 
     assert_eq!(result["code"], "no_linkage", "{result}");
     assert!(recorded.lock().unwrap().is_none(), "{result}");
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// #3589 RED: a provider-confirmed green PR with an exact-head but Pending
+/// PrState must be recovered through the full repo-action dispatch path.
+#[test]
+fn unwatched_pending_ci_is_recovered_at_real_merge_entry() {
+    let _env_guard = ci_env_test_guard();
+    let home = home("unwatched-pending-ci");
+    let recorded = Arc::new(Mutex::new(None));
+    let _provider = install_provider(recorded.clone());
+    let mut pending = state(
+        crate::daemon::pr_state::ReviewClass::Single,
+        vec![receipt(
+            "reviewer-1",
+            HEAD,
+            crate::daemon::pr_state::ReviewClass::Single,
+        )],
+    );
+    pending.ci_state = crate::daemon::pr_state::CiState::Pending;
+    seed(&home, &pending);
+
+    let previous_home = std::env::var("AGEND_HOME").ok();
+    std::env::set_var("AGEND_HOME", &home);
+    let result = crate::mcp::handlers::handle_tool(
+        "repo",
+        &json!({
+            "action": "merge",
+            "pr": PR,
+            "repository": REPO,
+        }),
+        "lead",
+    );
+    match previous_home {
+        Some(previous) => std::env::set_var("AGEND_HOME", previous),
+        None => std::env::remove_var("AGEND_HOME"),
+    }
+
+    assert_eq!(result["merged"], true, "{result}");
+    assert!(recorded.lock().unwrap().is_some(), "{result}");
     std::fs::remove_dir_all(home).ok();
 }
 
