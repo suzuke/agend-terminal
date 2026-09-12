@@ -248,7 +248,7 @@ pub(crate) fn def_decision() -> Value {
             "scope": {"type": "string", "enum": ["project", "fleet"]},
             "review_class": {"type": "string", "enum": ["single", "dual"], "description": "Create-only typed review authority for tasks governed by this decision."},
             "tags": {"type": "array", "items": {"type": "string"}},
-            "ttl_days": {"type": "number"}, "supersedes": {"type": "string"},
+            "ttl_days": {"type": "number"}, "supersedes": {"type": "string", "description": "post: decision ID being replaced; update: #3507 guarded retroactive link to an existing decision"},
             "id": {"type": "string"}, "archive": {"type": "boolean"},
             "include_archived": {"type": "boolean"},
             "view": {"type": "string", "enum": ["live", "audit_history"]},

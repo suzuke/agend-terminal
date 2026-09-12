@@ -289,6 +289,133 @@ fn test_supersede_archives_old() {
 }
 
 #[test]
+fn retroactive_supersession_rejects_invalid_pairs_3507() {
+    let home = tmp_home("retroactive-invalid-3507");
+    let predecessor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "old", "content": "v1"}),
+    );
+    let predecessor_id = predecessor["id"]
+        .as_str()
+        .expect("predecessor id")
+        .to_string();
+    let successor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "new", "content": "v2"}),
+    );
+    let successor_id = successor["id"].as_str().expect("successor id").to_string();
+
+    let missing = update(
+        &home,
+        "author",
+        &serde_json::json!({"id": successor_id, "supersedes": "d-missing"}),
+    );
+    assert_eq!(missing["code"], "decision_supersession_target_not_found");
+
+    let self_reference = update(
+        &home,
+        "author",
+        &serde_json::json!({"id": successor_id, "supersedes": successor_id}),
+    );
+    assert_eq!(self_reference["code"], "invalid_decision_supersession");
+
+    let other = post(
+        &home,
+        "other-author",
+        &serde_json::json!({"title": "other", "content": "protected"}),
+    );
+    let other_id = other["id"].as_str().expect("other id").to_string();
+    let unauthorized = update(
+        &home,
+        "author",
+        &serde_json::json!({"id": successor_id, "supersedes": other_id}),
+    );
+    assert_eq!(unauthorized["code"], "invalid_decision_supersession");
+
+    let old_after = get(&home, &serde_json::json!({"id": predecessor_id}));
+    assert_eq!(old_after["decision"]["archived"], false);
+    let other_after = get(&home, &serde_json::json!({"id": other_id}));
+    assert_eq!(other_after["decision"]["archived"], false);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn retroactive_supersession_rejects_existing_cycle_3507() {
+    let home = tmp_home("retroactive-cycle-3507");
+    let predecessor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "old", "content": "v1"}),
+    );
+    let predecessor_id = predecessor["id"]
+        .as_str()
+        .expect("predecessor id")
+        .to_string();
+    let successor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "new", "content": "v2"}),
+    );
+    let successor_id = successor["id"].as_str().expect("successor id").to_string();
+
+    let mut cyclic_predecessor = make_test_decision("author");
+    cyclic_predecessor.id = predecessor_id.clone();
+    cyclic_predecessor.supersedes = Some(successor_id.clone());
+    write_named_decision(
+        &home,
+        &format!("{predecessor_id}.json"),
+        &cyclic_predecessor,
+    );
+
+    let result = update(
+        &home,
+        "author",
+        &serde_json::json!({"id": successor_id, "supersedes": predecessor_id}),
+    );
+    assert_eq!(result["code"], "invalid_decision_supersession", "{result}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn retroactive_supersession_rejects_malformed_chain_3507() {
+    let home = tmp_home("retroactive-malformed-chain-3507");
+    let predecessor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "old", "content": "v1"}),
+    );
+    let predecessor_id = predecessor["id"]
+        .as_str()
+        .expect("predecessor id")
+        .to_string();
+    let successor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "new", "content": "v2"}),
+    );
+    let successor_id = successor["id"].as_str().expect("successor id").to_string();
+
+    let mut malformed_predecessor = make_test_decision("author");
+    malformed_predecessor.id = predecessor_id.clone();
+    malformed_predecessor.supersedes = Some("../outside".into());
+    write_named_decision(
+        &home,
+        &format!("{predecessor_id}.json"),
+        &malformed_predecessor,
+    );
+
+    let result = update(
+        &home,
+        "author",
+        &serde_json::json!({"id": successor_id, "supersedes": predecessor_id}),
+    );
+    assert_eq!(result["code"], "invalid_decision_supersession", "{result}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn supersede_new_save_failure_leaves_old_unmarked_3506() {
     let home = tmp_home("supersede-new-save-failure-3506");
     let posted = post(

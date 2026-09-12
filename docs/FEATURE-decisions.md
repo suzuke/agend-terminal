@@ -106,8 +106,15 @@ Edit the content, tags, or status of an existing decision.
 | `tags` | string[] | no | New tags |
 | `ttl_days` | number | no | New expiry window in days |
 | `archive` | bool | no | Set to true to archive manually |
+| `supersedes` | string | no | #3507: guarded retroactive link to an existing predecessor; archives the predecessor and records both directions |
 
 Edit permission: only the original author or the orchestrator of their team can edit.
+
+When `supersedes` is supplied, `update` requires authorization for both
+decisions, rejects missing/self-referential/cyclic or already-conflicting
+relationships, and updates the successor and predecessor under their ordered
+decision locks. The successor is saved first, matching `post`'s write order;
+`archive` cannot be combined with this repair operation.
 
 ### answer — resolve a pending question
 
@@ -190,7 +197,7 @@ When you need to revise a previous decision, use `supersedes` to create a link b
 }
 ```
 
-Execution flow:
+Execution flow for `post`:
 
 1. Acquire the lock on the old decision
 2. Mark the old decision as `archived: true`
@@ -202,6 +209,11 @@ This whole flow runs atomically under a file lock, so there is no race condition
 By default, `list` does not show archived decisions. To see the full history (including superseded old decisions), use `include_archived: true`.
 
 The `supersedes` field is the main mechanism for keeping the history useful instead of merely long.
+
+For a relationship discovered after both decisions were written, use
+`action: "update"` on the replacement with `supersedes` set to the existing
+predecessor ID. This is a guarded repair path; it is not a way to rewrite an
+existing supersession chain.
 
 It lets you say:
 
