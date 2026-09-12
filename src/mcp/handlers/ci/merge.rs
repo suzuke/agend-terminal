@@ -1,3 +1,4 @@
+use super::merge_ci_truth::{load_exact_merge_state, refresh_ci_truth};
 use super::watch::handle_watch_ci;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -324,21 +325,6 @@ fn acquire_head_base(
     Some((head, base, branch, s.merge_state_status))
 }
 
-fn load_exact_merge_state(
-    home: &Path,
-    repo: &str,
-    pr: u64,
-    branch: &str,
-    head: &str,
-) -> Option<crate::daemon::pr_state::PrState> {
-    let state = crate::daemon::pr_state::load(home, repo, branch)?;
-    (state.repo == repo
-        && state.pr_number == pr
-        && state.branch == branch
-        && state.head_sha == head)
-        .then_some(state)
-}
-
 fn review_deficit_response(deficit: crate::daemon::pr_state::MergeDeficit) -> Value {
     use crate::daemon::pr_state::MergeDeficit as D;
     let code = deficit.code();
@@ -655,28 +641,7 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     }
 
     if !force {
-        // #3589: provider-confirmed checks are the recovery source for an exact
-        // linked state that never had a CI watch. Reload after the final
-        // identity and correction fences, hydrate from that snapshot, then
-        // reload again before the unchanged gate.
-        let Some(state) = load_exact_merge_state(home, &repo, pr, &pr_branch, &gated_head) else {
-            return review_deficit_response(crate::daemon::pr_state::MergeDeficit::NoLinkage);
-        };
-        if !matches!(
-            &state.ci_state,
-            crate::daemon::pr_state::CiState::Green { sha, .. } if sha == &gated_head
-        ) {
-            crate::daemon::pr_state::record_ci_result(
-                home,
-                &repo,
-                &pr_branch,
-                &gated_head,
-                crate::daemon::pr_state::CiConclusion::Green,
-                state.subscribers.clone(),
-                state.review_class,
-            );
-        }
-        let Some(state) = load_exact_merge_state(home, &repo, pr, &pr_branch, &gated_head) else {
+        let Some(state) = refresh_ci_truth(home, &repo, pr, &pr_branch, &gated_head) else {
             return review_deficit_response(crate::daemon::pr_state::MergeDeficit::NoLinkage);
         };
         if let Err(deficit) = crate::daemon::pr_state::merge_readiness(&state) {

@@ -40,6 +40,7 @@ pub(crate) mod checkout_recovery;
 mod cleanup;
 mod handoff_ack;
 mod merge;
+mod merge_ci_truth;
 mod release;
 mod status_scope;
 pub(super) mod unwatch;
