@@ -106,8 +106,11 @@ lead agent 做出一個架構選擇，例如決定用 worktree 而不是直接 c
 | `tags` | string[] | 否 | 新標籤 |
 | `ttl_days` | number | 否 | 新的過期天數 |
 | `archive` | bool | 否 | 設為 true 手動封存 |
+| `supersedes` | string | 否 | #3507：受保護的 retroactive link，指向既有前身；會封存前身並記錄雙向關聯 |
 
 修改權限：只有原作者或其所屬團隊的 orchestrator 可以修改。
+
+提供 `supersedes` 時，`update` 也必須取得兩筆 decision 的修改授權，並拒絕不存在、自我指向、循環或已衝突的關係；整個雙向更新在排序後的 decision locks 下執行。替代 `post` 的 successor 會先寫入，因此 `archive` 不可與此修復操作合用。
 
 ### answer — 回答 pending question
 
@@ -190,7 +193,7 @@ Scope 目前作為元資料使用，不影響存取權限。
 }
 ```
 
-執行流程：
+`post` 的執行流程：
 
 1. 取得舊決策的鎖定
 2. 將舊決策標記為 `archived: true`
@@ -202,6 +205,9 @@ Scope 目前作為元資料使用，不影響存取權限。
 `list` 預設不顯示已封存的決策。要查看完整歷史（包含被取代的舊決策），使用 `include_archived: true`。
 
 `supersedes` 欄位是讓歷史保持有用、而不只是越來越長的主要機制。
+
+若是在兩筆 decision 都建立後才發現替代關係，請對替代 decision 使用
+`action: "update"` 並設定既有前身 ID。這是受保護的修復路徑，不是任意改寫既有 supersession chain 的工具。
 
 它讓你可以表達：
 
