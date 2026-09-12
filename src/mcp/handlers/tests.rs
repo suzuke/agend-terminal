@@ -563,6 +563,78 @@ fn answer_decision_records_and_notifies_author_2305() {
 }
 
 #[test]
+fn update_decision_can_record_retroactive_supersession_3507() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("decision_retroactive_supersedes_3507");
+    std::env::remove_var("AGEND_INSTANCE_NAME");
+
+    let predecessor = handle_tool(
+        "decision",
+        &json!({
+            "action": "post",
+            "title": "old policy",
+            "content": "the earlier policy",
+        }),
+        "author",
+    );
+    let predecessor_id = predecessor["id"].as_str().expect("predecessor id");
+    let successor = handle_tool(
+        "decision",
+        &json!({
+            "action": "post",
+            "title": "replacement policy",
+            "content": "the later policy",
+        }),
+        "author",
+    );
+    let successor_id = successor["id"].as_str().expect("successor id");
+
+    // Drive the real MCP decision/update dispatch path. The relationship is
+    // discovered after both decisions were posted, which is the repair case
+    // that #3507 adds without permitting arbitrary rewrites.
+    let updated = handle_tool(
+        "decision",
+        &json!({
+            "action": "update",
+            "id": successor_id,
+            "supersedes": predecessor_id,
+        }),
+        "author",
+    );
+    assert_eq!(updated["status"], "updated", "update result: {updated}");
+
+    let predecessor_after = handle_tool(
+        "decision",
+        &json!({"action": "get", "id": predecessor_id}),
+        "author",
+    );
+    assert_eq!(
+        predecessor_after["decision"]["archived"],
+        true,
+        "retroactive supersession must archive predecessor: {predecessor_after}"
+    );
+    assert_eq!(
+        predecessor_after["decision"]["superseded_by"],
+        successor_id,
+        "predecessor must point at successor: {predecessor_after}"
+    );
+
+    let successor_after = handle_tool(
+        "decision",
+        &json!({"action": "get", "id": successor_id}),
+        "author",
+    );
+    assert_eq!(
+        successor_after["decision"]["supersedes"],
+        predecessor_id,
+        "successor must point at predecessor: {successor_after}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn broadcast_emits_with_resolved_recipients() {
     let _g = fleet_test_guard();
     let (rec, home) = setup_recorder("fleet_broadcast");
