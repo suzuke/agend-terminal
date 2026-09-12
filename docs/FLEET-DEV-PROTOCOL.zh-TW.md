@@ -807,6 +807,12 @@ git push origin <your-branch>     # any branch except main
 
 Raw worktree lifecycle、切換 protected branch 與 push 至 main 都不屬於 agent bypass scope。使用 `repo`、`bind_self`、`release_worktree` 與 PR/merge workflow。
 
+Agent 的長期授權（standing authorization）同樣不授權修改受保護的
+canonical local refs。特別是，即使不切換 branch 也不 push，從 canonical
+checkout 執行 `git merge --ff-only @{u}` 仍屬 protected-branch mutation。
+Canonical sync 必須經由 daemon-managed repo/release/merge workflow，或另一個
+個別授權的 daemon-managed action。
+
 ### 13.3 Bypass 為何代價高昂
 
 跳過 shim 就會跳過 safety net：
