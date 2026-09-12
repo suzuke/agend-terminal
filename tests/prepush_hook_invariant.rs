@@ -11,6 +11,8 @@
 //! catch a regression here, the same way it catches #1734/#1735.)
 
 const PRE_PUSH: &str = include_str!("../scripts/hooks/pre-push");
+const CLAUDE_EN: &str = include_str!("../CLAUDE.md");
+const CLAUDE_ZH_TW: &str = include_str!("../CLAUDE.zh-TW.md");
 
 #[test]
 fn pre_push_runs_ci_parity_via_preflight() {
@@ -46,5 +48,30 @@ fn pre_push_documents_emergency_override() {
     assert!(
         PRE_PUSH.contains("--no-verify"),
         "pre-push must document the emergency override"
+    );
+}
+
+#[test]
+fn docs_define_pre_push_trust_boundary_3593() {
+    assert!(
+        CLAUDE_EN.contains("not a daemon trust boundary"),
+        "English docs must state that the shared daemon hooks directory is not a pre-push trust boundary"
+    );
+    assert!(
+        CLAUDE_EN.contains("operator-installed convenience"),
+        "English docs must define the shared pre-push copy as operator-installed convenience"
+    );
+    assert!(
+        CLAUDE_EN.contains("latest commit") && CLAUDE_EN.contains("--no-verify"),
+        "English docs must disclose latest-commit claim scope and the local bypass"
+    );
+
+    assert!(
+        CLAUDE_ZH_TW.contains("不是 daemon 的 trust boundary"),
+        "Traditional Chinese docs must state the shared daemon hooks directory is not a pre-push trust boundary"
+    );
+    assert!(
+        CLAUDE_ZH_TW.contains("僅檢查最新 commit") && CLAUDE_ZH_TW.contains("--no-verify"),
+        "Traditional Chinese docs must disclose latest-commit claim scope and the local bypass"
     );
 }
