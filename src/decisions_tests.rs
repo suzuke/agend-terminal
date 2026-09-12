@@ -296,7 +296,10 @@ fn retroactive_supersession_rejects_invalid_pairs_3507() {
         "author",
         &serde_json::json!({"title": "old", "content": "v1"}),
     );
-    let predecessor_id = predecessor["id"].as_str().expect("predecessor id").to_string();
+    let predecessor_id = predecessor["id"]
+        .as_str()
+        .expect("predecessor id")
+        .to_string();
     let successor = post(
         &home,
         "author",
@@ -346,7 +349,10 @@ fn retroactive_supersession_rejects_existing_cycle_3507() {
         "author",
         &serde_json::json!({"title": "old", "content": "v1"}),
     );
-    let predecessor_id = predecessor["id"].as_str().expect("predecessor id").to_string();
+    let predecessor_id = predecessor["id"]
+        .as_str()
+        .expect("predecessor id")
+        .to_string();
     let successor = post(
         &home,
         "author",

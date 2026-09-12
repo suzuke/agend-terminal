@@ -609,13 +609,11 @@ fn update_decision_can_record_retroactive_supersession_3507() {
         "author",
     );
     assert_eq!(
-        predecessor_after["decision"]["archived"],
-        true,
+        predecessor_after["decision"]["archived"], true,
         "retroactive supersession must archive predecessor: {predecessor_after}"
     );
     assert_eq!(
-        predecessor_after["decision"]["superseded_by"],
-        successor_id,
+        predecessor_after["decision"]["superseded_by"], successor_id,
         "predecessor must point at successor: {predecessor_after}"
     );
 
@@ -625,8 +623,7 @@ fn update_decision_can_record_retroactive_supersession_3507() {
         "author",
     );
     assert_eq!(
-        successor_after["decision"]["supersedes"],
-        predecessor_id,
+        successor_after["decision"]["supersedes"], predecessor_id,
         "successor must point at predecessor: {successor_after}"
     );
 

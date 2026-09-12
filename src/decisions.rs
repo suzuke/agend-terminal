@@ -425,7 +425,10 @@ fn validate_retroactive_supersession(
     let mut seen = std::collections::HashSet::new();
     let mut next = predecessor.supersedes.clone();
     while let Some(id) = next {
-        anyhow::ensure!(seen.insert(id.clone()), "supersession chain contains a cycle");
+        anyhow::ensure!(
+            seen.insert(id.clone()),
+            "supersession chain contains a cycle"
+        );
         anyhow::ensure!(id != successor.id, "supersession would create a cycle");
         let decision = read_decision_for_update(home, &id)?;
         next = decision.supersedes;
@@ -462,13 +465,13 @@ fn update_with_retroactive_supersession(
             return serde_json::json!({
                 "error": "supersedes must be a non-empty decision id",
                 "code": "invalid_supersession_target",
-            })
+            });
         }
         Some(_) => {
             return serde_json::json!({
                 "error": "supersedes must be a decision id string",
                 "code": "invalid_supersession_target",
-            })
+            });
         }
         None => unreachable!("retroactive update requires supersedes"),
     };
@@ -504,7 +507,7 @@ fn update_with_retroactive_supersession(
                 return serde_json::json!({
                     "error": error.to_string(),
                     "code": "decision_supersession_target_not_found",
-                })
+                });
             }
         };
         if let Err(error) =
