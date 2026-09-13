@@ -495,7 +495,7 @@ pub(super) fn handle_restart_instance_with_runtime(
         if let Some(wt) = crate::binding::read(home, name)
             .and_then(|b| b["worktree"].as_str().map(std::path::PathBuf::from))
         {
-            if wt.exists() && crate::worktree::has_uncommitted_changes(&wt) {
+            if wt.exists() && crate::worktree_pool::worktree_has_work_at_risk(&wt) {
                 return json!({
                     "error": "refusing fresh restart: bound worktree has uncommitted changes \
                               that a context drop would strand. Commit/push (or leave a task-board \
