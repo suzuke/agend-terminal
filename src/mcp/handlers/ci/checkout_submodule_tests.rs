@@ -1880,6 +1880,75 @@ fn checkout_idempotent_bound_reuse_inits_empty_submodules_2755() {
     }
 }
 
+/// #3611: a valid bound worktree whose ignored `.agend-managed` marker was
+/// externally removed must rebuild the marker from the authoritative binding
+/// before reuse, rather than remaining stuck behind the provenance gate.
+#[cfg(unix)]
+#[test]
+fn checkout_reuse_rebuilds_missing_marker_3611() {
+    let home = tmp_home("reuse-marker-rebuild");
+    let repo = tmp_repo_with_file("reuse-marker-rebuild", "readme.txt", "bound\n");
+    let instance = "agent-marker-rebuild";
+    let branch = "feat/marker-rebuild";
+    // Production repos ignore the daemon marker; otherwise reuse's clean sync
+    // would remove the marker immediately after the rebuild.
+    std::fs::write(repo.join(".gitignore"), ".agend-managed\n").unwrap();
+    git_run_ok(&repo, &["add", ".gitignore"], false);
+    git_run_ok(&repo, &["commit", "-m", "ignore managed marker"], false);
+    git_run_ok(&repo, &["branch", branch, "main"], false);
+
+    let mangled = mangled_for(instance, &repo);
+    let wt = home.join("worktrees").join(&mangled);
+    std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    git_run_ok(
+        &repo,
+        &["worktree", "add", &wt.display().to_string(), branch],
+        false,
+    );
+    assert!(!wt.join(crate::worktree_pool::MANAGED_MARKER).exists());
+
+    let bdir = home.join("runtime").join(instance);
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::write(
+        bdir.join("binding.json"),
+        json!({
+            "version": 1,
+            "agent": instance,
+            "task_id": "T-marker-rebuild",
+            "branch": branch,
+            "worktree": wt.display().to_string(),
+            "source_repo": repo.display().to_string(),
+            "issued_at": "2026-01-01T00:00:00+00:00",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let args = json!({
+        "repository_path": repo.display().to_string(),
+        "branch": branch,
+        "bind": true,
+    });
+    let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    assert_eq!(
+        resp.get("idempotent").and_then(|v| v.as_bool()),
+        Some(true),
+        "valid bound worktree with a missing marker must be reusable: {resp}"
+    );
+    let marker = std::fs::read_to_string(wt.join(crate::worktree_pool::MANAGED_MARKER))
+        .expect("reuse must rebuild the managed marker");
+    assert!(marker.contains(&format!("agent={instance}\n")));
+    assert!(marker.contains(&format!("branch={branch}\n")));
+    let repo_canonical = repo.canonicalize().unwrap();
+    assert!(
+        marker.contains(&format!("source_repo={}\n", repo_canonical.display())),
+        "marker source identity must come from the bound source: {marker}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// #2755 R3 (B4, indep P0.1 + codex m-…736): a `bind:true` reuse whose binding points
 /// at a worktree of a DIFFERENT repository than the requested source MUST fail closed —
 /// the bound tree is never mutated (sync/reset/init) or returned as success. The
