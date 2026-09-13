@@ -755,12 +755,19 @@ fn codex_remote_command_args(
         "-c".to_string(),
         "check_for_update_on_startup=false".to_string(),
     ]);
-    if spawn_mode == crate::backend::SpawnMode::Resume {
-        if let Some(thread_id) = crate::transport::codex_thread_for_spawn(locator, spawn_mode) {
-            enriched.extend(["resume".to_string(), thread_id]);
-        }
+    let resumed_thread = if spawn_mode == crate::backend::SpawnMode::Resume {
+        crate::transport::codex_thread_for_spawn(locator, spawn_mode)
+    } else {
+        None
+    };
+    if let Some(thread_id) = resumed_thread {
+        enriched.extend(["resume".to_string(), thread_id]);
+    } else {
+        // Codex rejects permission overrides when resuming a remote task.
+        // Keep the autonomous bypass for fresh/locator-less remote sessions,
+        // but never combine it with `resume <thread_id>`.
+        enriched.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     }
-    enriched.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     enriched.extend(args.iter().cloned());
     Ok(enriched)
 }
