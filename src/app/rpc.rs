@@ -154,10 +154,14 @@ fn open_event_stream(run_dir: &Path) -> Result<BufReader<TcpStream>, String> {
             .unwrap_or("event stream rejected")
             .to_string());
     }
-    ack["event_stream"]["source"]
+    let source = ack["event_stream"]["source"]
         .as_str()
         .filter(|source| !source.is_empty() && *source != "unknown")
         .ok_or_else(|| "event stream has unverifiable source".to_string())?;
+    let expected_source = crate::daemon::event_hub::source_id(run_dir);
+    if expected_source == "unknown" || source != expected_source {
+        return Err("event stream source does not match active daemon".to_string());
+    }
     Ok(reader)
 }
 
