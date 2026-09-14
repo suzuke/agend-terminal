@@ -132,6 +132,7 @@ fn validate_work_dir_rejects_outside_roots() {
 }
 
 #[test]
+#[serial_test::serial(env)]
 fn validate_work_dir_env_override_accepted() {
     let home = tmp_home("validate_env");
     // Use a sibling dir of home (not under home) as custom root
