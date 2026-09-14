@@ -30,7 +30,6 @@ const MAX_LOC: usize = 2500;
 const GRANDFATHERED: &[(&str, usize)] = &[
     // #2745 R3: pr_state/mod.rs test module re-homed to sibling `tests.rs`; the
     // production file dropped under MAX_LOC, so it is de-grandfathered (re-armed).
-    ("src/daemon/mod.rs", 3217),
     ("src/agent/mod.rs", 3216),
     ("src/vterm.rs", 3103),
 ];
