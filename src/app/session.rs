@@ -47,6 +47,21 @@ struct Session {
 struct SessionTab {
     name: String,
     root: SessionNode,
+    /// Focus identity is optional for backwards compatibility with legacy
+    /// session files. When present, InstanceRef is authoritative.
+    #[serde(default)]
+    focus: Option<SessionFocus>,
+    /// Zoom is a view preference, not pane data; old sessions default false.
+    #[serde(default)]
+    zoomed: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SessionFocus {
+    #[serde(default)]
+    instance_ref: Option<crate::types::InstanceRef>,
+    #[serde(default)]
+    fleet_instance_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -90,18 +105,72 @@ fn serialize_session(layout: &Layout) -> Option<String> {
             .map(|tab| SessionTab {
                 name: tab.name.clone(),
                 root: save_node(tab.root()),
+                focus: save_focus(tab),
+                zoomed: tab.zoomed,
             })
             .collect(),
     };
     serde_json::to_string_pretty(&session).ok()
 }
 
-pub(super) fn save_session(home: &Path, layout: &Layout) {
-    if let Some(json) = serialize_session(layout) {
-        let path = home.join("session.json");
-        let _ = crate::store::atomic_write(&path, json.as_bytes());
+const RETIRED_SESSION_FILE: &str = "session.retired.json";
+
+#[derive(Serialize, Deserialize, Default)]
+struct RetiredSession {
+    #[serde(default)]
+    instance_refs: Vec<crate::types::InstanceRef>,
+}
+
+fn retired_session_path(home: &Path) -> std::path::PathBuf {
+    home.join(RETIRED_SESSION_FILE)
+}
+
+fn load_retired_refs(home: &Path) -> HashSet<crate::types::InstanceRef> {
+    std::fs::read_to_string(retired_session_path(home))
+        .ok()
+        .and_then(|content| serde_json::from_str::<RetiredSession>(&content).ok())
+        .map(|pending| pending.instance_refs.into_iter().collect())
+        .unwrap_or_default()
+}
+
+pub(super) fn record_retired_ref(home: &Path, instance_ref: crate::types::InstanceRef) -> bool {
+    let mut refs = load_retired_refs(home);
+    refs.insert(instance_ref);
+    let mut instance_refs: Vec<_> = refs.into_iter().collect();
+    instance_refs.sort_by_key(|reference| (reference.instance_id.full(), reference.generation));
+    let pending = RetiredSession { instance_refs };
+    let Ok(json) = serde_json::to_string_pretty(&pending) else {
+        return false;
+    };
+    crate::store::atomic_write(&retired_session_path(home), json.as_bytes()).is_ok()
+}
+
+fn clear_retired_refs(home: &Path) {
+    let _ = std::fs::remove_file(retired_session_path(home));
+}
+
+fn save_focus(tab: &Tab) -> Option<SessionFocus> {
+    let pane = tab.root().find_pane(tab.focus_id)?;
+    if pane.instance_ref.is_none() && pane.fleet_instance_name.is_none() {
+        return None;
+    }
+    Some(SessionFocus {
+        instance_ref: pane.instance_ref,
+        fleet_instance_name: pane.fleet_instance_name.clone(),
+    })
+}
+
+pub(super) fn save_session(home: &Path, layout: &Layout) -> bool {
+    let Some(json) = serialize_session(layout) else {
+        return false;
+    };
+    let path = home.join("session.json");
+    let saved = crate::store::atomic_write(&path, json.as_bytes()).is_ok();
+    if saved {
+        clear_retired_refs(home);
         tracing::info!(path = %path.display(), "session saved");
     }
+    saved
 }
 
 /// #1479: write `session.json` only when the serialized layout differs from the
@@ -124,6 +193,7 @@ pub(super) fn save_session_if_changed(
     let path = home.join("session.json");
     if crate::store::atomic_write(&path, json.as_bytes()).is_ok() {
         *cache = Some(json);
+        clear_retired_refs(home);
         true
     } else {
         false
@@ -272,7 +342,14 @@ pub(super) fn restore_with_reconciliation_attached(
         match super::pane_factory::create_remote_pane(
             name, home, fleet_path, layout, cols, rows, wakeup_tx,
         ) {
-            Ok(pane) => Some(pane),
+            Ok(pane) if pane.instance_ref.is_some() => Some(pane),
+            Ok(_) => {
+                tracing::warn!(
+                    agent = %name,
+                    "remote pane attach returned no instance identity; refusing ambiguous restore"
+                );
+                None
+            }
             Err(e) => {
                 tracing::warn!(agent = %name, error = %e, "remote pane attach failed");
                 None
@@ -280,7 +357,8 @@ pub(super) fn restore_with_reconciliation_attached(
         }
     };
 
-    let applied = apply_session_layout(home, &agent_source, &mut pane_builder, layout);
+    let applied =
+        apply_session_layout_with_identity(home, &agent_source, &mut pane_builder, layout, true);
 
     if applied {
         return true;
@@ -323,6 +401,16 @@ fn apply_session_layout(
     pane_builder: &mut PaneBuilder<'_>,
     layout: &mut Layout,
 ) -> bool {
+    apply_session_layout_with_identity(home, agent_source, pane_builder, layout, false)
+}
+
+fn apply_session_layout_with_identity(
+    home: &Path,
+    agent_source: &HashSet<String>,
+    pane_builder: &mut PaneBuilder<'_>,
+    layout: &mut Layout,
+    require_identity: bool,
+) -> bool {
     let session_path = home.join("session.json");
     let session: Option<Session> = std::fs::read_to_string(&session_path)
         .ok()
@@ -336,12 +424,38 @@ fn apply_session_layout(
     }
 
     let mut placed: HashSet<String> = HashSet::new();
+    let retired_refs = load_retired_refs(home);
+    let mut successor_panes = Vec::new();
 
     for tab in &session.tabs {
-        if let Some(root_node) =
-            restore_node_reconciled(&tab.root, agent_source, pane_builder, layout, &mut placed)
-        {
-            layout.add_tab(Tab::with_root(tab.name.clone(), root_node));
+        if let Some(root_node) = restore_node_reconciled(
+            &tab.root,
+            agent_source,
+            &retired_refs,
+            pane_builder,
+            layout,
+            &mut placed,
+            &mut successor_panes,
+            require_identity,
+        ) {
+            let mut restored = Tab::with_root(tab.name.clone(), root_node);
+            let (focus_ref, focus_name) = tab
+                .focus
+                .as_ref()
+                .map(|focus| (focus.instance_ref, focus.fleet_instance_name.as_deref()))
+                .unwrap_or((None, None));
+            restored.restore_view_state(focus_ref, focus_name, tab.zoomed);
+            layout.add_tab(restored);
+        }
+    }
+
+    // A same-name successor was built from the live daemon, but its identity
+    // did not match the saved leaf. Keep that current pane and append it as a
+    // new view rather than invoking the remote attach path a second time.
+    for pane in successor_panes {
+        let name = pane.agent_name.to_string();
+        if placed.insert(name.clone()) {
+            layout.add_tab(Tab::new(name, pane));
         }
     }
 
@@ -349,7 +463,11 @@ fn apply_session_layout(
     // grouped by team where teams are defined in fleet.yaml.
     let mut unplaced: Vec<String> = agent_source.difference(&placed).cloned().collect();
     unplaced.sort();
-    place_agents_team_grouped(home, &unplaced, pane_builder, layout);
+    if require_identity {
+        place_agents_team_grouped_with_identity(home, &unplaced, pane_builder, layout, true);
+    } else {
+        place_agents_team_grouped(home, &unplaced, pane_builder, layout);
+    }
 
     if session.active_tab < layout.tabs.len() {
         layout.active = session.active_tab;
@@ -357,6 +475,7 @@ fn apply_session_layout(
 
     if !layout.tabs.is_empty() {
         let _ = std::fs::remove_file(&session_path);
+        clear_retired_refs(home);
         tracing::info!(
             tabs = layout.tabs.len(),
             "session restored with reconciliation"
@@ -378,6 +497,16 @@ pub(super) fn place_agents_team_grouped(
     agents: &[String],
     pane_builder: &mut PaneBuilder<'_>,
     layout: &mut Layout,
+) -> bool {
+    place_agents_team_grouped_with_identity(home, agents, pane_builder, layout, false)
+}
+
+fn place_agents_team_grouped_with_identity(
+    home: &Path,
+    agents: &[String],
+    pane_builder: &mut PaneBuilder<'_>,
+    layout: &mut Layout,
+    require_identity: bool,
 ) -> bool {
     let teams = crate::teams::list_all(home);
     let mut team_members: HashMap<String, Vec<String>> = HashMap::new();
@@ -411,7 +540,9 @@ pub(super) fn place_agents_team_grouped(
                 instance_ref: None,
                 display_name: None,
             };
-            if let Some(pane) = pane_builder(&synthetic_sp, layout) {
+            if let Some(pane) = pane_builder(&synthetic_sp, layout)
+                .filter(|pane| !require_identity || pane.instance_ref.is_some())
+            {
                 placed_any = true;
                 if !tab_created {
                     layout.add_tab(Tab::new(team_name.clone(), pane));
@@ -429,7 +560,9 @@ pub(super) fn place_agents_team_grouped(
             instance_ref: None,
             display_name: None,
         };
-        if let Some(pane) = pane_builder(&synthetic_sp, layout) {
+        if let Some(pane) = pane_builder(&synthetic_sp, layout)
+            .filter(|pane| !require_identity || pane.instance_ref.is_some())
+        {
             placed_any = true;
             let tab_name = pane.agent_name.to_string();
             layout.add_tab(Tab::new(tab_name, pane));
@@ -446,12 +579,16 @@ pub(super) fn place_agents_team_grouped(
 /// where `name` is NOT in `agent_source` returns None silently (no warn log).
 /// This is the operator's variant-3 scenario — stale session names that no
 /// longer match the daemon registry.
+#[allow(clippy::too_many_arguments)]
 fn restore_node_reconciled(
     node: &SessionNode,
     agent_source: &HashSet<String>,
+    retired_refs: &HashSet<crate::types::InstanceRef>,
     pane_builder: &mut PaneBuilder<'_>,
     layout: &mut Layout,
     placed: &mut HashSet<String>,
+    successor_panes: &mut Vec<Pane>,
+    require_identity: bool,
 ) -> Option<PaneNode> {
     match node {
         SessionNode::Leaf(sp) => {
@@ -462,13 +599,31 @@ fn restore_node_reconciled(
                 if !agent_source.contains(name) {
                     return None;
                 }
-                if !placed.insert(name.to_string()) {
-                    return None;
-                }
+            }
+            if sp
+                .instance_ref
+                .is_some_and(|instance_ref| retired_refs.contains(&instance_ref))
+            {
+                return None;
             }
             // For agent leaves (Some) and shell leaves (None), the closure
             // dispatches internally and returns None when unsupported.
             let mut pane = pane_builder(sp, layout)?;
+            if require_identity && sp.fleet_instance_name.is_some() && pane.instance_ref.is_none() {
+                return None;
+            }
+            if let Some(saved_ref) = sp.instance_ref {
+                if pane.instance_ref != Some(saved_ref) {
+                    pane.display_name = sp.display_name.clone();
+                    successor_panes.push(pane);
+                    return None;
+                }
+            }
+            if let Some(name) = sp.fleet_instance_name.as_deref() {
+                if !placed.insert(name.to_string()) {
+                    return None;
+                }
+            }
             pane.display_name = sp.display_name.clone();
             Some(PaneNode::Leaf(Box::new(pane)))
         }
@@ -486,8 +641,26 @@ fn restore_node_reconciled(
             // receive a degenerate depth. If a NON-serde tree-feed path is ever
             // added, or `disable_recursion_limit` is set anywhere, add an explicit
             // depth guard here.
-            let f = restore_node_reconciled(first, agent_source, pane_builder, layout, placed);
-            let s = restore_node_reconciled(second, agent_source, pane_builder, layout, placed);
+            let f = restore_node_reconciled(
+                first,
+                agent_source,
+                retired_refs,
+                pane_builder,
+                layout,
+                placed,
+                successor_panes,
+                require_identity,
+            );
+            let s = restore_node_reconciled(
+                second,
+                agent_source,
+                retired_refs,
+                pane_builder,
+                layout,
+                placed,
+                successor_panes,
+                require_identity,
+            );
             match (f, s) {
                 (Some(f), Some(s)) => Some(PaneNode::Split {
                     dir: *dir,
@@ -729,6 +902,215 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[test]
+    fn restore_does_not_reuse_saved_slot_for_same_name_successor() {
+        let home = tmp_home("same-name-successor");
+        let old_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+        let new_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 2);
+        write_session(
+            &home,
+            vec![(
+                "stale-layout".to_string(),
+                SessionNode::Leaf(SessionPane {
+                    fleet_instance_name: Some("dev".to_string()),
+                    instance_ref: Some(old_ref),
+                    display_name: None,
+                }),
+            )],
+        );
+
+        let agent_source: HashSet<String> = ["dev".to_string()].into_iter().collect();
+        let mut layout = Layout::new();
+        let mut id_counter = 0usize;
+        let mut pb = |sp: &SessionPane, _layout: &mut Layout| {
+            id_counter += 1;
+            let mut pane = test_pane(id_counter, sp.fleet_instance_name.as_deref()?, Some("dev"));
+            pane.instance_ref = Some(new_ref);
+            Some(pane)
+        };
+
+        assert!(apply_session_layout(
+            &home,
+            &agent_source,
+            &mut pb,
+            &mut layout
+        ));
+        assert_eq!(
+            layout.tabs.len(),
+            1,
+            "successor must be placed exactly once"
+        );
+        assert_eq!(
+            layout.tabs[0].name, "dev",
+            "stale saved tab must not be reused"
+        );
+        let pane = layout.tabs[0].root().first_pane();
+        assert_eq!(pane.instance_ref, Some(new_ref));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn attached_restore_drops_identityless_legacy_agent_leaf() {
+        let home = tmp_home("attached-legacy-no-identity");
+        write_session(
+            &home,
+            vec![(
+                "legacy".to_string(),
+                SessionNode::Leaf(SessionPane {
+                    fleet_instance_name: Some("dev".to_string()),
+                    instance_ref: None,
+                    display_name: None,
+                }),
+            )],
+        );
+
+        let agent_source: HashSet<String> = ["dev".to_string()].into_iter().collect();
+        let mut layout = Layout::new();
+        let mut pb = |sp: &SessionPane, _layout: &mut Layout| {
+            Some(test_pane(
+                1,
+                sp.fleet_instance_name.as_deref()?,
+                Some("dev"),
+            ))
+        };
+
+        assert!(!apply_session_layout_with_identity(
+            &home,
+            &agent_source,
+            &mut pb,
+            &mut layout,
+            true,
+        ));
+        assert!(layout.tabs.is_empty());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn save_session_persists_focus_identity_and_zoom_state() {
+        let home = tmp_home("focus-zoom");
+        let mut first = test_pane(1, "first", Some("first"));
+        first.instance_ref = Some(crate::types::InstanceRef::new(
+            crate::types::InstanceId::new(),
+            11,
+        ));
+        let mut second = test_pane(2, "second", Some("second"));
+        second.instance_ref = Some(crate::types::InstanceRef::new(
+            crate::types::InstanceId::new(),
+            12,
+        ));
+        let mut tab = Tab::new("custom".to_string(), first);
+        assert!(tab.split_focused(SplitDir::Vertical, second));
+        tab.focus_id = 2;
+        tab.zoomed = true;
+        let mut layout = Layout::new();
+        layout.add_tab(tab);
+
+        save_session(&home, &layout);
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join("session.json")).expect("session.json"),
+        )
+        .expect("valid session JSON");
+        assert_eq!(value["tabs"][0]["zoomed"], true);
+        assert!(value["tabs"][0]["focus"].is_object());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn pending_retired_ref_survives_session_write_failure_and_replay() {
+        let home = tmp_home("retired-retry");
+        let old_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 7);
+        let new_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 8);
+        let mut old_pane = test_pane(1, "dev", Some("dev"));
+        old_pane.instance_ref = Some(old_ref);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("dev".to_string(), old_pane));
+        save_session(&home, &layout);
+        assert!(layout.remove_fleet_instance_views_exact(old_ref));
+
+        let session_path = home.join("session.json");
+        crate::store::fail_next_atomic_write_for_test(&session_path);
+        assert!(!save_session(&home, &layout));
+        assert!(record_retired_ref(&home, old_ref));
+
+        let agent_source: HashSet<String> = ["dev".to_string()].into_iter().collect();
+        let mut replayed = Layout::new();
+        let mut id_counter = 1usize;
+        let mut pb = |sp: &SessionPane, _layout: &mut Layout| {
+            id_counter += 1;
+            let mut pane = test_pane(id_counter, sp.fleet_instance_name.as_deref()?, Some("dev"));
+            pane.instance_ref = Some(new_ref);
+            Some(pane)
+        };
+        assert!(apply_session_layout(
+            &home,
+            &agent_source,
+            &mut pb,
+            &mut replayed
+        ));
+        assert_eq!(replayed.tabs.len(), 1);
+        assert_eq!(
+            replayed.tabs[0].root().first_pane().instance_ref,
+            Some(new_ref)
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn restore_round_trips_focus_identity_and_zoom_state() {
+        let home = tmp_home("focus-zoom-restore");
+        let first_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 21);
+        let second_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 22);
+        let session = Session {
+            active_tab: 0,
+            tabs: vec![SessionTab {
+                name: "custom".to_string(),
+                root: SessionNode::Split {
+                    dir: SplitDir::Vertical,
+                    ratio: 0.6,
+                    first: Box::new(SessionNode::Leaf(SessionPane {
+                        fleet_instance_name: Some("first".to_string()),
+                        instance_ref: Some(first_ref),
+                        display_name: None,
+                    })),
+                    second: Box::new(SessionNode::Leaf(SessionPane {
+                        fleet_instance_name: Some("second".to_string()),
+                        instance_ref: Some(second_ref),
+                        display_name: None,
+                    })),
+                },
+                focus: Some(SessionFocus {
+                    instance_ref: Some(second_ref),
+                    fleet_instance_name: Some("second".to_string()),
+                }),
+                zoomed: true,
+            }],
+        };
+        let json = serde_json::to_vec_pretty(&session).expect("serialize session fixture");
+        crate::store::atomic_write(&home.join("session.json"), &json).expect("write fixture");
+
+        let agent_source: HashSet<String> =
+            ["first", "second"].into_iter().map(String::from).collect();
+        let mut layout = Layout::new();
+        let mut next_id = 0usize;
+        let mut pb = |sp: &SessionPane, _layout: &mut Layout| {
+            next_id += 1;
+            let mut pane = test_pane(next_id, sp.fleet_instance_name.as_deref()?, None);
+            pane.instance_ref = sp.instance_ref;
+            Some(pane)
+        };
+
+        assert!(apply_session_layout(
+            &home,
+            &agent_source,
+            &mut pb,
+            &mut layout
+        ));
+        assert_eq!(layout.tabs.len(), 1);
+        assert_eq!(layout.tabs[0].focus_id, 2);
+        assert!(layout.tabs[0].zoomed);
+        std::fs::remove_dir_all(home).ok();
+    }
+
     // -----------------------------------------------------------------------
     // #895 Option B RED tests. Strict expected assertions per reviewer pushback;
     // pre-fix observed outcome documented per test in PR description.
@@ -754,7 +1136,12 @@ mod tests {
             active_tab: 0,
             tabs: tabs
                 .into_iter()
-                .map(|(name, root)| SessionTab { name, root })
+                .map(|(name, root)| SessionTab {
+                    name,
+                    root,
+                    focus: None,
+                    zoomed: false,
+                })
                 .collect(),
         };
         let path = home.join("session.json");

@@ -468,7 +468,15 @@ pub(super) fn handle_key(
                         ) {
                             Ok(()) => {
                                 if let Some(expected_ref) = expected_ref {
-                                    ctx.layout.remove_fleet_instance_views_exact(expected_ref);
+                                    if ctx.layout.remove_fleet_instance_views_exact(expected_ref)
+                                        && !super::session::save_session(ctx.home, ctx.layout)
+                                        && !super::session::record_retired_ref(ctx.home, expected_ref)
+                                    {
+                                        tracing::error!(
+                                            name = %name,
+                                            "delete completed but session retirement could not be persisted"
+                                        );
+                                    }
                                 }
                                 *overlay = Overlay::None;
                                 outcome.needs_resize = true;

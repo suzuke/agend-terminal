@@ -69,6 +69,43 @@ impl Tab {
         }
     }
 
+    /// Restore the durable view state captured by session persistence. Exact
+    /// process identity wins; the name fallback is reserved for legacy
+    /// sessions that did not persist an identity. A missing identity always
+    /// falls back to the first pane instead of guessing a same-name successor.
+    pub fn restore_view_state(
+        &mut self,
+        focus_ref: Option<crate::types::InstanceRef>,
+        focus_name: Option<&str>,
+        zoomed: bool,
+    ) {
+        let focus_id = focus_ref
+            .and_then(|expected| {
+                self.root().pane_ids().into_iter().find(|&id| {
+                    self.root()
+                        .find_pane(id)
+                        .is_some_and(|pane| pane.instance_ref == Some(expected))
+                })
+            })
+            .or_else(|| {
+                if focus_ref.is_none() {
+                    focus_name.and_then(|name| {
+                        self.root().pane_ids().into_iter().find(|&id| {
+                            self.root().find_pane(id).is_some_and(|pane| {
+                                pane.agent_name.as_str() == name
+                                    || pane.fleet_instance_name.as_deref() == Some(name)
+                            })
+                        })
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| self.root().first_pane().id);
+        self.focus_id = focus_id;
+        self.zoomed = zoomed;
+    }
+
     pub fn root(&self) -> &PaneNode {
         self.root.as_ref().expect("root is always Some")
     }
