@@ -1449,9 +1449,11 @@ mod tests {
 
         let expected = authoritative_instance_ref_for_delete(&ctx, "managed");
         assert_eq!(expected, Some(current_ref));
-        assert!(ctx
-            .layout
-            .remove_fleet_instance_views_exact(expected.unwrap()));
+        let expected = match expected {
+            Some(expected) => expected,
+            None => panic!("current instance ref should be authoritative"),
+        };
+        assert!(ctx.layout.remove_fleet_instance_views_exact(expected));
         assert!(
             ctx.layout.find_pane_mut(1).is_some(),
             "old scrollback remains"
