@@ -1765,6 +1765,17 @@ mod tests {
     fn hot_reload_retained_team_pane_reconnects_in_place_3501() {
         let home = team_fixture_home("retained");
         let mut state = AppState::new();
+        // The production bridge supplies this identity during its greeting;
+        // keep the fixture's two attaches on the same incarnation so this
+        // pre-existing reconnect contract exercises the exact path.
+        state.remote_instance_refs.insert(
+            "m1".to_string(),
+            crate::types::InstanceRef::new(crate::types::InstanceId::new(), 201),
+        );
+        state.remote_instance_refs.insert(
+            "m2".to_string(),
+            crate::types::InstanceRef::new(crate::types::InstanceId::new(), 202),
+        );
         let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
         state.place_remote_team_grouped(
             &["m1".to_string(), "m2".to_string()],
