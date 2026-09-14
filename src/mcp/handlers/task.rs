@@ -212,6 +212,11 @@ pub(super) fn handle_update_team_as(
                     removed: outcome.removed.clone(),
                 });
             }
+            if outcome.config_changed && outcome.added.is_empty() && outcome.removed.is_empty() {
+                notifier.notify(crate::api::ApiEvent::ConfigChanged {
+                    name: team_name.to_string(),
+                });
+            }
         }
     }
     outcome.result

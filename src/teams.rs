@@ -831,6 +831,7 @@ pub struct TeamUpdateOutcome {
     pub result: Value,
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    pub config_changed: bool,
 }
 
 /// Apply a team update and return the original wire result plus the effective
@@ -846,6 +847,10 @@ pub fn update_with_diff_authorized(
     caller: TeamUpdateCaller<'_>,
 ) -> TeamUpdateOutcome {
     let team_name = args["name"].as_str().unwrap_or("");
+    let before_config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|fleet| fleet.teams.get(team_name).cloned())
+        .and_then(|config| serde_json::to_value(config).ok());
     let before = get_members(home, team_name);
     let result = update_authorized(home, args, caller);
     let after = get_members(home, team_name);
@@ -861,10 +866,15 @@ pub fn update_with_diff_authorized(
         .filter(|member| !after_set.contains(member))
         .cloned()
         .collect();
+    let after_config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|fleet| fleet.teams.get(team_name).cloned())
+        .and_then(|config| serde_json::to_value(config).ok());
     TeamUpdateOutcome {
         result,
         added,
         removed,
+        config_changed: before_config != after_config,
     }
 }
 

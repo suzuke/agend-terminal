@@ -1128,18 +1128,23 @@ fn init_daemon_services(
     let api_shutdown = Arc::clone(&shutdown);
     let api_configs = Arc::clone(&configs);
     let api_externals = Arc::clone(&externals);
+    let event_hub = crate::daemon::event_hub::EventHub::new(
+        crate::daemon::event_hub::source_id(&run_dir(home)),
+        128,
+    );
+    let api_event_hub = Arc::clone(&event_hub);
     let (api_ready_tx, api_ready_rx) = std::sync::mpsc::sync_channel(1);
     // fire-and-forget: the API accept loop blocks in accept() for the daemon's lifetime; process exit reaps the detached worker.
     std::thread::Builder::new()
         .name("api_server".into())
         .spawn(move || {
-            crate::api::serve_with_ready(
+            crate::api::serve_with_ready_events(
                 &api_home,
                 api_reg,
                 api_shutdown,
                 api_configs,
                 api_externals,
-                None,
+                api_event_hub,
                 crate::api::RestartCapability::Daemon,
                 None, // #2453 R2: no app-restart channel on the headless daemon
                 api_ready_tx,

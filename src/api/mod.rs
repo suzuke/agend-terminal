@@ -8,6 +8,7 @@ use crate::agent::{AgentRegistry, ExternalRegistry};
 use crate::tasks::operator_settlement as settlement;
 use anyhow::Context;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -29,7 +30,7 @@ pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>
 
 /// Domain events emitted by the API server when agents or teams change.
 /// These are independent of any UI representation.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)] // retained as the API notifier compatibility payload
 pub enum ApiEvent {
     InstanceCreated {
@@ -52,6 +53,11 @@ pub enum ApiEvent {
         added: Vec<String>,
         removed: Vec<String>,
     },
+    /// A persisted team/fleet configuration change that is not represented by
+    /// a membership diff. The TUI responds by requesting a Live roster.
+    ConfigChanged {
+        name: String,
+    },
     /// A `move_pane` MCP call asked for the pane displaying `agent` to be
     /// relocated into `target_tab`. If the target tab exists the pane is
     /// grouped with it; otherwise a new tab with that name is created. Lets
@@ -68,7 +74,7 @@ pub enum ApiEvent {
 /// Direction to split the destination tab's focused pane when the target tab
 /// already exists. Ignored when a new tab is created (the moved pane becomes
 /// the tab's root either way).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaneMoveSplitDir {
     #[default]
     Horizontal,
@@ -77,7 +83,7 @@ pub enum PaneMoveSplitDir {
 
 /// Layout hint for newly created instances. Parsed at the API boundary so
 /// invalid values are caught early rather than silently defaulting downstream.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LayoutHint {
     #[default]
     Tab,
@@ -101,8 +107,8 @@ impl LayoutHint {
 }
 
 /// Trait for receiving API lifecycle notifications. Implementations decide
-/// how (or whether) to react — the TUI adapter forwards to `TuiEvent`,
-/// while daemon mode simply drops them.
+/// how (or whether) to react. The daemon event hub fans them out to
+/// authenticated stream subscribers; other owners may drop them.
 pub trait ApiNotifier: Send + Sync {
     fn notify(&self, event: ApiEvent);
 }
@@ -198,6 +204,7 @@ pub mod method {
     pub const MCP_TOOL: &str = "mcp_tool";
     pub const MCP_TOOLS_LIST: &str = "mcp_tools_list";
     pub const PANE_SNAPSHOT: &str = "pane_snapshot";
+    pub const SUBSCRIBE_EVENTS: &str = "subscribe_events";
 }
 
 /// #2453 Stage R1: which host owns this API server, and therefore which restart
@@ -226,8 +233,9 @@ pub enum RestartCapability {
 /// Start API socket server (blocks calling thread).
 ///
 /// `notifier`: when running inside the TUI app, `Some(notifier)` to notify the
-/// event loop about instance/team creation and deletion. Daemon mode passes
-/// `None` and events are silently dropped.
+/// event loop about instance/team creation and deletion. The daemon composition
+/// root uses [`serve_with_ready_events`] to provide the notifier and stream.
+/// This legacy entry point passes `None`, so it does not expose events.
 ///
 /// `host`: the [`RestartCapability`] of this API-server owner, injected from the
 /// composition root so `restart_daemon` dispatches to the owner's strategy.
@@ -257,6 +265,7 @@ pub fn serve(
         app_restart,
         None,
         None,
+        None,
     );
 }
 
@@ -267,6 +276,7 @@ pub fn serve(
 /// agents. The bounded wait lives at the daemon composition root; this function
 /// reports either readiness or the exact startup failure once.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn serve_with_ready(
     home: &Path,
     registry: AgentRegistry,
@@ -290,6 +300,39 @@ pub(crate) fn serve_with_ready(
         app_restart,
         Some(ready_tx),
         shutdown_wake,
+        None,
+    );
+}
+
+/// Daemon-owned API entry with a lifecycle event stream. The dedicated stream
+/// uses a separate authenticated connection so ordinary request/response calls
+/// never receive unsolicited frames.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serve_with_ready_events(
+    home: &Path,
+    registry: AgentRegistry,
+    shutdown: Arc<AtomicBool>,
+    configs: ConfigRegistry,
+    externals: ExternalRegistry,
+    event_hub: Arc<crate::daemon::event_hub::EventHub>,
+    host: RestartCapability,
+    app_restart: Option<crate::api::app_restart::AppRestart>,
+    ready_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
+    shutdown_wake: Option<crossbeam_channel::Sender<()>>,
+) {
+    let notifier: Arc<dyn ApiNotifier> = event_hub.clone();
+    serve_inner(
+        home,
+        registry,
+        shutdown,
+        configs,
+        externals,
+        Some(notifier),
+        host,
+        app_restart,
+        Some(ready_tx),
+        shutdown_wake,
+        Some(event_hub),
     );
 }
 
@@ -314,6 +357,7 @@ fn serve_inner(
     app_restart: Option<crate::api::app_restart::AppRestart>,
     mut ready_tx: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
     shutdown_wake: Option<crossbeam_channel::Sender<()>>,
+    event_hub: Option<Arc<crate::daemon::event_hub::EventHub>>,
 ) {
     // #945 Phase 0: time the bind+port-publish step directly (not the
     // spawn of api::serve thread — that's sub-ms). Operators care about
@@ -484,6 +528,7 @@ fn serve_inner(
         // each session gets its own clone so the `move` closure satisfies `'static`.
         let session_app_restart = app_restart.clone();
         let session_shutdown_wake = shutdown_wake.clone();
+        let session_event_hub = event_hub.clone();
         if std::thread::Builder::new()
             .name("api_handler".into())
             .spawn(move || {
@@ -505,6 +550,7 @@ fn serve_inner(
                     session_host,
                     session_app_restart,
                     session_shutdown_wake,
+                    session_event_hub,
                 );
             })
             .is_err()
@@ -643,6 +689,7 @@ fn handle_session(
     host: RestartCapability,
     app_restart: Option<crate::api::app_restart::AppRestart>,
     shutdown_wake: Option<crossbeam_channel::Sender<()>>,
+    event_hub: Option<Arc<crate::daemon::event_hub::EventHub>>,
 ) {
     let cloned = match stream.try_clone() {
         Ok(c) => c,
@@ -734,6 +781,41 @@ fn handle_session(
 
         let method = req["method"].as_str().unwrap_or("");
         let params = &req["params"];
+        if method == method::SUBSCRIBE_EVENTS {
+            let Some(hub) = event_hub.as_ref() else {
+                let _ = writeln!(
+                    writer,
+                    "{}",
+                    json!({"ok": false, "error": "event stream unavailable"})
+                );
+                let _ = writer.flush();
+                continue;
+            };
+            let receiver = hub.subscribe();
+            let hello = json!({
+                "ok": true,
+                "event_stream": {"source": hub.source()},
+            });
+            if writeln!(writer, "{hello}").is_err() || writer.flush().is_err() {
+                break;
+            }
+            while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                match receiver.recv_timeout(std::time::Duration::from_millis(250)) {
+                    Ok(event) => {
+                        let line = match serde_json::to_string(&event) {
+                            Ok(line) => line,
+                            Err(_) => break,
+                        };
+                        if writeln!(writer, "{line}").is_err() || writer.flush().is_err() {
+                            break;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            break;
+        }
         // #842: bridge-emitted `request_id` (UUIDv4) drives idempotent
         // retry. Missing → skip dedup (legacy at-least-once for clients
         // that don't emit the field; see `request_dedup::DedupCache::dispatch`).

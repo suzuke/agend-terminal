@@ -430,6 +430,7 @@ fn run_app(
     let (task_rpc_tx, task_rpc_rx, task_rpc_worker) = rpc::spawn_task_worker(&home);
     let (remote_state_rpc_tx, remote_state_rpc_rx, remote_state_rpc_worker) =
         rpc::spawn_agent_state_worker(&home);
+    let (event_stop_tx, daemon_event_rx, event_worker) = rpc::spawn_event_worker(&home);
     let deps = AppDeps {
         home: &home,
         fleet_path: &fleet_path,
@@ -470,6 +471,7 @@ fn run_app(
             recv(attach_rx) -> outcome => state.handle_attach_outcome(outcome, &deps, &mut reap_workers),
             recv(task_rpc_rx) -> outcome => state.handle_task_rpc_outcome(outcome),
             recv(remote_state_rpc_rx) -> outcome => state.handle_agent_state_rpc_outcome(outcome),
+            recv(daemon_event_rx) -> outcome => state.handle_event_stream_outcome(outcome, &deps),
             default(state.select_timeout()) => state.handle_idle_tick(&deps),
         }
     };
@@ -478,6 +480,9 @@ fn run_app(
     let _ = remote_state_rpc_worker.join();
     drop(task_rpc_tx);
     let _ = task_rpc_worker.join();
+    let _ = event_stop_tx.try_send(());
+    drop(event_stop_tx);
+    let _ = event_worker.join();
     // Teardown gating rationale is documented on `app_teardown`.
     app_teardown(&home, &state.ui.layout, reap_workers, attach_workers);
     loop_result?;

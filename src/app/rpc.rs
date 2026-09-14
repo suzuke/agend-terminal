@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
 pub(super) type AgentStateSnapshot = HashMap<String, Option<crate::state::AgentState>>;
@@ -39,6 +41,125 @@ pub(super) struct AgentStateError {
 }
 
 pub(super) type AgentStateOutcome = Result<AgentStateSnapshotResult, AgentStateError>;
+
+#[derive(Debug)]
+pub(super) enum EventStreamOutcome {
+    Event(crate::daemon::event_hub::DaemonEvent),
+    Disconnected(String),
+}
+
+/// Subscribe on a dedicated authenticated API connection. The worker owns
+/// only the stream; AppState remains the sole owner of UI mutation.
+pub(super) fn spawn_event_worker(
+    home: &Path,
+) -> (
+    crossbeam_channel::Sender<()>,
+    crossbeam_channel::Receiver<EventStreamOutcome>,
+    std::thread::JoinHandle<()>,
+) {
+    let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+    let (outcome_tx, outcome_rx) = crossbeam_channel::bounded(64);
+    let home = home.to_path_buf();
+    // fire-and-forget: false; run_app joins this worker during teardown.
+    let worker = std::thread::Builder::new()
+        .name("app-event-stream".into())
+        .spawn(move || {
+            let run_dir = match resolve_active_run_dir(&home) {
+                Some(run_dir) => run_dir,
+                None => {
+                    let _ = outcome_tx.send(EventStreamOutcome::Disconnected(
+                        "no active daemon".to_string(),
+                    ));
+                    return;
+                }
+            };
+            let mut reader = match open_event_stream(&run_dir) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    let _ = outcome_tx.send(EventStreamOutcome::Disconnected(error));
+                    return;
+                }
+            };
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    return;
+                }
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = outcome_tx.send(EventStreamOutcome::Disconnected(
+                            "event stream closed".to_string(),
+                        ));
+                        return;
+                    }
+                    Ok(_) => match serde_json::from_str(&line) {
+                        Ok(event) => {
+                            if outcome_tx.send(EventStreamOutcome::Event(event)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = outcome_tx.send(EventStreamOutcome::Disconnected(format!(
+                                "invalid event stream payload: {error}"
+                            )));
+                            return;
+                        }
+                    },
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(error) => {
+                        let _ =
+                            outcome_tx.send(EventStreamOutcome::Disconnected(error.to_string()));
+                        return;
+                    }
+                }
+            }
+        })
+        .expect("spawn app event stream worker");
+    (stop_tx, outcome_rx, worker)
+}
+
+fn open_event_stream(run_dir: &Path) -> Result<BufReader<TcpStream>, String> {
+    let stream = crate::ipc::connect_run_dir_api(run_dir).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+        .map_err(|error| error.to_string())?;
+    let operator_token =
+        crate::auth_cookie::read_operator_token(run_dir).map_err(|error| error.to_string())?;
+    let mut writer = stream.try_clone().map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(stream);
+    crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &operator_token)
+        .map_err(|error| error.to_string())?;
+    writeln!(
+        writer,
+        "{}",
+        serde_json::json!({
+            "method": crate::api::method::SUBSCRIBE_EVENTS,
+            "params": {},
+        })
+    )
+    .map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())?;
+    let mut ack = String::new();
+    reader
+        .read_line(&mut ack)
+        .map_err(|error| error.to_string())?;
+    let ack: Value = serde_json::from_str(&ack).map_err(|error| error.to_string())?;
+    if ack["ok"].as_bool() != Some(true) {
+        return Err(ack["error"]
+            .as_str()
+            .unwrap_or("event stream rejected")
+            .to_string());
+    }
+    ack["event_stream"]["source"]
+        .as_str()
+        .filter(|source| !source.is_empty() && *source != "unknown")
+        .ok_or_else(|| "event stream has unverifiable source".to_string())?;
+    Ok(reader)
+}
 
 /// Create a managed instance through the daemon's lifecycle API.
 ///
