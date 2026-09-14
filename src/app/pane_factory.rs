@@ -322,7 +322,7 @@ fn attach_agent_to_pane(
 /// subscriber receiver + the initial screen dump for the main thread to finish
 /// wiring via [`apply_attachment`]. Mutates NO `Pane`/`Layout`, so it can run off
 /// the render thread on a background worker.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn spawn_and_subscribe(
     registry: &AgentRegistry,
     home: &Path,
