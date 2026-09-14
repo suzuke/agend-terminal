@@ -1093,16 +1093,24 @@ fn finish_successful_delete(
     name: &str,
     expected_ref: Option<crate::types::InstanceRef>,
 ) -> DeleteCompletion {
-    if let Some(expected_ref) = expected_ref {
-        if ctx.layout.remove_fleet_instance_views_exact(expected_ref)
-            && !super::session::save_session(ctx.home, ctx.layout)
-            && !super::session::record_retired_ref(ctx.home, expected_ref)
-        {
-            tracing::error!(
-                name = %name,
-                "delete completed but session retirement could not be persisted"
-            );
-        }
+    let Some(expected_ref) = expected_ref else {
+        return DeleteCompletion::Keep {
+            notice: "delete completed but instance identity is unavailable; view retained"
+                .to_string(),
+        };
+    };
+
+    ctx.layout.remove_fleet_instance_views_exact(expected_ref);
+    if !super::session::save_session(ctx.home, ctx.layout)
+        && !super::session::record_retired_ref(ctx.home, expected_ref)
+    {
+        tracing::error!(
+            name = %name,
+            "delete completed but session retirement is pending retry"
+        );
+        return DeleteCompletion::Keep {
+            notice: "delete completed; session retirement pending retry".to_string(),
+        };
     }
     DeleteCompletion::Close
 }
@@ -1284,7 +1292,7 @@ mod tests {
         ));
         let mut name_counter = HashMap::new();
         let mut reap_workers = Vec::new();
-        let overlay = Overlay::ConfirmDeleteInstance {
+        let mut overlay = Overlay::ConfirmDeleteInstance {
             name: "managed".to_string(),
             input: "manage".to_string(),
             notice: None,
@@ -1357,6 +1365,20 @@ mod tests {
         );
         assert!(matches!(overlay, Overlay::ConfirmDeleteInstance { .. }));
         assert!(home.join("session.json").exists());
+        crate::store::fail_next_atomic_write_for_test(&home.join("session.json"));
+        assert!(!super::super::session::save_session(&home, ctx.layout));
+        let retired: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join("session.retired.json"))
+                .expect("retry must persist retired identity"),
+        )
+        .expect("valid retired session JSON");
+        assert_eq!(
+            retired["instance_refs"]
+                .as_array()
+                .expect("instance_refs array")
+                .len(),
+            1
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -1397,7 +1419,10 @@ mod tests {
             DeleteCompletion::Keep { notice } if notice.contains("identity")
         ));
         assert!(matches!(overlay, Overlay::ConfirmDeleteInstance { .. }));
-        assert_eq!(std::fs::read(home.join("session.json")).unwrap(), sentinel);
+        assert_eq!(
+            std::fs::read(home.join("session.json")).expect("session sentinel"),
+            sentinel
+        );
         std::fs::remove_dir_all(home).ok();
     }
 

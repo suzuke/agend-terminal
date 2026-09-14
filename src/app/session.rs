@@ -22,7 +22,7 @@ use crate::layout::{Layout, Pane, PaneNode, SplitDir, Tab};
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Closure type: build a Pane for a SessionPane leaf.
 ///
@@ -115,6 +115,10 @@ fn serialize_session(layout: &Layout) -> Option<String> {
 
 const RETIRED_SESSION_FILE: &str = "session.retired.json";
 
+static PENDING_RETIRED_REFS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, HashSet<crate::types::InstanceRef>>>,
+> = std::sync::OnceLock::new();
+
 #[derive(Serialize, Deserialize, Default)]
 struct RetiredSession {
     #[serde(default)]
@@ -134,19 +138,58 @@ fn load_retired_refs(home: &Path) -> HashSet<crate::types::InstanceRef> {
 }
 
 pub(super) fn record_retired_ref(home: &Path, instance_ref: crate::types::InstanceRef) -> bool {
-    let mut refs = load_retired_refs(home);
-    refs.insert(instance_ref);
-    let mut instance_refs: Vec<_> = refs.into_iter().collect();
-    instance_refs.sort_by_key(|reference| (reference.instance_id.full(), reference.generation));
-    let pending = RetiredSession { instance_refs };
-    let Ok(json) = serde_json::to_string_pretty(&pending) else {
-        return false;
+    let path = retired_session_path(home);
+    let pending_store = PENDING_RETIRED_REFS.get_or_init(Default::default);
+    let mut pending_store = pending_store.lock().expect("pending retired session store");
+    let saved = {
+        let pending_refs = pending_store.entry(path.clone()).or_default();
+        pending_refs.insert(instance_ref);
+        persist_retired_refs(home, pending_refs).unwrap_or(false)
     };
-    crate::store::atomic_write(&retired_session_path(home), json.as_bytes()).is_ok()
+    if saved {
+        pending_store.remove(&path);
+    }
+    saved
 }
 
 fn clear_retired_refs(home: &Path) {
-    let _ = std::fs::remove_file(retired_session_path(home));
+    let path = retired_session_path(home);
+    let _ = std::fs::remove_file(&path);
+    if let Some(store) = PENDING_RETIRED_REFS.get() {
+        store
+            .lock()
+            .expect("pending retired session store")
+            .remove(&path);
+    }
+}
+
+fn persist_retired_refs(
+    home: &Path,
+    pending_refs: &HashSet<crate::types::InstanceRef>,
+) -> Result<bool, serde_json::Error> {
+    let mut refs = load_retired_refs(home);
+    refs.extend(pending_refs.iter().copied());
+    let mut instance_refs: Vec<_> = refs.into_iter().collect();
+    instance_refs.sort_by_key(|reference| (reference.instance_id.full(), reference.generation));
+    let pending = RetiredSession { instance_refs };
+    let json = serde_json::to_string_pretty(&pending)?;
+    Ok(crate::store::atomic_write(&retired_session_path(home), json.as_bytes()).is_ok())
+}
+
+fn retry_pending_retired_refs(home: &Path) -> bool {
+    let path = retired_session_path(home);
+    let Some(store) = PENDING_RETIRED_REFS.get() else {
+        return true;
+    };
+    let mut store = store.lock().expect("pending retired session store");
+    let Some(pending_refs) = store.get(&path) else {
+        return true;
+    };
+    let saved = persist_retired_refs(home, pending_refs).unwrap_or(false);
+    if saved {
+        store.remove(&path);
+    }
+    saved
 }
 
 fn save_focus(tab: &Tab) -> Option<SessionFocus> {
@@ -169,6 +212,8 @@ pub(super) fn save_session(home: &Path, layout: &Layout) -> bool {
     if saved {
         clear_retired_refs(home);
         tracing::info!(path = %path.display(), "session saved");
+    } else {
+        let _ = retry_pending_retired_refs(home);
     }
     saved
 }
@@ -196,6 +241,7 @@ pub(super) fn save_session_if_changed(
         clear_retired_refs(home);
         true
     } else {
+        let _ = retry_pending_retired_refs(home);
         false
     }
 }
