@@ -429,7 +429,7 @@ pub fn sweep_stale_run_dirs(home: &Path) {
     }
 }
 
-/// Write daemon identity file for PID reuse detection.
+/// Mint the daemon identity record used for PID reuse detection.
 ///
 /// Format: `{pid}:{boot_unix}:{start_token}`. The third field
 /// (CR-2026-06-14 zombie-kill identity-compare) is the OS process start-time
@@ -440,21 +440,30 @@ pub fn sweep_stale_run_dirs(home: &Path) {
 /// self-token can't be resolved — a recorded `0` will never match a real
 /// live token, so the conservative outcome is fail-closed (never signal),
 /// which is the safe direction.
-pub(crate) fn write_daemon_id(run_dir: &Path) {
+pub(crate) fn daemon_identity() -> String {
     let pid = std::process::id();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let token = crate::process::process_start_token(pid).unwrap_or(0);
+    format!("{pid}:{now}:{token}")
+}
+
+/// Write daemon identity file for PID reuse detection.
+pub(crate) fn write_daemon_id(run_dir: &Path) {
+    write_daemon_id_value(run_dir, &daemon_identity());
+}
+
+/// Publish a previously minted identity. Successor handoff uses this after
+/// flock promotion so the EventHub source and `.daemon` record are identical
+/// while the run directory remains undiscoverable before promotion.
+pub(crate) fn write_daemon_id_value(run_dir: &Path, identity: &str) {
     // A1: atomic write — a plain `fs::write` can be read mid-write (torn) by a
     // concurrent `read_daemon_pid`/liveness probe, which then parse-fails on a
     // truncated `pid:now:token` record. `store::atomic_write` publishes via a
     // unique tmp + rename so readers only ever see a complete record.
-    let _ = crate::store::atomic_write(
-        &run_dir.join(".daemon"),
-        format!("{pid}:{now}:{token}").as_bytes(),
-    );
+    let _ = crate::store::atomic_write(&run_dir.join(".daemon"), identity.as_bytes());
 }
 
 /// Read the PID recorded in `{run_dir}/.daemon`. Returns `None` if the file is
@@ -679,6 +688,7 @@ enum FleetSource {
         fleet_path: PathBuf,
         opts: crate::bootstrap::PrepareOptions,
         resume_requester: Option<crate::types::InstanceId>,
+        source_id: String,
     },
 }
 
@@ -713,12 +723,17 @@ pub fn run_successor_handoff(home: &Path, fleet_path: &Path) -> anyhow::Result<(
         std::process::exit(1);
     }
     crate::bootstrap::prepare_handoff_prelock(home)?;
+    // Mint the identity before API/EventHub construction, but do not publish
+    // it to `.daemon` until the successor owns the flock below. The exact
+    // value is carried through the handoff and written after promotion.
+    let source_id = daemon_identity();
     run_core(
         home,
         FleetSource::HandoffDeferred {
             fleet_path: fleet_path.to_path_buf(),
             opts: crate::bootstrap::PrepareOptions::default(),
             resume_requester: crate::daemon::restart::successor_requester_id(),
+            source_id,
         },
     )
 }
@@ -773,7 +788,11 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     crate::runtime_controls::reload_runtime_controls(home);
-    let (ctx, event_hub) = init_daemon_services(home, telegram_pre, shutdown_tx.clone())?;
+    let event_source_id = match &source {
+        FleetSource::Resolved { .. } => crate::daemon::event_hub::source_id(&run_dir(home)),
+        FleetSource::HandoffDeferred { source_id, .. } => source_id.clone(),
+    };
+    let ctx = init_daemon_services(home, telegram_pre, shutdown_tx.clone(), event_source_id)?;
 
     // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
     // subscribers once (the bus is the SOLE delivery path). Shared with
@@ -800,6 +819,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             fleet_path,
             opts,
             resume_requester,
+            source_id,
         } => {
             write_control_ready(home);
             // §3.9 FIX2 test seam: pass Phase-1 (api stays up to answer STATUS
@@ -832,13 +852,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             // publish the `.daemon` identity so generic discovery
             // (`find_active_run_dir`) starts routing to us. Before this point we
             // were intentionally undiscoverable (pre-flock = not the primary).
-            write_daemon_id(&run_dir(home));
-            // The API server and its EventHub were started before the flock so
-            // Phase-1 can probe the successor by its private run directory.
-            // Refresh the hub only after promotion: this preserves the
-            // undiscoverable pre-flock window without leaving its source token
-            // permanently at `unknown`.
-            event_hub.set_source(crate::daemon::event_hub::source_id(&run_dir(home)));
+            write_daemon_id_value(&run_dir(home), &source_id);
             tracing::info!(
                 "#1814 successor-handoff: flock acquired — sole daemon, running deferred reconciles + resolve"
             );
@@ -1085,7 +1099,8 @@ fn init_daemon_services(
     home: &Path,
     telegram: Option<Arc<dyn crate::channel::Channel>>,
     shutdown_wake: crossbeam_channel::Sender<()>,
-) -> anyhow::Result<(DaemonContext, Arc<crate::daemon::event_hub::EventHub>)> {
+    event_source_id: String,
+) -> anyhow::Result<DaemonContext> {
     const API_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     // #1487: source the operator timezone from fleet.yaml `display_timezone:`
     // (reusing the same operator-tz concept as ci_watch / display_time) for the
@@ -1133,7 +1148,7 @@ fn init_daemon_services(
     let api_shutdown = Arc::clone(&shutdown);
     let api_configs = Arc::clone(&configs);
     let api_externals = Arc::clone(&externals);
-    let event_hub = crate::daemon::event_hub::for_run_dir(home);
+    let event_hub = crate::daemon::event_hub::EventHub::new(event_source_id, 128);
     let api_event_hub = Arc::clone(&event_hub);
     let (api_ready_tx, api_ready_rx) = std::sync::mpsc::sync_channel(1);
     // fire-and-forget: the API accept loop blocks in accept() for the daemon's lifetime; process exit reaps the detached worker.
@@ -1166,17 +1181,14 @@ fn init_daemon_services(
         }
     }
 
-    Ok((
-        DaemonContext {
-            registry,
-            externals,
-            configs,
-            crash_tx,
-            crash_rx,
-            shutdown,
-        },
-        event_hub,
-    ))
+    Ok(DaemonContext {
+        registry,
+        externals,
+        configs,
+        crash_tx,
+        crash_rx,
+        shutdown,
+    })
 }
 
 /// #1814 Stage-2 (#t-27): the shared-state GC + migration steps that MUST run

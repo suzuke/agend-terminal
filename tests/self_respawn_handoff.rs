@@ -450,7 +450,14 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
     // reports a zombie as alive — a false "still alive". `active_pids` instead
     // sees old vanish the moment it removes its own run dir on exit, leaving
     // exactly the successor.
-    let new_pid = wait_for_single_active(&home, Duration::from_secs(60), |p| p != old_pid);
+    let new_pid = wait_for_single_active(&home, Duration::from_secs(60), |p| {
+        p != old_pid
+            && home
+                .join("run")
+                .join(p.to_string())
+                .join(".daemon")
+                .exists()
+    });
 
     let advertised_source = new_pid.and_then(|pid| event_stream_source(&home, pid));
     let daemon_source = new_pid.and_then(|pid| {
