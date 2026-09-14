@@ -16,7 +16,7 @@ pub(crate) struct DaemonEvent {
 /// Per-daemon fan-out hub. Publishing is deliberately non-blocking: a slow
 /// or gone TUI is removed and must rebuild from a subsequent Live snapshot.
 pub(crate) struct EventHub {
-    source: String,
+    source: Mutex<String>,
     next_sequence: AtomicU64,
     capacity: usize,
     subscribers: Mutex<Vec<Sender<DaemonEvent>>>,
@@ -25,15 +25,22 @@ pub(crate) struct EventHub {
 impl EventHub {
     pub(crate) fn new(source: String, capacity: usize) -> Arc<Self> {
         Arc::new(Self {
-            source,
+            source: Mutex::new(source),
             next_sequence: AtomicU64::new(0),
             capacity: capacity.max(1),
             subscribers: Mutex::new(Vec::new()),
         })
     }
 
-    pub(crate) fn source(&self) -> &str {
-        &self.source
+    pub(crate) fn source(&self) -> String {
+        self.source.lock().clone()
+    }
+
+    /// Publish the identity after a successor acquires the daemon flock.
+    /// Handoff control-plane setup intentionally precedes `.daemon` publication
+    /// so generic discovery cannot route into a half-promoted successor.
+    pub(crate) fn set_source(&self, source: String) {
+        *self.source.lock() = source;
     }
 
     pub(crate) fn subscribe(&self) -> Receiver<DaemonEvent> {
@@ -44,7 +51,7 @@ impl EventHub {
 
     fn publish(&self, event: ApiEvent) {
         let envelope = DaemonEvent {
-            source: self.source.clone(),
+            source: self.source(),
             sequence: self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1,
             event,
         };

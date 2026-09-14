@@ -773,7 +773,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     crate::runtime_controls::reload_runtime_controls(home);
-    let ctx = init_daemon_services(home, telegram_pre, shutdown_tx.clone())?;
+    let (ctx, event_hub) = init_daemon_services(home, telegram_pre, shutdown_tx.clone())?;
 
     // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
     // subscribers once (the bus is the SOLE delivery path). Shared with
@@ -833,6 +833,12 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             // (`find_active_run_dir`) starts routing to us. Before this point we
             // were intentionally undiscoverable (pre-flock = not the primary).
             write_daemon_id(&run_dir(home));
+            // The API server and its EventHub were started before the flock so
+            // Phase-1 can probe the successor by its private run directory.
+            // Refresh the hub only after promotion: this preserves the
+            // undiscoverable pre-flock window without leaving its source token
+            // permanently at `unknown`.
+            event_hub.set_source(crate::daemon::event_hub::source_id(&run_dir(home)));
             tracing::info!(
                 "#1814 successor-handoff: flock acquired — sole daemon, running deferred reconciles + resolve"
             );
@@ -1079,7 +1085,7 @@ fn init_daemon_services(
     home: &Path,
     telegram: Option<Arc<dyn crate::channel::Channel>>,
     shutdown_wake: crossbeam_channel::Sender<()>,
-) -> anyhow::Result<DaemonContext> {
+) -> anyhow::Result<(DaemonContext, Arc<crate::daemon::event_hub::EventHub>)> {
     const API_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     // #1487: source the operator timezone from fleet.yaml `display_timezone:`
     // (reusing the same operator-tz concept as ci_watch / display_time) for the
@@ -1128,6 +1134,7 @@ fn init_daemon_services(
     let api_configs = Arc::clone(&configs);
     let api_externals = Arc::clone(&externals);
     let event_hub = crate::daemon::event_hub::for_run_dir(home);
+    let api_event_hub = Arc::clone(&event_hub);
     let (api_ready_tx, api_ready_rx) = std::sync::mpsc::sync_channel(1);
     // fire-and-forget: the API accept loop blocks in accept() for the daemon's lifetime; process exit reaps the detached worker.
     std::thread::Builder::new()
@@ -1139,7 +1146,7 @@ fn init_daemon_services(
                 api_shutdown,
                 api_configs,
                 api_externals,
-                event_hub,
+                api_event_hub,
                 crate::api::RestartCapability::Daemon,
                 None, // #2453 R2: no app-restart channel on the headless daemon
                 api_ready_tx,
@@ -1159,14 +1166,17 @@ fn init_daemon_services(
         }
     }
 
-    Ok(DaemonContext {
-        registry,
-        externals,
-        configs,
-        crash_tx,
-        crash_rx,
-        shutdown,
-    })
+    Ok((
+        DaemonContext {
+            registry,
+            externals,
+            configs,
+            crash_tx,
+            crash_rx,
+            shutdown,
+        },
+        event_hub,
+    ))
 }
 
 /// #1814 Stage-2 (#t-27): the shared-state GC + migration steps that MUST run
