@@ -5540,7 +5540,6 @@ fn codex_managed_tui_resume_targets_the_persisted_thread() {
             "check_for_update_on_startup=false",
             "resume",
             "thread-1",
-            "--dangerously-bypass-approvals-and-sandbox",
             "--model=gpt-5",
         ]
     );
@@ -6349,10 +6348,11 @@ fn codex_remote_attach_argv_carries_mcp_overrides_before_resume_3317() {
         Some("--remote"),
         "#3317: the endpoint flag must stay first; argv={argv:?}"
     );
-    assert_eq!(
-        argv.last().map(String::as_str),
-        Some("--dangerously-bypass-approvals-and-sandbox"),
-        "#3317: bypass stays after the thread, ahead of caller args; argv={argv:?}"
+    assert!(
+        !argv
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+        "remote resume must not carry a permission override; argv={argv:?}"
     );
 }
 
