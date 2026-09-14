@@ -3213,25 +3213,4 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
-
-    /// Phase 2 RED: Codex's exact thread must be checkpointed while its TUI
-    /// client and app-server are still alive, before the shared agent teardown.
-    #[test]
-    fn shutdown_checkpoints_codex_before_agent_termination() {
-        let src = include_str!("./mod.rs");
-        let prod_end = src
-            .find("\n#[cfg(test)]\n#[allow(clippy::unwrap_used, clippy::expect_used)]\nmod tests {")
-            .unwrap_or(src.len());
-        let prod = &src[..prod_end];
-        let checkpoint = prod
-            .find("shutdown_cleanup::checkpoint_codex_sessions")
-            .expect("shutdown must checkpoint Codex sessions");
-        let terminate = prod
-            .find("terminate_agents_parallel(agents_to_kill)")
-            .expect("shutdown must terminate agents");
-        assert!(
-            checkpoint < terminate,
-            "Codex thread checkpoint must precede agent termination"
-        );
-    }
 }

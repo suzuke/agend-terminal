@@ -39,6 +39,28 @@ pub(crate) fn checkpoint_codex_sessions(home: &Path, instances: &[String]) -> (u
     (checkpointed, failed)
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shutdown_checkpoints_codex_before_agent_termination() {
+        let src = include_str!("./mod.rs");
+        let prod_end = src
+            .find("\n#[cfg(test)]\n#[allow(clippy::unwrap_used, clippy::expect_used)]\nmod tests {")
+            .unwrap_or(src.len());
+        let prod = &src[..prod_end];
+        let checkpoint = prod
+            .find("shutdown_cleanup::checkpoint_codex_sessions")
+            .expect("shutdown must checkpoint Codex sessions");
+        let terminate = prod
+            .find("terminate_agents_parallel(agents_to_kill)")
+            .expect("shutdown must terminate agents");
+        assert!(
+            checkpoint < terminate,
+            "Codex thread checkpoint must precede agent termination"
+        );
+    }
+}
+
 /// Per-instance managed-transport teardown invoked from
 /// `shutdown_sequence`. Reuses the single audited
 /// `remove_instance_delivery_state` entry (codex_app_server +
