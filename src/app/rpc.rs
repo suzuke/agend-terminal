@@ -39,6 +39,74 @@ pub(super) struct AgentStateError {
 
 pub(super) type AgentStateOutcome = Result<AgentStateSnapshotResult, AgentStateError>;
 
+/// Create a managed instance through the daemon's lifecycle API.
+///
+/// The app is a thin client: it may request a new instance, but it must never
+/// fork a second app-local child for a fleet identity. The daemon persists the
+/// fleet entry, owns the process, and publishes the bridge endpoint before this
+/// returns.
+pub(super) fn create_instance(
+    home: &Path,
+    name: &str,
+    backend: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Result<String, String> {
+    create_instance_with(
+        home,
+        name,
+        backend,
+        args,
+        env,
+        resolve_active_run_dir,
+        call_tool_at,
+    )
+}
+
+fn create_instance_with<R, C>(
+    home: &Path,
+    name: &str,
+    backend: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+    resolver: R,
+    caller: C,
+) -> Result<String, String>
+where
+    R: Fn(&Path) -> Option<PathBuf>,
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
+    let Some(run_dir) = resolver(home) else {
+        return Err("no active daemon (run dir not found)".to_string());
+    };
+    let mut arguments = serde_json::json!({
+        "name": name,
+        "backend": backend,
+    });
+    if !args.is_empty() {
+        arguments["args"] = Value::String(args.join(" "));
+    }
+    if !env.is_empty() {
+        arguments["env"] = serde_json::to_value(env)
+            .map_err(|error| format!("could not encode instance environment: {error}"))?;
+    }
+    let result = caller(
+        &run_dir,
+        "create_instance",
+        arguments,
+        std::time::Duration::from_secs(60),
+    )?;
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        return Err(error.to_string());
+    }
+    result
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|created| !created.is_empty())
+        .map(String::from)
+        .ok_or_else(|| "daemon create_instance returned no instance name".to_string())
+}
+
 pub(super) fn spawn_task_worker(
     home: &Path,
 ) -> (
@@ -450,6 +518,54 @@ mod tests {
             .unwrap_or(source);
         assert!(production.contains("crate::api::call_at("));
         assert!(production.contains("std::time::Duration::from_secs(10)"));
+    }
+
+    #[test]
+    fn create_instance_rpc_forwards_name_backend_args_and_env() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let caller = {
+            let calls = Arc::clone(&calls);
+            move |run_dir: &std::path::Path,
+                  tool: &str,
+                  arguments: Value,
+                  timeout: std::time::Duration| {
+                calls.lock().expect("calls mutex not poisoned").push((
+                    run_dir.to_path_buf(),
+                    tool.to_string(),
+                    arguments,
+                    timeout,
+                ));
+                Ok(serde_json::json!({"name": "codex-created"}))
+            }
+        };
+        let mut env = HashMap::new();
+        env.insert("CODEX_TEST_FLAG".to_string(), "1".to_string());
+        let created = super::create_instance_with(
+            std::path::Path::new("/home"),
+            "codex-requested",
+            "codex",
+            &["--model".to_string(), "gpt-test".to_string()],
+            &env,
+            |_home| Some(std::path::PathBuf::from("/run/current")),
+            caller,
+        )
+        .expect("daemon create_instance succeeded");
+
+        assert_eq!(created, "codex-created");
+        let calls = calls.lock().expect("calls mutex not poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, std::path::Path::new("/run/current"));
+        assert_eq!(calls[0].1, "create_instance");
+        assert_eq!(calls[0].3, std::time::Duration::from_secs(60));
+        assert_eq!(
+            calls[0].2,
+            serde_json::json!({
+                "name": "codex-requested",
+                "backend": "codex",
+                "args": "--model gpt-test",
+                "env": {"CODEX_TEST_FLAG": "1"}
+            })
+        );
     }
 
     #[test]

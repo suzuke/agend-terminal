@@ -3,7 +3,7 @@
 //! Kept out of `app::mod` so quick-spawn additions do not grow the already
 //! grandfathered TUI event-loop module.
 
-use super::{pane_factory, tui_spawn, MenuItem, MenuItemKind};
+use super::{pane_factory, MenuItem, MenuItemKind};
 use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
 use crate::layout::{Layout, Pane};
@@ -133,61 +133,21 @@ pub(super) fn pane_from_menu_item(
         MenuItemKind::Backend(backend) => {
             let preset = backend.preset();
             let inst_name = pane_factory::unique_fleet_name(home, preset.command);
-            // #966: TUI Backend menu (ctrl+b c) previously called
-            // `add_instance_to_yaml` directly, bypassing the topic-creation
-            // side effect that `handle_spawn` does. Now routes through
-            // `tui_spawn::add_instance_with_topic` so the channel topic is
-            // created + topic_id persisted to topics.json at TUI-spawn time.
-            if let Err(e) = tui_spawn::add_instance_with_topic(
+            // The daemon is the sole owner of a managed backend child. It
+            // persists the fleet entry and starts the process before publishing
+            // its bridge endpoint; the app only attaches a remote pane here.
+            let created_name =
+                super::rpc::create_instance(home, &inst_name, backend.name(), &[], &HashMap::new())
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            pane_factory::create_remote_pane(
+                &created_name,
                 home,
-                &inst_name,
-                &crate::fleet::InstanceYamlEntry {
-                    backend: Some(backend.name().to_string()),
-                    ..Default::default()
-                },
-            ) {
-                tracing::warn!(error = %e, "failed to write fleet.yaml");
-            }
-            // Resolve from fleet to get defaults merged
-            let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-            match fleet
-                .as_ref()
-                .map(|f| f.resolve_instance_checked(&inst_name))
-            {
-                Some(Ok(Some(resolved))) => pane_factory::create_pane_from_resolved(
-                    &inst_name,
-                    &resolved,
-                    layout,
-                    registry,
-                    home,
-                    cols,
-                    rows,
-                    wakeup_tx,
-                    name_counter,
-                    crate::backend::SpawnMode::Fresh,
-                ),
-                Some(Err(error)) => Err(anyhow::Error::new(error)),
-                Some(Ok(None)) | None => {
-                    // Preset args are added by spawn_agent; no need to compose here.
-                    pane_factory::create_pane(
-                        layout,
-                        registry,
-                        home,
-                        &inst_name,
-                        preset.command,
-                        &[],
-                        crate::backend::SpawnMode::Fresh,
-                        None,
-                        &HashMap::new(),
-                        preset.submit_key,
-                        cols,
-                        rows,
-                        wakeup_tx,
-                        name_counter,
-                        pane_factory::SpawnIdentity::Managed,
-                    )
-                }
-            }
+                fleet_path,
+                layout,
+                cols,
+                rows,
+                wakeup_tx,
+            )
         }
         MenuItemKind::Fugu => {
             // Provision (idempotent) the Fugu Codex profile (`fugu.config.toml`)
@@ -204,35 +164,23 @@ pub(super) fn pane_from_menu_item(
             if crate::provider_detect::default_codex_home().as_ref() != Some(&codex_home) {
                 env.insert("CODEX_HOME".to_string(), codex_home.display().to_string());
             }
-            if let Err(e) = tui_spawn::add_instance_with_topic(
+            let created_name = super::rpc::create_instance(
                 home,
                 &inst_name,
-                &crate::fleet::InstanceYamlEntry {
-                    backend: Some("codex".to_string()),
-                    args: Some(vec!["-p".to_string(), "fugu".to_string()]),
-                    env: (!env.is_empty()).then_some(env),
-                    ..Default::default()
-                },
-            ) {
-                tracing::warn!(error = %e, "failed to write fleet.yaml for fugu");
-            }
-            let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-            if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {
-                pane_factory::create_pane_from_resolved(
-                    &inst_name,
-                    &resolved,
-                    layout,
-                    registry,
-                    home,
-                    cols,
-                    rows,
-                    wakeup_tx,
-                    name_counter,
-                    crate::backend::SpawnMode::Fresh,
-                )
-            } else {
-                anyhow::bail!("failed to resolve fugu instance after creation")
-            }
+                "codex",
+                &["-p".to_string(), "fugu".to_string()],
+                &env,
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+            pane_factory::create_remote_pane(
+                &created_name,
+                home,
+                fleet_path,
+                layout,
+                cols,
+                rows,
+                wakeup_tx,
+            )
         }
         MenuItemKind::FleetInstance(inst_name) => {
             let fleet = crate::fleet::FleetConfig::load(fleet_path)?;
@@ -349,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_menu_missing_default_env_source_does_not_create_pane_3540_r2() {
+    fn backend_menu_without_daemon_does_not_create_pane_3540_r2() {
         let home = std::env::temp_dir().join(format!(
             "agend-menu-missing-env-{}-{}",
             std::process::id(),
@@ -387,13 +335,12 @@ mod tests {
             &mut name_counter,
         );
         let error = match result {
-            Ok(_) => panic!("missing environment source must refuse the menu spawn"),
+            Ok(_) => panic!("menu spawn must refuse when daemon ownership is unavailable"),
             Err(error) => error,
         };
 
         let message = error.to_string();
-        assert!(message.contains("AGEND_TEST_MISSING_MENU_ENV_3540_R2"));
-        assert!(!message.contains("secret-value-must-not-leak"));
+        assert!(message.contains("no active daemon"));
         assert!(layout.tabs.is_empty());
         assert!(crate::agent::lock_registry(&registry).is_empty());
         std::fs::remove_dir_all(home).ok();
