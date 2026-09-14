@@ -432,12 +432,14 @@ fn collect_resize_needs(
 mod tests {
     use super::*;
     use crate::layout::pane::PaneSource;
+    use crate::types::{InstanceId, InstanceRef};
     use crate::vterm::VTerm;
 
     fn leaf(id: usize, name: &str) -> Pane {
         Pane {
             agent_name: name.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,
@@ -455,6 +457,54 @@ mod tests {
             offthread: None,
             _fwd_cancel: None,
         }
+    }
+
+    #[test]
+    fn stale_delete_event_cannot_remove_same_name_replacement_3625() {
+        let old_ref = InstanceRef::new(InstanceId::new(), 11);
+        let new_ref = InstanceRef::new(InstanceId::new(), 12);
+        let mut old = leaf(1, "same-name");
+        old.instance_ref = Some(old_ref);
+        let mut replacement = leaf(2, "same-name");
+        replacement.instance_ref = Some(new_ref);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("old".into(), old));
+        layout.add_tab(Tab::new("new".into(), replacement));
+
+        assert!(layout.remove_fleet_instance_views_exact(old_ref));
+        assert!(layout.find_pane_mut(1).is_none());
+        assert!(layout.find_pane_mut(2).is_some());
+        assert!(!layout.remove_fleet_instance_views_exact(old_ref));
+    }
+
+    #[test]
+    fn stale_reconnect_cannot_overwrite_same_name_replacement_3625() {
+        let old_ref = InstanceRef::new(InstanceId::new(), 21);
+        let new_ref = InstanceRef::new(InstanceId::new(), 22);
+        let mut current = leaf(1, "same-name");
+        current.instance_ref = Some(new_ref);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("team".into(), current));
+        let mut stale = leaf(99, "same-name");
+        stale.instance_ref = Some(old_ref);
+        stale.display_name = Some("stale".into());
+
+        assert!(!layout.reconnect_agent_pane_exact(old_ref, stale));
+        assert_eq!(layout.find_pane_mut(1).unwrap().display_name, None);
+        assert!(layout.find_pane_mut(99).is_none());
+    }
+
+    #[test]
+    fn instance_ref_round_trips_in_session_payload_3625() {
+        let instance_ref = InstanceRef::new(InstanceId::new(), 31);
+        let mut pane = leaf(1, "persisted");
+        pane.instance_ref = Some(instance_ref);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("team".into(), pane));
+
+        let encoded = serde_json::to_string(&layout.session_identity_snapshot()).unwrap();
+        assert!(encoded.contains(&instance_ref.instance_id.full()));
+        assert!(encoded.contains("31"));
     }
 
     #[test]
