@@ -1231,14 +1231,26 @@ impl AppState {
                         self.remote_attach_failures.remove(name);
                         if already_has_pane {
                             // Reuse retained pane (same as standalone's reconnect).
-                            self.ui
+                            match self
+                                .ui
                                 .layout
-                                .reconnect_or_append_agent_pane(&tab_name, pane);
-                            tracing::info!(
-                                agent = %name,
-                                team = %team_name,
-                                "reused retained team pane for re-appeared remote agent"
-                            );
+                                .reconnect_or_append_agent_pane(&tab_name, pane)
+                            {
+                                crate::layout::PaneReconnectOutcome::Reconnected => {
+                                    tracing::info!(
+                                        agent = %name,
+                                        team = %team_name,
+                                        "reused retained team pane for re-appeared remote agent"
+                                    );
+                                }
+                                crate::layout::PaneReconnectOutcome::Appended => {
+                                    tracing::info!(
+                                        agent = %name,
+                                        team = %team_name,
+                                        "opened separate remote pane because identity was unavailable"
+                                    );
+                                }
+                            }
                         } else if let Some(idx) = self
                             .ui
                             .layout
@@ -1300,20 +1312,23 @@ impl AppState {
                     // This sync is add-only: a gone agent's pane is retained
                     // for scrollback. Reconnect that leaf in place when the
                     // agent reappears, including inside an operator split.
-                    if self
+                    match self
                         .ui
                         .layout
                         .reconnect_or_append_agent_pane(&tab_name, pane)
                     {
-                        tracing::info!(
-                            agent = %name,
-                            "reused retained pane for re-appeared remote agent (no duplicate)"
-                        );
-                    } else {
-                        tracing::info!(
-                            agent = %name,
-                            "opened tab for newly-appeared remote agent"
-                        );
+                        crate::layout::PaneReconnectOutcome::Reconnected => {
+                            tracing::info!(
+                                agent = %name,
+                                "reused retained pane for re-appeared remote agent (no duplicate)"
+                            );
+                        }
+                        crate::layout::PaneReconnectOutcome::Appended => {
+                            tracing::info!(
+                                agent = %name,
+                                "opened tab for newly-appeared remote agent"
+                            );
+                        }
                     }
                     self.needs_resize = true;
                 }

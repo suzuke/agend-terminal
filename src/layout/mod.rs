@@ -28,6 +28,15 @@ pub enum MovePlacement {
     NewTab { name: String },
 }
 
+/// Result of trying to reconnect an agent pane. A pane without an exact
+/// identity is appended as a separate view so callers do not report the
+/// fail-closed append as a reconnect failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneReconnectOutcome {
+    Reconnected,
+    Appended,
+}
+
 /// #1939: full placement of an agent's pane at removal time. Extends the
 /// #1431 tab-name-only memory so a `SameTab` respawn (restart_instance)
 /// restores the pane's position, not just its tab.
@@ -177,10 +186,14 @@ impl Layout {
     /// Reconnect a retained agent pane in place, or append a tab for a new
     /// agent. A retained pane is replaced only when its exact process identity
     /// matches; name-only reconnects fail closed and append a separate view.
-    pub fn reconnect_or_append_agent_pane(&mut self, agent_name: &str, pane: Pane) -> bool {
+    pub fn reconnect_or_append_agent_pane(
+        &mut self,
+        agent_name: &str,
+        pane: Pane,
+    ) -> PaneReconnectOutcome {
         let Some(expected) = pane.instance_ref else {
             self.push_tab_preserve_focus(Tab::new(agent_name.to_string(), pane));
-            return false;
+            return PaneReconnectOutcome::Appended;
         };
         let has_exact_match = self.tabs.iter().any(|tab| {
             tab.root().pane_ids().into_iter().any(|id| {
@@ -190,10 +203,14 @@ impl Layout {
             })
         });
         if has_exact_match {
-            return self.reconnect_agent_pane_exact(expected, pane);
+            return if self.reconnect_agent_pane_exact(expected, pane) {
+                PaneReconnectOutcome::Reconnected
+            } else {
+                PaneReconnectOutcome::Appended
+            };
         }
         self.push_tab_preserve_focus(Tab::new(agent_name.to_string(), pane));
-        false
+        PaneReconnectOutcome::Appended
     }
 
     /// Reconnect a pane only when the incoming process incarnation exactly
@@ -438,6 +455,33 @@ impl Layout {
             .enumerate()
             .find_map(|(i, t)| t.root().find_pane_id_by_agent(agent).map(|p| (i, p)))
     }
+
+    /// Resolve an unambiguous identity from panes carrying the given agent
+    /// name. Name-only panes are ignored; conflicting exact identities fail
+    /// closed instead of guessing which same-name incarnation is current.
+    pub fn unique_instance_ref_for_agent(&self, agent: &str) -> Option<InstanceRef> {
+        let mut found = None;
+        for tab in &self.tabs {
+            for pane_id in tab.root().pane_ids() {
+                let Some(pane) = tab.root().find_pane(pane_id) else {
+                    continue;
+                };
+                if pane.agent_name.as_str() != agent
+                    && pane.fleet_instance_name.as_deref() != Some(agent)
+                {
+                    continue;
+                }
+                let Some(instance_ref) = pane.instance_ref else {
+                    continue;
+                };
+                if found.is_some_and(|previous| previous != instance_ref) {
+                    return None;
+                }
+                found = Some(instance_ref);
+            }
+        }
+        found
+    }
 }
 
 /// Resize all panes in the active tab to fit the given area.
@@ -617,7 +661,10 @@ mod tests {
             .and_then(Pane::instance_ref);
         fresh.display_name = Some("fresh".to_string());
 
-        assert!(layout.reconnect_or_append_agent_pane("returning", fresh));
+        assert_eq!(
+            layout.reconnect_or_append_agent_pane("returning", fresh),
+            PaneReconnectOutcome::Reconnected
+        );
 
         assert_eq!(layout.tabs.len(), 1, "must not append a duplicate tab");
         assert_eq!(layout.tabs[0].root().pane_count(), 2, "split is preserved");
@@ -632,8 +679,43 @@ mod tests {
             "the retained leaf carries the fresh connection"
         );
 
-        assert!(!layout.reconnect_or_append_agent_pane("new", leaf(3, "new")));
+        assert_eq!(
+            layout.reconnect_or_append_agent_pane("new", leaf(3, "new")),
+            PaneReconnectOutcome::Appended
+        );
         assert_eq!(layout.tabs.len(), 2, "a new agent still appends one tab");
+    }
+
+    #[test]
+    fn name_only_reconnect_appends_without_claiming_reconnect_3625() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("legacy".to_string(), leaf(1, "legacy")));
+
+        let outcome = layout.reconnect_or_append_agent_pane("legacy", leaf(2, "legacy"));
+
+        assert_eq!(outcome, PaneReconnectOutcome::Appended);
+        assert_eq!(
+            layout.tabs.len(),
+            2,
+            "identity-less attach must not replace"
+        );
+        assert_eq!(layout.tabs[0].root().pane_count(), 1);
+        assert_eq!(layout.tabs[1].root().pane_count(), 1);
+    }
+
+    #[test]
+    fn conflicting_instance_refs_fail_closed_for_delete_lookup_3625() {
+        let first_ref = InstanceRef::new(InstanceId::new(), 51);
+        let second_ref = InstanceRef::new(InstanceId::new(), 52);
+        let mut first = leaf(1, "same-name");
+        first.instance_ref = Some(first_ref);
+        let mut second = leaf(2, "same-name");
+        second.instance_ref = Some(second_ref);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("first".to_string(), first));
+        layout.add_tab(Tab::new("second".to_string(), second));
+
+        assert_eq!(layout.unique_instance_ref_for_agent("same-name"), None);
     }
     #[test]
     fn move_pane_across_tabs_same_tab_rejected() {

@@ -460,11 +460,7 @@ pub(super) fn handle_key(
                         // Capture the exact view identity before the daemon
                         // delete. A name-only pane (legacy session) is not
                         // safe to remove after a same-name replacement.
-                        let expected_ref = ctx
-                            .layout
-                            .find_agent_pane(name)
-                            .and_then(|(_, pane_id)| ctx.layout.find_pane_mut(pane_id))
-                            .and_then(|pane| pane.instance_ref());
+                        let expected_ref = authoritative_instance_ref_for_delete(ctx, name);
                         match crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
                             ctx.home,
                             name,
@@ -1075,6 +1071,14 @@ pub(super) fn handle_key(
     outcome
 }
 
+fn authoritative_instance_ref_for_delete(
+    ctx: &OverlayCtx<'_>,
+    name: &str,
+) -> Option<crate::types::InstanceRef> {
+    crate::agent::instance_ref_for_name(ctx.registry, ctx.home, name)
+        .or_else(|| ctx.layout.unique_instance_ref_for_agent(name))
+}
+
 fn submit_task_request(
     tx: &crossbeam_channel::Sender<super::rpc::TaskRequest>,
     arguments: serde_json::Value,
@@ -1410,6 +1414,52 @@ mod tests {
             2
         );
 
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_instance_removes_current_ref_when_old_name_only_view_precedes_it_3625() {
+        let home = dec_home("delete_replacement_view");
+        let current_id = crate::types::InstanceId::new();
+        let current_ref = crate::types::InstanceRef::new(current_id, 77);
+
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut old = close_test_pane(crate::types::InstanceId::new(), "managed", Some("managed"));
+        old.instance_ref = None;
+        let mut replacement = close_test_pane(current_id, "managed", Some("managed"));
+        replacement.id = 2;
+        replacement.instance_ref = Some(current_ref);
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(Tab::new("old".to_string(), old));
+        layout.add_tab(Tab::new("replacement".to_string(), replacement));
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            reap_workers: &mut reap_workers,
+        };
+
+        let expected = authoritative_instance_ref_for_delete(&ctx, "managed");
+        assert_eq!(expected, Some(current_ref));
+        assert!(ctx
+            .layout
+            .remove_fleet_instance_views_exact(expected.unwrap()));
+        assert!(
+            ctx.layout.find_pane_mut(1).is_some(),
+            "old scrollback remains"
+        );
+        assert!(
+            ctx.layout.find_pane_mut(2).is_none(),
+            "current view removed"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
