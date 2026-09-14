@@ -399,6 +399,41 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
+    /// Regression for the app/daemon ownership split: the Ctrl+B c backend
+    /// path must create through the daemon and attach a remote pane. The old
+    /// path persisted fleet.yaml and then called the app-local
+    /// `create_pane_from_resolved`, leaving the daemon registry unaware of the
+    /// live child until the next restart.
+    #[test]
+    fn backend_menu_creation_is_daemon_owned_3612() {
+        let source = include_str!("menu.rs");
+        let backend_start = source
+            .find("MenuItemKind::Backend(backend)")
+            .expect("backend menu arm");
+        let fugu_start = source[backend_start..]
+            .find("MenuItemKind::Fugu")
+            .map(|offset| backend_start + offset)
+            .expect("backend menu arm terminator");
+        let backend_arm = &source[backend_start..fugu_start];
+
+        assert!(
+            backend_arm.contains("create_instance"),
+            "Ctrl+B c must use the daemon create_instance lifecycle"
+        );
+        assert!(
+            backend_arm.contains("create_remote_pane"),
+            "Ctrl+B c must attach the daemon-owned process through the bridge"
+        );
+        assert!(
+            !backend_arm.contains("create_pane_from_resolved"),
+            "Ctrl+B c must not spawn a second app-local child"
+        );
+        assert!(
+            !backend_arm.contains("add_instance_with_topic"),
+            "Ctrl+B c must let daemon create_instance own persistence/topic setup"
+        );
+    }
+
     fn menu_test_pane(id: usize, fleet_instance_name: Option<&str>) -> Pane {
         Pane {
             agent_name: "menu-test".into(),
