@@ -67,7 +67,7 @@ pub(super) fn spawn_event_worker(
             let run_dir = match resolve_active_run_dir(&home) {
                 Some(run_dir) => run_dir,
                 None => {
-                    let _ = outcome_tx.send(EventStreamOutcome::Disconnected(
+                    let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
                         "no active daemon".to_string(),
                     ));
                     return;
@@ -76,7 +76,7 @@ pub(super) fn spawn_event_worker(
             let mut reader = match open_event_stream(&run_dir) {
                 Ok(reader) => reader,
                 Err(error) => {
-                    let _ = outcome_tx.send(EventStreamOutcome::Disconnected(error));
+                    let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(error));
                     return;
                 }
             };
@@ -87,19 +87,18 @@ pub(super) fn spawn_event_worker(
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
                     Ok(0) => {
-                        let _ = outcome_tx.send(EventStreamOutcome::Disconnected(
+                        let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
                             "event stream closed".to_string(),
                         ));
                         return;
                     }
                     Ok(_) => match serde_json::from_str(&line) {
-                        Ok(event) => {
-                            if outcome_tx.send(EventStreamOutcome::Event(event)).is_err() {
-                                return;
-                            }
-                        }
+                        Ok(event) => match outcome_tx.try_send(EventStreamOutcome::Event(event)) {
+                            Ok(()) => {}
+                            Err(_) => return,
+                        },
                         Err(error) => {
-                            let _ = outcome_tx.send(EventStreamOutcome::Disconnected(format!(
+                            let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(format!(
                                 "invalid event stream payload: {error}"
                             )));
                             return;
@@ -111,8 +110,8 @@ pub(super) fn spawn_event_worker(
                             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                         ) => {}
                     Err(error) => {
-                        let _ =
-                            outcome_tx.send(EventStreamOutcome::Disconnected(error.to_string()));
+                        let _ = outcome_tx
+                            .try_send(EventStreamOutcome::Disconnected(error.to_string()));
                         return;
                     }
                 }
