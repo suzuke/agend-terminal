@@ -72,6 +72,10 @@ pub(crate) fn source_id(run_dir: &std::path::Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+pub(crate) fn for_run_dir(home: &std::path::Path) -> Arc<EventHub> {
+    EventHub::new(source_id(&crate::daemon::run_dir(home)), 128)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

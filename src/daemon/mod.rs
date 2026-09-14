@@ -1117,7 +1117,6 @@ fn init_daemon_services(
     crate::agent::crash_disposition::install_owner_crash_wake(crash_tx.clone());
     let configs: Arc<Mutex<HashMap<String, AgentConfig>>> = Arc::new(Mutex::new(HashMap::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
-
     // fire-and-forget: api::serve runs the loopback TCP accept loop, which blocks
     // in accept() for the daemon's lifetime. It never polls the shutdown flag —
     // its only early exit is a persistent accept-error streak — so process exit
@@ -1128,11 +1127,7 @@ fn init_daemon_services(
     let api_shutdown = Arc::clone(&shutdown);
     let api_configs = Arc::clone(&configs);
     let api_externals = Arc::clone(&externals);
-    let event_hub = crate::daemon::event_hub::EventHub::new(
-        crate::daemon::event_hub::source_id(&run_dir(home)),
-        128,
-    );
-    let api_event_hub = Arc::clone(&event_hub);
+    let event_hub = crate::daemon::event_hub::for_run_dir(home);
     let (api_ready_tx, api_ready_rx) = std::sync::mpsc::sync_channel(1);
     // fire-and-forget: the API accept loop blocks in accept() for the daemon's lifetime; process exit reaps the detached worker.
     std::thread::Builder::new()
@@ -1144,7 +1139,7 @@ fn init_daemon_services(
                 api_shutdown,
                 api_configs,
                 api_externals,
-                api_event_hub,
+                event_hub,
                 crate::api::RestartCapability::Daemon,
                 None, // #2453 R2: no app-restart channel on the headless daemon
                 api_ready_tx,
