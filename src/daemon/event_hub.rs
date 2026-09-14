@@ -20,6 +20,16 @@ pub(crate) struct EventHub {
     next_sequence: AtomicU64,
     capacity: usize,
     subscribers: Mutex<Vec<Sender<DaemonEvent>>>,
+    #[cfg(test)]
+    test_pause_after_first_reservation: Mutex<Option<Arc<TestSequencePause>>>,
+}
+
+#[cfg(test)]
+struct TestSequencePause {
+    reserved: std::sync::atomic::AtomicBool,
+    release: std::sync::atomic::AtomicBool,
+    second_reserved: std::sync::atomic::AtomicBool,
+    second_release: std::sync::atomic::AtomicBool,
 }
 
 impl EventHub {
@@ -29,6 +39,8 @@ impl EventHub {
             next_sequence: AtomicU64::new(0),
             capacity: capacity.max(1),
             subscribers: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            test_pause_after_first_reservation: Mutex::new(None),
         })
     }
 
@@ -43,12 +55,32 @@ impl EventHub {
     }
 
     fn publish(&self, event: ApiEvent) {
+        let mut subscribers = self.subscribers.lock();
         let envelope = DaemonEvent {
             source: self.source.clone(),
             sequence: self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1,
             event,
         };
-        let mut subscribers = self.subscribers.lock();
+        #[cfg(test)]
+        if envelope.sequence == 1 {
+            let pause = self.test_pause_after_first_reservation.lock().clone();
+            if let Some(pause) = pause {
+                pause.reserved.store(true, Ordering::Release);
+                while !pause.release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
+        }
+        #[cfg(test)]
+        if envelope.sequence == 2 {
+            let pause = self.test_pause_after_first_reservation.lock().clone();
+            if let Some(pause) = pause {
+                pause.second_reserved.store(true, Ordering::Release);
+                while !pause.second_release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
+        }
         subscribers.retain(|tx| match tx.try_send(envelope.clone()) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
@@ -111,5 +143,64 @@ mod tests {
         });
         assert!(rx.recv().is_ok());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn concurrent_publish_preserves_sequence_order_per_subscriber() {
+        let hub = EventHub::new("daemon-a".to_string(), 4);
+        let rx = hub.subscribe();
+        let pause = Arc::new(TestSequencePause {
+            reserved: std::sync::atomic::AtomicBool::new(false),
+            release: std::sync::atomic::AtomicBool::new(false),
+            second_reserved: std::sync::atomic::AtomicBool::new(false),
+            second_release: std::sync::atomic::AtomicBool::new(false),
+        });
+        *hub.test_pause_after_first_reservation.lock() = Some(pause.clone());
+
+        let first_hub = Arc::clone(&hub);
+        let first = std::thread::spawn(move || {
+            first_hub.notify(ApiEvent::TeamCreated {
+                name: "first".to_string(),
+                members: vec![],
+            });
+        });
+        while !pause.reserved.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        let second_hub = Arc::clone(&hub);
+        let second = std::thread::spawn(move || {
+            second_hub.notify(ApiEvent::TeamCreated {
+                name: "second".to_string(),
+                members: vec![],
+            });
+        });
+
+        if let Some(subscribers) = hub.subscribers.try_lock() {
+            // Before the ordering fix, the first publisher has not acquired
+            // the subscriber lock yet. Hold it while the second publisher
+            // reserves sequence 2, then let sequence 2 publish first.
+            while !pause.second_reserved.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            pause.second_release.store(true, Ordering::Release);
+            drop(subscribers);
+            second.join().expect("second publisher");
+            pause.release.store(true, Ordering::Release);
+            first.join().expect("first publisher");
+        } else {
+            // After the ordering fix, the first publisher holds the lock
+            // while paused, so the second publisher cannot reserve sequence 2.
+            pause.release.store(true, Ordering::Release);
+            first.join().expect("first publisher");
+            while !pause.second_reserved.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            pause.second_release.store(true, Ordering::Release);
+            second.join().expect("second publisher");
+        }
+
+        assert_eq!(rx.recv().expect("first event").sequence, 1);
+        assert_eq!(rx.recv().expect("second event").sequence, 2);
     }
 }
