@@ -22,6 +22,7 @@ pub(crate) mod discharge_ledger;
 pub(crate) mod dispatch_idle;
 pub(crate) mod escalation_persist;
 pub(crate) mod event_bus;
+pub(crate) mod event_hub;
 pub(crate) mod handoff_timeout_watchdog;
 pub(crate) mod heartbeat_pair;
 pub(crate) mod helper_staleness_watchdog;
