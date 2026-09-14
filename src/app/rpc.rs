@@ -73,8 +73,8 @@ pub(super) fn spawn_event_worker(
                     return;
                 }
             };
-            let mut reader = match open_event_stream(&run_dir) {
-                Ok(reader) => reader,
+            let (mut reader, stream_source) = match open_event_stream(&run_dir) {
+                Ok(stream) => stream,
                 Err(error) => {
                     let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(error));
                     return;
@@ -92,18 +92,30 @@ pub(super) fn spawn_event_worker(
                         ));
                         return;
                     }
-                    Ok(_) => match serde_json::from_str(&line) {
-                        Ok(event) => match outcome_tx.try_send(EventStreamOutcome::Event(event)) {
-                            Ok(()) => {}
-                            Err(_) => return,
-                        },
-                        Err(error) => {
-                            let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(format!(
-                                "invalid event stream payload: {error}"
-                            )));
-                            return;
+                    Ok(_) => {
+                        match serde_json::from_str::<crate::daemon::event_hub::DaemonEvent>(&line) {
+                            Ok(event) if event.source == stream_source => {
+                                if outcome_tx
+                                    .try_send(EventStreamOutcome::Event(event))
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Ok(_) => {
+                                let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
+                                    "event stream source changed".to_string(),
+                                ));
+                                return;
+                            }
+                            Err(error) => {
+                                let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
+                                    format!("invalid event stream payload: {error}"),
+                                ));
+                                return;
+                            }
                         }
-                    },
+                    }
                     Err(error)
                         if matches!(
                             error.kind(),
@@ -121,7 +133,7 @@ pub(super) fn spawn_event_worker(
     (stop_tx, outcome_rx, worker)
 }
 
-fn open_event_stream(run_dir: &Path) -> Result<BufReader<TcpStream>, String> {
+fn open_event_stream(run_dir: &Path) -> Result<(BufReader<TcpStream>, String), String> {
     let stream = crate::ipc::connect_run_dir_api(run_dir).map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_millis(250)))
@@ -161,7 +173,7 @@ fn open_event_stream(run_dir: &Path) -> Result<BufReader<TcpStream>, String> {
     if expected_source == "unknown" || source != expected_source {
         return Err("event stream source does not match active daemon".to_string());
     }
-    Ok(reader)
+    Ok((reader, source.to_string()))
 }
 
 /// Create a managed instance through the daemon's lifecycle API.
