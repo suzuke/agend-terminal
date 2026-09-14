@@ -147,6 +147,11 @@ pub(super) struct AppState {
     /// Successful Live state snapshots waiting for the next pre-select roster
     /// reconciliation. Non-Live outcomes never populate this queue.
     pub(super) pending_remote_roster_names: Option<std::collections::HashSet<String>>,
+    pub(super) pending_remote_roster_refs:
+        Option<std::collections::HashMap<String, crate::types::InstanceRef>>,
+    /// Exact identities from the most recent live daemon roster. Remote panes
+    /// stay untrusted when this map has no entry (legacy/fallback roster).
+    pub(super) remote_instance_refs: std::collections::HashMap<String, crate::types::InstanceRef>,
     /// Placeholder forwarder senders, keyed by pane id, retained until the
     /// matching AttachOutcome is applied (or the pane is closed first).
     pub(super) pending_fwd: HashMap<usize, crossbeam_channel::Sender<Vec<u8>>>,
@@ -264,6 +269,8 @@ impl AppState {
             remote_attach_failures: std::collections::HashMap::new(),
             remote_agent_states: HashMap::new(),
             pending_remote_roster_names: None,
+            pending_remote_roster_refs: None,
+            remote_instance_refs: std::collections::HashMap::new(),
             pending_fwd: HashMap::new(),
             needs_resize: true,
             last_remote_sync: std::time::Instant::now(),
@@ -1014,16 +1021,27 @@ impl AppState {
                 self.pending_remote_roster_names =
                     matches!(result.mode, crate::runtime::AgentListMode::Live)
                         .then_some(result.names);
+                self.pending_remote_roster_refs =
+                    matches!(result.mode, crate::runtime::AgentListMode::Live)
+                        .then_some(result.instance_refs);
+                self.remote_instance_refs =
+                    if matches!(result.mode, crate::runtime::AgentListMode::Live) {
+                        self.pending_remote_roster_refs.clone().unwrap_or_default()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
             }
             Ok(Err(error)) => {
                 self.remote_agent_states.clear();
                 self.pending_remote_roster_names = None;
+                self.pending_remote_roster_refs = None;
                 self.daemon_list_mode = error.mode;
                 tracing::warn!(error = %error.error, "daemon agent-state snapshot unavailable");
             }
             Err(_) => {
                 self.remote_agent_states.clear();
                 self.pending_remote_roster_names = None;
+                self.pending_remote_roster_refs = None;
                 tracing::warn!("daemon agent-state RPC worker stopped");
             }
         }
@@ -1088,6 +1106,30 @@ impl AppState {
             reconcile_remote_roster_candidates(current, &self.known_remote_agents, mode, |name| {
                 self.ui.layout.agent_pane_is_disconnected(name)
             });
+        let mut names = names;
+        // A same-name replacement does not change the roster set. Compare the
+        // daemon's exact identity against the retained view so a new bridge is
+        // attached even when the old pane is still marked connected.
+        if matches!(mode, crate::runtime::AgentListMode::Live) {
+            for name in current {
+                let Some(expected) = self.remote_instance_refs.get(name).copied() else {
+                    continue;
+                };
+                let current_ref =
+                    self.ui
+                        .layout
+                        .find_agent_pane(name)
+                        .and_then(|(tab_idx, pane_id)| {
+                            self.ui.layout.tabs[tab_idx]
+                                .root()
+                                .find_pane(pane_id)
+                                .and_then(Pane::instance_ref)
+                        });
+                if current_ref != Some(expected) {
+                    names.to_add.insert(name.clone());
+                }
+            }
+        }
         let mut to_add: Vec<String> = names.to_add.into_iter().collect();
         to_add.sort();
         let mut pane_builder = |name: &str, layout: &mut Layout| {
@@ -1180,7 +1222,10 @@ impl AppState {
                 // leaf — preserves the existing team tab/split.
                 let already_has_pane = self.ui.layout.find_agent_pane(name).is_some();
                 match pane_builder(name, &mut self.ui.layout) {
-                    Ok(pane) => {
+                    Ok(mut pane) => {
+                        if pane.instance_ref.is_none() {
+                            pane.instance_ref = self.remote_instance_refs.get(name).copied();
+                        }
                         let tab_name = pane.agent_name.clone();
                         self.known_remote_agents.insert(tab_name.to_string());
                         self.remote_attach_failures.remove(name);
@@ -1245,7 +1290,10 @@ impl AppState {
         // Standalone: per-agent tabs as before.
         for name in &standalone {
             match pane_builder(name, &mut self.ui.layout) {
-                Ok(pane) => {
+                Ok(mut pane) => {
+                    if pane.instance_ref.is_none() {
+                        pane.instance_ref = self.remote_instance_refs.get(name).copied();
+                    }
                     let tab_name = pane.agent_name.clone();
                     self.known_remote_agents.insert(tab_name.to_string());
                     self.remote_attach_failures.remove(name);
@@ -1287,6 +1335,7 @@ impl AppState {
         let Some(names) = self.pending_remote_roster_names.take() else {
             return;
         };
+        self.pending_remote_roster_refs.take();
         // A healthy Live snapshot owns this roster pass and refreshes the
         // idle-sync throttle, preventing the fallback poll from starving the
         // Live path with a competing reconciliation.
@@ -1383,6 +1432,7 @@ mod tests {
             Ok(pane_factory::AttachOutcome::Ready {
                 pane_id,
                 instance_id,
+                instance_ref: None,
                 unmanaged,
                 rx: sub_rx,
                 dump: Vec::new(),
@@ -1408,6 +1458,7 @@ mod tests {
         Ok(Pane {
             agent_name: agent.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: crate::vterm::VTerm::new(10, 10),
             rx,
             id: layout.next_pane_id(),
@@ -1467,6 +1518,7 @@ mod tests {
         state.handle_agent_state_rpc_outcome(Ok(Ok(rpc::AgentStateSnapshotResult {
             snapshot: HashMap::new(),
             names: HashSet::from(["live-agent".to_string()]),
+            instance_refs: HashMap::new(),
             mode: crate::runtime::AgentListMode::Live,
         })));
         assert_eq!(state.daemon_list_mode, crate::runtime::AgentListMode::Live);
@@ -1492,6 +1544,7 @@ mod tests {
         state.handle_agent_state_rpc_outcome(Ok(Ok(rpc::AgentStateSnapshotResult {
             snapshot: HashMap::new(),
             names: HashSet::from(["stale-agent".to_string()]),
+            instance_refs: HashMap::new(),
             mode: crate::runtime::AgentListMode::FallbackDaemonStuck,
         })));
 
@@ -1500,6 +1553,40 @@ mod tests {
             crate::runtime::AgentListMode::FallbackDaemonStuck
         );
         assert!(state.pending_remote_roster_names.is_none());
+    }
+
+    #[test]
+    fn same_name_remote_replacement_cannot_overwrite_retained_pane_3625() {
+        let home = team_fixture_home("identity-replacement");
+        let mut state = AppState::new();
+        let old_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 101);
+        let new_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 102);
+        state
+            .remote_instance_refs
+            .insert("solo".to_string(), old_ref);
+        let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
+        state.place_remote_team_grouped(&["solo".to_string()], &home, &mut pane_builder);
+        state
+            .remote_instance_refs
+            .insert("solo".to_string(), new_ref);
+        state.place_remote_team_grouped(&["solo".to_string()], &home, &mut pane_builder);
+
+        assert_eq!(state.ui.layout.tabs.len(), 2);
+        assert_eq!(
+            state.ui.layout.tabs[0]
+                .root()
+                .find_pane(0)
+                .and_then(Pane::instance_ref),
+            Some(old_ref)
+        );
+        assert_eq!(
+            state.ui.layout.tabs[1]
+                .root()
+                .find_pane(1)
+                .and_then(Pane::instance_ref),
+            Some(new_ref)
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]

@@ -70,6 +70,11 @@ fn default_ratio() -> f32 {
 pub(super) struct SessionPane {
     /// Fleet instance name (key in fleet.yaml). None for shell panes.
     pub(super) fleet_instance_name: Option<String>,
+    /// Exact process identity when the pane was saved. Legacy sessions omit
+    /// this field and remain name-only hints until the live registry confirms
+    /// the current incarnation.
+    #[serde(default)]
+    pub(super) instance_ref: Option<crate::types::InstanceRef>,
     /// User-defined display name override.
     pub(super) display_name: Option<String>,
 }
@@ -129,6 +134,7 @@ fn save_node(node: &PaneNode) -> SessionNode {
     match node {
         PaneNode::Leaf(pane) => SessionNode::Leaf(SessionPane {
             fleet_instance_name: pane.fleet_instance_name.clone(),
+            instance_ref: pane.instance_ref,
             display_name: pane.display_name.clone(),
         }),
         PaneNode::Split {
@@ -289,6 +295,7 @@ pub(super) fn restore_with_reconciliation_attached(
         for name in &names {
             let synthetic_sp = SessionPane {
                 fleet_instance_name: Some(name.clone()),
+                instance_ref: None,
                 display_name: None,
             };
             if let Some(pane) = pane_builder(&synthetic_sp, layout) {
@@ -401,6 +408,7 @@ pub(super) fn place_agents_team_grouped(
         for name in &sorted {
             let synthetic_sp = SessionPane {
                 fleet_instance_name: Some(name.clone()),
+                instance_ref: None,
                 display_name: None,
             };
             if let Some(pane) = pane_builder(&synthetic_sp, layout) {
@@ -418,6 +426,7 @@ pub(super) fn place_agents_team_grouped(
     for name in &standalone {
         let synthetic_sp = SessionPane {
             fleet_instance_name: Some(name.clone()),
+            instance_ref: None,
             display_name: None,
         };
         if let Some(pane) = pane_builder(&synthetic_sp, layout) {
@@ -505,6 +514,7 @@ mod tests {
         Pane {
             agent_name: agent.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,
@@ -636,6 +646,18 @@ mod tests {
             SessionNode::Leaf(sp) => {
                 assert_eq!(sp.fleet_instance_name, Some("dev-x1y2".to_string()));
             }
+            _ => panic!("expected Leaf"),
+        }
+    }
+
+    #[test]
+    fn save_node_preserves_instance_ref() {
+        let instance_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 37);
+        let mut pane = test_pane(1, "dev", Some("dev-x1y2"));
+        pane.instance_ref = Some(instance_ref);
+        let saved = save_node(&PaneNode::Leaf(Box::new(pane)));
+        match saved {
+            SessionNode::Leaf(sp) => assert_eq!(sp.instance_ref, Some(instance_ref)),
             _ => panic!("expected Leaf"),
         }
     }
@@ -837,6 +859,7 @@ mod tests {
             ratio: 0.5,
             first: Box::new(SessionNode::Leaf(SessionPane {
                 fleet_instance_name: Some("orch".to_string()),
+                instance_ref: None,
                 display_name: None,
             })),
             second: Box::new(SessionNode::Split {
@@ -844,10 +867,12 @@ mod tests {
                 ratio: 0.5,
                 first: Box::new(SessionNode::Leaf(SessionPane {
                     fleet_instance_name: Some("dev-1".to_string()),
+                    instance_ref: None,
                     display_name: None,
                 })),
                 second: Box::new(SessionNode::Leaf(SessionPane {
                     fleet_instance_name: Some("dev-2".to_string()),
+                    instance_ref: None,
                     display_name: None,
                 })),
             }),
@@ -908,6 +933,7 @@ mod tests {
                     "A-tab".to_string(),
                     SessionNode::Leaf(SessionPane {
                         fleet_instance_name: Some("A".to_string()),
+                        instance_ref: None,
                         display_name: None,
                     }),
                 ),
@@ -915,6 +941,7 @@ mod tests {
                     "B-tab".to_string(),
                     SessionNode::Leaf(SessionPane {
                         fleet_instance_name: Some("B".to_string()),
+                        instance_ref: None,
                         display_name: None,
                     }),
                 ),
@@ -966,6 +993,7 @@ mod tests {
                     "A-tab".to_string(),
                     SessionNode::Leaf(SessionPane {
                         fleet_instance_name: Some("A".to_string()),
+                        instance_ref: None,
                         display_name: None,
                     }),
                 ),
@@ -973,6 +1001,7 @@ mod tests {
                     "B-tab".to_string(),
                     SessionNode::Leaf(SessionPane {
                         fleet_instance_name: Some("B".to_string()),
+                        instance_ref: None,
                         display_name: None,
                     }),
                 ),
@@ -980,6 +1009,7 @@ mod tests {
                     "C-stale-tab".to_string(),
                     SessionNode::Leaf(SessionPane {
                         fleet_instance_name: Some("C-stale".to_string()),
+                        instance_ref: None,
                         display_name: None,
                     }),
                 ),
@@ -1022,15 +1052,18 @@ mod tests {
             ratio: 0.5,
             first: Box::new(SessionNode::Leaf(SessionPane {
                 fleet_instance_name: Some("A".to_string()),
+                instance_ref: None,
                 display_name: None,
             })),
             second: Box::new(SessionNode::Leaf(SessionPane {
                 fleet_instance_name: Some("B".to_string()),
+                instance_ref: None,
                 display_name: None,
             })),
         };
         let duplicate = SessionNode::Leaf(SessionPane {
             fleet_instance_name: Some("A".to_string()),
+            instance_ref: None,
             display_name: None,
         });
         write_session(

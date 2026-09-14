@@ -1095,6 +1095,7 @@ mod tests {
         let pane = Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -1125,6 +1126,7 @@ mod tests {
         let pane = Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -1158,6 +1160,7 @@ mod tests {
         let pane = Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -1209,6 +1212,7 @@ mod tests {
         let pane = Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -1242,6 +1246,7 @@ mod tests {
         let pane = Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -1283,6 +1288,7 @@ mod tests {
         let pane = Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -1335,6 +1341,7 @@ mod tests {
             crate::layout::Pane {
                 agent_name: "test".into(),
                 instance_id: crate::types::InstanceId::default(),
+                instance_ref: None,
                 vterm: VTerm::new(10, 10),
                 rx: crossbeam_channel::bounded(1).1,
                 id: 1,
@@ -1369,6 +1376,7 @@ mod tests {
         let pane = Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             // 40x20 frame -> pane tree is 40x18 after tab/status chrome, and
             // pane border leaves a 38x16 terminal content area. Start 5 rows
             // short to reproduce #2046's floating backend footer symptom.
@@ -1452,6 +1460,7 @@ mod tests {
         let pane = Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             // Blank/idle — the render source MUST be the snapshot, not this VTerm.
             vterm: VTerm::new(38, 16),
             rx: crossbeam_channel::bounded(1).1,
@@ -1994,6 +2003,7 @@ mod tests {
         let pane = Pane {
             agent_name: "agent".into(),
             instance_id: id,
+            instance_ref: None,
             vterm: VTerm::new(38, 11),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -2048,6 +2058,7 @@ mod tests {
         let pane = Pane {
             agent_name: "remote".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(38, 11),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -2092,6 +2103,7 @@ mod tests {
         let pane = Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(38, 11),
             rx,
             id: 1,
@@ -2123,6 +2135,7 @@ mod tests {
         Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(38, 11),
             rx,
             id,

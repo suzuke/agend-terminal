@@ -1666,6 +1666,7 @@ mod tests {
         Pane {
             agent_name: name.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,

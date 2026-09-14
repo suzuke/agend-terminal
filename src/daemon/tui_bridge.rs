@@ -281,7 +281,11 @@ fn read_and_verify_tui_cookie(
 /// input thread blocks on framed reads for the life of the connection), and the
 /// write budget is a socket-level option, so the forwarder's `try_clone` handle
 /// inherits it.
-fn greet_authenticated_client(stream: &mut std::net::TcpStream, dump: &[u8]) -> bool {
+fn greet_authenticated_client(
+    stream: &mut std::net::TcpStream,
+    instance_ref: crate::types::InstanceRef,
+    dump: &[u8],
+) -> bool {
     if stream.set_read_timeout(None).is_err()
         || stream.set_write_timeout(Some(CLIENT_WRITE_BUDGET)).is_err()
     {
@@ -290,7 +294,12 @@ fn greet_authenticated_client(stream: &mut std::net::TcpStream, dump: &[u8]) -> 
     if stream.write_all(&[framing::PROTOCOL_VERSION]).is_err() || stream.flush().is_err() {
         return false;
     }
-    framing::write_frame(stream, dump).is_ok()
+    let identity = match serde_json::to_vec(&instance_ref) {
+        Ok(identity) => identity,
+        Err(_) => return false,
+    };
+    framing::write_tagged(stream, framing::TAG_IDENTITY, &identity).is_ok()
+        && framing::write_frame(stream, dump).is_ok()
 }
 
 /// Start one of a client's two threads, and report whether it started.
@@ -530,7 +539,7 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         // closed for the PTY path), wedging the whole daemon. `dump` is an owned
         // Vec, so it survives the drop; intervening PTY output buffers in `rx`
         // and is sent by the tui_out thread after this initial frame.
-        let (rx, dump, pty_writer, pty_master, core) = {
+        let (rx, dump, pty_writer, pty_master, core, instance_ref) = {
             let reg = agent::lock_registry(registry);
             // #1441: registry is UUID-keyed; this TUI-bridge server only knows
             // the display name, so locate the live handle by name.
@@ -545,11 +554,12 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
                 Arc::clone(&agent.pty_writer),
                 Arc::clone(&agent.pty_master),
                 Arc::clone(&agent.core),
+                crate::types::InstanceRef::new(agent.id, agent.generation.value()),
             )
         };
         // Registry lock released — the greeting's writes run lock-free, and are
         // bounded so a client that never reads cannot park this accept thread.
-        if !greet_authenticated_client(&mut stream, &dump) {
+        if !greet_authenticated_client(&mut stream, instance_ref, &dump) {
             continue;
         }
 
@@ -1441,7 +1451,11 @@ mod tests {
         let peer = pair.peer;
 
         let started = Instant::now();
-        let greeted = super::greet_authenticated_client(&mut server, &wedging_payload());
+        let greeted = super::greet_authenticated_client(
+            &mut server,
+            crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1),
+            &wedging_payload(),
+        );
         let elapsed = started.elapsed();
 
         drop(peer);

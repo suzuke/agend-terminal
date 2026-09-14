@@ -28,6 +28,7 @@ pub(super) enum TaskOutcome {
 pub(super) struct AgentStateSnapshotResult {
     pub(super) snapshot: AgentStateSnapshot,
     pub(super) names: HashSet<String>,
+    pub(super) instance_refs: HashMap<String, crate::types::InstanceRef>,
     pub(super) mode: crate::runtime::AgentListMode,
 }
 
@@ -306,11 +307,17 @@ where
         })?;
     let mut states = HashMap::new();
     let mut names = HashSet::new();
+    let mut instance_refs = HashMap::new();
     for instance in instances {
         let Some(name) = instance["name"].as_str() else {
             continue;
         };
         names.insert(name.to_string());
+        if let Ok(instance_ref) =
+            serde_json::from_value::<crate::types::InstanceRef>(instance["instance_ref"].clone())
+        {
+            instance_refs.insert(name.to_string(), instance_ref);
+        }
         states.insert(
             name.to_string(),
             instance["agent_state"].as_str().and_then(parse_agent_state),
@@ -319,6 +326,7 @@ where
     Ok(AgentStateSnapshotResult {
         snapshot: states,
         names,
+        instance_refs,
         mode: crate::runtime::AgentListMode::Live,
     })
 }

@@ -34,12 +34,14 @@ pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>
 pub enum ApiEvent {
     InstanceCreated {
         name: String,
+        instance_ref: Option<crate::types::InstanceRef>,
         layout: LayoutHint,
         spawner: Option<String>,
         target_pane: Option<String>,
     },
     InstanceDeleted {
         name: String,
+        instance_ref: Option<crate::types::InstanceRef>,
     },
     TeamCreated {
         name: String,
@@ -1278,10 +1280,11 @@ mod tests {
         let rec = RecordingNotifier::new();
         rec.notify(ApiEvent::InstanceDeleted {
             name: "agent-1".into(),
+            instance_ref: None,
         });
         let events = rec.take();
         assert_eq!(events.len(), 1);
-        let ApiEvent::InstanceDeleted { name } = &events[0] else {
+        let ApiEvent::InstanceDeleted { name, .. } = &events[0] else {
             panic!("wrong variant")
         };
         assert_eq!(name, "agent-1");
@@ -1292,6 +1295,7 @@ mod tests {
         let rec = RecordingNotifier::new();
         rec.notify(ApiEvent::InstanceCreated {
             name: "agent-2".into(),
+            instance_ref: None,
             layout: LayoutHint::SplitRight,
             spawner: Some("caller".into()),
             target_pane: None,
@@ -1303,6 +1307,7 @@ mod tests {
             layout,
             spawner,
             target_pane,
+            ..
         } = &events[0]
         else {
             panic!("wrong variant")
@@ -1358,7 +1363,10 @@ mod tests {
     fn none_notifier_instance_deleted_no_panic() {
         let notifier: Option<&dyn ApiNotifier> = None;
         if let Some(n) = notifier {
-            n.notify(ApiEvent::InstanceDeleted { name: "x".into() });
+            n.notify(ApiEvent::InstanceDeleted {
+                name: "x".into(),
+                instance_ref: None,
+            });
         }
     }
 
@@ -1368,6 +1376,7 @@ mod tests {
         if let Some(n) = notifier {
             n.notify(ApiEvent::InstanceCreated {
                 name: "x".into(),
+                instance_ref: None,
                 layout: LayoutHint::Tab,
                 spawner: None,
                 target_pane: None,
@@ -1417,7 +1426,10 @@ mod tests {
     fn panicking_notifier_unwinds_safely() {
         let result = std::panic::catch_unwind(|| {
             let n: &dyn ApiNotifier = &PanickingNotifier;
-            n.notify(ApiEvent::InstanceDeleted { name: "x".into() });
+            n.notify(ApiEvent::InstanceDeleted {
+                name: "x".into(),
+                instance_ref: None,
+            });
         });
         assert!(result.is_err(), "expected panic to propagate");
     }
@@ -1427,11 +1439,15 @@ mod tests {
         let rec = RecordingNotifier::new();
         rec.notify(ApiEvent::InstanceCreated {
             name: "a".into(),
+            instance_ref: None,
             layout: LayoutHint::Tab,
             spawner: None,
             target_pane: None,
         });
-        rec.notify(ApiEvent::InstanceDeleted { name: "a".into() });
+        rec.notify(ApiEvent::InstanceDeleted {
+            name: "a".into(),
+            instance_ref: None,
+        });
         let events = rec.take();
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], ApiEvent::InstanceCreated { .. }));
@@ -1573,7 +1589,7 @@ mod tests {
         assert_eq!(resp["ok"], true);
         let events = notifier.take();
         assert_eq!(events.len(), 1, "expected 1 event, got {events:?}");
-        let ApiEvent::InstanceDeleted { name } = &events[0] else {
+        let ApiEvent::InstanceDeleted { name, .. } = &events[0] else {
             panic!("expected InstanceDeleted, got {:?}", events[0])
         };
         assert_eq!(name, "agent-x");

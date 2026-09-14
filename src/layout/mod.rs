@@ -14,6 +14,7 @@ pub use split::{adjust_split_ratio, find_split_border, resize_focused, Direction
 pub use tab::{DragTabTarget, Tab};
 pub use tree::{swap_panes, PaneNode, SplitDir};
 
+use crate::types::InstanceRef;
 use ratatui::layout::Rect;
 use std::collections::HashMap;
 
@@ -173,16 +174,50 @@ impl Layout {
         self.tabs.push(tab);
     }
 
-    /// Reconnect a retained agent pane in place, or append a tab for a new agent.
-    pub fn reconnect_or_append_agent_pane(&mut self, agent_name: &str, mut pane: Pane) -> bool {
-        let Some((_, pane_id)) = self.find_agent_pane(agent_name) else {
+    /// Reconnect a retained agent pane in place, or append a tab for a new
+    /// agent. A retained pane is replaced only when its exact process identity
+    /// matches; name-only reconnects fail closed and append a separate view.
+    pub fn reconnect_or_append_agent_pane(&mut self, agent_name: &str, pane: Pane) -> bool {
+        let Some(expected) = pane.instance_ref else {
             self.push_tab_preserve_focus(Tab::new(agent_name.to_string(), pane));
             return false;
         };
+        let has_exact_match = self.tabs.iter().any(|tab| {
+            tab.root().pane_ids().into_iter().any(|id| {
+                tab.root()
+                    .find_pane(id)
+                    .is_some_and(|candidate| candidate.instance_ref == Some(expected))
+            })
+        });
+        if has_exact_match {
+            return self.reconnect_agent_pane_exact(expected, pane);
+        }
+        self.push_tab_preserve_focus(Tab::new(agent_name.to_string(), pane));
+        false
+    }
+
+    /// Reconnect a pane only when the incoming process incarnation exactly
+    /// matches the retained pane. A name match is intentionally insufficient:
+    /// the same fleet name may have been replaced while a stale attach result
+    /// is still in flight.
+    pub fn reconnect_agent_pane_exact(&mut self, expected: InstanceRef, mut pane: Pane) -> bool {
+        let Some((_, pane_id)) = self.tabs.iter().enumerate().find_map(|(tab_idx, tab)| {
+            tab.root().pane_ids().into_iter().find_map(|id| {
+                tab.root()
+                    .find_pane(id)
+                    .filter(|candidate| candidate.instance_ref == Some(expected))
+                    .map(|_| (tab_idx, id))
+            })
+        }) else {
+            return false;
+        };
         pane.id = pane_id;
-        let existing = self
-            .find_pane_mut(pane_id)
-            .expect("pane id returned by find_agent_pane must exist");
+        let Some(existing) = self.find_pane_mut(pane_id) else {
+            return false;
+        };
+        if existing.instance_ref != Some(expected) {
+            return false;
+        }
         *existing = pane;
         true
     }
@@ -251,6 +286,7 @@ impl Layout {
 
     /// Remove every view of an exact fleet instance name across all tabs.
     /// Target-only tabs disappear; mixed tabs retain their other panes.
+    #[allow(dead_code)]
     pub fn remove_fleet_instance_views(&mut self, name: &str) -> bool {
         let mut removed = false;
         for tab_idx in (0..self.tabs.len()).rev() {
@@ -281,6 +317,54 @@ impl Layout {
             }
         }
         removed
+    }
+
+    /// Remove only views carrying the exact process identity. The operation is
+    /// fail-closed when a pane has no identity or a generation mismatch.
+    pub fn remove_fleet_instance_views_exact(&mut self, expected: InstanceRef) -> bool {
+        let mut removed = false;
+        for tab_idx in (0..self.tabs.len()).rev() {
+            let matching_ids: Vec<usize> = self.tabs[tab_idx]
+                .root()
+                .pane_ids()
+                .into_iter()
+                .filter(|&id| {
+                    self.tabs[tab_idx]
+                        .root()
+                        .find_pane(id)
+                        .is_some_and(|pane| pane.instance_ref == Some(expected))
+                })
+                .collect();
+            if matching_ids.is_empty() {
+                continue;
+            }
+            if matching_ids.len() == self.tabs[tab_idx].root().pane_count() {
+                self.close_tab(tab_idx);
+                removed = true;
+                continue;
+            }
+            for pane_id in matching_ids {
+                if self.tabs[tab_idx].close_pane_by_id(pane_id).is_some() {
+                    removed = true;
+                }
+            }
+        }
+        removed
+    }
+
+    /// Stable identity projection used by session persistence tests and by the
+    /// session writer's identity-aware format.
+    #[cfg(test)]
+    pub(crate) fn session_identity_snapshot(&self) -> Vec<InstanceRef> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.root().pane_ids())
+            .filter_map(|id| {
+                self.tabs
+                    .iter()
+                    .find_map(|tab| tab.root().find_pane(id).and_then(Pane::instance_ref))
+            })
+            .collect()
     }
 
     /// Move a pane from one tab to another, preserving its VTerm, scrollback,
@@ -522,9 +606,15 @@ mod tests {
     fn replace_reappeared_agent_inside_split_without_duplicate_tab() {
         let mut layout = Layout::new();
         layout.push_tab_preserve_focus(Tab::new("team".to_string(), leaf(1, "peer")));
-        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "returning"));
+        let mut returning = leaf(2, "returning");
+        returning.instance_ref = Some(InstanceRef::new(InstanceId::new(), 41));
+        layout.tabs[0].split_focused(SplitDir::Vertical, returning);
         layout.tabs[0].focus_id = 2;
         let mut fresh = leaf(99, "returning");
+        fresh.instance_ref = layout
+            .find_pane_mut(2)
+            .as_deref()
+            .and_then(Pane::instance_ref);
         fresh.display_name = Some("fresh".to_string());
 
         assert!(layout.reconnect_or_append_agent_pane("returning", fresh));

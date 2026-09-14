@@ -32,6 +32,10 @@ pub struct Pane {
     /// inbox identity and cannot drift when a name is reused. Carries
     /// `InstanceId::default()` for non-fleet test panes (never routed).
     pub instance_id: crate::types::InstanceId,
+    /// Exact daemon process identity. `None` is reserved for local shells and
+    /// pre-attach placeholders; managed panes must populate this before they
+    /// can be used by identity-sensitive lifecycle operations.
+    pub instance_ref: Option<crate::types::InstanceRef>,
     pub vterm: VTerm,
     pub rx: crossbeam_channel::Receiver<Vec<u8>>,
     pub id: usize,
@@ -153,6 +157,10 @@ fn thread_cpu_time_us() -> Option<u64> {
 }
 
 impl Pane {
+    pub fn instance_ref(&self) -> Option<crate::types::InstanceRef> {
+        self.instance_ref
+    }
+
     pub fn is_disconnected(&self) -> bool {
         matches!(&self.source, PaneSource::Remote(_, connected) if !connected.load(Ordering::Acquire))
     }
@@ -562,6 +570,7 @@ mod tests {
         Pane {
             agent_name: name.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,
@@ -691,6 +700,7 @@ mod tests {
         Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(cols, rows),
             rx,
             id: 1,

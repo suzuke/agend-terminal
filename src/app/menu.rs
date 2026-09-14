@@ -219,6 +219,7 @@ mod tests {
         let local = Pane {
             agent_name: "shell".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: crate::vterm::VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -240,6 +241,7 @@ mod tests {
         let attached = Pane {
             agent_name: "label".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: crate::vterm::VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 2,
@@ -385,6 +387,7 @@ mod tests {
         Pane {
             agent_name: "menu-test".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: crate::vterm::VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,

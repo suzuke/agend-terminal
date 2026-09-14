@@ -457,13 +457,23 @@ pub(super) fn handle_key(
                     if crate::daemon::find_active_run_dir(ctx.home).is_none() {
                         *notice = Some("delete refused: no active daemon".to_string());
                     } else {
+                        // Capture the exact view identity before the daemon
+                        // delete. A name-only pane (legacy session) is not
+                        // safe to remove after a same-name replacement.
+                        let expected_ref = ctx
+                            .layout
+                            .find_agent_pane(name)
+                            .and_then(|(_, pane_id)| ctx.layout.find_pane_mut(pane_id))
+                            .and_then(|pane| pane.instance_ref());
                         match crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
                             ctx.home,
                             name,
                             None,
                         ) {
                             Ok(()) => {
-                                ctx.layout.remove_fleet_instance_views(name);
+                                if let Some(expected_ref) = expected_ref {
+                                    ctx.layout.remove_fleet_instance_views_exact(expected_ref);
+                                }
                                 *overlay = Overlay::None;
                                 outcome.needs_resize = true;
                             }
@@ -1109,6 +1119,7 @@ mod tests {
         crate::layout::Pane {
             agent_name: name.into(),
             instance_id: id,
+            instance_ref: None,
             vterm: crate::vterm::VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
