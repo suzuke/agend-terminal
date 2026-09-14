@@ -782,4 +782,23 @@ mod tests {
             let _ = std::fs::remove_dir_all(&tmp);
         });
     }
+
+    /// Phase 2 RED: a restart must persist exact Codex thread identity before
+    /// spawning a successor that could otherwise create a fresh context.
+    #[test]
+    fn daemon_restart_checkpoints_codex_before_successor_spawn() {
+        let src = include_str!("restart.rs");
+        let prod_end = src.find("\n#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..prod_end];
+        let checkpoint = prod
+            .find("checkpoint_codex_sessions")
+            .expect("restart must checkpoint Codex sessions");
+        let successor = prod
+            .find("spawn_successor_handoff")
+            .expect("restart must spawn a successor");
+        assert!(
+            checkpoint < successor,
+            "Codex thread checkpoint must precede successor spawn"
+        );
+    }
 }

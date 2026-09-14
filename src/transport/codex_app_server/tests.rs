@@ -374,6 +374,30 @@ fn first_delivery_discovers_the_tui_created_thread_without_precreating_one() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+/// Phase 2 RED: a shutdown checkpoint must discover and persist the exact
+/// thread already loaded by the live Codex app-server, without sending a turn.
+#[test]
+fn checkpoint_persists_loaded_tui_thread_without_delivery() {
+    let home = std::env::temp_dir().join(format!("agend-codex-checkpoint-{}", Uuid::new_v4()));
+    let endpoint = std::env::temp_dir().join(format!("a-{}.sock", Uuid::new_v4()));
+    std::fs::create_dir_all(&home).expect("home");
+    let server = run_fake_codex(&endpoint);
+    let locator = SessionLocator::codex(endpoint.clone(), None);
+    super::super::registry::save_session_locator(&home, "codex-agent", &locator)
+        .expect("write null-thread locator");
+
+    let checkpointed = checkpoint_codex_session(&home, "codex-agent")
+        .expect("checkpoint must discover the loaded Codex thread");
+    assert_eq!(checkpointed.as_deref(), Some("thread-1"));
+    let persisted = super::super::registry::load_session_locator(&home, "codex-agent")
+        .expect("checkpoint must persist the discovered TUI thread");
+    assert_eq!(persisted.thread_id.as_deref(), Some("thread-1"));
+
+    server.join().expect("fake server");
+    let _ = std::fs::remove_file(endpoint);
+    let _ = std::fs::remove_dir_all(home);
+}
+
 #[test]
 fn websocket_handshake_turn_and_event_receipts_are_structured() {
     let home = std::env::temp_dir().join(format!("agend-codex-native-{}", Uuid::new_v4()));
