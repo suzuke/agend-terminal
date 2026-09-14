@@ -8,6 +8,37 @@
 
 use std::path::Path;
 
+/// Discover and persist null Codex thread locators while the agent TUI and
+/// managed app-server are still alive. Shutdown remains best-effort so one
+/// broken backend cannot strand teardown; callers receive counts for the
+/// operator-visible shutdown receipt/log.
+pub(crate) fn checkpoint_codex_sessions(home: &Path, instances: &[String]) -> (usize, usize) {
+    let mut checkpointed = 0usize;
+    let mut failed = 0usize;
+    for instance in instances {
+        match crate::transport::checkpoint_codex_session(home, instance) {
+            Ok(Some(thread_id)) => {
+                tracing::info!(
+                    instance = %instance,
+                    thread_id = %thread_id,
+                    "Codex thread checkpoint persisted before shutdown"
+                );
+                checkpointed += 1;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    instance = %instance,
+                    error = %error,
+                    "Codex thread checkpoint failed before shutdown"
+                );
+                failed += 1;
+            }
+        }
+    }
+    (checkpointed, failed)
+}
+
 /// Per-instance managed-transport teardown invoked from
 /// `shutdown_sequence`. Reuses the single audited
 /// `remove_instance_delivery_state` entry (codex_app_server +

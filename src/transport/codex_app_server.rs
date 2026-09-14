@@ -115,6 +115,38 @@ impl CodexNativeShared {
         }
     }
 
+    /// Checkpoint the exact user thread already loaded by a managed Codex
+    /// app-server. A persisted thread id is already authoritative; a missing
+    /// id is discovered through the same validated app-server handshake used
+    /// by structured delivery, then atomically persisted before the caller can
+    /// tear down the agent/client.
+    pub(crate) fn checkpoint_session(
+        home: &Path,
+        instance: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(locator) = super::registry::codex_attach_locator(home, instance)? else {
+            return Ok(None);
+        };
+        if let Some(thread_id) = locator
+            .thread_id
+            .as_deref()
+            .filter(|thread_id| !thread_id.is_empty())
+        {
+            return Ok(Some(thread_id.to_string()));
+        }
+
+        let mut adapter = Self::new(home, instance);
+        adapter.start_or_attach_blocking(locator)?;
+        let thread_id = adapter
+            .locator
+            .as_ref()
+            .and_then(|locator| locator.thread_id.as_deref())
+            .filter(|thread_id| !thread_id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Codex checkpoint completed without a thread_id"))?;
+        Ok(Some(thread_id))
+    }
+
     pub(crate) fn deliver_blocking(
         &mut self,
         mut envelope: DeliveryEnvelope,
@@ -831,6 +863,32 @@ impl CodexNativeShared {
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("Codex event stream produced no event"))
     }
+}
+
+pub(crate) fn checkpoint_codex_session(
+    home: &Path,
+    instance: &str,
+) -> anyhow::Result<Option<String>> {
+    CodexNativeShared::checkpoint_session(home, instance)
+}
+
+/// Strict restart gate: every configured Codex instance must have an exact
+/// persisted or discoverable thread. A missing locator is not a permission to
+/// start a fresh context during restart.
+pub(crate) fn checkpoint_codex_sessions_strict(
+    home: &Path,
+    instances: &[String],
+) -> anyhow::Result<usize> {
+    let mut checkpointed = 0usize;
+    for instance in instances {
+        if checkpoint_codex_session(home, instance)?.is_none() {
+            return Err(anyhow::anyhow!(
+                "Codex instance {instance:?} has no session locator to checkpoint"
+            ));
+        }
+        checkpointed += 1;
+    }
+    Ok(checkpointed)
 }
 
 fn readiness_failure_detail(error: &anyhow::Error) -> String {

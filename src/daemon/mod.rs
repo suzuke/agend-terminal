@@ -1610,6 +1610,15 @@ pub(crate) fn shutdown_sequence(
         reg.values().map(|handle| handle.name.to_string()).collect()
     };
 
+    let (codex_checkpointed, codex_checkpoint_failed) =
+        shutdown_cleanup::checkpoint_codex_sessions(home, &instance_names);
+    tracing::info!(
+        codex_checkpointed,
+        codex_checkpoint_failed,
+        event = "shutdown_codex_checkpoint_complete",
+        "Codex thread checkpoint phase complete"
+    );
+
     // Drain registry FIRST, then kill. PTY close handlers check the
     // registry — if the agent is gone, they return silently instead of
     // sending crash events. This eliminates all shutdown race conditions.
