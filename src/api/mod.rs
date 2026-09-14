@@ -781,7 +781,11 @@ fn handle_session(
 
         let method = req["method"].as_str().unwrap_or("");
         let params = &req["params"];
-        if method == method::SUBSCRIBE_EVENTS {
+        // Event streaming is a direct API method, so apply the authenticated
+        // principal's capability before entering the long-lived stream.
+        if method == method::SUBSCRIBE_EVENTS
+            && operator_gate::capability_allows_request(principal, method, params)
+        {
             let Some(hub) = event_hub.as_ref() else {
                 let _ = writeln!(
                     writer,
