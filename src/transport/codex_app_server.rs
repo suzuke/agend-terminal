@@ -1199,7 +1199,17 @@ fn launch_managed_server(
     locator: &mut SessionLocator,
     cwd: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let config_args = crate::mcp_config::codex_managed_config_args(home, Some(instance), cwd)?;
+    let mut config_args = crate::mcp_config::codex_managed_config_args(home, Some(instance), cwd)?;
+    // Codex rejects client permission overrides when a remote `resume
+    // <thread_id>` is requested. Apply the same autonomous policy to the
+    // managed app-server so resumed clients can omit that forbidden override
+    // without making AgEnD MCP calls approval-gated.
+    config_args.extend([
+        "-c".to_string(),
+        "approval_policy=\"never\"".to_string(),
+        "-c".to_string(),
+        "sandbox_mode=\"danger-full-access\"".to_string(),
+    ]);
     let cwd = cwd.unwrap_or_else(|| Path::new("."));
     let child = CodexNativeShared::launch(codex, locator, cwd, &config_args)?;
     let pid = child.id();
