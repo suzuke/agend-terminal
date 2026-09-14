@@ -337,7 +337,9 @@ fn event_stream_source(home: &Path, pid: u32) -> Option<String> {
         .trim()
         .parse()
         .ok()?;
-    let cookie_bytes = std::fs::read(run_dir.join("api.cookie")).ok()?;
+    // Event streaming is a direct API method; use the full-capability operator
+    // token rather than the Agent-only MCP tunnel cookie.
+    let cookie_bytes = std::fs::read(run_dir.join("api.operator")).ok()?;
     let stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     let mut writer = stream.try_clone().ok()?;
