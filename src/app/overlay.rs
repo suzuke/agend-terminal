@@ -467,19 +467,15 @@ pub(super) fn handle_key(
                             None,
                         ) {
                             Ok(()) => {
-                                if let Some(expected_ref) = expected_ref {
-                                    if ctx.layout.remove_fleet_instance_views_exact(expected_ref)
-                                        && !super::session::save_session(ctx.home, ctx.layout)
-                                        && !super::session::record_retired_ref(ctx.home, expected_ref)
-                                    {
-                                        tracing::error!(
-                                            name = %name,
-                                            "delete completed but session retirement could not be persisted"
-                                        );
+                                match finish_successful_delete(ctx, name, expected_ref) {
+                                    DeleteCompletion::Close => {
+                                        *overlay = Overlay::None;
+                                        outcome.needs_resize = true;
+                                    }
+                                    DeleteCompletion::Keep { notice: message } => {
+                                        *notice = Some(message);
                                     }
                                 }
-                                *overlay = Overlay::None;
-                                outcome.needs_resize = true;
                             }
                             Err(error) => {
                                 *notice = Some(error);
@@ -1087,6 +1083,30 @@ fn authoritative_instance_ref_for_delete(
         .or_else(|| ctx.layout.unique_instance_ref_for_agent(name))
 }
 
+enum DeleteCompletion {
+    Close,
+    Keep { notice: String },
+}
+
+fn finish_successful_delete(
+    ctx: &mut OverlayCtx<'_>,
+    name: &str,
+    expected_ref: Option<crate::types::InstanceRef>,
+) -> DeleteCompletion {
+    if let Some(expected_ref) = expected_ref {
+        if ctx.layout.remove_fleet_instance_views_exact(expected_ref)
+            && !super::session::save_session(ctx.home, ctx.layout)
+            && !super::session::record_retired_ref(ctx.home, expected_ref)
+        {
+            tracing::error!(
+                name = %name,
+                "delete completed but session retirement could not be persisted"
+            );
+        }
+    }
+    DeleteCompletion::Close
+}
+
 fn submit_task_request(
     tx: &crossbeam_channel::Sender<super::rpc::TaskRequest>,
     arguments: serde_json::Value,
@@ -1264,7 +1284,7 @@ mod tests {
         ));
         let mut name_counter = HashMap::new();
         let mut reap_workers = Vec::new();
-        let mut overlay = Overlay::ConfirmDeleteInstance {
+        let overlay = Overlay::ConfirmDeleteInstance {
             name: "managed".to_string(),
             input: "manage".to_string(),
             notice: None,
@@ -1293,6 +1313,91 @@ mod tests {
                 && notice.contains("type exact name")
         ));
         assert_eq!(layout.tabs.len(), 1, "mismatch must preserve all views");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_persistence_failure_keeps_explicit_retry_state() {
+        let home = dec_home("delete_persistence_retry");
+        let expected_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 91);
+        let mut pane = close_test_pane(crate::types::InstanceId::new(), "managed", Some("managed"));
+        pane.instance_ref = Some(expected_ref);
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(crate::layout::Tab::new("managed".to_string(), pane));
+        assert!(super::super::session::save_session(&home, &layout));
+        assert!(layout.remove_fleet_instance_views_exact(expected_ref));
+        crate::store::fail_next_atomic_write_for_test(&home.join("session.json"));
+        crate::store::fail_next_atomic_write_for_test(&home.join("session.retired.json"));
+
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            reap_workers: &mut reap_workers,
+        };
+        let overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "managed".to_string(),
+            notice: None,
+        };
+        let completion = finish_successful_delete(&mut ctx, "managed", Some(expected_ref));
+
+        assert!(
+            matches!(completion, DeleteCompletion::Keep { notice } if notice.contains("pending")),
+            "failed persistence must leave an explicit retry state"
+        );
+        assert!(matches!(overlay, Overlay::ConfirmDeleteInstance { .. }));
+        assert!(home.join("session.json").exists());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_without_authoritative_identity_fails_closed() {
+        let home = dec_home("delete_missing_identity");
+        let sentinel = br#"{"active_tab":0,"tabs":[]}"#;
+        std::fs::write(home.join("session.json"), sentinel).expect("write session sentinel");
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(crate::layout::Tab::new(
+            "managed".to_string(),
+            close_test_pane(crate::types::InstanceId::new(), "managed", Some("managed")),
+        ));
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            reap_workers: &mut reap_workers,
+        };
+        let overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "managed".to_string(),
+            notice: None,
+        };
+        let completion = finish_successful_delete(&mut ctx, "managed", None);
+
+        assert!(matches!(
+            completion,
+            DeleteCompletion::Keep { notice } if notice.contains("identity")
+        ));
+        assert!(matches!(overlay, Overlay::ConfirmDeleteInstance { .. }));
+        assert_eq!(std::fs::read(home.join("session.json")).unwrap(), sentinel);
         std::fs::remove_dir_all(home).ok();
     }
 
