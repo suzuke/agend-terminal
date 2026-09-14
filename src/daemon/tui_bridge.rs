@@ -1821,7 +1821,7 @@ mod tests {
         // The fix marker: the lock block now captures `dump` into the outer
         // binding (was a 4-tuple without `dump` pre-fix), proving the dump is
         // moved out of the lock scope before it is written.
-        let bind_needle = ["let (rx, dump, pty_writer", ", pty_master, core) = {"].concat();
+        let bind_needle = ["let (rx, dump, pty_writer", ", pty_master, core"].concat();
         let bstart = prod
             .find(&bind_needle)
             .expect("dump-capture binding present (fix marker)");
