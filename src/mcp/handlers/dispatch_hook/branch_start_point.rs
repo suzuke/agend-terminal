@@ -4,7 +4,7 @@
 //! data-loss guard (prefer an existing `origin/<branch>` over `from_ref`) and its
 //! fail-closed state table live inline below, next to the code they govern.
 
-use super::{DispatchError, ErrorCode, Stage, DISPATCH_FETCH_TIMEOUT};
+use super::{DispatchError, ErrorCode, SourceRepoTier, Stage, DISPATCH_FETCH_TIMEOUT};
 use std::path::Path;
 
 /// What provisioning did, and whether the base it used could be trusted.
@@ -46,6 +46,7 @@ impl BranchProvision {
 /// otherwise creates from `from_ref` (the #1755 refresh-then-create path). Returns
 /// a [`BranchProvision`]. `remote` / `from_ref_branch` are the base ref's
 /// resolved remote (`resolve_from_ref_remote`), computed once by the caller.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn create_new_branch(
     home: &Path,
     source: &Path,
@@ -54,6 +55,7 @@ pub(super) fn create_new_branch(
     actor: &str,
     remote: &str,
     from_ref_branch: Option<&str>,
+    source_repo_tier: Option<SourceRepoTier>,
 ) -> Result<BranchProvision, DispatchError> {
     // Step 1.5 (#t-83936-5 data-loss, incident-followup — lead-vetted hybrid):
     // the LOCAL ref is absent, but the branch may ALREADY EXIST on the remote — the
@@ -161,6 +163,45 @@ pub(super) fn create_new_branch(
         }
     }
     if !work_fetch_ok {
+        let source_check =
+            crate::git_helpers::git_bypass(source, &["rev-parse", "--show-toplevel"]);
+        let source_is_repo = matches!(&source_check, Ok(output) if output.status.success());
+        let origin_check = if source_is_repo {
+            Some(crate::git_helpers::git_bypass(
+                source,
+                &["remote", "get-url", "origin"],
+            ))
+        } else {
+            None
+        };
+        let origin_is_configured =
+            matches!(origin_check.as_ref(), Some(Ok(output)) if output.status.success());
+        if !source_is_repo || !origin_is_configured {
+            let resolution = source_repo_tier
+                .map(|tier| format!(" (resolved via {})", tier.label()))
+                .unwrap_or_default();
+            let raw = match (source_check, origin_check) {
+                (Err(error), _) => Some(error.to_string()),
+                (Ok(output), _) if !output.status.success() => {
+                    Some(String::from_utf8_lossy(&output.stderr).trim().to_string())
+                }
+                (_, Some(Err(error))) => Some(error.to_string()),
+                (_, Some(Ok(output))) => {
+                    Some(String::from_utf8_lossy(&output.stderr).trim().to_string())
+                }
+                _ => None,
+            };
+            return Err(DispatchError {
+                message: format!(
+                    "source repository unavailable at '{}'{}: resolved path is not a usable Git repository or has no origin remote; configure source_repo to a valid checkout",
+                    source.display(), resolution
+                ),
+                code: ErrorCode::EnvSourceMissing,
+                stage: Stage::ResolveSourceRepo,
+                fetch_attempted: false,
+                raw,
+            });
+        }
         // origin/<branch> is absent from our view AND we could not refresh it.
         // Discriminate state 3 (fail-open) from state 4 (fail-closed) by whether we
         // have ANY remote-tracking view of origin at all. `refs/remotes/origin/HEAD`
@@ -184,9 +225,18 @@ pub(super) fn create_new_branch(
                 actor,
                 &format!("branch={branch} from_ref={from_ref} refused: no origin remote-tracking view + fetch failed, cannot rule out existing origin/{branch} (#t-83936-5 data-loss guard)"),
             );
+            let resolution = source_repo_tier
+                .map(|tier| {
+                    format!(
+                        " for source repository '{}' (resolved via {})",
+                        source.display(),
+                        tier.label()
+                    )
+                })
+                .unwrap_or_default();
             return Err(DispatchError {
                 message: format!(
-                    "refusing to provision '{branch}': cannot reach origin and have no \
+                    "refusing to provision '{branch}': cannot reach origin{resolution} and have no \
                      remote-tracking view to confirm whether origin/{branch} already exists. \
                      Creating from '{from_ref}' now could silently orphan existing remote \
                      commits on that branch. Restore connectivity and retry."

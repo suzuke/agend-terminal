@@ -177,6 +177,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
                 ErrorCode::ProtectedBranch => "e4_5_protected_branch",
                 ErrorCode::LeaseConflict => "cross_agent_conflict",
                 ErrorCode::StaleWorktreeDir => "stale_worktree_dir",
+                ErrorCode::EnvSourceMissing => "env_source_missing",
                 _ => "lease_failed",
             };
             let mut response = json!({"error": err.message, "code": code});

@@ -5419,10 +5419,8 @@ fn dispatch_path_records_the_stale_base_in_the_signed_binding_3546() {
 #[test]
 fn dispatch_classifies_unusable_source_repo_as_configuration_error_3638() {
     let _guard = crate::mcp::handlers::fleet_test_guard();
-    let home = std::env::temp_dir().join(format!(
-        "agend-3638-unusable-source-{}",
-        std::process::id()
-    ));
+    let home =
+        std::env::temp_dir().join(format!("agend-3638-unusable-source-{}", std::process::id()));
     std::fs::remove_dir_all(&home).ok();
     std::fs::create_dir_all(&home).unwrap();
     let missing = home.join("configured-working-directory");

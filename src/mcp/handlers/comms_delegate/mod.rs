@@ -213,6 +213,10 @@ fn maybe_auto_bind_lease(
             }
             return result;
         }
+        if e.code == dispatch_hook::ErrorCode::EnvSourceMissing {
+            result["code"] = serde_json::to_value(e.code).unwrap_or(Value::Null);
+            result["stage"] = serde_json::to_value(e.stage).unwrap_or(Value::Null);
+        }
         if expected_head.is_some()
             && matches!(
                 e.code,

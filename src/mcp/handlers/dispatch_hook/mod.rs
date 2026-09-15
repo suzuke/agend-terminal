@@ -409,7 +409,14 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             crate::git_helpers::default_branch(&source_repo)
         );
         let base = expected_head.as_deref().unwrap_or(&default_base);
-        let provision = ensure_branch_exists_provisioned(home, &source_repo, branch, base, target)?;
+        let provision = ensure_branch_exists_provisioned_with_context(
+            home,
+            &source_repo,
+            branch,
+            base,
+            target,
+            Some(source_repo_tier),
+        )?;
         (
             provision.created,
             provision.fetch_attempted,
@@ -720,6 +727,17 @@ pub(crate) fn ensure_branch_exists_provisioned(
     from_ref: &str,
     actor: &str,
 ) -> Result<BranchProvision, DispatchError> {
+    ensure_branch_exists_provisioned_with_context(home, source, branch, from_ref, actor, None)
+}
+
+fn ensure_branch_exists_provisioned_with_context(
+    home: &Path,
+    source: &Path,
+    branch: &str,
+    from_ref: &str,
+    actor: &str,
+    source_repo_tier: Option<SourceRepoTier>,
+) -> Result<BranchProvision, DispatchError> {
     // CR-2026-06-14 F1 (security): validate `branch` before it reaches
     // `git branch <branch>` as a positional (arg-injection: `--upload-pack=...`).
     if !crate::agent_ops::validate_branch(branch) {
@@ -908,6 +926,7 @@ pub(crate) fn ensure_branch_exists_provisioned(
         actor,
         &remote,
         from_ref_branch.as_deref(),
+        source_repo_tier,
     )
 }
 

@@ -90,6 +90,18 @@ pub enum SourceRepoTier {
     Stub,
 }
 
+impl SourceRepoTier {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Override => "override",
+            Self::FleetSourceRepo => "fleet_source_repo",
+            Self::TeamSourceRepo => "team_source_repo",
+            Self::WorkingDirectory => "working_directory",
+            Self::Stub => "stub",
+        }
+    }
+}
+
 /// Pipeline stage that produced a [`DispatchError`]. Coarse enough to
 /// remain stable across refactors, fine enough to debug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -129,7 +141,8 @@ pub enum Stage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
-    /// A configured fleet environment source was absent or non-Unicode.
+    /// A configured fleet environment source or source repository was absent
+    /// or unusable.
     EnvSourceMissing,
     /// `expected_head` was not a full 40/64-hex SHA.
     InvalidExpectedHead,
