@@ -1371,8 +1371,7 @@ mod tests {
 
         let target_drag = drag_left_at(15, 5);
         assert_eq!(
-            super::pane_for_mouse_forward(&layout, &target_drag)
-                .map(|(pane_id, _, _)| pane_id),
+            super::pane_for_mouse_forward(&layout, &target_drag).map(|(pane_id, _, _)| pane_id),
             Some(2),
             "test precondition: target body must be a real mouse-forward target"
         );
@@ -1398,7 +1397,10 @@ mod tests {
             &empty_registry(),
             None,
         );
-        assert!(up_out.needs_resize, "completed pane swap must request resize");
+        assert!(
+            up_out.needs_resize,
+            "completed pane swap must request resize"
+        );
         assert_eq!(
             layout.tabs[0].root().pane_ids(),
             vec![2, 1],
