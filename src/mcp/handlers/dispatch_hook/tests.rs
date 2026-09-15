@@ -5412,6 +5412,100 @@ fn dispatch_path_records_the_stale_base_in_the_signed_binding_3546() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3638: a missing or unusable configured working directory must not be
+/// reported as an origin connectivity outage. Drive the production dispatch
+/// seam so the source-resolution fallback and branch-provisioning guard are
+/// exercised together.
+#[test]
+fn dispatch_classifies_unusable_source_repo_as_configuration_error_3638() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = std::env::temp_dir().join(format!(
+        "agend-3638-unusable-source-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).unwrap();
+    let missing = home.join("configured-working-directory");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  target-agent:\n    backend: claude\n    working_directory: {}\n",
+            missing.display()
+        ),
+    )
+    .unwrap();
+
+    let err = super::dispatch_auto_bind_lease_with_source_and_chain(
+        &home,
+        "target-agent",
+        "task-3638-unusable",
+        "feat/3638-unusable",
+        None,
+        None,
+        None,
+        &[],
+        None,
+        false,
+    )
+    .expect_err("an unavailable source repository must fail closed");
+
+    assert_eq!(err.code, super::ErrorCode::EnvSourceMissing);
+    assert_eq!(err.stage, super::Stage::ResolveSourceRepo);
+    assert!(err.message.contains(&missing.display().to_string()));
+    assert!(err.message.contains("working_directory"));
+    assert!(!err.message.contains("cannot reach origin"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3638 negative control: a valid configured Git repository whose origin is
+/// unreachable remains the existing fail-closed connectivity error.
+#[test]
+fn dispatch_preserves_connectivity_error_for_unreachable_origin_3638() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = std::env::temp_dir().join(format!(
+        "agend-3638-unreachable-origin-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).unwrap();
+    let repo = setup_test_repo(&home, "target-agent");
+    std::process::Command::new("git")
+        .args(["update-ref", "-d", "refs/remotes/origin/main"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  target-agent:\n    backend: claude\n    source_repo: {}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+
+    let err = super::dispatch_auto_bind_lease_with_source_and_chain(
+        &home,
+        "target-agent",
+        "task-3638-unreachable",
+        "feat/3638-unreachable",
+        None,
+        None,
+        None,
+        &[],
+        None,
+        false,
+    )
+    .expect_err("an unreachable origin with no tracking view must fail closed");
+
+    assert_eq!(err.code, super::ErrorCode::FetchFailed);
+    assert_eq!(err.stage, super::Stage::Fetch);
+    assert!(err.message.contains("cannot reach origin"));
+    assert!(err.message.contains(&repo.display().to_string()));
+    assert!(err.message.contains("fleet_source_repo"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #3546 R1 blocker 2 (the reviewer's P1 shape): an existing local branch that was
 /// never pushed, with origin perfectly reachable, must NOT be flagged.
 ///
