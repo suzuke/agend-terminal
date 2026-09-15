@@ -4377,20 +4377,20 @@ fn task_done_accepts_clean_squash_merged_branch_but_rejects_real_work() {
 
     let runtime = crate::paths::runtime_dir(&home).join("dev");
     std::fs::create_dir_all(&runtime).unwrap();
-    std::fs::write(
-        runtime.join("binding.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "agent": "dev",
-            "task_id": task_id,
-            "branch": branch,
-            "worktree": repo,
-            "source_repo": repo,
-            "issued_at": "2026-07-30T00:00:00Z",
-        }))
-        .unwrap(),
-    )
+    let binding_body = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "agent": "dev",
+        "task_id": task_id,
+        "branch": branch,
+        "worktree": repo,
+        "source_repo": repo,
+        "issued_at": "2026-07-30T00:00:00Z",
+    }))
     .unwrap();
+    std::fs::write(runtime.join("binding.json"), &binding_body).unwrap();
+    let binding_signature =
+        agentic_git_core::integrity_core::sign_binding(&home, &binding_body).unwrap();
+    std::fs::write(runtime.join("binding.json.sig"), binding_signature).unwrap();
 
     let ahead = {
         let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
