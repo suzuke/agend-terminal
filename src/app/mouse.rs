@@ -1322,6 +1322,82 @@ mod tests {
         );
     }
 
+    /// #3657 immutable RED: a title drag released over a mouse-forwarding
+    /// target must still complete through the real top-level `handle()` path.
+    /// The source title Down is local; the target-body Drag and Up must remain
+    /// local continuation events for the active pane drag.
+    #[test]
+    #[serial]
+    fn title_drag_through_forwarded_target_body_swaps_and_clears_3657() {
+        let _home = ScopedHome::new("title-drag-forwarded-target");
+
+        let mut layout = two_pane_layout("opencode");
+        layout.tabs[0].focus_id = 2;
+        enable_opencode_mouse(layout.tabs[0].root_mut().find_pane_mut(2).unwrap());
+
+        let source_down = down_left_at(2, 1);
+        assert_eq!(
+            layout.tabs[0].title_bar_at(2, 1),
+            Some(1),
+            "test precondition: source Down must hit pane 1 title text"
+        );
+
+        let mut state = MouseState::default();
+        let fleet_path = std::path::Path::new("/nonexistent/fleet.yaml");
+        let down_out = super::handle(
+            source_down,
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+            None,
+        );
+        assert!(!down_out.needs_resize);
+        assert_eq!(layout.tabs[0].dragging_pane, Some(1));
+
+        let target_drag = drag_left_at(15, 5);
+        assert_eq!(
+            super::pane_for_mouse_forward(&layout, &target_drag)
+                .map(|(pane_id, _, _)| pane_id),
+            Some(2),
+            "test precondition: target body must be a real mouse-forward target"
+        );
+        super::handle(
+            target_drag,
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+            None,
+        );
+        assert_eq!(
+            layout.tabs[0].drag_target,
+            Some(2),
+            "active local pane drag must record the target under the cursor"
+        );
+
+        let up_out = super::handle(
+            up_left_at(15, 5),
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+            None,
+        );
+        assert!(up_out.needs_resize, "completed pane swap must request resize");
+        assert_eq!(
+            layout.tabs[0].root().find_pane(1).unwrap().agent_name,
+            "opencode".into()
+        );
+        assert_eq!(
+            layout.tabs[0].root().find_pane(2).unwrap().agent_name,
+            "left".into()
+        );
+        assert_eq!(layout.tabs[0].dragging_pane, None);
+        assert_eq!(layout.tabs[0].drag_target, None);
+        assert_eq!(layout.tabs[0].drag_target_tab, None);
+    }
+
     // ----- #92758-3: a left-click dismisses a stale selection anywhere -----
 
     fn wide_selection() -> crate::layout::Selection {
