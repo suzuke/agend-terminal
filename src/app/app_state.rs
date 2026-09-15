@@ -1970,6 +1970,22 @@ mod tests {
     }
 
     #[test]
+    fn restart_state_has_bounded_pending_cleanup_and_pre_registration_delete_buffer_3649() {
+        let source = include_str!("app_state.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            source.contains("REMOTE_RESTART_PENDING_TTL"),
+            "pending restart state must have an explicit bounded lifetime"
+        );
+        assert!(
+            source.contains("pending_restart_deletes"),
+            "deletes observed before request registration must be buffered"
+        );
+    }
+
+    #[test]
     fn same_name_remote_replacement_cannot_overwrite_retained_pane_3625() {
         let home = team_fixture_home("identity-replacement");
         let mut state = AppState::new();

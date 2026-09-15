@@ -896,14 +896,14 @@ mod tests {
     }
 
     #[test]
-    fn remote_restart_worker_teardown_unblocks_full_outcome_queue_3649() {
+    fn remote_restart_worker_blocks_on_outcome_capacity_until_receiver_closes_3649() {
         for round in 0..32 {
             let home = std::env::temp_dir().join(format!(
                 "remote-restart-worker-teardown-{round}-{}",
                 crate::types::InstanceId::new()
             ));
             let (request_tx, outcome_rx, worker) = super::spawn_remote_restart_worker(&home);
-            for index in 0..16 {
+            for index in 0..17 {
                 request_tx
                     .send(super::super::commands::RemoteRestartRequest {
                         restart_id: format!("restart-{round}-{index}"),
@@ -915,6 +915,14 @@ mod tests {
                     .expect("worker request queue open");
             }
             drop(request_tx);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while worker.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                !worker.is_finished(),
+                "worker must block on the 17th outcome until the receiver closes"
+            );
             drop(outcome_rx);
             worker.join().expect("remote restart worker joined cleanly");
         }

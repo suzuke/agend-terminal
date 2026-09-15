@@ -2304,6 +2304,24 @@ mod probe_poll_tests {
     }
 
     #[test]
+    fn remote_restart_teardown_drops_outcome_receiver_before_join_3649() {
+        let source = include_str!("mod.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        let drop_at = source
+            .find("drop(remote_restart_outcome_rx)")
+            .expect("teardown must close the outcome receiver");
+        let join_at = source
+            .find("remote_restart_worker.join()")
+            .expect("teardown must join the restart worker");
+        assert!(
+            drop_at < join_at,
+            "closing the outcome receiver must precede joining the worker"
+        );
+    }
+
+    #[test]
     fn preflight_failure_aborts_gate_to_serving_no_commit() {
         let (probe, _rx) = exited_probe(1);
         let gate = AppRestartGate::new();

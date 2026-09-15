@@ -43,6 +43,35 @@ fn start_instance_rejects_missing_env_source_with_structured_error_3540_r1() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn restart_with_runtime_missing_predecessor_refuses_caller_identity_3649() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("restart-authority-missing");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev:\n    backend: claude\n    args: []\n",
+    )
+    .unwrap();
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    let requested = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+    let result = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({
+            "instance": "dev",
+            "mode": "resume",
+            "force": true,
+            "old_instance_ref": requested,
+        }),
+        Some(&runtime),
+    );
+    assert_eq!(
+        result["code"], "restart_identity_unavailable",
+        "runtime authority must refuse when the predecessor is absent: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2454 residual RED: pure generated-member team mode must route a live MCP
 /// RuntimeContext directly to the merged typed CREATE_TEAM owner. The missing
 /// owner wire-up currently tries the API socket and therefore reports its
