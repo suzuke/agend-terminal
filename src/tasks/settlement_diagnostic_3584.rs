@@ -425,7 +425,7 @@ fn rebind_before_report_preserves_new_work_3584() {
 }
 
 #[test]
-fn valid_receipt_unrelated_binding_denies_but_unbound_permits_3584() {
+fn valid_receipt_unrelated_legacy_binding_permits_3584() {
     let home = Home::new();
     let id = task(&home);
     let proof = receipt(&id);
@@ -435,15 +435,11 @@ fn valid_receipt_unrelated_binding_denies_but_unbound_permits_3584() {
     std::fs::create_dir_all(&runtime).unwrap();
     crate::store::save_atomic(&binding, &json!({"version":1,"agent":"dev","task_id":"unrelated","branch":"fix/unrelated","worktree":home.0,"source_repo":home.0})).unwrap();
     assert!(crate::binding::read(&home.0, "dev").is_some());
-    let denied = done(&home, &id);
-    assert_eq!(denied["code"], "assignee_completion_blocked", "{denied}");
-    assert!(crate::merge_receipt::find_for_task_completion(&home.0, &id, "dev").is_some());
-    // Same receipt and task, only the unrelated isolated binding removed.
-    crate::binding::unbind(&home.0, "dev");
-    assert!(crate::binding::read(&home.0, "dev").is_none());
     let accepted = done(&home, &id);
     assert_eq!(accepted["status"], "done", "{accepted}");
     assert!(crate::merge_receipt::find_for_task_completion(&home.0, &id, "dev").is_none());
+    // Receipt completion must not release or rewrite an unrelated workspace.
+    assert!(crate::binding::read(&home.0, "dev").is_some());
 }
 
 #[test]
