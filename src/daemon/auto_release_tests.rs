@@ -1120,6 +1120,7 @@ fn merged_task_is_auto_closed_before_release_with_receipt() {
 }
 
 #[test]
+#[tracing_test::traced_test]
 fn integration_open_pr_retains_via_real_handler() {
     let home = tmp_home("itest-open");
     write_fleet(&home, "dev");
@@ -1142,6 +1143,10 @@ fn integration_open_pr_retains_via_real_handler() {
         "open PR → NOT released (binding stays)"
     );
     assert_eq!(queue_len(&home), 1, "open-PR intent retained for retry");
+    assert!(
+        logs_contain("reason=ObservedOpen") && logs_contain("retaining for retry"),
+        "open-PR retain must be visible at info with a bounded reason"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
