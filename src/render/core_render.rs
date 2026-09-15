@@ -976,7 +976,12 @@ fn pane_title_segments_with_team(
         .map(|(name, view)| view.badge(name, pane.instance_ref().as_ref()))
     {
         let (text, style) = match badge {
-            LeadBadge::Lead => (" [LEAD]".to_string(), title_style),
+            LeadBadge::Lead => (
+                " [LEAD]".to_string(),
+                title_style
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
             LeadBadge::Uncertain => (
                 " [LEAD?]".to_string(),
                 title_style.fg(Color::Red).add_modifier(Modifier::BOLD),

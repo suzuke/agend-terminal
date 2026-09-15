@@ -103,8 +103,15 @@ impl TeamView {
         live_roster: Option<HashMap<String, InstanceRef>>,
         previous: Option<&Self>,
     ) -> Self {
-        if !path.exists() {
-            return Self::from_fleet(FleetConfig::default(), live_roster);
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self::from_fleet(FleetConfig::default(), live_roster);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "team view fleet config unavailable");
+                return previous.map(Self::stale).unwrap_or_else(Self::empty);
+            }
         }
         let config = match FleetConfig::load(path) {
             Ok(config) => config,
@@ -119,9 +126,7 @@ impl TeamView {
                 return Self::stale(previous);
             }
         }
-        if let Some(previous) = previous {
-            view.last_roster = previous.last_roster.clone();
-        }
+        view.last_roster = view.current_roster.clone();
         view
     }
 
