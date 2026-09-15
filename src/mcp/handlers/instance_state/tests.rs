@@ -974,7 +974,11 @@ fn concurrent_restart_admission_has_one_winner_per_target_3649() {
     ));
     let home = &home;
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-    let winners = std::thread::scope(|scope| {
+    // Join every contender before dropping any successful guard. Dropping the
+    // first winner while later handles are still being joined turns this test
+    // into a scheduling race: a delayed contender can acquire the slot after
+    // the first restart has already been cleaned up.
+    let admissions = std::thread::scope(|scope| {
         let handles = (0..8)
             .map(|index| {
                 let barrier = std::sync::Arc::clone(&barrier);
@@ -987,10 +991,12 @@ fn concurrent_restart_admission_has_one_winner_per_target_3649() {
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .filter_map(|handle| handle.join().expect("admission worker panicked"))
-            .count()
+            .map(|handle| handle.join().expect("admission worker panicked"))
+            .collect::<Vec<_>>()
     });
+    let winners = admissions.iter().filter(|admission| admission.is_some()).count();
     assert_eq!(winners, 1);
+    drop(admissions);
 }
 
 /// must-follow ②: the self-kick flag is INDEPENDENT — set ONLY by the
