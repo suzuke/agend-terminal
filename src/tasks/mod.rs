@@ -244,6 +244,9 @@ fn assignee_binding_check(
                     .to_string()
             });
     }
+    if !signature_valid {
+        return Err("assignee completion binding signature is invalid or missing".to_string());
+    }
     let binding = binding.ok_or_else(|| "assignee binding unavailable".to_string())?;
     let binding_agent = binding["agent"].as_str();
     let binding_task = binding["task_id"].as_str();
