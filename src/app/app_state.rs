@@ -2417,15 +2417,7 @@ mod attach_backoff_3505_tests {
     /// Reintroducing inline arithmetic here must go red.
     #[test]
     fn skip_branch_routes_through_shared_advance_deferred_3505() {
-        let src = include_str!("app_state.rs");
-        let reconcile_at = src
-            .find("fn reconcile_remote_roster(")
-            .expect("reconcile_remote_roster must exist");
-        let region = &src[reconcile_at..];
-        let end = region
-            .find("fn reconcile_pending_remote_roster(")
-            .expect("region end must exist");
-        let body = &region[..end];
+        let body = include_str!("app_state_remote.rs");
         assert!(
             body.contains("advance_deferred(fails)"),
             "skip branch must call the shared advance_deferred(fails)"
