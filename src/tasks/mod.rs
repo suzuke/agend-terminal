@@ -217,7 +217,23 @@ fn assignee_binding_check(
             && value["source_repo"].as_str().is_some_and(|s| !s.is_empty())
             && value["worktree"].as_str().is_some_and(|s| !s.is_empty())
     });
-    if binding.is_none() || prior_task_binding {
+    // A legacy binding can predate the HMAC sidecar and therefore cannot be
+    // used as completion authority. When it explicitly names a different
+    // task, however, it is unrelated to this receipt-backed completion and
+    // must not become a false denial. The receipt remains the sole authority;
+    // this arm never cleans or releases the legacy workspace. Present-but-
+    // invalid modern signatures stay fail-closed below.
+    let unrelated_legacy_binding = binding.as_ref().is_some_and(|value| {
+        !signature_valid
+            && value.get("issued_at").is_none()
+            && value["agent"].as_str() == Some(caller)
+            && value["task_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty() && id != task_id)
+            && value["branch"].as_str().is_some_and(|s| !s.is_empty())
+            && value["worktree"].as_str().is_some_and(|s| !s.is_empty())
+    });
+    if binding.is_none() || prior_task_binding || unrelated_legacy_binding {
         return crate::merge_receipt::find_for_task_completion(home, task_id, caller)
             .map(Some)
             .ok_or_else(|| {
