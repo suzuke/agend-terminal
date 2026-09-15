@@ -200,6 +200,44 @@ pub(super) fn create_instance(
     )
 }
 
+/// Restart a daemon-owned instance through the authenticated daemon API.
+pub(super) fn restart_instance(home: &Path, name: &str) -> Result<(), String> {
+    restart_instance_with(home, name, resolve_active_run_dir, call_tool_at)
+}
+
+fn restart_instance_with<R, C>(
+    home: &Path,
+    name: &str,
+    resolver: R,
+    caller: C,
+) -> Result<(), String>
+where
+    R: Fn(&Path) -> Option<PathBuf>,
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
+    let Some(run_dir) = resolver(home) else {
+        return Err("no active daemon (run dir not found)".to_string());
+    };
+    let result = caller(
+        &run_dir,
+        "restart_instance",
+        serde_json::json!({
+            "instance": name,
+            "mode": "resume",
+            "reason": "manual TUI :restart",
+        }),
+        std::time::Duration::from_secs(60),
+    )?;
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        return Err(error.to_string());
+    }
+    if result.get("spawned").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!("daemon restart_instance did not spawn '{name}'"))
+    }
+}
+
 fn create_instance_with<R, C>(
     home: &Path,
     name: &str,

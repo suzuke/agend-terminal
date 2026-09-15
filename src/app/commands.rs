@@ -336,6 +336,13 @@ pub(crate) fn tab_complete(
 /// completion list) — `command_specs_match_execute_arms_bidirectional` asserts the
 /// two sets are exactly equal (both directions).
 pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
+    execute_with_restart(cmd, ctx, super::rpc::restart_instance)
+}
+
+fn execute_with_restart<F>(cmd: &str, ctx: &mut CommandCtx<'_>, _restart_instance: F) -> bool
+where
+    F: Fn(&Path, &str) -> Result<(), String>,
+{
     let parts: Vec<&str> = cmd.trim().splitn(3, ' ').collect();
     if parts.is_empty() {
         return false;
@@ -749,6 +756,59 @@ mod tests {
             offthread: None,
             _fwd_cancel: None,
         }
+    }
+
+    fn remote_test_pane(id: usize, agent: &str, fleet_name: &str) -> (Pane, std::net::TcpStream) {
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind((crate::ipc::LOOPBACK, 0)).expect("bind test bridge");
+        let client_stream = TcpStream::connect(listener.local_addr().expect("listener addr"))
+            .expect("connect test bridge");
+        let (server_stream, _) = listener.accept().expect("accept test bridge");
+        let client = crate::bridge_client::BridgeClient::from_stream_for_test(client_stream);
+        let mut pane = test_pane(id, agent, Some(fleet_name));
+        pane.source = PaneSource::Remote(
+            std::sync::Arc::new(parking_lot::Mutex::new(client)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        (pane, server_stream)
+    }
+
+    /// RED for #3642: the real command dispatcher must hand a daemon-owned
+    /// Remote pane to the daemon, even when the local pane has no backend.
+    #[test]
+    fn tui_restart_remote_real_command_entry_uses_daemon_authority() {
+        let registry = empty_registry();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = Layout::new();
+        let (remote, _server) = remote_test_pane(7, "agent", "fleet-agent");
+        layout.add_tab(Tab::new("agent".to_string(), remote));
+        let mut name_counter = HashMap::new();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: Path::new("/home"),
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+        };
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let calls_for_restart = std::sync::Arc::clone(&calls);
+
+        let resized = execute_with_restart("restart agent", &mut ctx, move |_home, name| {
+            calls_for_restart.lock().push(name.to_string());
+            Ok(())
+        });
+
+        assert!(
+            !resized,
+            "daemon restart does not replace the layout locally"
+        );
+        assert_eq!(&*calls.lock(), &["fleet-agent"]);
+        assert_eq!(layout.tabs.len(), 1);
+        let pane = layout.tabs[0]
+            .root()
+            .find_pane(7)
+            .expect("remote pane retained until daemon roster refresh");
+        assert!(matches!(pane.source, PaneSource::Remote(_, _)));
     }
 
     #[test]
