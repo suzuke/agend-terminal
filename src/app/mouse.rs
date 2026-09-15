@@ -161,7 +161,7 @@ fn handle_down(
         .then(|| {
             layout
                 .active_tab()
-                .and_then(|tab| tab.title_bar_at(mouse.column, mouse.row))
+                .and_then(|tab| tab.title_bar_at_with_team(mouse.column, mouse.row, team_view))
         })
         .flatten();
     if let Some(pane_id) = title_hit {

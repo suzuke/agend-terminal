@@ -189,6 +189,24 @@ impl TeamView {
         self.member_team.get(member).map(String::as_str)
     }
 
+    pub(crate) fn orchestrator_for_team(&self, team: &str) -> Option<&str> {
+        self.teams
+            .get(team)
+            .map(|record| record.orchestrator.as_str())
+    }
+
+    pub(crate) fn authoritative_lead_for_members<'a, I>(&self, members: I) -> Option<&str>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let team = self.authoritative_tab_name(members)?;
+        self.orchestrator_for_team(team)
+    }
+
+    pub(crate) fn roster_summary(&self) -> (usize, bool) {
+        (self.current_roster.len(), self.roster_live)
+    }
+
     /// Return a team label only when every pane belongs to the same
     /// authoritative team. `Tab::name` is intentionally not consulted.
     pub(crate) fn authoritative_tab_name<'a, I>(&self, members: I) -> Option<&str>

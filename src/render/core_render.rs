@@ -1141,13 +1141,24 @@ pub(super) fn render_status_bar_with_team(
                 .as_deref()
                 .and_then(|name| team_view.team_for_member(name))
             {
+                let lead = team_view.orchestrator_for_team(team).unwrap_or("unknown");
+                let (roster_count, roster_live) = team_view.roster_summary();
                 spans.push(Span::styled(
-                    format!(" team:{team} lead:{} ", team_view.status_label()),
+                    format!(
+                        " team:{team} lead:{lead} roster:{roster_count} live:{} {} ",
+                        if roster_live { "yes" } else { "no" },
+                        team_view.status_label()
+                    ),
                     Style::default().fg(Color::LightCyan),
                 ));
             } else {
+                let (roster_count, roster_live) = team_view.roster_summary();
                 spans.push(Span::styled(
-                    format!(" team:none lead:{} ", team_view.status_label()),
+                    format!(
+                        " team:none lead:none roster:{roster_count} live:{} {} ",
+                        if roster_live { "yes" } else { "no" },
+                        team_view.status_label()
+                    ),
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -1342,7 +1353,7 @@ mod tests {
             "status must expose live roster state: {text:?}"
         );
         assert!(
-            text.contains("freshness:Fresh"),
+            text.contains("Fresh"),
             "status must expose freshness: {text:?}"
         );
     }

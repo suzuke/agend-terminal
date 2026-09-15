@@ -134,12 +134,37 @@ impl Tab {
         } else {
             ""
         };
-        let name = team_view
-            .and_then(|view| {
-                view.authoritative_tab_name(self.root().agent_names().iter().map(String::as_str))
+        let pane_ids = self.root().pane_ids();
+        let members: Vec<&str> = pane_ids
+            .iter()
+            .filter_map(|id| {
+                self.root()
+                    .find_pane(*id)
+                    .and_then(|pane| pane.fleet_instance_name.as_deref())
             })
+            .collect();
+        let all_have_identity = members.len() == pane_ids.len();
+        let name = team_view
+            .filter(|_| all_have_identity)
+            .and_then(|view| view.authoritative_tab_name(members.iter().copied()))
             .unwrap_or(self.name.as_str());
-        format!(" {name}{notif_badge} ")
+        let lead_badge = team_view
+            .filter(|_| all_have_identity)
+            .and_then(|view| {
+                let lead = view.authoritative_lead_for_members(members.iter().copied())?;
+                let pane = pane_ids.iter().find_map(|id| {
+                    self.root()
+                        .find_pane(*id)
+                        .filter(|pane| pane.fleet_instance_name.as_deref() == Some(lead))
+                })?;
+                match view.badge(lead, pane.instance_ref.as_ref()) {
+                    crate::team_view::LeadBadge::Lead => Some(" [LEAD]"),
+                    crate::team_view::LeadBadge::Uncertain => Some(" [LEAD?]"),
+                    crate::team_view::LeadBadge::None => None,
+                }
+            })
+            .unwrap_or("");
+        format!(" {name}{lead_badge}{notif_badge} ")
     }
 
     pub fn focused_pane(&self) -> Option<&Pane> {
@@ -329,10 +354,10 @@ impl Tab {
         &self,
         col: u16,
         row: u16,
-        _team_view: Option<&crate::team_view::TeamView>,
+        team_view: Option<&crate::team_view::TeamView>,
     ) -> Option<usize> {
         use unicode_width::UnicodeWidthStr;
-        for (&id, &(px, py, _pw, _ph)) in &self.pane_rects {
+        for (&id, &(px, py, pw, _ph)) in &self.pane_rects {
             if row != py {
                 continue;
             }
@@ -343,9 +368,31 @@ impl Tab {
             // Hit area covers only the rendered ` {label} ` region starting
             // at px+1 (first col is the border glyph). Clicks outside the
             // label text fall through to border resize handling.
-            let label_w = UnicodeWidthStr::width(pane.label()) as u16;
+            let available = pw.saturating_sub(2);
+            let base_w = UnicodeWidthStr::width(pane.label()) as u16 + 1;
+            let badge_w = pane
+                .fleet_instance_name
+                .as_deref()
+                .zip(team_view)
+                .and_then(
+                    |(name, view)| match view.badge(name, pane.instance_ref.as_ref()) {
+                        crate::team_view::LeadBadge::Lead => {
+                            Some(UnicodeWidthStr::width(" [LEAD]"))
+                        }
+                        crate::team_view::LeadBadge::Uncertain => {
+                            Some(UnicodeWidthStr::width(" [LEAD?]"))
+                        }
+                        crate::team_view::LeadBadge::None => None,
+                    },
+                )
+                .map(|width| width as u16);
+            let hit_width = match badge_w {
+                Some(badge_w) if available <= badge_w => available,
+                Some(badge_w) => base_w.min(available - badge_w) + badge_w,
+                None => base_w + 1,
+            };
             let hit_start = px + 1;
-            let hit_end = hit_start + label_w + 2; // leading space + label + trailing space
+            let hit_end = hit_start + hit_width;
             if col >= hit_start && col < hit_end {
                 return Some(id);
             }
