@@ -339,7 +339,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
     execute_with_restart(cmd, ctx, super::rpc::restart_instance)
 }
 
-fn execute_with_restart<F>(cmd: &str, ctx: &mut CommandCtx<'_>, _restart_instance: F) -> bool
+fn execute_with_restart<F>(cmd: &str, ctx: &mut CommandCtx<'_>, restart_instance: F) -> bool
 where
     F: Fn(&Path, &str) -> Result<(), String>,
 {
@@ -466,18 +466,22 @@ where
                 // Single pass: find pane info, fleet name, and location
                 #[allow(clippy::type_complexity)]
                 let mut pane_info: Option<(
-                    String,
+                    Option<String>,
                     Option<PathBuf>,
                     Option<String>,
                     Option<String>,
+                    bool,
                 )> = None;
                 let mut pane_loc: Option<(usize, usize)> = None;
                 'outer: for (ti, tab) in ctx.layout.tabs.iter().enumerate() {
                     for id in tab.root().pane_ids() {
                         if let Some(p) = tab.root().find_pane(id) {
                             if p.agent_name.as_str() == name {
+                                let is_remote =
+                                    matches!(&p.source, crate::layout::PaneSource::Remote(_, _));
                                 let cmd = match &p.backend {
-                                    Some(b) => b.preset().command.to_string(),
+                                    Some(b) => Some(b.preset().command.to_string()),
+                                    None if is_remote => None,
                                     None => {
                                         tracing::warn!(agent = name, "cannot restart shell pane");
                                         break 'outer;
@@ -488,6 +492,7 @@ where
                                     p.working_dir.clone(),
                                     p.display_name.clone(),
                                     p.fleet_instance_name.clone(),
+                                    is_remote,
                                 ));
                                 pane_loc = Some((ti, id));
                                 break 'outer;
@@ -496,7 +501,40 @@ where
                     }
                 }
 
-                if let Some((backend_cmd, work_dir, display_name, fleet_name)) = pane_info {
+                if let Some((backend_cmd, work_dir, display_name, fleet_name, is_remote)) =
+                    pane_info
+                {
+                    if is_remote {
+                        let Some(fleet_name) = fleet_name.as_deref() else {
+                            tracing::warn!(
+                                agent = name,
+                                "cannot restart remote pane without fleet instance identity"
+                            );
+                            return false;
+                        };
+                        match restart_instance(ctx.home, fleet_name) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    agent = name,
+                                    fleet_instance = fleet_name,
+                                    "requested daemon-owned remote restart"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    agent = name,
+                                    fleet_instance = fleet_name,
+                                    error = %error,
+                                    "daemon-owned remote restart failed"
+                                );
+                            }
+                        }
+                        return false;
+                    }
+
+                    let Some(backend_cmd) = backend_cmd else {
+                        return false;
+                    };
                     super::kill_agent(ctx.home, ctx.registry, &name);
 
                     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
@@ -809,6 +847,35 @@ mod tests {
             .find_pane(7)
             .expect("remote pane retained until daemon roster refresh");
         assert!(matches!(pane.source, PaneSource::Remote(_, _)));
+    }
+
+    #[test]
+    fn tui_restart_remote_rpc_failure_keeps_existing_pane() {
+        let registry = empty_registry();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = Layout::new();
+        let (remote, _server) = remote_test_pane(8, "agent", "fleet-agent");
+        layout.add_tab(Tab::new("agent".to_string(), remote));
+        let mut name_counter = HashMap::new();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: Path::new("/home"),
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+        };
+
+        let resized = execute_with_restart("restart agent", &mut ctx, |_home, _name| {
+            Err("daemon unavailable".to_string())
+        });
+
+        assert!(!resized);
+        assert_eq!(layout.tabs.len(), 1);
+        assert!(layout.tabs[0].root().find_pane(8).is_some());
+        assert!(layout.tabs[0]
+            .root()
+            .find_pane(8)
+            .is_some_and(|pane| matches!(pane.source, PaneSource::Remote(_, _))));
     }
 
     #[test]

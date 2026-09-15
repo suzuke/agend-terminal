@@ -751,6 +751,48 @@ mod tests {
     }
 
     #[test]
+    fn restart_instance_rpc_forwards_exact_name_and_resume_mode() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let caller = {
+            let calls = Arc::clone(&calls);
+            move |run_dir: &std::path::Path,
+                  tool: &str,
+                  arguments: Value,
+                  timeout: std::time::Duration| {
+                calls.lock().expect("calls mutex not poisoned").push((
+                    run_dir.to_path_buf(),
+                    tool.to_string(),
+                    arguments,
+                    timeout,
+                ));
+                Ok(serde_json::json!({"spawned": true, "tui_handoff": true}))
+            }
+        };
+
+        super::restart_instance_with(
+            std::path::Path::new("/home"),
+            "fleet-agent",
+            |_home| Some(std::path::PathBuf::from("/run/current")),
+            caller,
+        )
+        .expect("daemon restart_instance succeeded");
+
+        let calls = calls.lock().expect("calls mutex not poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, std::path::Path::new("/run/current"));
+        assert_eq!(calls[0].1, "restart_instance");
+        assert_eq!(calls[0].3, std::time::Duration::from_secs(60));
+        assert_eq!(
+            calls[0].2,
+            serde_json::json!({
+                "instance": "fleet-agent",
+                "mode": "resume",
+                "reason": "manual TUI :restart",
+            })
+        );
+    }
+
+    #[test]
     fn app_production_task_paths_do_not_read_or_write_task_files() {
         for (path, source) in [
             ("dispatch.rs", include_str!("dispatch.rs")),
