@@ -344,7 +344,7 @@ fn handle_mcp_tool_counted(
 /// the calling agent's role (#2300 P0).
 ///
 /// The bridge passes the caller's `instance` in params (mirroring the tool-call
-/// path); we resolve its fleet `role` and subset the surface via
+/// path); we resolve its fleet `role_kind` and subset the surface via
 /// [`crate::mcp::tools::tool_definitions_for_role`]. Default-all-open:
 /// no instance (old bridge / non-agent caller), unknown instance, or a role not
 /// in the capability registry (dev / lead / orchestrator / …) → the full surface.

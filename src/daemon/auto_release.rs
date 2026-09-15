@@ -838,7 +838,10 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
             tracing::info!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, role = ?sender_role, "auto_release: reviewer-binding bypass — reviewer verdict + review task terminal, releasing if clean (#2010 2a)");
             true
         } else {
-            tracing::debug!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, "auto_release: invariant not yet satisfied — retaining for retry");
+            // Info-level is intentional: retained intents are operationally
+            // significant at the daemon's default filter; bounded confidence
+            // distinguishes a waiting/open-PR condition from an unknown one.
+            tracing::info!(agent = %assignee, repo = %repo, branch = %branch, event, reason = ?confidence, "auto_release: invariant not yet satisfied — retaining for retry");
             // #3005: only the Unknown-only probe path is deferred. Every other
             // retain reason (open PR, unresolved route, repo/branch unresolved)
             // keeps its unchanged every-sweep cadence.
