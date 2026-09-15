@@ -5,15 +5,15 @@ mod set_model_tests;
 use serde_json::{json, Value};
 use std::path::Path;
 
+mod instance_layout;
 pub(crate) mod lifecycle;
 mod restart_prep;
-mod instance_layout;
 mod topic;
-use restart_prep::{await_unsent_draft_or_grace, restart_spawn_params};
 pub(super) use instance_layout::resolve_team_layout;
-pub(super) use topic::handle_bind_topic;
+use restart_prep::{await_unsent_draft_or_grace, restart_spawn_params};
 #[cfg(test)]
 use restart_prep::{restart_draft_gate, DraftGate, RESTART_DRAFT_GRACE};
+pub(super) use topic::handle_bind_topic;
 #[cfg(not(test))]
 pub(super) mod spawn;
 #[cfg(test)]

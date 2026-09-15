@@ -1203,7 +1203,10 @@ impl AppState {
                                     pending.request.old_instance_ref == Some(instance_ref)
                                 });
                             if retained_for_restart.is_none()
-                                && self.ui.layout.remove_fleet_instance_views_exact(instance_ref)
+                                && self
+                                    .ui
+                                    .layout
+                                    .remove_fleet_instance_views_exact(instance_ref)
                             {
                                 self.needs_resize = true;
                             }
@@ -1350,7 +1353,6 @@ impl AppState {
             self.remote_restarts.remove(&restart_id);
             tracing::warn!(restart_id = %restart_id, "remote restart correlation expired");
         }
-
     }
 
     pub(super) fn handle_idle_tick(&mut self, deps: &AppDeps<'_>) {
