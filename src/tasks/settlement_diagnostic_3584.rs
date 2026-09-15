@@ -433,12 +433,55 @@ fn valid_receipt_unrelated_legacy_binding_permits_3584() {
     let runtime = crate::paths::runtime_dir(&home.0).join("dev");
     let binding = runtime.join("binding.json");
     std::fs::create_dir_all(&runtime).unwrap();
-    crate::store::save_atomic(&binding, &json!({"version":1,"agent":"dev","task_id":"unrelated","branch":"fix/unrelated","worktree":home.0,"source_repo":home.0})).unwrap();
+    crate::store::save_atomic(&binding, &json!({"version":1,"agent":"dev","task_id":"unrelated","branch":"fix/unrelated","issued_at":chrono::Utc::now().to_rfc3339(),"worktree":home.0,"source_repo":home.0})).unwrap();
     assert!(crate::binding::read(&home.0, "dev").is_some());
     let accepted = done(&home, &id);
     assert_eq!(accepted["status"], "done", "{accepted}");
     assert!(crate::merge_receipt::find_for_task_completion(&home.0, &id, "dev").is_none());
     // Receipt completion must not release or rewrite an unrelated workspace.
+    assert!(crate::binding::read(&home.0, "dev").is_some());
+}
+
+#[test]
+fn invalid_signature_on_legacy_binding_denies_done_3584() {
+    invalid_signature_on_legacy_binding_denies_3584(false);
+}
+
+#[test]
+fn invalid_signature_on_legacy_binding_denies_report_3584() {
+    invalid_signature_on_legacy_binding_denies_3584(true);
+}
+
+fn invalid_signature_on_legacy_binding_denies_3584(report: bool) {
+    let home = Home::new();
+    let id = task(&home);
+    let proof = receipt(&id);
+    crate::merge_receipt::persist(&home.0, &proof).unwrap();
+    let runtime = crate::paths::runtime_dir(&home.0).join("dev");
+    let binding = runtime.join("binding.json");
+    let signature = runtime.join("binding.json.sig");
+    std::fs::create_dir_all(&runtime).unwrap();
+    crate::store::save_atomic(&binding, &json!({"version":1,"agent":"dev","task_id":"unrelated","branch":"fix/unrelated","issued_at":chrono::Utc::now().to_rfc3339(),"worktree":home.0,"source_repo":home.0})).unwrap();
+    std::fs::write(&signature, b"invalid signature").unwrap();
+    assert!(!crate::binding::signature_valid(&home.0, "dev"));
+    if report {
+        let denied = super::auto_close::auto_close_on_report(
+            &home.0,
+            "report",
+            &id,
+            "dev",
+            "invalid legacy signature",
+            true,
+        );
+        assert!(
+            denied.is_err(),
+            "invalid legacy signature was accepted: {denied:?}"
+        );
+    } else {
+        let denied = done(&home, &id);
+        assert_eq!(denied["code"], "assignee_completion_blocked", "{denied}");
+    }
+    assert!(crate::merge_receipt::find_for_task_completion(&home.0, &id, "dev").is_some());
     assert!(crate::binding::read(&home.0, "dev").is_some());
 }
 
