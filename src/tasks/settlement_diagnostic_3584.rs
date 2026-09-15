@@ -205,6 +205,8 @@ fn signed_other_task_receipt_completion_3584(
     invalid_signature: bool,
     same_task: bool,
     rebind: bool,
+    missing_signature: bool,
+    matching_branch: bool,
 ) {
     let home = Home::new();
     let id = task(&home);
@@ -218,6 +220,11 @@ fn signed_other_task_receipt_completion_3584(
     let other_id = other["id"].as_str().unwrap();
     let claimed = super::handle(&home.0, "dev", &json!({"action":"claim", "id":other_id}));
     assert!(claimed.get("error").is_none(), "{claimed}");
+    let bound_branch = if same_task && matching_branch {
+        "fix/evidence"
+    } else {
+        "fix/other"
+    };
     let source = home.0.join("source");
     std::fs::create_dir_all(&source).unwrap();
     crate::git_helpers::git_cmd(&source, &["init", "-b", "main"]).unwrap();
@@ -243,9 +250,20 @@ fn signed_other_task_receipt_completion_3584(
         &["remote", "add", "origin", origin.to_str().unwrap()],
     )
     .unwrap();
+    crate::git_helpers::git_cmd(&source, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+        .unwrap();
+    crate::git_helpers::git_cmd(
+        &source,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    )
+    .unwrap();
     let checkout = crate::mcp::handlers::ci::handle_checkout_repo(
         &home.0,
-        &json!({"repository_path":source, "branch":"fix/other", "from_ref":"main", "bind":true, "task_id":other_id}),
+        &json!({"repository_path":source, "branch":bound_branch, "from_ref":"main", "bind":true, "task_id":other_id}),
         "dev",
     );
     assert_eq!(checkout["bound"], true, "{checkout}");
@@ -255,7 +273,7 @@ fn signed_other_task_receipt_completion_3584(
             &home.0,
             "dev",
             &id,
-            "fix/other",
+            bound_branch,
             std::path::Path::new(current["worktree"].as_str().unwrap()),
             &source,
             false,
@@ -272,7 +290,7 @@ fn signed_other_task_receipt_completion_3584(
     assert!(crate::worktree_pool::is_daemon_managed(worktree));
     assert_eq!(
         crate::git_helpers::git_cmd(worktree, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
-        "fix/other"
+        bound_branch
     );
     assert_ne!(worktree, source);
     let binding_path = crate::paths::runtime_dir(&home.0).join("dev/binding.json");
@@ -281,8 +299,11 @@ fn signed_other_task_receipt_completion_3584(
     if invalid_signature {
         std::fs::write(&signature_path, b"invalid signature").unwrap();
         assert!(!crate::binding::signature_valid(&home.0, "dev"));
+    } else if missing_signature {
+        std::fs::remove_file(&signature_path).unwrap();
+        assert!(!crate::binding::signature_valid(&home.0, "dev"));
     }
-    let signature_before = std::fs::read(&signature_path).unwrap();
+    let signature_before = std::fs::read(&signature_path).ok();
     let task_before =
         serde_json::to_value(super::load_routed(&home.0, &id).unwrap().record()).unwrap();
     let other_before =
@@ -290,7 +311,7 @@ fn signed_other_task_receipt_completion_3584(
     crate::daemon::auto_release::enqueue_release_recompute(
         &home.0,
         "",
-        "fix/other",
+        bound_branch,
         "existing-evidence",
     );
     let intents_before = release_intents(&home);
@@ -298,7 +319,9 @@ fn signed_other_task_receipt_completion_3584(
         !intents_before.is_empty(),
         "must preserve an actual existing intent"
     );
-    let rebound = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let rebound = std::rc::Rc::new(std::cell::RefCell::new(
+        None::<(Vec<u8>, Option<Vec<u8>>, Value)>,
+    ));
     let wip = worktree.join("current-wip.txt");
     if rebind {
         std::fs::write(&wip, b"preserve new work").unwrap();
@@ -313,7 +336,7 @@ fn signed_other_task_receipt_completion_3584(
                 &hook_home,
                 "dev",
                 &hook_task,
-                "fix/other",
+                bound_branch,
                 &hook_worktree,
                 &hook_source,
                 false,
@@ -322,7 +345,7 @@ fn signed_other_task_receipt_completion_3584(
             let path = crate::paths::runtime_dir(&hook_home).join("dev/binding.json");
             *captured.borrow_mut() = Some((
                 std::fs::read(&path).unwrap(),
-                std::fs::read(path.with_file_name("binding.json.sig")).unwrap(),
+                std::fs::read(path.with_file_name("binding.json.sig")).ok(),
                 crate::binding::read(&hook_home, "dev").unwrap(),
             ));
         });
@@ -362,11 +385,16 @@ fn signed_other_task_receipt_completion_3584(
         (before_bytes, signature_before, binding)
     };
     assert_eq!(std::fs::read(&binding_path).unwrap(), before_bytes);
-    assert_eq!(std::fs::read(&signature_path).unwrap(), signature_before);
+    match signature_before {
+        Some(signature_before) => {
+            assert_eq!(std::fs::read(&signature_path).unwrap(), signature_before)
+        }
+        None => assert!(!signature_path.exists()),
+    }
     assert_eq!(crate::binding::read(&home.0, "dev").unwrap(), binding);
     assert_eq!(
         crate::binding::signature_valid(&home.0, "dev"),
-        !invalid_signature
+        !invalid_signature && !missing_signature
     );
     assert_eq!(
         serde_json::to_value(super::load_routed(&home.0, other_id).unwrap().record()).unwrap(),
@@ -388,40 +416,60 @@ fn signed_other_task_receipt_completion_3584(
 
 #[test]
 fn corrective_done_preserves_signed_other_task_3584() {
-    signed_other_task_receipt_completion_3584(false, false, false, false);
+    signed_other_task_receipt_completion_3584(false, false, false, false, false, false);
 }
 
 #[test]
 fn corrective_report_preserves_signed_other_task_3584() {
-    signed_other_task_receipt_completion_3584(true, false, false, false);
+    signed_other_task_receipt_completion_3584(true, false, false, false, false, false);
 }
 
 #[test]
 fn invalid_signature_denies_done_3584() {
-    signed_other_task_receipt_completion_3584(false, true, false, false);
+    signed_other_task_receipt_completion_3584(false, true, false, false, false, false);
 }
 
 #[test]
 fn invalid_signature_denies_report_3584() {
-    signed_other_task_receipt_completion_3584(true, true, false, false);
+    signed_other_task_receipt_completion_3584(true, true, false, false, false, false);
 }
 
 #[test]
 fn same_task_branch_mismatch_denies_done_3584() {
-    signed_other_task_receipt_completion_3584(false, false, true, false);
+    signed_other_task_receipt_completion_3584(false, false, true, false, false, false);
 }
 #[test]
 fn same_task_branch_mismatch_denies_report_3584() {
-    signed_other_task_receipt_completion_3584(true, false, true, false);
+    signed_other_task_receipt_completion_3584(true, false, true, false, false, false);
 }
 
 #[test]
 fn rebind_before_done_preserves_new_work_3584() {
-    signed_other_task_receipt_completion_3584(false, false, false, true);
+    signed_other_task_receipt_completion_3584(false, false, false, true, false, false);
 }
 #[test]
 fn rebind_before_report_preserves_new_work_3584() {
-    signed_other_task_receipt_completion_3584(true, false, false, true);
+    signed_other_task_receipt_completion_3584(true, false, false, true, false, false);
+}
+
+#[test]
+fn invalid_signature_same_task_denies_done_3584() {
+    signed_other_task_receipt_completion_3584(false, true, true, false, false, true);
+}
+
+#[test]
+fn invalid_signature_same_task_denies_report_3584() {
+    signed_other_task_receipt_completion_3584(true, true, true, false, false, true);
+}
+
+#[test]
+fn missing_signature_same_task_denies_done_3584() {
+    signed_other_task_receipt_completion_3584(false, false, true, false, true, true);
+}
+
+#[test]
+fn missing_signature_same_task_denies_report_3584() {
+    signed_other_task_receipt_completion_3584(true, false, true, false, true, true);
 }
 
 #[test]
