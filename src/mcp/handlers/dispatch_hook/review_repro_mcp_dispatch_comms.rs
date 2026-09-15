@@ -141,18 +141,17 @@ fn ensure_branch_exists_rejects_option_injection_branch_before_git_mcp_dispatch_
 }
 
 /// Helper shared by the two source-scanning invariants below: read the
-/// body of `fn ensure_branch_exists` from this module's defining file.
+/// body of the production implementation from this module's defining file.
 fn ensure_branch_exists_body() -> String {
     let mod_rs =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp/handlers/dispatch_hook/mod.rs");
     let text = std::fs::read_to_string(&mod_rs).expect("read dispatch_hook/mod.rs");
-    // #3546: `ensure_branch_exists` is now a thin tuple-returning wrapper, and the
-    // body these scans are about — the validation and the bounded fetch — lives in
-    // `ensure_branch_exists_provisioned`. The anchor follows the body rather than
-    // the name: scanning the wrapper would report "no validate_branch call" while
-    // the guard is present and running one call away, which is a weaker invariant
-    // wearing a green light.
-    extract_fn_body(&text, "fn ensure_branch_exists_provisioned")
+    // #3546: `ensure_branch_exists` and `ensure_branch_exists_provisioned` are
+    // compatibility wrappers; the validation and bounded fetch live in the
+    // context-aware production implementation. Scanning the wrapper would
+    // report "no validate_branch call" while the guard is present and running
+    // one call away, which is a weaker invariant wearing a green light.
+    extract_fn_body(&text, "fn ensure_branch_exists_provisioned_with_context")
 }
 
 /// Extract the `{ ... }` body of the first function whose signature line
@@ -198,14 +197,15 @@ fn strip_comments_and_blank(body: &str) -> String {
 /// comment claims the option-injection rule is "the same rule applied to
 /// the user-supplied `branch` arg" — but the implementation only validates
 /// `from_ref`. The comment is only HONEST once `validate_branch(branch)`
-/// actually runs in the function body.
+/// actually runs in the production implementation body.
 ///
-/// RED now: the function body contains `validate_branch(from_ref)` but no
-/// `validate_branch(branch)` call, so the doc comment's claim is false.
+/// RED now: the production implementation body contains
+/// `validate_branch(from_ref)` but no `validate_branch(branch)` call, so the
+/// doc comment's claim is false.
 ///
 /// GREEN after fix: the preferred resolution (add the missing
-/// `validate_branch(branch)` call) makes the comment's claim true; this
-/// scan then finds the call.
+/// `validate_branch(branch)` call) makes the comment's claim true; this scan
+/// then finds the call.
 #[test]
 fn ensure_branch_exists_doc_claim_matches_code_mcp_dispatch_comms() {
     let body = strip_comments_and_blank(&ensure_branch_exists_body());
