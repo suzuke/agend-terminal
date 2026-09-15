@@ -1414,16 +1414,6 @@ mod tests {
                 "force",
                 "instance_state/mod.rs fresh-restart uncommitted-work guard bypass (#2476)",
             ),
-            (
-                "restart_instance",
-                "restart_id",
-                "app/rpc.rs internal correlated restart identity",
-            ),
-            (
-                "restart_instance",
-                "old_instance_ref",
-                "app/rpc.rs internal predecessor identity for exact pane replacement",
-            ),
             // ── config ── (#2548: watchdog moved to CLI, mode retired, no longer coordination tools)
             ("config", "action", "mcp/handlers/dispatch.rs get/list"),
             ("config", "key", "mcp/handlers/dispatch.rs runtime_config::get_key"),
