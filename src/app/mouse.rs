@@ -92,10 +92,24 @@ pub(super) fn handle(
     // pane id under the cursor that wants mouse + SGR; we then call
     // `write_to_pane` (sibling of `write_to_focused`) to deliver bytes to
     // that specific pane's PTY.
-    if let Some((pane_id, inner_x, inner_y)) = pane_for_mouse_forward(layout, &mouse) {
-        if let Some(encoded) = crate::mouse_forward::encode_sgr(&mouse, inner_x, inner_y) {
-            super::write_to_pane(&crate::home_dir(), layout, registry, pane_id, &encoded);
-            return out;
+    // #3657: once a title-bar drag owns the left-button gesture, keep its
+    // Drag/Up continuation in the local pane-drag state machine. The source
+    // title Down was local, so forwarding these events would both create an
+    // orphan backend gesture and prevent target selection/release cleanup.
+    // Restrict this exemption to left Drag/Up: right/middle gestures and
+    // scroll events must retain ordinary backend forwarding semantics.
+    let local_pane_drag_continuation = matches!(
+        mouse.kind,
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+    ) && layout
+        .active_tab()
+        .is_some_and(|tab| tab.dragging_pane.is_some());
+    if !local_pane_drag_continuation {
+        if let Some((pane_id, inner_x, inner_y)) = pane_for_mouse_forward(layout, &mouse) {
+            if let Some(encoded) = crate::mouse_forward::encode_sgr(&mouse, inner_x, inner_y) {
+                super::write_to_pane(&crate::home_dir(), layout, registry, pane_id, &encoded);
+                return out;
+            }
         }
     }
 
@@ -1320,6 +1334,82 @@ mod tests {
             "handle_selection MUST cache selecting_pane on Down so drag \
              continues against the same pane"
         );
+    }
+
+    /// #3657 immutable RED: a title drag released over a mouse-forwarding
+    /// target must still complete through the real top-level `handle()` path.
+    /// The source title Down is local; the target-body Drag and Up must remain
+    /// local continuation events for the active pane drag.
+    #[test]
+    #[serial]
+    fn title_drag_through_forwarded_target_body_swaps_and_clears_3657() {
+        let _home = ScopedHome::new("title-drag-forwarded-target");
+
+        let mut layout = two_pane_layout("opencode");
+        layout.tabs[0].focus_id = 2;
+        enable_opencode_mouse(layout.tabs[0].root_mut().find_pane_mut(2).unwrap());
+
+        let source_down = down_left_at(2, 1);
+        assert_eq!(
+            layout.tabs[0].title_bar_at(2, 1),
+            Some(1),
+            "test precondition: source Down must hit pane 1 title text"
+        );
+
+        let mut state = MouseState::default();
+        let fleet_path = std::path::Path::new("/nonexistent/fleet.yaml");
+        let down_out = super::handle(
+            source_down,
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+            None,
+        );
+        assert!(!down_out.needs_resize);
+        assert_eq!(layout.tabs[0].dragging_pane, Some(1));
+
+        let target_drag = drag_left_at(15, 5);
+        assert_eq!(
+            super::pane_for_mouse_forward(&layout, &target_drag).map(|(pane_id, _, _)| pane_id),
+            Some(2),
+            "test precondition: target body must be a real mouse-forward target"
+        );
+        super::handle(
+            target_drag,
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+            None,
+        );
+        assert_eq!(
+            layout.tabs[0].drag_target,
+            Some(2),
+            "active local pane drag must record the target under the cursor"
+        );
+
+        let up_out = super::handle(
+            up_left_at(15, 5),
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+            None,
+        );
+        assert!(
+            up_out.needs_resize,
+            "completed pane swap must request resize"
+        );
+        assert_eq!(
+            layout.tabs[0].root().pane_ids(),
+            vec![2, 1],
+            "target pane must move into the source's visual slot"
+        );
+        assert_eq!(layout.tabs[0].focus_id, 1);
+        assert_eq!(layout.tabs[0].dragging_pane, None);
+        assert_eq!(layout.tabs[0].drag_target, None);
+        assert_eq!(layout.tabs[0].drag_target_tab, None);
     }
 
     // ----- #92758-3: a left-click dismisses a stale selection anywhere -----
