@@ -156,8 +156,12 @@ impl Tab {
                     self.root()
                         .find_pane(*id)
                         .filter(|pane| pane.fleet_instance_name.as_deref() == Some(lead))
-                })?;
-                match view.badge(lead, pane.instance_ref.as_ref()) {
+                });
+                let badge = match pane {
+                    Some(pane) => view.badge(lead, pane.instance_ref.as_ref()),
+                    None => view.badge(lead, None),
+                };
+                match badge {
                     crate::team_view::LeadBadge::Lead => Some(" [LEAD]"),
                     crate::team_view::LeadBadge::Uncertain => Some(" [LEAD?]"),
                     crate::team_view::LeadBadge::None => None,

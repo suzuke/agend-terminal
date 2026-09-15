@@ -207,6 +207,19 @@ impl TeamView {
         (self.current_roster.len(), self.roster_live)
     }
 
+    pub(crate) fn roster_summary_for_team(&self, team: &str) -> (usize, bool) {
+        let count = self
+            .current_roster
+            .keys()
+            .filter(|member| {
+                self.member_team
+                    .get(*member)
+                    .is_some_and(|name| name == team)
+            })
+            .count();
+        (count, self.roster_live)
+    }
+
     /// Return a team label only when every pane belongs to the same
     /// authoritative team. `Tab::name` is intentionally not consulted.
     pub(crate) fn authoritative_tab_name<'a, I>(&self, members: I) -> Option<&str>

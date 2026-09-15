@@ -8,6 +8,7 @@ pub mod panels;
 pub mod panels_fleet;
 pub mod resize;
 pub mod scratch;
+mod team_render;
 
 #[allow(unused_imports)]
 pub use core_render::{
