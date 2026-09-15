@@ -288,8 +288,7 @@ fn checkout_expected_head_public_mismatch_has_no_state() {
     let source = setup_source_repo(&parent, "review/public-mismatch");
     let expected = get_sha(&source, "main");
     let review_head = commit_tree(&source, &expected, "review head");
-    remove_origin(&source);
-    seed_origin_view(&source, "main", &expected);
+    configure_local_github_origin(&source, &parent);
     let sender = None;
     let checkout = |args: &serde_json::Value| {
         crate::mcp::handlers::dispatch::dispatch_repo(&crate::mcp::handlers::dispatch::HandlerCtx {
@@ -805,9 +804,8 @@ fn checkout_expected_head_absent_branch_pins_movable_from_ref() {
     let home = tmp_home("eh-drift-absent");
     let parent = tmp_home("eh-drift-absent-src");
     let source = setup_source_repo(&parent, "feat/eh-drift-base");
-    remove_origin(&source);
     let expected = get_sha(&source, "main");
-    seed_origin_view(&source, "main", &expected);
+    configure_local_github_origin(&source, &parent);
     let source_for_hook = source.clone();
     let _hook = super::checkout_helpers::install_expected_head_validation_hook(move || {
         advance_ref(&source_for_hook, "main", "movable from_ref after precheck");
@@ -961,8 +959,7 @@ fn checkout_disposable_review_persists_provenance_and_terminal_release_deletes()
     let parent = tmp_home("disposable-review-fresh-src");
     let source = setup_source_repo(&parent, "seed");
     let expected = get_sha(&source, "main");
-    remove_origin(&source);
-    seed_origin_view(&source, "main", &expected);
+    configure_local_github_origin(&source, &parent);
     seed_terminal_task(
         &home,
         "task-disposable-fresh",
@@ -1000,10 +997,11 @@ fn checkout_disposable_review_persists_provenance_and_terminal_release_deletes()
         Some(expected.as_str())
     );
 
-    // This fixture intentionally has no SCM provider to answer PR state. A
+    // This fixture intentionally has no SCM provider to answer PR state. The
     // missing origin is the deterministic "no open PR" signal; the review
     // branch's strict provisioned-head CAS still drives deletion after the
     // terminal task gate passes.
+    remove_origin(&source);
 
     let active_release = crate::mcp::handlers::worktree::handle_release_worktree(
         &home,
@@ -1093,8 +1091,7 @@ fn checkout_then_public_repo_release_round_trip_marker_symmetry() {
     let parent = releasable_home("src");
     let source = setup_source_repo(&parent, "seed");
     let expected = get_sha(&source, "main");
-    remove_origin(&source);
-    seed_origin_view(&source, "main", &expected);
+    configure_local_github_origin(&source, &parent);
     seed_terminal_task(&home, "task-roundtrip", "review/roundtrip", false);
 
     let checkout = super::handle_checkout_repo(
@@ -1139,6 +1136,7 @@ fn checkout_then_public_repo_release_round_trip_marker_symmetry() {
          transaction requires; marker was: {marker:?}"
     );
 
+    remove_origin(&source);
     finish_task(&home, "task-roundtrip");
 
     let released =
@@ -1560,7 +1558,7 @@ fn checkout_disposable_review_reuse_cannot_bypass_new_branch_gate() {
     let home = tmp_home("disposable-review-reuse-gate");
     let parent = tmp_home("disposable-review-reuse-gate-src");
     let source = setup_source_repo(&parent, "seed");
-    remove_origin(&source);
+    configure_local_github_origin(&source, &parent);
     let expected = get_sha(&source, "main");
     seed_origin_view(&source, "main", &expected);
     let branch = "review/disposable-reuse-gate";
