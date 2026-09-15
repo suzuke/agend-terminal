@@ -92,10 +92,24 @@ pub(super) fn handle(
     // pane id under the cursor that wants mouse + SGR; we then call
     // `write_to_pane` (sibling of `write_to_focused`) to deliver bytes to
     // that specific pane's PTY.
-    if let Some((pane_id, inner_x, inner_y)) = pane_for_mouse_forward(layout, &mouse) {
-        if let Some(encoded) = crate::mouse_forward::encode_sgr(&mouse, inner_x, inner_y) {
-            super::write_to_pane(&crate::home_dir(), layout, registry, pane_id, &encoded);
-            return out;
+    // #3657: once a title-bar drag owns the left-button gesture, keep its
+    // Drag/Up continuation in the local pane-drag state machine. The source
+    // title Down was local, so forwarding these events would both create an
+    // orphan backend gesture and prevent target selection/release cleanup.
+    // Restrict this exemption to left Drag/Up: right/middle gestures and
+    // scroll events must retain ordinary backend forwarding semantics.
+    let local_pane_drag_continuation = matches!(
+        mouse.kind,
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+    ) && layout
+        .active_tab()
+        .is_some_and(|tab| tab.dragging_pane.is_some());
+    if !local_pane_drag_continuation {
+        if let Some((pane_id, inner_x, inner_y)) = pane_for_mouse_forward(layout, &mouse) {
+            if let Some(encoded) = crate::mouse_forward::encode_sgr(&mouse, inner_x, inner_y) {
+                super::write_to_pane(&crate::home_dir(), layout, registry, pane_id, &encoded);
+                return out;
+            }
         }
     }
 
@@ -1386,13 +1400,11 @@ mod tests {
         );
         assert!(up_out.needs_resize, "completed pane swap must request resize");
         assert_eq!(
-            layout.tabs[0].root().find_pane(1).unwrap().agent_name,
-            "opencode".into()
+            layout.tabs[0].root().pane_ids(),
+            vec![2, 1],
+            "target pane must move into the source's visual slot"
         );
-        assert_eq!(
-            layout.tabs[0].root().find_pane(2).unwrap().agent_name,
-            "left".into()
-        );
+        assert_eq!(layout.tabs[0].focus_id, 1);
         assert_eq!(layout.tabs[0].dragging_pane, None);
         assert_eq!(layout.tabs[0].drag_target, None);
         assert_eq!(layout.tabs[0].drag_target_tab, None);
