@@ -113,6 +113,10 @@ pub(super) fn spawn_runtime_or_legacy(
         layout: params["layout"].as_str().unwrap_or("tab"),
         spawner: params["spawner"].as_str().filter(|s| !s.is_empty()),
         target_pane: params["target_pane"].as_str().filter(|s| !s.is_empty()),
+        restart_id: params["restart_id"].as_str().filter(|s| !s.is_empty()),
+        old_instance_ref: params
+            .get("old_instance_ref")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
     };
     let spawn_request = crate::agent_ops::spawn::resolve_spawn_request(home, &spawn_params)?;
     let outcome = crate::agent_ops::spawn::spawn_instance(

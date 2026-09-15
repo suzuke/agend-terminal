@@ -36,6 +36,10 @@ pub enum ApiEvent {
     InstanceCreated {
         name: String,
         instance_ref: Option<crate::types::InstanceRef>,
+        /// Correlates a daemon-owned restart with its request. Ordinary
+        /// spawns leave this unset; name alone is never a lifecycle proof.
+        restart_id: Option<String>,
+        old_instance_ref: Option<crate::types::InstanceRef>,
         layout: LayoutHint,
         spawner: Option<String>,
         target_pane: Option<String>,

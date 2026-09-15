@@ -229,6 +229,8 @@ fn notifier_receives_instance_created() {
     rec.notify(ApiEvent::InstanceCreated {
         name: "agent-2".into(),
         instance_ref: None,
+        restart_id: None,
+        old_instance_ref: None,
         layout: LayoutHint::SplitRight,
         spawner: Some("caller".into()),
         target_pane: None,
@@ -310,6 +312,8 @@ fn none_notifier_instance_created_no_panic() {
         n.notify(ApiEvent::InstanceCreated {
             name: "x".into(),
             instance_ref: None,
+            restart_id: None,
+            old_instance_ref: None,
             layout: LayoutHint::Tab,
             spawner: None,
             target_pane: None,
@@ -373,6 +377,8 @@ fn notifier_multiple_events_accumulate() {
     rec.notify(ApiEvent::InstanceCreated {
         name: "a".into(),
         instance_ref: None,
+        restart_id: None,
+        old_instance_ref: None,
         layout: LayoutHint::Tab,
         spawner: None,
         target_pane: None,

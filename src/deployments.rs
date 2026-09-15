@@ -501,6 +501,8 @@ fn spawn_instances(
                 layout: "tab",
                 spawner: None,
                 target_pane: None,
+                restart_id: None,
+                old_instance_ref: None,
             };
             let request = match crate::agent_ops::spawn::resolve_spawn_request(home, &params) {
                 Ok(request) => request,

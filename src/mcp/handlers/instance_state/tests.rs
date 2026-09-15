@@ -883,7 +883,7 @@ fn fresh_restart_requeues_unconfirmed_inbox_rows_3228() {
 #[test]
 fn restart_spawn_params_carries_same_tab_fresh() {
     let env = HashMap::new();
-    let p = restart_spawn_params("dev", "claude", &[], None, &env, "fresh");
+    let p = restart_spawn_params("dev", "claude", &[], None, &env, "fresh", "r1", None);
     assert_eq!(p["layout"], "same-tab");
     // fresh must NOT request a resume.
     assert!(p.get("mode").is_none());
@@ -894,7 +894,7 @@ fn restart_spawn_params_carries_same_tab_fresh() {
 #[test]
 fn restart_spawn_params_carries_same_tab_resume() {
     let env = HashMap::new();
-    let p = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
+    let p = restart_spawn_params("dev", "claude", &[], None, &env, "resume", "r1", None);
     assert_eq!(p["layout"], "same-tab");
     assert_eq!(p["mode"], "resume");
     // resume preserves context → must NOT self-kick.
@@ -904,11 +904,37 @@ fn restart_spawn_params_carries_same_tab_resume() {
 #[test]
 fn restart_spawn_params_carries_restart_correlation_3649() {
     let env = HashMap::new();
-    let p = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
+    let p = restart_spawn_params(
+        "dev",
+        "claude",
+        &[],
+        None,
+        &env,
+        "resume",
+        "restart-3649",
+        Some(crate::types::InstanceRef::new(
+            crate::types::InstanceId::new(),
+            7,
+        )),
+    );
     assert!(p["restart_id"]
         .as_str()
         .is_some_and(|restart_id| !restart_id.is_empty()));
     assert!(p["old_instance_ref"].is_object());
+}
+
+#[test]
+fn restart_admission_is_one_slot_and_drops_on_terminal_cleanup_3649() {
+    let home = std::env::temp_dir().join(format!(
+        "restart-admission-{}",
+        crate::types::InstanceId::new()
+    ));
+    let first = super::restart_prep::try_admit_restart(&home, "dev", "restart-a")
+        .expect("first request admitted");
+    assert!(super::restart_prep::try_admit_restart(&home, "dev", "restart-a").is_err());
+    assert!(super::restart_prep::try_admit_restart(&home, "dev", "restart-b").is_err());
+    drop(first);
+    assert!(super::restart_prep::try_admit_restart(&home, "dev", "restart-b").is_ok());
 }
 
 /// must-follow ②: the self-kick flag is INDEPENDENT — set ONLY by the
@@ -921,10 +947,10 @@ fn restart_spawn_params_carries_restart_correlation_3649() {
 fn self_kick_flag_set_only_by_fresh_restart_fail_safe_default() {
     let env = HashMap::new();
     // fresh restart → flag present + true.
-    let fresh = restart_spawn_params("dev", "claude", &[], None, &env, "fresh");
+    let fresh = restart_spawn_params("dev", "claude", &[], None, &env, "fresh", "r1", None);
     assert!(fresh["self_kick_on_ready"].as_bool().unwrap_or(false));
     // resume restart → no flag → reads false.
-    let resume = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
+    let resume = restart_spawn_params("dev", "claude", &[], None, &env, "resume", "r1", None);
     assert!(!resume["self_kick_on_ready"].as_bool().unwrap_or(false));
     // a generic spawn-params object (the initial-fleet / create_instance shape,
     // which also maps to SpawnMode::Fresh) carries no flag → reads false.

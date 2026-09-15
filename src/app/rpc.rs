@@ -27,6 +27,18 @@ pub(super) enum TaskOutcome {
 }
 
 #[derive(Debug)]
+pub(super) struct RemoteRestartOutcome {
+    pub(super) request: super::commands::RemoteRestartRequest,
+    pub(super) result: Result<RemoteRestartResult, String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RemoteRestartResult {
+    pub(super) old_instance_ref: Option<crate::types::InstanceRef>,
+    pub(super) successor_instance_ref: Option<crate::types::InstanceRef>,
+}
+
+#[derive(Debug)]
 pub(super) struct AgentStateSnapshotResult {
     pub(super) snapshot: AgentStateSnapshot,
     pub(super) names: HashSet<String>,
@@ -215,6 +227,22 @@ where
     R: Fn(&Path) -> Option<PathBuf>,
     C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
 {
+    let restart_id = crate::types::InstanceId::new().full();
+    restart_instance_with_correlation(home, name, &restart_id, None, resolver, caller).map(|_| ())
+}
+
+fn restart_instance_with_correlation<R, C>(
+    home: &Path,
+    name: &str,
+    restart_id: &str,
+    old_instance_ref: Option<crate::types::InstanceRef>,
+    resolver: R,
+    caller: C,
+) -> Result<RemoteRestartResult, String>
+where
+    R: Fn(&Path) -> Option<PathBuf>,
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
     let Some(run_dir) = resolver(home) else {
         return Err("no active daemon (run dir not found)".to_string());
     };
@@ -225,17 +253,68 @@ where
             "instance": name,
             "mode": "resume",
             "reason": "manual TUI :restart",
+            "restart_id": restart_id,
+            "old_instance_ref": old_instance_ref,
         }),
         std::time::Duration::from_secs(60),
     )?;
     if let Some(error) = result.get("error").and_then(Value::as_str) {
         return Err(error.to_string());
     }
+    if result.get("restart_id").and_then(Value::as_str) != Some(restart_id) {
+        return Err(format!(
+            "daemon restart_instance returned a mismatched restart_id for '{name}'"
+        ));
+    }
     if result.get("spawned").and_then(Value::as_bool) == Some(true) {
-        Ok(())
+        Ok(RemoteRestartResult {
+            old_instance_ref: result
+                .get("old_instance_ref")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .or(old_instance_ref),
+            successor_instance_ref: result
+                .get("successor_instance_ref")
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
+        })
     } else {
         Err(format!("daemon restart_instance did not spawn '{name}'"))
     }
+}
+
+pub(super) fn spawn_remote_restart_worker(
+    home: &Path,
+) -> (
+    crossbeam_channel::Sender<super::commands::RemoteRestartRequest>,
+    crossbeam_channel::Receiver<RemoteRestartOutcome>,
+    std::thread::JoinHandle<()>,
+) {
+    let (request_tx, request_rx) =
+        crossbeam_channel::bounded::<super::commands::RemoteRestartRequest>(16);
+    let (outcome_tx, outcome_rx) = crossbeam_channel::bounded(16);
+    let home = home.to_path_buf();
+    // fire-and-forget: false; run_app joins this worker during teardown.
+    let worker = std::thread::Builder::new()
+        .name("app-remote-restart-rpc".into())
+        .spawn(move || {
+            while let Ok(request) = request_rx.recv() {
+                let result = restart_instance_with_correlation(
+                    &home,
+                    &request.name,
+                    &request.restart_id,
+                    request.old_instance_ref,
+                    resolve_active_run_dir,
+                    call_tool_at,
+                );
+                if outcome_tx
+                    .send(RemoteRestartOutcome { request, result })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .expect("spawn app remote restart RPC worker");
+    (request_tx, outcome_rx, worker)
 }
 
 fn create_instance_with<R, C>(
@@ -759,13 +838,18 @@ mod tests {
                   tool: &str,
                   arguments: Value,
                   timeout: std::time::Duration| {
+                let restart_id = arguments.get("restart_id").cloned();
                 calls.lock().expect("calls mutex not poisoned").push((
                     run_dir.to_path_buf(),
                     tool.to_string(),
                     arguments,
                     timeout,
                 ));
-                Ok(serde_json::json!({"spawned": true, "tui_handoff": true}))
+                Ok(serde_json::json!({
+                    "spawned": true,
+                    "tui_handoff": true,
+                    "restart_id": restart_id,
+                }))
             }
         };
 
@@ -785,14 +869,30 @@ mod tests {
         assert!(calls[0].2["restart_id"]
             .as_str()
             .is_some_and(|restart_id| !restart_id.is_empty()));
-        assert_eq!(
-            calls[0].2,
-            serde_json::json!({
-                "instance": "fleet-agent",
-                "mode": "resume",
-                "reason": "manual TUI :restart",
-            })
+        assert_eq!(calls[0].2["instance"], "fleet-agent");
+        assert_eq!(calls[0].2["mode"], "resume");
+        assert_eq!(calls[0].2["reason"], "manual TUI :restart");
+    }
+
+    #[test]
+    fn restart_instance_rpc_rejects_mismatched_correlation() {
+        let result = super::restart_instance_with_correlation(
+            std::path::Path::new("/home"),
+            "fleet-agent",
+            "restart-expected",
+            None,
+            |_home| Some(std::path::PathBuf::from("/run/current")),
+            |_run_dir, _tool, _arguments, _timeout| {
+                Ok(serde_json::json!({
+                    "spawned": true,
+                    "restart_id": "restart-other",
+                }))
+            },
         );
+
+        assert!(result
+            .expect_err("mismatched correlation must fail closed")
+            .contains("mismatched restart_id"));
     }
 
     #[test]

@@ -239,6 +239,36 @@ impl Layout {
         true
     }
 
+    /// Replace a retained pane at the requester's original location only when
+    /// both exact lifecycle identities match. A stale response can therefore
+    /// never overwrite a same-name successor or a pane moved by the operator.
+    pub fn replace_agent_pane_at_exact(
+        &mut self,
+        tab_index: usize,
+        pane_id: usize,
+        old_instance_ref: InstanceRef,
+        mut pane: Pane,
+    ) -> Result<(), Box<Pane>> {
+        let Some(tab) = self.tabs.get_mut(tab_index) else {
+            return Err(Box::new(pane));
+        };
+        let Some(existing) = tab.root().find_pane(pane_id) else {
+            return Err(Box::new(pane));
+        };
+        if existing.instance_ref != Some(old_instance_ref) {
+            return Err(Box::new(pane));
+        }
+        pane.id = pane_id;
+        let Some(existing) = tab.root_mut().find_pane_mut(pane_id) else {
+            return Err(Box::new(pane));
+        };
+        if existing.instance_ref != Some(old_instance_ref) {
+            return Err(Box::new(pane));
+        }
+        *existing = pane;
+        Ok(())
+    }
+
     pub fn agent_pane_is_disconnected(&self, agent_name: &str) -> bool {
         self.find_agent_pane(agent_name)
             .and_then(|(tab_idx, pane_id)| self.tabs[tab_idx].root().find_pane(pane_id))
@@ -620,6 +650,37 @@ mod tests {
         assert!(!layout.reconnect_agent_pane_exact(old_ref, stale));
         assert_eq!(layout.find_pane_mut(1).unwrap().display_name, None);
         assert!(layout.find_pane_mut(99).is_none());
+    }
+
+    #[test]
+    fn correlated_restart_replaces_only_the_exact_original_location_3649() {
+        let old_ref = InstanceRef::new(InstanceId::new(), 24);
+        let new_ref = InstanceRef::new(InstanceId::new(), 25);
+        let mut old = leaf(1, "same-name");
+        old.instance_ref = Some(old_ref);
+        let mut replacement = leaf(9, "same-name");
+        replacement.instance_ref = Some(new_ref);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("team".into(), old));
+
+        assert!(layout
+            .replace_agent_pane_at_exact(0, 1, old_ref, replacement)
+            .is_ok());
+        assert_eq!(layout.tabs.len(), 1);
+        assert_eq!(
+            layout.tabs[0].root().find_pane(1).unwrap().instance_ref,
+            Some(new_ref)
+        );
+
+        let mut stale = leaf(9, "same-name");
+        stale.instance_ref = Some(InstanceRef::new(InstanceId::new(), 26));
+        assert!(layout
+            .replace_agent_pane_at_exact(0, 1, old_ref, stale)
+            .is_err());
+        assert_eq!(
+            layout.tabs[0].root().find_pane(1).unwrap().instance_ref,
+            Some(new_ref)
+        );
     }
 
     #[test]

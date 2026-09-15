@@ -30,6 +30,8 @@ pub(super) struct UiDeps<'a> {
     pub(super) fleet_path: &'a Path,
     pub(super) wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub(super) task_rpc_tx: &'a crossbeam_channel::Sender<super::rpc::TaskRequest>,
+    pub(super) restart_request_tx:
+        Option<&'a crossbeam_channel::Sender<super::commands::RemoteRestartRequest>>,
     pub(super) task_snapshot: &'a [crate::tasks::Task],
     pub(super) reap_workers: &'a mut Vec<std::thread::JoinHandle<()>>,
     pub(super) team_view: Option<&'a TeamView>,
@@ -59,6 +61,7 @@ impl UiState {
                 wakeup_tx: deps.wakeup_tx,
                 name_counter: &mut self.name_counter,
                 task_rpc_tx: deps.task_rpc_tx,
+                restart_request_tx: deps.restart_request_tx,
                 reap_workers: &mut *deps.reap_workers,
             };
             let outcome = overlay::handle_key(&mut self.overlay, key, &mut octx);
@@ -141,6 +144,7 @@ mod tests {
             fleet_path: &fleet_path,
             wakeup_tx: &wakeup_tx,
             task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
             task_snapshot: &[],
             reap_workers: &mut reap_workers,
             team_view: None,
@@ -228,6 +232,7 @@ mod tests {
             fleet_path: &fleet_path,
             wakeup_tx: &wakeup_tx,
             task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
             task_snapshot: &[],
             reap_workers: &mut reap_workers,
             team_view: None,

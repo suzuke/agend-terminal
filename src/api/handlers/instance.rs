@@ -143,6 +143,10 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         layout: params["layout"].as_str().unwrap_or("tab"),
         spawner: params["spawner"].as_str().filter(|s| !s.is_empty()),
         target_pane: params["target_pane"].as_str().filter(|s| !s.is_empty()),
+        // Public create_instance requests are deliberately uncorrelated. Only
+        // the internal restart SPAWN path may carry lifecycle identity.
+        restart_id: None,
+        old_instance_ref: None,
     };
     let request = match crate::agent_ops::spawn::resolve_spawn_request(ctx.home, &spawn_params) {
         Ok(request) => request,

@@ -481,6 +481,7 @@ where
                     Option<String>,
                     Option<String>,
                     bool,
+                    Option<crate::types::InstanceRef>,
                 )> = None;
                 let mut pane_loc: Option<(usize, usize)> = None;
                 'outer: for (ti, tab) in ctx.layout.tabs.iter().enumerate() {
@@ -503,6 +504,7 @@ where
                                     p.display_name.clone(),
                                     p.fleet_instance_name.clone(),
                                     is_remote,
+                                    p.instance_ref,
                                 ));
                                 pane_loc = Some((ti, id));
                                 break 'outer;
@@ -511,7 +513,7 @@ where
                     }
                 }
 
-                if let Some((backend_cmd, work_dir, display_name, fleet_name, is_remote)) =
+                if let Some((backend_cmd, work_dir, display_name, fleet_name, is_remote, old_ref)) =
                     pane_info
                 {
                     if is_remote {
@@ -522,21 +524,38 @@ where
                             );
                             return false;
                         };
-                        match restart_instance(ctx.home, fleet_name) {
-                            Ok(()) => {
-                                tracing::info!(
+                        if let Some(restart_tx) = ctx.restart_tx {
+                            let request = RemoteRestartRequest {
+                                restart_id: crate::types::InstanceId::new().full(),
+                                old_instance_ref: old_ref,
+                                tab_index: pane_loc.map(|(tab_idx, _)| tab_idx).unwrap_or(0),
+                                pane_id: pane_loc.map(|(_, pane_id)| pane_id).unwrap_or(0),
+                                name: fleet_name.to_string(),
+                            };
+                            if restart_tx.try_send(request).is_err() {
+                                tracing::warn!(
                                     agent = name,
                                     fleet_instance = fleet_name,
-                                    "requested daemon-owned remote restart"
+                                    "remote restart queue is full or stopped"
                                 );
                             }
-                            Err(error) => {
-                                tracing::error!(
-                                    agent = name,
-                                    fleet_instance = fleet_name,
-                                    error = %error,
-                                    "daemon-owned remote restart failed"
-                                );
+                        } else {
+                            match restart_instance(ctx.home, fleet_name) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        agent = name,
+                                        fleet_instance = fleet_name,
+                                        "requested daemon-owned remote restart"
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        agent = name,
+                                        fleet_instance = fleet_name,
+                                        error = %error,
+                                        "daemon-owned remote restart failed"
+                                    );
+                                }
                             }
                         }
                         return false;

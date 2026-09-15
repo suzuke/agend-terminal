@@ -191,6 +191,8 @@ pub(super) struct OverlayCtx<'a> {
     pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
     pub task_rpc_tx: &'a crossbeam_channel::Sender<super::rpc::TaskRequest>,
+    pub restart_request_tx:
+        Option<&'a crossbeam_channel::Sender<super::commands::RemoteRestartRequest>>,
     pub reap_workers: &'a mut Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -619,7 +621,7 @@ pub(super) fn handle_key(
                     home: ctx.home,
                     wakeup_tx: ctx.wakeup_tx,
                     name_counter: &mut *ctx.name_counter,
-                    restart_tx: None,
+                    restart_tx: ctx.restart_request_tx,
                 };
                 if super::commands::execute(&cmd, &mut cctx) {
                     outcome.needs_resize = true;
@@ -1201,6 +1203,7 @@ mod tests {
             wakeup_tx: &wakeup_tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
         handle_key(&mut overlay, press(KeyCode::Char('y')), &mut ctx);
@@ -1307,6 +1310,7 @@ mod tests {
             wakeup_tx: &wakeup_tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
 
@@ -1351,6 +1355,7 @@ mod tests {
             wakeup_tx: &wakeup_tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
         let overlay = Overlay::ConfirmDeleteInstance {
@@ -1406,6 +1411,7 @@ mod tests {
             wakeup_tx: &wakeup_tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
         let overlay = Overlay::ConfirmDeleteInstance {
@@ -1463,6 +1469,7 @@ mod tests {
             wakeup_tx: &wakeup_tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
 
@@ -1525,6 +1532,7 @@ mod tests {
             wakeup_tx: &wakeup_tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
 
@@ -1583,6 +1591,7 @@ mod tests {
             wakeup_tx: &wakeup_tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
 
@@ -1676,6 +1685,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
         for k in keys {
@@ -1700,6 +1710,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
         let mut overlay = task_overlay();
@@ -1725,6 +1736,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {
@@ -1758,6 +1770,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {
@@ -1810,6 +1823,7 @@ mod tests {
             wakeup_tx: tx,
             name_counter,
             task_rpc_tx,
+            restart_request_tx: None,
             reap_workers,
         }
     }
@@ -2018,6 +2032,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {
@@ -2067,6 +2082,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
             reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {

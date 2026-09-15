@@ -243,6 +243,8 @@ impl JobRuntime for ManagedRuntime {
             layout: "tab",
             spawner: None,
             target_pane: None,
+            restart_id: None,
+            old_instance_ref: None,
         };
         let request = crate::agent_ops::spawn::resolve_spawn_request(&self.home, &params)?;
         // Reject common pre-launch failures before creating an uncertain intent.

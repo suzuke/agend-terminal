@@ -23,6 +23,8 @@ pub struct SpawnParams<'a> {
     pub layout: &'a str,
     pub spawner: Option<&'a str>,
     pub target_pane: Option<&'a str>,
+    pub restart_id: Option<&'a str>,
+    pub old_instance_ref: Option<crate::types::InstanceRef>,
 }
 
 /// Fully resolved SPAWN request. All precedence decisions happen once here.
@@ -40,6 +42,8 @@ pub struct SpawnRequest {
     pub layout: String,
     pub spawner: Option<String>,
     pub target_pane: Option<String>,
+    pub restart_id: Option<String>,
+    pub old_instance_ref: Option<crate::types::InstanceRef>,
 }
 
 /// Runtime-owned state required by the neutral SPAWN service.
@@ -161,6 +165,8 @@ pub fn resolve_spawn_request(
         layout: params.layout.to_string(),
         spawner: params.spawner.map(str::to_string),
         target_pane: params.target_pane.map(str::to_string),
+        restart_id: params.restart_id.map(str::to_string),
+        old_instance_ref: params.old_instance_ref,
     })
 }
 
@@ -275,6 +281,8 @@ pub fn spawn_instance(
                 context.home,
                 &request.name,
             ),
+            restart_id: request.restart_id.clone(),
+            old_instance_ref: request.old_instance_ref,
             layout: crate::api::LayoutHint::parse(&request.layout),
             spawner: request.spawner.clone(),
             target_pane: request.target_pane.clone(),

@@ -121,6 +121,12 @@ pub(super) struct RestartState {
     pub(super) restart_commit_pending: Option<CommitPending>,
 }
 
+struct RemoteRestartPending {
+    request: commands::RemoteRestartRequest,
+    successor_instance_ref: Option<crate::types::InstanceRef>,
+    conflicted: bool,
+}
+
 /// #2453: root owner of `run_app`'s durable render-loop state. The only
 /// mutable lifecycle locals permitted OUTSIDE this struct are `attach_jobs`
 /// and `attach_workers` (startup/teardown-scoped). Channels, registries, and
@@ -219,6 +225,10 @@ pub(super) struct AppState {
     pub(super) attaches_expected: usize,
     /// #2453 R2: app owner-restart in-flight state (bounded typed sub-owner).
     pub(super) restart: RestartState,
+    /// Correlated remote restarts waiting for both the daemon result and the
+    /// roster attach. Bounded to the worker queue capacity; terminal outcomes
+    /// remove entries immediately.
+    remote_restarts: HashMap<String, RemoteRestartPending>,
 }
 
 /// #render-first attach pipeline handles: (keepalive sender, outcome
@@ -255,6 +265,8 @@ pub(super) struct AppDeps<'a> {
     pub size_debug: bool,
     pub task_rpc_tx: &'a crossbeam_channel::Sender<rpc::TaskRequest>,
     pub remote_state_rpc_tx: &'a crossbeam_channel::Sender<rpc::AgentStateRequest>,
+    pub remote_restart_request_tx: &'a crossbeam_channel::Sender<commands::RemoteRestartRequest>,
+    pub remote_restart_worker_tx: &'a crossbeam_channel::Sender<commands::RemoteRestartRequest>,
 }
 
 /// #2453 Slice 2: the extracted run_app loop/setup logic, method-by-method.
@@ -309,6 +321,7 @@ impl AppState {
                 restart_probe: None,
                 restart_commit_pending: None,
             },
+            remote_restarts: HashMap::new(),
         }
     }
 
@@ -921,6 +934,7 @@ impl AppState {
             fleet_path,
             wakeup_tx,
             task_rpc_tx: deps.task_rpc_tx,
+            restart_request_tx: Some(deps.remote_restart_request_tx),
             task_snapshot: &self.task_snapshot,
             reap_workers,
             team_view: Some(&self.team_view),
@@ -1175,14 +1189,38 @@ impl AppState {
                     self.invalidate_team_view();
                 }
                 if !self.event_resync_required {
-                    if let crate::api::ApiEvent::InstanceDeleted {
-                        instance_ref: Some(instance_ref),
-                        ..
-                    } = event.event
-                    {
-                        self.ui
-                            .layout
-                            .remove_fleet_instance_views_exact(instance_ref);
+                    match event.event {
+                        crate::api::ApiEvent::InstanceDeleted {
+                            instance_ref: Some(instance_ref),
+                            ..
+                        } => {
+                            let retained_for_restart =
+                                self.remote_restarts.values_mut().find(|pending| {
+                                    pending.request.old_instance_ref == Some(instance_ref)
+                                });
+                            if retained_for_restart.is_none() {
+                                self.ui
+                                    .layout
+                                    .remove_fleet_instance_views_exact(instance_ref);
+                            }
+                        }
+                        crate::api::ApiEvent::InstanceCreated {
+                            restart_id: Some(restart_id),
+                            instance_ref,
+                            old_instance_ref,
+                            ..
+                        } => {
+                            if let Some(pending) = self.remote_restarts.get_mut(&restart_id) {
+                                if pending.request.old_instance_ref.is_some()
+                                    && pending.request.old_instance_ref == old_instance_ref
+                                {
+                                    pending.successor_instance_ref = instance_ref;
+                                } else {
+                                    pending.conflicted = true;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 self.request_event_refresh(deps);
@@ -1204,6 +1242,66 @@ impl AppState {
                 self.daemon_list_mode = crate::runtime::AgentListMode::FallbackDaemonStuck;
                 tracing::warn!("daemon event stream worker stopped");
                 self.request_event_refresh(deps);
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn handle_remote_restart_request(
+        &mut self,
+        request: commands::RemoteRestartRequest,
+        deps: &AppDeps<'_>,
+    ) {
+        if self.remote_restarts.len() >= 16 {
+            tracing::warn!(restart_id = %request.restart_id, "remote restart registry is full");
+            return;
+        }
+        let restart_id = request.restart_id.clone();
+        self.remote_restarts.insert(
+            restart_id.clone(),
+            RemoteRestartPending {
+                request: request.clone(),
+                successor_instance_ref: None,
+                conflicted: false,
+            },
+        );
+        if deps.remote_restart_worker_tx.try_send(request).is_err() {
+            self.remote_restarts.remove(&restart_id);
+            tracing::warn!("remote restart worker queue is full or stopped");
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn handle_remote_restart_outcome(
+        &mut self,
+        outcome: Result<rpc::RemoteRestartOutcome, crossbeam_channel::RecvError>,
+        deps: &AppDeps<'_>,
+    ) {
+        let Ok(outcome) = outcome else {
+            self.dirty = true;
+            return;
+        };
+        let restart_id = outcome.request.restart_id.clone();
+        let Some(pending) = self.remote_restarts.get_mut(&restart_id) else {
+            return;
+        };
+        match outcome.result {
+            Ok(result)
+                if pending.request.old_instance_ref.is_some()
+                    && result.old_instance_ref == pending.request.old_instance_ref
+                    && result.successor_instance_ref.is_some()
+                    && !pending.conflicted =>
+            {
+                pending.successor_instance_ref = result.successor_instance_ref;
+                self.request_event_refresh(deps);
+            }
+            Ok(_) => {
+                self.remote_restarts.remove(&restart_id);
+                tracing::warn!(restart_id = %restart_id, "remote restart identity correlation failed");
+            }
+            Err(error) => {
+                tracing::warn!(restart_id = %restart_id, error = %error, "remote restart failed");
+                self.remote_restarts.remove(&restart_id);
             }
         }
         self.dirty = true;
@@ -1326,6 +1424,38 @@ impl AppState {
         }
     }
 
+    fn place_correlated_remote_pane(&mut self, pane: Pane) -> Option<Pane> {
+        let Some(successor_ref) = pane.instance_ref else {
+            return Some(pane);
+        };
+        let Some((restart_id, request)) = self.remote_restarts.iter().find_map(|(id, pending)| {
+            (!pending.conflicted
+                && pending.successor_instance_ref == Some(successor_ref)
+                && (pending.request.name
+                    == pane.fleet_instance_name.as_deref().unwrap_or_default()
+                    || pending.request.name == pane.agent_name.as_str()))
+            .then(|| (id.clone(), pending.request.clone()))
+        }) else {
+            return Some(pane);
+        };
+        let Some(old_ref) = request.old_instance_ref else {
+            return Some(pane);
+        };
+        match self.ui.layout.replace_agent_pane_at_exact(
+            request.tab_index,
+            request.pane_id,
+            old_ref,
+            pane,
+        ) {
+            Ok(()) => {
+                self.remote_restarts.remove(&restart_id);
+                self.needs_resize = true;
+                None
+            }
+            Err(pane) => Some(*pane),
+        }
+    }
+
     // #3501: team-grouped placement for hot-reload — mirrors
     // session::place_agents_team_grouped. `to_add` is already sorted.
     fn place_remote_team_grouped(
@@ -1395,6 +1525,9 @@ impl AppState {
                         if pane.instance_ref.is_none() {
                             pane.instance_ref = self.remote_instance_refs.get(name).copied();
                         }
+                        let Some(pane) = self.place_correlated_remote_pane(pane) else {
+                            continue;
+                        };
                         let tab_name = pane.agent_name.clone();
                         self.known_remote_agents.insert(tab_name.to_string());
                         self.remote_attach_failures.remove(name);
@@ -1475,6 +1608,9 @@ impl AppState {
                     if pane.instance_ref.is_none() {
                         pane.instance_ref = self.remote_instance_refs.get(name).copied();
                     }
+                    let Some(pane) = self.place_correlated_remote_pane(pane) else {
+                        continue;
+                    };
                     let tab_name = pane.agent_name.clone();
                     self.known_remote_agents.insert(tab_name.to_string());
                     self.remote_attach_failures.remove(name);
@@ -1597,6 +1733,10 @@ mod tests {
         let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded::<rpc::TaskRequest>();
         let (remote_state_rpc_tx, _remote_state_rpc_rx) =
             crossbeam_channel::unbounded::<rpc::AgentStateRequest>();
+        let (remote_restart_request_tx, _remote_restart_request_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+        let (remote_restart_worker_tx, _remote_restart_worker_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
         let deps = AppDeps {
             home: &home,
             fleet_path: &fleet_path,
@@ -1610,6 +1750,8 @@ mod tests {
             size_debug: false,
             task_rpc_tx: &task_rpc_tx,
             remote_state_rpc_tx: &remote_state_rpc_tx,
+            remote_restart_request_tx: &remote_restart_request_tx,
+            remote_restart_worker_tx: &remote_restart_worker_tx,
         };
         let (_sub_tx, sub_rx) = crossbeam_channel::unbounded();
         let mut reap_workers = Vec::new();
@@ -1753,6 +1895,10 @@ mod tests {
         let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded::<rpc::TaskRequest>();
         let (remote_state_rpc_tx, _remote_state_rpc_rx) =
             crossbeam_channel::unbounded::<rpc::AgentStateRequest>();
+        let (remote_restart_request_tx, _remote_restart_request_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+        let (remote_restart_worker_tx, _remote_restart_worker_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
         let deps = AppDeps {
             home: &home,
             fleet_path: &fleet_path,
@@ -1766,6 +1912,8 @@ mod tests {
             size_debug: false,
             task_rpc_tx: &task_rpc_tx,
             remote_state_rpc_tx: &remote_state_rpc_tx,
+            remote_restart_request_tx: &remote_restart_request_tx,
+            remote_restart_worker_tx: &remote_restart_worker_tx,
         };
         let mut state = AppState::new();
         let event = |source: &str, sequence: u64| {

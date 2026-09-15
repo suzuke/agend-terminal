@@ -430,6 +430,10 @@ fn run_app(
     let (task_rpc_tx, task_rpc_rx, task_rpc_worker) = rpc::spawn_task_worker(&home);
     let (remote_state_rpc_tx, remote_state_rpc_rx, remote_state_rpc_worker) =
         rpc::spawn_agent_state_worker(&home);
+    let (remote_restart_request_tx, remote_restart_request_rx) =
+        crossbeam_channel::bounded::<commands::RemoteRestartRequest>(16);
+    let (remote_restart_worker_tx, remote_restart_outcome_rx, remote_restart_worker) =
+        rpc::spawn_remote_restart_worker(&home);
     let (event_stop_tx, daemon_event_rx, event_worker) = rpc::spawn_event_worker(&home);
     let deps = AppDeps {
         home: &home,
@@ -444,6 +448,8 @@ fn run_app(
         size_debug,
         task_rpc_tx: &task_rpc_tx,
         remote_state_rpc_tx: &remote_state_rpc_tx,
+        remote_restart_request_tx: &remote_restart_request_tx,
+        remote_restart_worker_tx: &remote_restart_worker_tx,
     };
     // `_attach_tx` keepalive for the loop scope: see `restore_and_attach`.
     let (_attach_tx, attach_rx, attach_workers) = state.restore_and_attach(&deps, restore_start)?;
@@ -471,6 +477,14 @@ fn run_app(
             recv(attach_rx) -> outcome => state.handle_attach_outcome(outcome, &deps, &mut reap_workers),
             recv(task_rpc_rx) -> outcome => state.handle_task_rpc_outcome(outcome),
             recv(remote_state_rpc_rx) -> outcome => state.handle_agent_state_rpc_outcome(outcome),
+            recv(remote_restart_request_rx) -> request => {
+                if let Ok(request) = request {
+                    state.handle_remote_restart_request(request, &deps);
+                }
+            },
+            recv(remote_restart_outcome_rx) -> outcome => {
+                state.handle_remote_restart_outcome(outcome, &deps);
+            },
             recv(daemon_event_rx) -> outcome => state.handle_event_stream_outcome(outcome, &deps),
             default(state.select_timeout()) => state.handle_idle_tick(&deps),
         }
@@ -478,6 +492,9 @@ fn run_app(
     drop(remote_state_rpc_tx);
     drop(remote_state_rpc_rx);
     let _ = remote_state_rpc_worker.join();
+    drop(remote_restart_worker_tx);
+    drop(remote_restart_request_tx);
+    let _ = remote_restart_worker.join();
     drop(task_rpc_tx);
     let _ = task_rpc_worker.join();
     let _ = event_stop_tx.try_send(());

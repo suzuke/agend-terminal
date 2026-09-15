@@ -1044,6 +1044,14 @@ mod tests {
                 "internal: public task done/update boundary rejects caller-supplied force; intentionally not advertised",
             ),
             (
+                "restart_id",
+                "internal: app TUI restart correlation; not agent-facing",
+            ),
+            (
+                "old_instance_ref",
+                "internal: app TUI predecessor identity; not agent-facing",
+            ),
+            (
                 "provenance",
                 "internal: delegate_task provenance metadata, set by dispatch path",
             ),
@@ -1405,6 +1413,16 @@ mod tests {
                 "restart_instance",
                 "force",
                 "instance_state/mod.rs fresh-restart uncommitted-work guard bypass (#2476)",
+            ),
+            (
+                "restart_instance",
+                "restart_id",
+                "app/rpc.rs internal correlated restart identity",
+            ),
+            (
+                "restart_instance",
+                "old_instance_ref",
+                "app/rpc.rs internal predecessor identity for exact pane replacement",
             ),
             // ── config ── (#2548: watchdog moved to CLI, mode retired, no longer coordination tools)
             ("config", "action", "mcp/handlers/dispatch.rs get/list"),

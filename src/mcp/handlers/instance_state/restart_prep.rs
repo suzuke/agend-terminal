@@ -7,13 +7,65 @@
 //! unchanged — the items are the same, only their home and visibility moved.
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+
+type RestartKey = (std::path::PathBuf, String);
+
+static RESTART_ADMISSIONS: OnceLock<Mutex<HashMap<RestartKey, String>>> = OnceLock::new();
+
+pub(super) struct RestartAdmission {
+    key: RestartKey,
+    restart_id: String,
+}
+
+impl Drop for RestartAdmission {
+    fn drop(&mut self) {
+        if let Ok(mut admissions) = admissions().lock() {
+            if admissions.get(&self.key) == Some(&self.restart_id) {
+                admissions.remove(&self.key);
+            }
+        }
+    }
+}
+
+fn admissions() -> &'static Mutex<HashMap<RestartKey, String>> {
+    RESTART_ADMISSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Admit one restart per configured target. The guard is held through draft
+/// grace, DELETE, SPAWN, and handoff settlement; dropping it is the bounded
+/// terminal cleanup, so retries do not accumulate replay state.
+pub(super) fn try_admit_restart(
+    home: &Path,
+    name: &str,
+    restart_id: &str,
+) -> Result<RestartAdmission, String> {
+    let key = (home.to_path_buf(), name.to_string());
+    let mut current = admissions()
+        .lock()
+        .map_err(|_| "restart admission lock poisoned".to_string())?;
+    if let Some(existing) = current.get(&key) {
+        return Err(format!(
+            "restart already in progress for '{name}' (restart_id={existing}, request_id={restart_id})"
+        ));
+    }
+    current.insert(key.clone(), restart_id.to_string());
+    Ok(RestartAdmission {
+        key,
+        restart_id: restart_id.to_string(),
+    })
+}
 
 /// #1625: assemble the SPAWN params for a restart. Tags `layout: same-tab` so
 /// the respawned pane returns to the tab the killed pane occupied (recorded
 /// on its DELETE) instead of opening a fresh tab. `mode` only toggles backend
 /// resume args — placement is identical for resume and fresh restarts — so
 /// the hint is applied unconditionally.
+// The existing restart parameter helper carries the complete spawn shape;
+// correlation adds two lifecycle fields without changing its call contract.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn restart_spawn_params(
     name: &str,
     backend_command: &str,
@@ -21,6 +73,8 @@ pub(super) fn restart_spawn_params(
     working_directory: Option<&Path>,
     env: &std::collections::HashMap<String, String>,
     mode: &str,
+    restart_id: &str,
+    old_instance_ref: Option<crate::types::InstanceRef>,
 ) -> Value {
     let mut spawn_params = json!({
         "name": name,
@@ -29,6 +83,8 @@ pub(super) fn restart_spawn_params(
         "working_directory": working_directory.map(|p| p.display().to_string()),
         "env": serde_json::to_value(env).unwrap_or(serde_json::Value::Null),
         "layout": "same-tab",
+        "restart_id": restart_id,
+        "old_instance_ref": old_instance_ref,
     });
     if mode == "resume" {
         spawn_params["mode"] = json!("resume");

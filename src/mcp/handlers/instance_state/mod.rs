@@ -484,6 +484,14 @@ pub(super) fn handle_restart_instance_with_runtime(
     crate::validate_name_or_err!(name);
     let reason = args["reason"].as_str().unwrap_or("manual restart");
     let mode = args["mode"].as_str().unwrap_or("resume");
+    let restart_id = args["restart_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::types::InstanceId::new().full());
+    let requested_old_instance_ref = args
+        .get("old_instance_ref")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
 
     // #2476: a `fresh` restart DROPS the agent's in-memory context (that is its
     // value — it releases a stale prompt cache while a dev idles waiting on
@@ -572,6 +580,24 @@ pub(super) fn handle_restart_instance_with_runtime(
             restart_prep::ResumeGate::Proceed { codex_thread } => codex_thread,
             restart_prep::ResumeGate::Refused { response } => return response,
         };
+
+    // Correlation is authoritative only when the daemon can snapshot the live
+    // predecessor. A caller-supplied ref is accepted for legacy/no-runtime
+    // paths, but never overrides the daemon's registry identity.
+    let old_instance_ref = runtime
+        .and_then(|runtime| crate::agent::instance_ref_for_name(&runtime.registry, home, name))
+        .or(requested_old_instance_ref);
+    let _restart_admission = match restart_prep::try_admit_restart(home, name, &restart_id) {
+        Ok(admission) => admission,
+        Err(error) => {
+            return json!({
+                "error": error,
+                "code": "restart_in_progress",
+                "name": name,
+                "restart_id": restart_id,
+            })
+        }
+    };
 
     // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
     // self-orch once-off latch, so a fresh terminal death after this restart re-pages.
@@ -662,6 +688,8 @@ pub(super) fn handle_restart_instance_with_runtime(
         resolved.working_directory.as_deref(),
         &resolved.env,
         mode,
+        &restart_id,
+        old_instance_ref,
     );
 
     let spawn_request = json!({
@@ -679,7 +707,9 @@ pub(super) fn handle_restart_instance_with_runtime(
     let (tui_handoff, handoff_warning) = restart_prep::settle_tui_handoff(home, name, spawned);
 
     tracing::info!(%name, %reason, %mode, %spawned, tui_handoff, "restart_instance");
-    let mut resp = json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned, "tui_handoff": tui_handoff});
+    let successor_instance_ref = runtime
+        .and_then(|runtime| crate::agent::instance_ref_for_name(&runtime.registry, home, name));
+    let mut resp = json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned, "tui_handoff": tui_handoff, "restart_id": restart_id, "old_instance_ref": old_instance_ref, "successor_instance_ref": successor_instance_ref});
     if let Some(warning) = handoff_warning {
         resp["tui_handoff_warning"] = json!(warning);
     }
