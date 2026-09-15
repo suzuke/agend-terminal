@@ -1270,6 +1270,84 @@ mod tests {
     }
 
     #[test]
+    fn focused_status_entry_point_renders_lead_and_roster_summary() {
+        let lead_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 7);
+        let config: crate::fleet::FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let mut roster = HashMap::new();
+        roster.insert("lead".to_string(), lead_ref);
+        let view = TeamView::from_fleet(config, Some(roster));
+        let pane = Pane {
+            agent_name: "lead".into(),
+            instance_id: lead_ref.instance_id,
+            instance_ref: Some(lead_ref),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: Some("lead".into()),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        let mut layout = Layout::new();
+        layout.add_tab(crate::layout::Tab::new("ops".into(), pane));
+        let backend = ratatui::backend::TestBackend::new(120, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_status_bar_with_team(
+                    frame,
+                    frame.area(),
+                    &layout,
+                    TelegramStatus::NotConfigured,
+                    false,
+                    0,
+                    crate::runtime::AgentListMode::Live,
+                    Some(&view),
+                );
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("team:ops"),
+            "status must identify the team: {text:?}"
+        );
+        assert!(
+            text.contains("lead:lead"),
+            "status must identify the lead: {text:?}"
+        );
+        assert!(
+            text.contains("roster:1"),
+            "status must summarize roster size: {text:?}"
+        );
+        assert!(
+            text.contains("live:yes"),
+            "status must expose live roster state: {text:?}"
+        );
+        assert!(
+            text.contains("freshness:Fresh"),
+            "status must expose freshness: {text:?}"
+        );
+    }
+
+    #[test]
     fn badge_shows_pending_count() {
         let pane = Pane {
             agent_name: "agent".into(),

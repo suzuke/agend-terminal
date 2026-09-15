@@ -322,6 +322,15 @@ impl Tab {
     /// rendering in render_pane. Agent state suffix (` [state] `) is excluded so
     /// that clicks on it fall through to split-border resize.
     pub fn title_bar_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.title_bar_at_with_team(col, row, None)
+    }
+
+    pub fn title_bar_at_with_team(
+        &self,
+        col: u16,
+        row: u16,
+        _team_view: Option<&crate::team_view::TeamView>,
+    ) -> Option<usize> {
         use unicode_width::UnicodeWidthStr;
         for (&id, &(px, py, _pw, _ph)) in &self.pane_rects {
             if row != py {
@@ -495,6 +504,29 @@ mod tests {
         for col in 1..11 {
             assert_eq!(tab.title_bar_at(col, 0), Some(1), "col {col}");
         }
+    }
+
+    #[test]
+    fn title_bar_hit_test_includes_authoritative_badge() {
+        let lead_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+        let mut pane = leaf(1, "lead");
+        pane.fleet_instance_name = Some("lead".into());
+        pane.instance_ref = Some(lead_ref);
+        let mut tab = tab_with_pane("lead", 1, (0, 0, 20, 10));
+        tab.root = Some(PaneNode::Leaf(Box::new(pane)));
+        let config: crate::fleet::FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let mut roster = std::collections::HashMap::new();
+        roster.insert("lead".to_string(), lead_ref);
+        let view = crate::team_view::TeamView::from_fleet(config, Some(roster));
+
+        assert_eq!(
+            tab.title_bar_at_with_team(11, 0, Some(&view)),
+            Some(1),
+            "clicking the rendered [LEAD] suffix must select the pane title"
+        );
     }
     #[test]
     fn split_at_pane_targets_non_focused_pane() {

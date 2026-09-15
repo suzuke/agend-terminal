@@ -1016,7 +1016,7 @@ mod tests {
         let view = crate::team_view::TeamView::from_fleet(config, Some(HashMap::new()));
         assert_eq!(
             layout.tabs[0].tab_bar_label_with_team(true, Some(&view)),
-            " ops ",
+            " ops [LEAD?] ",
             "tab identity must come from the authoritative member set"
         );
         assert_eq!(
