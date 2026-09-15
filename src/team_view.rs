@@ -354,6 +354,73 @@ mod tests {
     }
 
     #[test]
+    fn successful_reload_tracks_latest_roster_for_future_stale_claims() {
+        let home = std::env::temp_dir().join(format!(
+            "team-view-latest-roster-{}",
+            crate::types::InstanceId::new()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "teams:\n  ops:\n    members: [lead]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+
+        let first_ref = id_ref(1);
+        let mut first_roster = HashMap::new();
+        first_roster.insert("lead".to_string(), first_ref);
+        let first = TeamView::load(&home, Some(first_roster));
+
+        let latest_ref = id_ref(2);
+        let mut latest_roster = HashMap::new();
+        latest_roster.insert("lead".to_string(), latest_ref);
+        crate::fleet::invalidate_cache();
+        let latest = TeamView::load_with_previous(&home, Some(latest_roster), Some(&first));
+        std::fs::write(home.join("fleet.yaml"), "teams: [").unwrap();
+        crate::fleet::invalidate_cache();
+        let stale = TeamView::load_with_previous(&home, None, Some(&latest));
+
+        assert_eq!(stale.status(), TeamViewStatus::Stale);
+        assert_eq!(
+            stale.badge("lead", Some(&latest_ref)),
+            LeadBadge::Uncertain,
+            "the latest live identity remains possible after degradation"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_existing_symlink_is_not_treated_as_missing_fleet() {
+        use std::os::unix::fs::symlink;
+
+        let home = std::env::temp_dir().join(format!(
+            "team-view-broken-link-{}",
+            crate::types::InstanceId::new()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("fleet.yaml");
+        std::fs::write(
+            &path,
+            "teams:\n  ops:\n    members: [lead]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let lead_ref = id_ref(1);
+        let mut roster = HashMap::new();
+        roster.insert("lead".to_string(), lead_ref);
+        let previous = TeamView::load(&home, Some(roster));
+
+        std::fs::remove_file(&path).unwrap();
+        symlink("missing-fleet.yaml", &path).unwrap();
+        crate::fleet::invalidate_cache();
+        let view = TeamView::load_with_previous(&home, None, Some(&previous));
+
+        assert_eq!(view.status(), TeamViewStatus::Stale);
+        assert_eq!(view.badge("lead", None), LeadBadge::Uncertain);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn narrow_badge_width_keeps_deterministic_prefix() {
         assert_eq!(clip_badge("[LEAD]", 0), "");
         assert_eq!(clip_badge("[LEAD]", 3), "[LE");

@@ -1250,6 +1250,9 @@ mod tests {
             segments.iter().any(|(text, _)| text == " [LEAD]"),
             "real title segmentation must include the authoritative badge: {segments:?}"
         );
+        let (_, badge_style) = segments.iter().find(|(text, _)| text == " [LEAD]").unwrap();
+        assert_eq!(badge_style.fg, Some(Color::LightGreen));
+        assert!(badge_style.add_modifier.contains(Modifier::BOLD));
         pane.instance_ref = Some(crate::types::InstanceRef::new(lead_ref.instance_id, 8));
         let segments = pane_title_segments_with_team(
             &pane,
