@@ -21,7 +21,7 @@ pub(crate) use release_guard::{
 mod rebind_guard;
 use rebind_guard::same_agent_metadata_catchup_allowed;
 mod signature;
-pub(crate) use signature::signature_valid;
+pub(crate) use signature::{signature_status, signature_valid, SignatureStatus};
 mod unbind;
 pub(crate) use unbind::{unbind_with_permit, BindingRemoval};
 mod unbind_compat;

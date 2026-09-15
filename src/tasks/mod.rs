@@ -191,13 +191,14 @@ fn assignee_binding_check(
 ) -> Result<Option<crate::merge_receipt::MergeReceipt>, String> {
     // Authenticate the same disk snapshot while both binding writer locks are
     // held. Drop them before task/assignment locks or completion side effects.
-    let (snapshot, signature_valid) = {
+    let (snapshot, signature_status) = {
         let _agent = crate::binding::acquire_agent_mutation_lock(home, caller)?;
         let _binding = crate::binding::acquire_binding_file_lock(home, caller)?;
         let snapshot = crate::binding::guarded_binding_disk_fresh(home, caller);
-        let signature_valid = crate::binding::signature_valid(home, caller);
-        (snapshot, signature_valid)
+        let signature_status = crate::binding::signature_status(home, caller);
+        (snapshot, signature_status)
     };
+    let signature_valid = signature_status == crate::binding::SignatureStatus::Valid;
     let binding = match snapshot {
         crate::binding::GuardedBinding::Absent => None,
         crate::binding::GuardedBinding::Opaque(reason) => {
@@ -217,19 +218,21 @@ fn assignee_binding_check(
             && value["source_repo"].as_str().is_some_and(|s| !s.is_empty())
             && value["worktree"].as_str().is_some_and(|s| !s.is_empty())
     });
-    // A legacy binding can predate the HMAC sidecar and therefore cannot be
-    // used as completion authority. When it explicitly names a different
-    // task, however, it is unrelated to this receipt-backed completion and
-    // must not become a false denial. The receipt remains the sole authority;
-    // this arm never cleans or releases the legacy workspace. Present-but-
-    // invalid modern signatures stay fail-closed below.
+    // A sidecar-less schema-1 binding carrying the original issued_at field can
+    // predate the HMAC rollout and therefore cannot be used as completion
+    // authority. When it explicitly names a different task, however, it is
+    // unrelated to this receipt-backed completion and must not become a false
+    // denial. The receipt remains the sole authority; this arm never cleans or
+    // releases the legacy workspace. A present-but-invalid sidecar is classified
+    // separately and stays fail-closed below.
     let unrelated_legacy_binding = binding.as_ref().is_some_and(|value| {
-        !signature_valid
-            && value.get("issued_at").is_none()
+        signature_status == crate::binding::SignatureStatus::Missing
+            && value["version"].as_u64() == Some(1)
             && value["agent"].as_str() == Some(caller)
             && value["task_id"]
                 .as_str()
                 .is_some_and(|id| !id.is_empty() && id != task_id)
+            && value["issued_at"].as_str().is_some_and(|s| !s.is_empty())
             && value["branch"].as_str().is_some_and(|s| !s.is_empty())
             && value["worktree"].as_str().is_some_and(|s| !s.is_empty())
     });
