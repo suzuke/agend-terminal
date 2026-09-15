@@ -576,6 +576,29 @@ mod tests {
             "clicking the rendered [LEAD] suffix must select the pane title"
         );
     }
+
+    #[test]
+    fn member_only_team_tab_shows_uncertain_badge_when_lead_is_offline_3629() {
+        let member_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 2);
+        let mut pane = leaf(1, "member");
+        pane.fleet_instance_name = Some("member".into());
+        pane.instance_ref = Some(member_ref);
+        let mut tab = tab_with_pane("member", 1, (0, 0, 20, 10));
+        tab.root = Some(PaneNode::Leaf(Box::new(pane)));
+        let config: crate::fleet::FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead, member]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let mut roster = std::collections::HashMap::new();
+        roster.insert("member".to_string(), member_ref);
+        let view = crate::team_view::TeamView::from_fleet(config, Some(roster));
+
+        assert_eq!(
+            tab.tab_bar_label_with_team(true, Some(&view)),
+            " ops [LEAD?] ",
+            "a team tab without its online lead must expose uncertainty"
+        );
+    }
     #[test]
     fn split_at_pane_targets_non_focused_pane() {
         let mut tab = Tab::new("t".to_string(), leaf(1, "a"));

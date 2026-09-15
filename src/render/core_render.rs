@@ -1359,6 +1359,73 @@ mod tests {
     }
 
     #[test]
+    fn focused_status_entry_point_scopes_roster_summary_to_active_team_3629() {
+        let lead_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 7);
+        let member_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 3);
+        let other_lead_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 4);
+        let config: crate::fleet::FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead, member]\n    orchestrator: lead\n  infra:\n    members: [infra-lead]\n    orchestrator: infra-lead\n",
+        )
+        .unwrap();
+        let mut roster = HashMap::new();
+        roster.insert("lead".to_string(), lead_ref);
+        roster.insert("member".to_string(), member_ref);
+        roster.insert("infra-lead".to_string(), other_lead_ref);
+        let view = TeamView::from_fleet(config, Some(roster));
+        let pane = Pane {
+            agent_name: "lead".into(),
+            instance_id: lead_ref.instance_id,
+            instance_ref: Some(lead_ref),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: Some("lead".into()),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        let mut layout = Layout::new();
+        layout.add_tab(crate::layout::Tab::new("ops".into(), pane));
+        let backend = ratatui::backend::TestBackend::new(120, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_status_bar_with_team(
+                    frame,
+                    frame.area(),
+                    &layout,
+                    TelegramStatus::NotConfigured,
+                    false,
+                    0,
+                    crate::runtime::AgentListMode::Live,
+                    Some(&view),
+                );
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("roster:2"),
+            "status must count only active-team roster members: {text:?}"
+        );
+        assert!(!text.contains("roster:3"));
+    }
+
+    #[test]
     fn badge_shows_pending_count() {
         let pane = Pane {
             agent_name: "agent".into(),
