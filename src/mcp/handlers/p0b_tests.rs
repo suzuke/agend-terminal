@@ -435,6 +435,11 @@ fn ec6_dispatch_uses_fleet_source_repo_tier_when_present() {
         .current_dir(&src)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
+    let _ = std::process::Command::new("git")
+        .args(["remote", "add", "origin", "https://github.com/o/r.git"])
+        .current_dir(&src)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
     populate_origin_main_for_strict_ensure_branch(&src);
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
@@ -472,12 +477,9 @@ fn ec4_fleet_repo_override_wins_over_derive() {
     let home = tmp_home("ec4-override");
     let src = home.join("src-noremote");
     std::fs::create_dir_all(&src).ok();
-    // git init but NO origin remote registered → derive returns None.
-    // #781 Phase 3 r1: populate `refs/remotes/origin/main` so strict
-    // `ensure_branch_exists` resolves locally; we intentionally skip
-    // `git remote add origin <url>` so `derive_repo_from_remote`
-    // returns None (this is the assertion under test — fleet.yaml
-    // `repo:` override wins over remote-URL derivation).
+    // The explicit fleet.yaml `repo:` override must win over the configured
+    // origin URL. Populate `refs/remotes/origin/main` so strict
+    // `ensure_branch_exists` resolves locally without network access.
     let _ = std::process::Command::new("git")
         .args(["init", "-b", "main"])
         .current_dir(&src)
@@ -493,6 +495,16 @@ fn ec4_fleet_repo_override_wins_over_derive() {
             "--allow-empty",
             "-m",
             "init",
+        ])
+        .current_dir(&src)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    let _ = std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/derived/repo.git",
         ])
         .current_dir(&src)
         .env("AGEND_GIT_BYPASS", "1")
@@ -626,6 +638,11 @@ fn dispatch_with_source_repo_override_wins_over_fleet() {
             "-m",
             "init",
         ])
+        .current_dir(&real_src)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["remote", "add", "origin", "https://github.com/o/r.git"])
         .current_dir(&real_src)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
@@ -764,6 +781,10 @@ fn dispatch_workspace_as_worktree_binds_workspace_path_2234() {
             "-m",
             "init",
         ],
+    );
+    git(
+        &canonical,
+        &["remote", "add", "origin", "https://github.com/o/r.git"],
     );
     let sha = String::from_utf8_lossy(&git(&canonical, &["rev-parse", "HEAD"]).stdout)
         .trim()
