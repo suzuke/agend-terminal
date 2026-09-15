@@ -994,7 +994,10 @@ fn concurrent_restart_admission_has_one_winner_per_target_3649() {
             .map(|handle| handle.join().expect("admission worker panicked"))
             .collect::<Vec<_>>()
     });
-    let winners = admissions.iter().filter(|admission| admission.is_some()).count();
+    let winners = admissions
+        .iter()
+        .filter(|admission| admission.is_some())
+        .count();
     assert_eq!(winners, 1);
     drop(admissions);
 }
