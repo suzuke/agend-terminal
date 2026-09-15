@@ -364,8 +364,10 @@ mod tests {
 
     #[test]
     fn strict_read_distinguishes_missing_malformed_and_stale() {
-        let home =
-            std::env::temp_dir().join(format!("team-view-{}", crate::types::InstanceId::new()));
+        let home = std::env::temp_dir().join(format!(
+            "team-view-strict-read-{}",
+            crate::types::InstanceId::new()
+        ));
         std::fs::create_dir_all(&home).unwrap();
         let missing = TeamView::load(Path::new(&home), None);
         assert_eq!(missing.status(), TeamViewStatus::Fresh);
