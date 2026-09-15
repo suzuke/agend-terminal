@@ -346,6 +346,7 @@ impl Tab {
     /// Title occupies columns [px+1, px+1+label_len+2) — matches the ` {label} `
     /// rendering in render_pane. Agent state suffix (` [state] `) is excluded so
     /// that clicks on it fall through to split-border resize.
+    #[allow(dead_code)]
     pub fn title_bar_at(&self, col: u16, row: u16) -> Option<usize> {
         self.title_bar_at_with_team(col, row, None)
     }
