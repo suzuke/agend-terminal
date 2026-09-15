@@ -1692,8 +1692,7 @@ fn checkout_disposable_review_binding_failure_rolls_back_worktree() {
     let parent = tmp_home("disposable-review-atomic-src");
     let source = setup_source_repo(&parent, "seed");
     let expected = get_sha(&source, "main");
-    remove_origin(&source);
-    seed_origin_view(&source, "main", &expected);
+    configure_local_github_origin(&source, &parent);
     let agent = "disposable-atomic-agent";
     let binding_path = crate::paths::binding_path(&home, agent);
     crate::store::fail_next_atomic_write_for_test(&binding_path);
