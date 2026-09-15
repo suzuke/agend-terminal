@@ -7,7 +7,11 @@ use std::path::Path;
 
 pub(crate) mod lifecycle;
 mod restart_prep;
+mod instance_layout;
+mod topic;
 use restart_prep::{await_unsent_draft_or_grace, restart_spawn_params};
+pub(super) use instance_layout::resolve_team_layout;
+pub(super) use topic::handle_bind_topic;
 #[cfg(test)]
 use restart_prep::{restart_draft_gate, DraftGate, RESTART_DRAFT_GRACE};
 #[cfg(not(test))]
@@ -374,40 +378,6 @@ pub(super) fn handle_delete_instance_with_runtime(
 /// §4 — that resolver returns `None` whenever 0 OR MULTIPLE channels are
 /// registered, a pre-existing, separately-tracked bug this action avoids by
 /// never calling it).
-pub(super) fn handle_bind_topic(home: &Path, args: &Value) -> Value {
-    let name = match super::require_instance(args) {
-        Ok(n) => n,
-        Err(e) => return e,
-    };
-    crate::validate_name_or_err!(name);
-    if let Some(channel) = args["channel"].as_str() {
-        if channel != "telegram" {
-            return json!({
-                "error": format!("bind_topic: channel '{channel}' not yet supported (only 'telegram')"),
-                "code": "channel_not_supported"
-            });
-        }
-    }
-    use crate::channel::telegram::BindTopicOutcome;
-    match crate::channel::telegram::bind_topic_for_instance(home, name) {
-        BindTopicOutcome::Bound(tid) => json!({"bound": true, "topic_id": tid}),
-        BindTopicOutcome::AlreadyBound(tid) => {
-            json!({"bound": true, "topic_id": tid, "already_bound": true})
-        }
-        BindTopicOutcome::NotEligible { reason } => {
-            json!({"error": reason, "code": "not_eligible"})
-        }
-        BindTopicOutcome::InstanceNotFound => {
-            json!({"error": format!("instance '{name}' not found"), "code": "instance_not_found"})
-        }
-        BindTopicOutcome::ChannelUnavailable => json!({
-            "error": "telegram channel not ready yet — retry in a few seconds",
-            "code": "channel_unavailable"
-        }),
-        BindTopicOutcome::ApiError(e) => json!({"error": e, "code": "api_error"}),
-    }
-}
-
 pub(super) fn handle_start_instance_with_runtime(
     home: &Path,
     args: &Value,
@@ -758,36 +728,6 @@ pub(crate) fn restart_instance_autonomic(home: &Path, name: &str, reason: &str) 
         .get("spawned")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
-}
-
-pub(super) fn resolve_team_layout(
-    home: &Path,
-    name: &str,
-    layout_arg: Option<&serde_json::Value>,
-    target_pane_arg: Option<&serde_json::Value>,
-) -> (&'static str, Option<String>) {
-    let caller_set_layout = layout_arg.and_then(|v| v.as_str()).is_some();
-    let caller_set_target = target_pane_arg
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .is_some();
-    if !caller_set_layout && !caller_set_target {
-        if let Some(team) = crate::teams::find_team_for(home, name) {
-            let anchor = team.orchestrator.or_else(|| team.members.first().cloned());
-            return ("split-right", anchor);
-        }
-    }
-    let layout = layout_arg.and_then(|v| v.as_str()).unwrap_or("tab");
-    let target = target_pane_arg
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-    let layout = match layout {
-        "split-right" => "split-right",
-        "split-below" => "split-below",
-        _ => "tab",
-    };
-    (layout, target)
 }
 
 #[cfg(test)]

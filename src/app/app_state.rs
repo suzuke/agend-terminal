@@ -130,7 +130,6 @@ struct RemoteRestartPending {
 
 const REMOTE_RESTART_CAPACITY: usize = 16;
 const REMOTE_RESTART_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-const REMOTE_RESTART_DELETE_BUFFER_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// #2453: root owner of `run_app`'s durable render-loop state. The only
 /// mutable lifecycle locals permitted OUTSIDE this struct are `attach_jobs`
@@ -234,10 +233,6 @@ pub(super) struct AppState {
     /// roster attach. Bounded to the worker queue capacity; terminal outcomes
     /// remove entries immediately and delayed outcomes expire during ticks.
     remote_restarts: HashMap<String, RemoteRestartPending>,
-    /// InstanceDeleted can be selected before the separate restart request
-    /// channel. Retain the exact identity briefly so request registration can
-    /// still establish the correlation; expiry then applies ordinary removal.
-    pending_restart_deletes: HashMap<crate::types::InstanceRef, std::time::Instant>,
 }
 
 /// #render-first attach pipeline handles: (keepalive sender, outcome
@@ -331,7 +326,6 @@ impl AppState {
                 restart_commit_pending: None,
             },
             remote_restarts: HashMap::new(),
-            pending_restart_deletes: HashMap::new(),
         }
     }
 
@@ -1208,9 +1202,10 @@ impl AppState {
                                 self.remote_restarts.values_mut().find(|pending| {
                                     pending.request.old_instance_ref == Some(instance_ref)
                                 });
-                            if retained_for_restart.is_none() {
-                                self.pending_restart_deletes
-                                    .insert(instance_ref, std::time::Instant::now());
+                            if retained_for_restart.is_none()
+                                && self.ui.layout.remove_fleet_instance_views_exact(instance_ref)
+                            {
+                                self.needs_resize = true;
                             }
                         }
                         crate::api::ApiEvent::InstanceCreated {
@@ -1282,9 +1277,6 @@ impl AppState {
             return;
         }
         let restart_id = request.restart_id.clone();
-        if let Some(old_instance_ref) = request.old_instance_ref {
-            self.pending_restart_deletes.remove(&old_instance_ref);
-        }
         self.remote_restarts.insert(
             restart_id.clone(),
             RemoteRestartPending {
@@ -1359,20 +1351,6 @@ impl AppState {
             tracing::warn!(restart_id = %restart_id, "remote restart correlation expired");
         }
 
-        let expired_deletes: Vec<crate::types::InstanceRef> = self
-            .pending_restart_deletes
-            .iter()
-            .filter(|(_, inserted_at)| {
-                now.saturating_duration_since(**inserted_at) >= REMOTE_RESTART_DELETE_BUFFER_TTL
-            })
-            .map(|(instance_ref, _)| *instance_ref)
-            .collect();
-        for instance_ref in expired_deletes {
-            self.pending_restart_deletes.remove(&instance_ref);
-            self.ui
-                .layout
-                .remove_fleet_instance_views_exact(instance_ref);
-        }
     }
 
     pub(super) fn handle_idle_tick(&mut self, deps: &AppDeps<'_>) {
@@ -2043,8 +2021,9 @@ mod tests {
             source.contains("REMOTE_RESTART_CAPACITY"),
             "active restart correlation must have an explicit capacity"
         );
+        let removed_name = ["REMOTE_RESTART_DELETE_BUFFER", "_TTL"].concat();
         assert!(
-            !source.contains("pending_restart_deletes"),
+            !source.contains(&removed_name),
             "uncorrelated deletes must not be retained in a broad TTL buffer"
         );
     }
