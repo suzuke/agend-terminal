@@ -937,6 +937,33 @@ fn restart_admission_is_one_slot_and_drops_on_terminal_cleanup_3649() {
     assert!(super::restart_prep::try_admit_restart(&home, "dev", "restart-b").is_ok());
 }
 
+#[test]
+fn concurrent_restart_admission_has_one_winner_per_target_3649() {
+    let home = std::env::temp_dir().join(format!(
+        "restart-admission-concurrent-{}",
+        crate::types::InstanceId::new()
+    ));
+    let home = &home;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let winners = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|index| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    super::restart_prep::try_admit_restart(home, "dev", &format!("restart-{index}"))
+                        .ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().expect("admission worker panicked"))
+            .count()
+    });
+    assert_eq!(winners, 1);
+}
+
 /// must-follow ②: the self-kick flag is INDEPENDENT — set ONLY by the
 /// fresh-restart path, NEVER derived from `SpawnMode::Fresh` (initial fleet
 /// spawns / create_instance / team-spawn are Fresh too but never set it). The

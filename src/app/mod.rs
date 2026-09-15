@@ -494,6 +494,9 @@ fn run_app(
     let _ = remote_state_rpc_worker.join();
     drop(remote_restart_worker_tx);
     drop(remote_restart_request_tx);
+    // Stop consuming outcomes before joining: a full bounded outcome queue
+    // must wake the worker's blocking send so teardown cannot deadlock.
+    drop(remote_restart_outcome_rx);
     let _ = remote_restart_worker.join();
     drop(task_rpc_tx);
     let _ = task_rpc_worker.join();

@@ -896,6 +896,31 @@ mod tests {
     }
 
     #[test]
+    fn remote_restart_worker_teardown_unblocks_full_outcome_queue_3649() {
+        for round in 0..32 {
+            let home = std::env::temp_dir().join(format!(
+                "remote-restart-worker-teardown-{round}-{}",
+                crate::types::InstanceId::new()
+            ));
+            let (request_tx, outcome_rx, worker) = super::spawn_remote_restart_worker(&home);
+            for index in 0..16 {
+                request_tx
+                    .send(super::super::commands::RemoteRestartRequest {
+                        restart_id: format!("restart-{round}-{index}"),
+                        old_instance_ref: None,
+                        tab_index: 0,
+                        pane_id: 0,
+                        name: "missing-agent".into(),
+                    })
+                    .expect("worker request queue open");
+            }
+            drop(request_tx);
+            drop(outcome_rx);
+            worker.join().expect("remote restart worker joined cleanly");
+        }
+    }
+
+    #[test]
     fn app_production_task_paths_do_not_read_or_write_task_files() {
         for (path, source) in [
             ("dispatch.rs", include_str!("dispatch.rs")),
