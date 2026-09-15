@@ -116,6 +116,7 @@ mod team_ops;
 #[cfg(test)]
 mod team_ops_tests;
 mod teams;
+mod team_view;
 mod thread_census;
 mod token_cost;
 mod tool_cli;
