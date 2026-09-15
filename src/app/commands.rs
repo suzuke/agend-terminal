@@ -22,7 +22,7 @@ pub(super) struct CommandCtx<'a> {
     pub restart_tx: Option<&'a crossbeam_channel::Sender<RemoteRestartRequest>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RemoteRestartRequest {
     pub restart_id: String,
     pub old_instance_ref: Option<crate::types::InstanceRef>,

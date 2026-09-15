@@ -125,7 +125,12 @@ struct RemoteRestartPending {
     request: commands::RemoteRestartRequest,
     successor_instance_ref: Option<crate::types::InstanceRef>,
     conflicted: bool,
+    created_at: std::time::Instant,
 }
+
+const REMOTE_RESTART_CAPACITY: usize = 16;
+const REMOTE_RESTART_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const REMOTE_RESTART_DELETE_BUFFER_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// #2453: root owner of `run_app`'s durable render-loop state. The only
 /// mutable lifecycle locals permitted OUTSIDE this struct are `attach_jobs`
@@ -227,8 +232,12 @@ pub(super) struct AppState {
     pub(super) restart: RestartState,
     /// Correlated remote restarts waiting for both the daemon result and the
     /// roster attach. Bounded to the worker queue capacity; terminal outcomes
-    /// remove entries immediately.
+    /// remove entries immediately and delayed outcomes expire during ticks.
     remote_restarts: HashMap<String, RemoteRestartPending>,
+    /// InstanceDeleted can be selected before the separate restart request
+    /// channel. Retain the exact identity briefly so request registration can
+    /// still establish the correlation; expiry then applies ordinary removal.
+    pending_restart_deletes: HashMap<crate::types::InstanceRef, std::time::Instant>,
 }
 
 /// #render-first attach pipeline handles: (keepalive sender, outcome
@@ -322,6 +331,7 @@ impl AppState {
                 restart_commit_pending: None,
             },
             remote_restarts: HashMap::new(),
+            pending_restart_deletes: HashMap::new(),
         }
     }
 
@@ -1199,9 +1209,8 @@ impl AppState {
                                     pending.request.old_instance_ref == Some(instance_ref)
                                 });
                             if retained_for_restart.is_none() {
-                                self.ui
-                                    .layout
-                                    .remove_fleet_instance_views_exact(instance_ref);
+                                self.pending_restart_deletes
+                                    .insert(instance_ref, std::time::Instant::now());
                             }
                         }
                         crate::api::ApiEvent::InstanceCreated {
@@ -1252,17 +1261,37 @@ impl AppState {
         request: commands::RemoteRestartRequest,
         deps: &AppDeps<'_>,
     ) {
-        if self.remote_restarts.len() >= 16 {
+        self.reap_remote_restart_state();
+        if request.old_instance_ref.is_none() {
+            tracing::warn!(
+                restart_id = %request.restart_id,
+                "remote restart refused without predecessor identity"
+            );
+            return;
+        }
+        if let Some(existing) = self.remote_restarts.get(&request.restart_id) {
+            if existing.request == request {
+                tracing::debug!(restart_id = %request.restart_id, "duplicate remote restart request ignored");
+            } else {
+                tracing::warn!(restart_id = %request.restart_id, "conflicting remote restart request ignored");
+            }
+            return;
+        }
+        if self.remote_restarts.len() >= REMOTE_RESTART_CAPACITY {
             tracing::warn!(restart_id = %request.restart_id, "remote restart registry is full");
             return;
         }
         let restart_id = request.restart_id.clone();
+        if let Some(old_instance_ref) = request.old_instance_ref {
+            self.pending_restart_deletes.remove(&old_instance_ref);
+        }
         self.remote_restarts.insert(
             restart_id.clone(),
             RemoteRestartPending {
                 request: request.clone(),
                 successor_instance_ref: None,
                 conflicted: false,
+                created_at: std::time::Instant::now(),
             },
         );
         if deps.remote_restart_worker_tx.try_send(request).is_err() {
@@ -1315,12 +1344,44 @@ impl AppState {
         }
     }
 
+    fn reap_remote_restart_state(&mut self) {
+        let now = std::time::Instant::now();
+        let expired_restarts: Vec<String> = self
+            .remote_restarts
+            .iter()
+            .filter(|(_, pending)| {
+                now.saturating_duration_since(pending.created_at) >= REMOTE_RESTART_PENDING_TTL
+            })
+            .map(|(restart_id, _)| restart_id.clone())
+            .collect();
+        for restart_id in expired_restarts {
+            self.remote_restarts.remove(&restart_id);
+            tracing::warn!(restart_id = %restart_id, "remote restart correlation expired");
+        }
+
+        let expired_deletes: Vec<crate::types::InstanceRef> = self
+            .pending_restart_deletes
+            .iter()
+            .filter(|(_, inserted_at)| {
+                now.saturating_duration_since(**inserted_at) >= REMOTE_RESTART_DELETE_BUFFER_TTL
+            })
+            .map(|(instance_ref, _)| *instance_ref)
+            .collect();
+        for instance_ref in expired_deletes {
+            self.pending_restart_deletes.remove(&instance_ref);
+            self.ui
+                .layout
+                .remove_fleet_instance_views_exact(instance_ref);
+        }
+    }
+
     pub(super) fn handle_idle_tick(&mut self, deps: &AppDeps<'_>) {
         let AppDeps {
             home,
             attached_run_dir,
             ..
         } = *deps;
+        self.reap_remote_restart_state();
         // #t-84833-10: periodic idle refresh — mark self.dirty so the cap above
         // redraws (catches non-wakeup state changes; ~50ms cadence when idle).
         self.dirty = true;
@@ -1684,6 +1745,7 @@ impl AppState {
         reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
     ) {
         self.refresh_team_view(deps);
+        self.reap_remote_restart_state();
         self.reconcile_pending_remote_roster(deps);
         self.request_remote_agent_state_refresh(deps);
         self.close_dead_scratch_shell(deps, reap_workers);
@@ -1702,7 +1764,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::PaneSource;
+    use crate::layout::{PaneSource, Tab};
     use std::collections::HashSet;
 
     fn closed_before_attach_registry_survives(unmanaged: bool) -> bool {
@@ -1971,10 +2033,8 @@ mod tests {
 
     #[test]
     fn restart_state_has_bounded_pending_cleanup_and_pre_registration_delete_buffer_3649() {
-        let source = include_str!("app_state.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap_or_default();
+        let source = include_str!("app_state.rs");
+        let source = &source[..source.rfind("#[cfg(test)]").unwrap_or(source.len())];
         assert!(
             source.contains("REMOTE_RESTART_PENDING_TTL"),
             "pending restart state must have an explicit bounded lifetime"
@@ -1983,6 +2043,140 @@ mod tests {
             source.contains("pending_restart_deletes"),
             "deletes observed before request registration must be buffered"
         );
+    }
+
+    #[test]
+    fn expired_remote_restart_correlation_is_reaped_3649() {
+        let mut state = AppState::new();
+        let old_instance_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+        let request = commands::RemoteRestartRequest {
+            restart_id: "expired-restart".into(),
+            old_instance_ref: Some(old_instance_ref),
+            tab_index: 0,
+            pane_id: 0,
+            name: "agent".into(),
+        };
+        state.remote_restarts.insert(
+            request.restart_id.clone(),
+            RemoteRestartPending {
+                request,
+                successor_instance_ref: None,
+                conflicted: false,
+                created_at: std::time::Instant::now()
+                    .checked_sub(REMOTE_RESTART_PENDING_TTL + std::time::Duration::from_secs(1))
+                    .expect("test instant remains representable"),
+            },
+        );
+
+        state.reap_remote_restart_state();
+
+        assert!(state.remote_restarts.is_empty());
+    }
+
+    #[test]
+    fn delete_before_restart_request_is_buffered_and_claimed_3649() {
+        let home = std::env::temp_dir().join(format!(
+            "remote-restart-ordering-{}",
+            crate::types::InstanceId::new()
+        ));
+        let fleet_path = home.join("fleet.yaml");
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let app_restart_gate = crate::api::app_restart::AppRestartGate::new();
+        let daemon_binary_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attached_run_dir = None;
+        let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded::<rpc::TaskRequest>();
+        let (remote_state_rpc_tx, _remote_state_rpc_rx) =
+            crossbeam_channel::unbounded::<rpc::AgentStateRequest>();
+        let (remote_restart_request_tx, _remote_restart_request_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+        let (remote_restart_worker_tx, remote_restart_worker_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+        let deps = AppDeps {
+            home: &home,
+            fleet_path: &fleet_path,
+            registry: &registry,
+            wakeup_tx: &wakeup_tx,
+            app_restart_gate: &app_restart_gate,
+            daemon_binary_stale: &daemon_binary_stale,
+            telegram_status: TelegramStatus::NotConfigured,
+            attached_run_dir: &attached_run_dir,
+            attached_mode: false,
+            size_debug: false,
+            task_rpc_tx: &task_rpc_tx,
+            remote_state_rpc_tx: &remote_state_rpc_tx,
+            remote_restart_request_tx: &remote_restart_request_tx,
+            remote_restart_worker_tx: &remote_restart_worker_tx,
+        };
+        let old_instance_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 2);
+        let mut state = AppState::new();
+        let mut pane = test_remote_pane(&mut state.ui.layout, "agent").expect("test pane");
+        pane.instance_ref = Some(old_instance_ref);
+        state.ui.layout.add_tab(Tab::new("agent".into(), pane));
+        state.handle_event_stream_outcome(
+            Ok(rpc::EventStreamOutcome::Event(
+                crate::daemon::event_hub::DaemonEvent {
+                    source: "daemon".into(),
+                    sequence: 1,
+                    event: crate::api::ApiEvent::InstanceDeleted {
+                        name: "agent".into(),
+                        instance_ref: Some(old_instance_ref),
+                    },
+                },
+            )),
+            &deps,
+        );
+        assert!(state
+            .pending_restart_deletes
+            .contains_key(&old_instance_ref));
+        assert!(state.ui.layout.find_agent_pane("agent").is_some());
+
+        state.handle_remote_restart_request(
+            commands::RemoteRestartRequest {
+                restart_id: "restart-ordering".into(),
+                old_instance_ref: Some(old_instance_ref),
+                tab_index: 0,
+                pane_id: 0,
+                name: "agent".into(),
+            },
+            &deps,
+        );
+
+        assert!(!state
+            .pending_restart_deletes
+            .contains_key(&old_instance_ref));
+        assert!(state.remote_restarts.contains_key("restart-ordering"));
+        assert!(state.ui.layout.find_agent_pane("agent").is_some());
+        state.handle_remote_restart_request(
+            commands::RemoteRestartRequest {
+                restart_id: "restart-ordering".into(),
+                old_instance_ref: Some(old_instance_ref),
+                tab_index: 0,
+                pane_id: 0,
+                name: "agent".into(),
+            },
+            &deps,
+        );
+        assert_eq!(
+            state.remote_restarts.len(),
+            1,
+            "duplicate must be idempotent"
+        );
+
+        let conflicting_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 3);
+        state.handle_remote_restart_request(
+            commands::RemoteRestartRequest {
+                restart_id: "restart-ordering".into(),
+                old_instance_ref: Some(conflicting_ref),
+                tab_index: 9,
+                pane_id: 9,
+                name: "different-agent".into(),
+            },
+            &deps,
+        );
+        assert_eq!(state.remote_restarts.len(), 1, "conflict must be ignored");
+        drop(remote_restart_worker_rx);
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]

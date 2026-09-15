@@ -916,9 +916,10 @@ mod tests {
             }
             drop(request_tx);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while worker.is_finished() && std::time::Instant::now() < deadline {
+            while outcome_rx.len() < 16 && std::time::Instant::now() < deadline {
                 std::thread::yield_now();
             }
+            assert_eq!(outcome_rx.len(), 16, "worker must fill the outcome queue");
             assert!(
                 !worker.is_finished(),
                 "worker must block on the 17th outcome until the receiver closes"

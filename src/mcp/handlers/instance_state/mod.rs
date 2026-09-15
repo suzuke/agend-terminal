@@ -582,11 +582,26 @@ pub(super) fn handle_restart_instance_with_runtime(
         };
 
     // Correlation is authoritative only when the daemon can snapshot the live
-    // predecessor. A caller-supplied ref is accepted for legacy/no-runtime
-    // paths, but never overrides the daemon's registry identity.
-    let old_instance_ref = runtime
-        .and_then(|runtime| crate::agent::instance_ref_for_name(&runtime.registry, home, name))
-        .or(requested_old_instance_ref);
+    // predecessor. A caller-supplied ref is accepted only for legacy/no-runtime
+    // paths; an in-process runtime with no registry identity must fail closed.
+    let old_instance_ref = if let Some(runtime) = runtime {
+        match crate::agent::instance_ref_for_name(&runtime.registry, home, name) {
+            Some(instance_ref) => Some(instance_ref),
+            None => {
+                if requested_old_instance_ref.is_some() {
+                    return json!({
+                        "error": format!("runtime registry has no live identity for '{name}'"),
+                        "code": "restart_identity_unavailable",
+                        "name": name,
+                        "restart_id": restart_id,
+                    });
+                }
+                None
+            }
+        }
+    } else {
+        requested_old_instance_ref
+    };
     let _restart_admission = match restart_prep::try_admit_restart(home, name, &restart_id) {
         Ok(admission) => admission,
         Err(error) => {
