@@ -19,7 +19,7 @@ pub(super) fn handle_restart_daemon(
     app_restart: Option<crate::api::app_restart::AppRestart>,
     post_flush: Option<crate::api::app_restart::PostFlushSlot>,
 ) -> Value {
-    handle_restart_daemon_with_shutdown(home, capability, app_restart, post_flush, None, None)
+    handle_restart_daemon_with_shutdown(home, capability, app_restart, post_flush, None, None, None)
 }
 
 /// #2454 Slice 9: carries the API-owned shutdown authority through the daemon
@@ -32,10 +32,13 @@ pub(super) fn handle_restart_daemon_with_shutdown(
     post_flush: Option<crate::api::app_restart::PostFlushSlot>,
     shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     requester_id: Option<crate::types::InstanceId>,
+    live_registry: Option<&crate::agent::AgentRegistry>,
 ) -> Value {
     use crate::api::RestartCapability;
     match capability {
-        Some(RestartCapability::Daemon) => daemon_restart_strategy(home, shutdown, requester_id),
+        Some(RestartCapability::Daemon) => {
+            daemon_restart_strategy(home, shutdown, requester_id, live_registry)
+        }
         Some(RestartCapability::App) => app_restart_strategy(app_restart, post_flush, requester_id),
         Some(RestartCapability::Unsupported) | None => unsupported_fail_closed(),
     }
@@ -238,6 +241,7 @@ fn daemon_restart_strategy(
     home: &Path,
     shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     requester_id: Option<crate::types::InstanceId>,
+    live_registry: Option<&crate::agent::AgentRegistry>,
 ) -> Value {
     // #1814: self-respawn is the DEFAULT (Stage 4). By default the daemon owns
     // its own respawn (spawn successor → Phase-1 health gate → abort-stay-alive
@@ -258,6 +262,12 @@ fn daemon_restart_strategy(
         "#1814 restart_daemon path selected"
     );
     if self_respawn {
+        if let Err(error) = checkpoint_codex_before_restart(home, live_registry) {
+            return json!({
+                "ok": false,
+                "error": format!("restart refused: Codex context checkpoint failed; daemon stays alive: {error}")
+            });
+        }
         return handle_self_respawn(home, requester_id);
     }
 
@@ -298,11 +308,58 @@ fn daemon_restart_strategy(
             "error": "restart_daemon requires an injected shutdown authority; refusing to mutate restart state"
         });
     };
+    if let Err(error) = checkpoint_codex_before_restart(home, live_registry) {
+        return json!({
+            "ok": false,
+            "error": format!("restart refused: Codex context checkpoint failed; daemon stays alive: {error}")
+        });
+    }
     crate::daemon::RESTART_PENDING.store(true, std::sync::atomic::Ordering::Release);
     std::fs::write(home.join("restart-requested"), "").ok();
     crate::daemon::record_shutdown_reason(crate::daemon::ShutdownReason::ApiShutdown);
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     json!({"ok": true, "restart": "pending", "note": "daemon will exit(42) after graceful shutdown; supervisor restarts"})
+}
+
+fn checkpoint_codex_before_restart(
+    home: &Path,
+    live_registry: Option<&crate::agent::AgentRegistry>,
+) -> anyhow::Result<()> {
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .map_err(|error| anyhow::anyhow!("cannot load fleet config: {error}"))?;
+    let configured_codex_instances: Vec<String> = fleet
+        .instances
+        .iter()
+        .filter(|(_, instance)| {
+            instance
+                .backend
+                .as_ref()
+                .or(fleet.defaults.backend.as_ref())
+                == Some(&crate::backend::Backend::Codex)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let codex_instances: Vec<String> = if let Some(registry) = live_registry {
+        let live: std::collections::HashSet<String> = crate::agent::lock_registry(registry)
+            .values()
+            .map(|handle| handle.name.to_string())
+            .collect();
+        configured_codex_instances
+            .into_iter()
+            .filter(|name| live.contains(name))
+            .collect()
+    } else {
+        configured_codex_instances
+    };
+    let checkpointed = crate::transport::checkpoint_codex_sessions_strict(home, &codex_instances)?;
+    tracing::info!(
+        target: "handoff",
+        codex_instances = codex_instances.len(),
+        checkpointed,
+        event = "codex_context_checkpoint_complete",
+        "restart Codex context checkpoint complete"
+    );
+    Ok(())
 }
 
 /// #1814 self-respawn orchestration (runs in the daemon's `mcp_tool_*` worker

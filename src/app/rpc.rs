@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
 pub(super) type AgentStateSnapshot = HashMap<String, Option<crate::state::AgentState>>;
@@ -28,6 +30,7 @@ pub(super) enum TaskOutcome {
 pub(super) struct AgentStateSnapshotResult {
     pub(super) snapshot: AgentStateSnapshot,
     pub(super) names: HashSet<String>,
+    pub(super) instance_refs: HashMap<String, crate::types::InstanceRef>,
     pub(super) mode: crate::runtime::AgentListMode,
 }
 
@@ -38,6 +41,208 @@ pub(super) struct AgentStateError {
 }
 
 pub(super) type AgentStateOutcome = Result<AgentStateSnapshotResult, AgentStateError>;
+
+#[derive(Debug)]
+pub(super) enum EventStreamOutcome {
+    Event(crate::daemon::event_hub::DaemonEvent),
+    Disconnected(String),
+}
+
+/// Subscribe on a dedicated authenticated API connection. The worker owns
+/// only the stream; AppState remains the sole owner of UI mutation.
+pub(super) fn spawn_event_worker(
+    home: &Path,
+) -> (
+    crossbeam_channel::Sender<()>,
+    crossbeam_channel::Receiver<EventStreamOutcome>,
+    std::thread::JoinHandle<()>,
+) {
+    let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+    let (outcome_tx, outcome_rx) = crossbeam_channel::bounded(64);
+    let home = home.to_path_buf();
+    // fire-and-forget: false; run_app joins this worker during teardown.
+    let worker = std::thread::Builder::new()
+        .name("app-event-stream".into())
+        .spawn(move || {
+            let run_dir = match resolve_active_run_dir(&home) {
+                Some(run_dir) => run_dir,
+                None => {
+                    let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
+                        "no active daemon".to_string(),
+                    ));
+                    return;
+                }
+            };
+            let (mut reader, stream_source) = match open_event_stream(&run_dir) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(error));
+                    return;
+                }
+            };
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    return;
+                }
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
+                            "event stream closed".to_string(),
+                        ));
+                        return;
+                    }
+                    Ok(_) => {
+                        match serde_json::from_str::<crate::daemon::event_hub::DaemonEvent>(&line) {
+                            Ok(event) if event.source == stream_source => {
+                                if outcome_tx
+                                    .try_send(EventStreamOutcome::Event(event))
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Ok(_) => {
+                                let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
+                                    "event stream source changed".to_string(),
+                                ));
+                                return;
+                            }
+                            Err(error) => {
+                                let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
+                                    format!("invalid event stream payload: {error}"),
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(error) => {
+                        let _ = outcome_tx
+                            .try_send(EventStreamOutcome::Disconnected(error.to_string()));
+                        return;
+                    }
+                }
+            }
+        })
+        .expect("spawn app event stream worker");
+    (stop_tx, outcome_rx, worker)
+}
+
+fn open_event_stream(run_dir: &Path) -> Result<(BufReader<TcpStream>, String), String> {
+    let stream = crate::ipc::connect_run_dir_api(run_dir).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+        .map_err(|error| error.to_string())?;
+    let operator_token =
+        crate::auth_cookie::read_operator_token(run_dir).map_err(|error| error.to_string())?;
+    let mut writer = stream.try_clone().map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(stream);
+    crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &operator_token)
+        .map_err(|error| error.to_string())?;
+    writeln!(
+        writer,
+        "{}",
+        serde_json::json!({
+            "method": crate::api::method::SUBSCRIBE_EVENTS,
+            "params": {},
+        })
+    )
+    .map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())?;
+    let mut ack = String::new();
+    reader
+        .read_line(&mut ack)
+        .map_err(|error| error.to_string())?;
+    let ack: Value = serde_json::from_str(&ack).map_err(|error| error.to_string())?;
+    if ack["ok"].as_bool() != Some(true) {
+        return Err(ack["error"]
+            .as_str()
+            .unwrap_or("event stream rejected")
+            .to_string());
+    }
+    let source = ack["event_stream"]["source"]
+        .as_str()
+        .filter(|source| !source.is_empty() && *source != "unknown")
+        .ok_or_else(|| "event stream has unverifiable source".to_string())?;
+    let expected_source = crate::daemon::event_hub::source_id(run_dir);
+    if expected_source == "unknown" || source != expected_source {
+        return Err("event stream source does not match active daemon".to_string());
+    }
+    Ok((reader, source.to_string()))
+}
+
+/// Create a managed instance through the daemon's lifecycle API.
+///
+/// The app is a thin client: it may request a new instance, but it must never
+/// fork a second app-local child for a fleet identity. The daemon persists the
+/// fleet entry, owns the process, and publishes the bridge endpoint before this
+/// returns.
+pub(super) fn create_instance(
+    home: &Path,
+    name: &str,
+    backend: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Result<String, String> {
+    create_instance_with(
+        home,
+        name,
+        backend,
+        args,
+        env,
+        resolve_active_run_dir,
+        call_tool_at,
+    )
+}
+
+fn create_instance_with<R, C>(
+    home: &Path,
+    name: &str,
+    backend: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+    resolver: R,
+    caller: C,
+) -> Result<String, String>
+where
+    R: Fn(&Path) -> Option<PathBuf>,
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
+    let Some(run_dir) = resolver(home) else {
+        return Err("no active daemon (run dir not found)".to_string());
+    };
+    let mut arguments = serde_json::json!({
+        "name": name,
+        "backend": backend,
+    });
+    if !args.is_empty() {
+        arguments["args"] = Value::String(args.join(" "));
+    }
+    if !env.is_empty() {
+        arguments["env"] = serde_json::to_value(env)
+            .map_err(|error| format!("could not encode instance environment: {error}"))?;
+    }
+    let result = caller(
+        &run_dir,
+        "create_instance",
+        arguments,
+        std::time::Duration::from_secs(60),
+    )?;
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        return Err(error.to_string());
+    }
+    result
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|created| !created.is_empty())
+        .map(String::from)
+        .ok_or_else(|| "daemon create_instance returned no instance name".to_string())
+}
 
 pub(super) fn spawn_task_worker(
     home: &Path,
@@ -238,11 +443,17 @@ where
         })?;
     let mut states = HashMap::new();
     let mut names = HashSet::new();
+    let mut instance_refs = HashMap::new();
     for instance in instances {
         let Some(name) = instance["name"].as_str() else {
             continue;
         };
         names.insert(name.to_string());
+        if let Ok(instance_ref) =
+            serde_json::from_value::<crate::types::InstanceRef>(instance["instance_ref"].clone())
+        {
+            instance_refs.insert(name.to_string(), instance_ref);
+        }
         states.insert(
             name.to_string(),
             instance["agent_state"].as_str().and_then(parse_agent_state),
@@ -251,6 +462,7 @@ where
     Ok(AgentStateSnapshotResult {
         snapshot: states,
         names,
+        instance_refs,
         mode: crate::runtime::AgentListMode::Live,
     })
 }
@@ -450,6 +662,54 @@ mod tests {
             .unwrap_or(source);
         assert!(production.contains("crate::api::call_at("));
         assert!(production.contains("std::time::Duration::from_secs(10)"));
+    }
+
+    #[test]
+    fn create_instance_rpc_forwards_name_backend_args_and_env() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let caller = {
+            let calls = Arc::clone(&calls);
+            move |run_dir: &std::path::Path,
+                  tool: &str,
+                  arguments: Value,
+                  timeout: std::time::Duration| {
+                calls.lock().expect("calls mutex not poisoned").push((
+                    run_dir.to_path_buf(),
+                    tool.to_string(),
+                    arguments,
+                    timeout,
+                ));
+                Ok(serde_json::json!({"name": "codex-created"}))
+            }
+        };
+        let mut env = HashMap::new();
+        env.insert("CODEX_TEST_FLAG".to_string(), "1".to_string());
+        let created = super::create_instance_with(
+            std::path::Path::new("/home"),
+            "codex-requested",
+            "codex",
+            &["--model".to_string(), "gpt-test".to_string()],
+            &env,
+            |_home| Some(std::path::PathBuf::from("/run/current")),
+            caller,
+        )
+        .expect("daemon create_instance succeeded");
+
+        assert_eq!(created, "codex-created");
+        let calls = calls.lock().expect("calls mutex not poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, std::path::Path::new("/run/current"));
+        assert_eq!(calls[0].1, "create_instance");
+        assert_eq!(calls[0].3, std::time::Duration::from_secs(60));
+        assert_eq!(
+            calls[0].2,
+            serde_json::json!({
+                "name": "codex-requested",
+                "backend": "codex",
+                "args": "--model gpt-test",
+                "env": {"CODEX_TEST_FLAG": "1"}
+            })
+        );
     }
 
     #[test]

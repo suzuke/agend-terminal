@@ -1880,6 +1880,142 @@ fn checkout_idempotent_bound_reuse_inits_empty_submodules_2755() {
     }
 }
 
+/// #3611: a valid bound worktree whose ignored `.agend-managed` marker was
+/// externally removed must rebuild the marker from the authoritative binding
+/// before reuse, rather than remaining stuck behind the provenance gate.
+#[cfg(unix)]
+#[test]
+fn checkout_reuse_rebuilds_missing_marker_3611() {
+    let home = tmp_home("reuse-marker-rebuild");
+    let repo = tmp_repo_with_file("reuse-marker-rebuild", "readme.txt", "bound\n");
+    let instance = "agent-marker-rebuild";
+    let branch = "feat/marker-rebuild";
+    // Production repos ignore the daemon marker; otherwise reuse's clean sync
+    // would remove the marker immediately after the rebuild.
+    std::fs::write(repo.join(".gitignore"), ".agend-managed\n").unwrap();
+    git_run_ok(&repo, &["add", ".gitignore"], false);
+    git_run_ok(&repo, &["commit", "-m", "ignore managed marker"], false);
+    git_run_ok(&repo, &["branch", branch, "main"], false);
+
+    let mangled = mangled_for(instance, &repo);
+    let wt = home.join("worktrees").join(&mangled);
+    std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    git_run_ok(
+        &repo,
+        &["worktree", "add", &wt.display().to_string(), branch],
+        false,
+    );
+    assert!(!wt.join(crate::worktree_pool::MANAGED_MARKER).exists());
+
+    let bdir = home.join("runtime").join(instance);
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::write(
+        bdir.join("binding.json"),
+        json!({
+            "version": 1,
+            "agent": instance,
+            "task_id": "T-marker-rebuild",
+            "branch": branch,
+            "worktree": wt.display().to_string(),
+            "source_repo": repo.display().to_string(),
+            "issued_at": "2026-01-01T00:00:00+00:00",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let args = json!({
+        "repository_path": repo.display().to_string(),
+        "branch": branch,
+        "bind": true,
+    });
+    let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    assert_eq!(
+        resp.get("idempotent").and_then(|v| v.as_bool()),
+        Some(true),
+        "valid bound worktree with a missing marker must be reusable: {resp}"
+    );
+    let marker = std::fs::read_to_string(wt.join(crate::worktree_pool::MANAGED_MARKER))
+        .expect("reuse must rebuild the managed marker");
+    assert!(marker.contains(&format!("agent={instance}\n")));
+    assert!(marker.contains(&format!("branch={branch}\n")));
+    let repo_canonical = repo.canonicalize().unwrap();
+    assert!(
+        marker.contains(&format!("source_repo={}\n", repo_canonical.display())),
+        "marker source identity must come from the bound source: {marker}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #3611: a marker rebuild write/sync failure must preserve the bound worktree
+/// and return a failure instead of claiming idempotent reuse.
+#[cfg(unix)]
+#[test]
+fn checkout_reuse_marker_rebuild_failure_fails_closed_3611() {
+    let home = tmp_home("reuse-marker-write-failure");
+    let repo = tmp_repo_with_file("reuse-marker-write-failure", "readme.txt", "bound\n");
+    let instance = "agent-marker-write-failure";
+    let branch = "feat/marker-write-failure";
+    std::fs::write(repo.join(".gitignore"), ".agend-managed\n").unwrap();
+    git_run_ok(&repo, &["add", ".gitignore"], false);
+    git_run_ok(&repo, &["commit", "-m", "ignore managed marker"], false);
+    git_run_ok(&repo, &["branch", branch, "main"], false);
+
+    let mangled = mangled_for(instance, &repo);
+    let wt = home.join("worktrees").join(&mangled);
+    std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    git_run_ok(
+        &repo,
+        &["worktree", "add", &wt.display().to_string(), branch],
+        false,
+    );
+    let bdir = home.join("runtime").join(instance);
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::write(
+        bdir.join("binding.json"),
+        json!({
+            "version": 1,
+            "agent": instance,
+            "task_id": "T-marker-write-failure",
+            "branch": branch,
+            "worktree": wt.display().to_string(),
+            "source_repo": repo.display().to_string(),
+            "issued_at": "2026-01-01T00:00:00+00:00",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    crate::worktree_pool::set_fail_managed_marker_write(true);
+    let resp = super::checkout::handle_checkout_repo(
+        &home,
+        &json!({
+            "repository_path": repo.display().to_string(),
+            "branch": branch,
+            "bind": true,
+        }),
+        instance,
+    );
+    crate::worktree_pool::set_fail_managed_marker_write(false);
+
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("reuse_marker_write_failed"),
+        "marker rebuild failure must fail closed: {resp}"
+    );
+    assert!(resp.get("idempotent").is_none());
+    assert!(
+        wt.exists(),
+        "failed marker rebuild must not remove the worktree"
+    );
+    assert!(!wt.join(crate::worktree_pool::MANAGED_MARKER).exists());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// #2755 R3 (B4, indep P0.1 + codex m-…736): a `bind:true` reuse whose binding points
 /// at a worktree of a DIFFERENT repository than the requested source MUST fail closed —
 /// the bound tree is never mutated (sync/reset/init) or returned as success. The
@@ -1899,7 +2035,7 @@ fn checkout_reuse_different_source_fails_closed_2755() {
     git_run_ok(&requested, &["branch", branch, "main"], false);
     git_run_ok(&bound, &["branch", branch, "main"], false);
 
-    // A REAL daemon-managed worktree OF THE OTHER (bound) repo, with a sentinel file.
+    // A REAL worktree OF THE OTHER (bound) repo, with a sentinel and no marker.
     let wt = home.join("worktrees").join("agent-diff-bound");
     std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
     git_run_ok(
@@ -1907,11 +2043,6 @@ fn checkout_reuse_different_source_fails_closed_2755() {
         &["worktree", "add", &wt.display().to_string(), branch],
         false,
     );
-    std::fs::write(
-        wt.join(crate::worktree_pool::MANAGED_MARKER),
-        "agent=agent-diff\n",
-    )
-    .unwrap();
     let sentinel = wt.join("sentinel.txt");
     std::fs::write(&sentinel, "UNTOUCHED").unwrap();
 
@@ -1948,6 +2079,10 @@ fn checkout_reuse_different_source_fails_closed_2755() {
     assert!(
         resp.get("idempotent").is_none(),
         "must NOT return idempotent success: {resp}"
+    );
+    assert!(
+        !wt.join(crate::worktree_pool::MANAGED_MARKER).exists(),
+        "source mismatch must not rebuild a missing marker"
     );
     assert_eq!(
         std::fs::read_to_string(&sentinel).unwrap(),

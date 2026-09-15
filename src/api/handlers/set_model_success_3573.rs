@@ -102,7 +102,16 @@ mod tests {
             json!({"instance":"restart-evidence", "model":"test-model-3573", "restart":true}),
         );
         assert_eq!(response["result"]["persisted"], true, "{response}");
-        assert_eq!(response["result"]["restart_ok"], true, "{response}");
+        // Restart/TUI 交接語義：此 fixture 真 spawn 成功（successor 存活見下），
+        // 但測試環境沒有 TUI client 連新 listener，故交接未確認、
+        // restart_ok 為 false（不再誤報成功），persist 與 successor 不變。
+        assert_eq!(response["result"]["restart_ok"], false, "{response}");
+        assert!(
+            response["result"]["restart_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("TUI did not take over")),
+            "restart_error 必須說明交接未確認：{response}"
+        );
         let registry = crate::agent::lock_registry(&fixture.registry);
         assert_eq!(registry.len(), 1);
         let successor = registry.get(&id).unwrap();

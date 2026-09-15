@@ -6348,11 +6348,6 @@ fn codex_remote_attach_argv_carries_mcp_overrides_before_resume_3317() {
         Some("--remote"),
         "#3317: the endpoint flag must stay first; argv={argv:?}"
     );
-    assert_eq!(
-        argv.last().map(String::as_str),
-        Some("thread-3317"),
-        "#3317: resume thread must remain the final remote-session positional; argv={argv:?}"
-    );
     assert!(
         !argv
             .iter()

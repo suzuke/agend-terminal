@@ -35,6 +35,8 @@ pub(crate) use registry::{
     prepare_codex_tui_session, prepare_opencode_tui_session,
 };
 
+pub(crate) use codex_app_server::{checkpoint_codex_session, checkpoint_codex_sessions_strict};
+
 /// #3515 follow-up: ask an instance's resident transport workers to stop, without
 /// waiting for any of them. Pairs with [`remove_instance_delivery_state`], which
 /// still does the removal and the waiting per instance — calling this for the

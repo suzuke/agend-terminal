@@ -326,6 +326,49 @@ fn trigger_restart(home: &Path, active_pid: u32) -> Option<serde_json::Value> {
     serde_json::from_str(line.trim()).ok()
 }
 
+/// Open the successor's dedicated authenticated event stream and return the
+/// source advertised by its subscription hello. This uses the real handoff
+/// run directory instead of generic discovery because the successor is
+/// intentionally undiscoverable until it acquires the daemon flock.
+fn event_stream_source(home: &Path, pid: u32) -> Option<String> {
+    let run_dir = home.join("run").join(pid.to_string());
+    let port: u16 = std::fs::read_to_string(run_dir.join("api.port"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    // Event streaming is a direct API method; use the full-capability operator
+    // token rather than the Agent-only MCP tunnel cookie.
+    let cookie_bytes = std::fs::read(run_dir.join("api.operator")).ok()?;
+    let stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let mut writer = stream.try_clone().ok()?;
+    let mut reader = BufReader::new(stream);
+    writeln!(writer, "{{\"auth\":\"{}\"}}", hex(&cookie_bytes)).ok()?;
+    writer.flush().ok()?;
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if auth.get("ok").and_then(|ok| ok.as_bool()) != Some(true) {
+        return None;
+    }
+    writeln!(
+        writer,
+        "{}",
+        serde_json::json!({"method": "subscribe_events", "params": {}})
+    )
+    .ok()?;
+    writer.flush().ok()?;
+    line.clear();
+    reader.read_line(&mut line).ok()?;
+    let hello: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    hello
+        .get("event_stream")
+        .and_then(|stream| stream.get("source"))
+        .and_then(|source| source.as_str())
+        .map(ToOwned::to_owned)
+}
+
 /// #3421 item 3: assert a restart was ACCEPTED, not merely that a reply arrived.
 ///
 /// The mcp_tool tunnel wraps handler output as `{ok:true, result:{...}}`, so a
@@ -409,7 +452,21 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
     // reports a zombie as alive — a false "still alive". `active_pids` instead
     // sees old vanish the moment it removes its own run dir on exit, leaving
     // exactly the successor.
-    let new_pid = wait_for_single_active(&home, Duration::from_secs(60), |p| p != old_pid);
+    let new_pid = wait_for_single_active(&home, Duration::from_secs(60), |p| {
+        p != old_pid
+            && home
+                .join("run")
+                .join(p.to_string())
+                .join(".daemon")
+                .exists()
+    });
+
+    let advertised_source = new_pid.and_then(|pid| event_stream_source(&home, pid));
+    let daemon_source = new_pid.and_then(|pid| {
+        std::fs::read_to_string(home.join("run").join(pid.to_string()).join(".daemon"))
+            .ok()
+            .map(|source| source.trim().to_string())
+    });
 
     // The successor's agents must be re-spawned (probe served by the new pid).
     let served = new_pid.is_some() && ls_lists_probe_within(&home, Duration::from_secs(30));
@@ -436,6 +493,15 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
     assert!(
         served,
         "successor must re-spawn agents (probe served by new pid)"
+    );
+    assert_eq!(
+        advertised_source, daemon_source,
+        "successor event stream must advertise its promoted daemon identity"
+    );
+    assert_ne!(
+        advertised_source.as_deref(),
+        Some("unknown"),
+        "successor event stream must not retain pre-promotion unknown identity"
     );
     assert_eq!(
         requester_kicks, 1,

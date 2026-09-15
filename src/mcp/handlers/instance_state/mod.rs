@@ -21,6 +21,7 @@ pub(crate) mod spawn;
 /// 64 is already far beyond any real team size; reject above it at the MCP
 /// boundary, before the allocation and the CREATE_TEAM RPC.
 const MAX_TEAM_COUNT: usize = 64;
+// Restart/TUI 交接 helper 住 restart_prep（mod.rs 受 750-LOC bound 約束）。
 
 pub(super) fn handle_create_instance(
     home: &Path,
@@ -674,8 +675,14 @@ pub(super) fn handle_restart_instance_with_runtime(
         .map(|r| r["ok"].as_bool() == Some(true))
         .unwrap_or(false);
 
-    tracing::info!(%name, %reason, %mode, %spawned, "restart_instance");
-    let mut resp = json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned});
+    // Restart/TUI 交接確認見 restart_prep::settle_tui_handoff。
+    let (tui_handoff, handoff_warning) = restart_prep::settle_tui_handoff(home, name, spawned);
+
+    tracing::info!(%name, %reason, %mode, %spawned, tui_handoff, "restart_instance");
+    let mut resp = json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned, "tui_handoff": tui_handoff});
+    if let Some(warning) = handoff_warning {
+        resp["tui_handoff_warning"] = json!(warning);
+    }
     // #3538: exact-thread resume signal (boolean only — never leaks the id).
     if codex_thread {
         resp["resumed_thread"] = json!(true);

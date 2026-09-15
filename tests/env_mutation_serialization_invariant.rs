@@ -180,7 +180,6 @@ const KNOWN_UNSERIALIZED: &[(&str, &str)] = &[
     ("src/api/handlers/mcp_proxy.rs", "AGEND_RESTART_HANDOFF"),
     ("src/api/handlers/mcp_proxy.rs", "AGEND_SUPERVISED"),
     ("src/api/handlers/mcp_proxy_2454_tests.rs", "AGEND_HOME"),
-    ("src/api/mod.rs", "AGEND_ALLOWED_ROOTS"),
     (
         "tests/agend_git_shim_phase4_stress.rs",
         "AGEND_WORKTREE_ARCHIVE_FALLBACK",

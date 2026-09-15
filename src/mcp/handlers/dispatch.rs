@@ -424,6 +424,7 @@ pub(crate) fn dispatch_restart_daemon_with_requester(
         ctx.runtime.and_then(|r| r.post_flush.clone()),
         ctx.runtime.and_then(|r| r.shutdown.clone()),
         requester_id,
+        ctx.runtime.map(|runtime| &runtime.registry),
     )
 }
 

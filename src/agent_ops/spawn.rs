@@ -270,6 +270,11 @@ pub fn spawn_instance(
     if let Some(notifier) = context.notifier {
         notifier.notify(crate::api::ApiEvent::InstanceCreated {
             name: request.name.clone(),
+            instance_ref: agent::instance_ref_for_name(
+                context.registry,
+                context.home,
+                &request.name,
+            ),
             layout: crate::api::LayoutHint::parse(&request.layout),
             spawner: request.spawner.clone(),
             target_pane: request.target_pane.clone(),

@@ -115,6 +115,38 @@ impl CodexNativeShared {
         }
     }
 
+    /// Checkpoint the exact user thread already loaded by a managed Codex
+    /// app-server. A persisted thread id is already authoritative; a missing
+    /// id is discovered through the same validated app-server handshake used
+    /// by structured delivery, then atomically persisted before the caller can
+    /// tear down the agent/client.
+    pub(crate) fn checkpoint_session(
+        home: &Path,
+        instance: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(locator) = super::registry::codex_attach_locator(home, instance)? else {
+            return Ok(None);
+        };
+        if let Some(thread_id) = locator
+            .thread_id
+            .as_deref()
+            .filter(|thread_id| !thread_id.is_empty())
+        {
+            return Ok(Some(thread_id.to_string()));
+        }
+
+        let mut adapter = Self::new(home, instance);
+        adapter.start_or_attach_blocking(locator)?;
+        let thread_id = adapter
+            .locator
+            .as_ref()
+            .and_then(|locator| locator.thread_id.as_deref())
+            .filter(|thread_id| !thread_id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Codex checkpoint completed without a thread_id"))?;
+        Ok(Some(thread_id))
+    }
+
     pub(crate) fn deliver_blocking(
         &mut self,
         mut envelope: DeliveryEnvelope,
@@ -833,6 +865,32 @@ impl CodexNativeShared {
     }
 }
 
+pub(crate) fn checkpoint_codex_session(
+    home: &Path,
+    instance: &str,
+) -> anyhow::Result<Option<String>> {
+    CodexNativeShared::checkpoint_session(home, instance)
+}
+
+/// Strict restart gate: every configured Codex instance must have an exact
+/// persisted or discoverable thread. A missing locator is not a permission to
+/// start a fresh context during restart.
+pub(crate) fn checkpoint_codex_sessions_strict(
+    home: &Path,
+    instances: &[String],
+) -> anyhow::Result<usize> {
+    let mut checkpointed = 0usize;
+    for instance in instances {
+        if checkpoint_codex_session(home, instance)?.is_none() {
+            return Err(anyhow::anyhow!(
+                "Codex instance {instance:?} has no session locator to checkpoint"
+            ));
+        }
+        checkpointed += 1;
+    }
+    Ok(checkpointed)
+}
+
 fn readiness_failure_detail(error: &anyhow::Error) -> String {
     let mut detail = format!("NativeShared readiness failed closed: {error}");
     if detail.len() <= MAX_READINESS_DETAIL_BYTES {
@@ -1141,7 +1199,17 @@ fn launch_managed_server(
     locator: &mut SessionLocator,
     cwd: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let config_args = crate::mcp_config::codex_managed_config_args(home, Some(instance), cwd)?;
+    let mut config_args = crate::mcp_config::codex_managed_config_args(home, Some(instance), cwd)?;
+    // Codex rejects client permission overrides when a remote `resume
+    // <thread_id>` is requested. Apply the same autonomous policy to the
+    // managed app-server so resumed clients can omit that forbidden override
+    // without making AgEnD MCP calls approval-gated.
+    config_args.extend([
+        "-c".to_string(),
+        "approval_policy=\"never\"".to_string(),
+        "-c".to_string(),
+        "sandbox_mode=\"danger-full-access\"".to_string(),
+    ]);
     let cwd = cwd.unwrap_or_else(|| Path::new("."));
     let child = CodexNativeShared::launch(codex, locator, cwd, &config_args)?;
     let pid = child.id();

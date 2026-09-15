@@ -380,6 +380,7 @@ fn delete_instance_impl(
         return (DeleteOutcome::External, true);
     }
 
+    let instance_ref = agent::instance_ref_for_name(context.registry, home, name);
     let observed_exit = crate::daemon::lifecycle::delete_transaction_under_guard(
         home,
         name,
@@ -392,6 +393,7 @@ fn delete_instance_impl(
         tracing::info!(agent = name, "DELETE emitting InstanceDeleted");
         notifier.notify(crate::api::ApiEvent::InstanceDeleted {
             name: name.to_string(),
+            instance_ref,
         });
     }
     (DeleteOutcome::Managed, observed_exit)
@@ -1106,6 +1108,13 @@ pub(crate) fn list_snapshot(
             };
             let entry = json!({
                 "name": name.as_str(),
+                // The UUID is the configured identity and generation fences
+                // replacements of the same configured instance. Keep this
+                // additive so older roster consumers remain compatible.
+                "instance_ref": crate::types::InstanceRef::new(
+                    handle.id,
+                    handle.generation.value(),
+                ),
                 "backend": handle.backend_command,
                 "submit_key": handle.submit_key,
                 "inject_prefix": handle.inject_prefix,
@@ -1417,6 +1426,11 @@ mod tests {
                 .clone()
         };
         let cl = by_name("cl");
+        assert!(cl["instance_ref"]["instance_id"].is_string());
+        assert_eq!(
+            cl["instance_ref"]["generation"], 0,
+            "roster identity must expose the live handle generation"
+        );
         assert_eq!(
             cl["context_meaning"], "window_fill",
             "Claude's scraped figure is context-WINDOW fill, not session budget: {cl}"

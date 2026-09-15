@@ -782,4 +782,46 @@ mod tests {
             let _ = std::fs::remove_dir_all(&tmp);
         });
     }
+
+    /// Phase 2 RED: a restart must persist exact Codex thread identity before
+    /// spawning a successor that could otherwise create a fresh context.
+    #[test]
+    fn daemon_restart_checkpoints_codex_before_successor_spawn() {
+        let src = include_str!("restart.rs");
+        let prod_end = src
+            .find("\n#[cfg(test)]\n#[path = \"restart_tests.rs\"]\nmod restart_tests;")
+            .unwrap_or(src.len());
+        let prod = &src[..prod_end];
+        let checkpoint = prod
+            .find("checkpoint_codex_sessions")
+            .expect("restart must checkpoint Codex sessions");
+        let successor = prod
+            .find("spawn_successor_handoff")
+            .expect("restart must spawn a successor");
+        assert!(
+            checkpoint < successor,
+            "Codex thread checkpoint must precede successor spawn"
+        );
+    }
+
+    /// A configured Codex instance without a persisted locator is an unknown
+    /// restart identity and must refuse the restart rather than create a new
+    /// conversation.
+    #[test]
+    fn restart_checkpoint_fails_closed_on_missing_codex_locator() {
+        let tmp = unique_tmp("codex-checkpoint-missing-locator");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&tmp),
+            "instances:\n  codex-agent:\n    backend: codex\n",
+        )
+        .expect("write fleet config");
+
+        let error = checkpoint_codex_before_restart(&tmp, None)
+            .expect_err("missing Codex locator must block restart");
+        assert!(
+            error.to_string().contains("no session locator"),
+            "error must explain the missing exact identity: {error}"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
 }

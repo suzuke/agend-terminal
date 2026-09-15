@@ -87,22 +87,55 @@ pub(super) fn try_reuse_bound_worktree(
         .and_then(|s| Path::new(s).canonicalize().ok())
         .map(|c| c.as_path() == source_canonical)
         .unwrap_or(false);
+    let binding_agent_ok = reread
+        .as_ref()
+        .and_then(|r| r.get("agent").and_then(|v| v.as_str()))
+        .map(|a| a == instance_name)
+        .unwrap_or(false);
     // #2755 R4 (item 4): CANONICALIZE both the bound worktree and the pool — a symlink or
     // `..` path inside the pool can otherwise point at an EXTERNAL worktree yet pass a
     // lexical `starts_with`, and the sync/reset/init below would then mutate the resolved
     // external target. Require the CANONICAL worktree to be a strict descendant of the
     // CANONICAL pool (fail closed if either cannot be canonicalized) AND carry the marker.
-    let managed = wt.join(crate::worktree_pool::MANAGED_MARKER).is_file()
-        && match (wt.canonicalize(), home.join("worktrees").canonicalize()) {
-            (Ok(cwt), Ok(cpool)) => cwt.starts_with(&cpool) && cwt != cpool,
-            _ => false,
-        };
-    if !bound_source_ok || !managed {
+    let pool_confined = match (wt.canonicalize(), home.join("worktrees").canonicalize()) {
+        (Ok(cwt), Ok(cpool)) => cwt.starts_with(&cpool) && cwt != cpool,
+        _ => false,
+    };
+    let marker_path = wt.join(crate::worktree_pool::MANAGED_MARKER);
+    let marker_present = match std::fs::symlink_metadata(&marker_path) {
+        Ok(metadata) if metadata.file_type().is_file() => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(_) | Err(_) => {
+            return json!({
+                "error": "reuse refused: the managed marker is not a regular file",
+                "code": "reuse_provenance",
+                "branch": branch,
+            });
+        }
+    };
+    if !bound_source_ok || !binding_agent_ok || !pool_confined {
         return json!({
             "error": "reuse refused: the bound worktree is not a daemon-managed worktree of the requested source at the exact bound path",
             "code": "reuse_provenance",
             "branch": branch,
         });
+    }
+    if !marker_present {
+        if let Err(error) = crate::worktree_pool::write_managed_marker(
+            &marker_path,
+            instance_name,
+            branch,
+            source_canonical,
+        ) {
+            return json!({
+                "error": format!(
+                    "reuse: managed marker rebuild failed: {}",
+                    redact_paths(&error.to_string())
+                ),
+                "code": "reuse_marker_write_failed",
+                "branch": branch,
+            });
+        }
     }
     if let Some(expected) = expected_head {
         let actual_worktree =

@@ -1836,7 +1836,7 @@ mod tests {
         assert!(
             !fleet_has_victim
                 && !config_present
-                && matches!(events.as_slice(), [ApiEvent::InstanceDeleted { name }] if name == "victim"),
+                && matches!(events.as_slice(), [ApiEvent::InstanceDeleted { name, .. }] if name == "victim"),
             "managed delete must remove fleet/config state and emit InstanceDeleted; got \
              fleet_has_victim={fleet_has_victim}, config_present={config_present}, \
              events={events:?}, response={response}"

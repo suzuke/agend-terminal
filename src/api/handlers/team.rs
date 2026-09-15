@@ -29,6 +29,11 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
                     removed: outcome.removed.clone(),
                 });
             }
+            if outcome.config_changed && !diff_nonempty {
+                n.notify(ApiEvent::ConfigChanged {
+                    name: team_name.clone(),
+                });
+            }
         }
     }
     json!({"ok": true, "result": outcome.result})

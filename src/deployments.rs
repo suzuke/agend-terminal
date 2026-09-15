@@ -88,6 +88,15 @@ fn validate_deploy_args(home: &Path, args: &Value) -> Result<DeployParams, Value
         .map_err(|e| serde_json::json!({"error": format!("invalid template name: {e}")}))?;
     crate::agent::validate_name(&deploy_name)
         .map_err(|e| serde_json::json!({"error": format!("invalid deploy name: {e}")}))?;
+    // #3624 症狀 2：前後 dash 的 deploy name 會拼出雙 dash 實例名
+    // （`eo-team-` + `lead` → `eo-team--lead`），讓 create_deployment_team
+    // 的 orchestrator 匹配失敗、team 無主。`validate_name` 本身允許 dash，
+    // 這裡額外拒絕前後 dash（早於任何 side-effect）。
+    if deploy_name.starts_with('-') || deploy_name.ends_with('-') {
+        return Err(serde_json::json!({"error": format!(
+            "invalid deploy name '{deploy_name}': leading/trailing dash is not allowed (it produces double-dash instance names)"
+        )}));
+    }
 
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     if !fleet_path.exists() {
@@ -728,8 +737,12 @@ pub(crate) fn deploy_with_runtime(
         return e;
     }
 
-    spawn_instances(home, &yaml_entries, &params.directory, runtime);
-
+    // #3624 症狀 1：先 CREATE_TEAM（members 用 entries 建好的預期名單）
+    // 後 spawn。舊順序 spawn → team 讓 TUI roster sync 在 team 建好前的
+    // tick 把先出現的成員歸進 standalone tab（實測 lead 落單）。team 建在
+    // persist 之後（persist 失敗不留孤 team）、spawn 之前；spawn 失敗的
+    // 成員由既有 stale-member 機制承接（#785）。CREATE_TEAM 與 SPAWN 同為
+    // self-IPC，仍在下方 store flock 之外（#1617/#1629 不變）。
     let team_created = create_deployment_team(
         home,
         &params.deploy_name,
@@ -739,6 +752,8 @@ pub(crate) fn deploy_with_runtime(
         &created,
         runtime,
     );
+
+    spawn_instances(home, &yaml_entries, &params.directory, runtime);
 
     let deployment = Deployment {
         name: params.deploy_name.to_string(),

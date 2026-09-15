@@ -152,6 +152,29 @@ pub(crate) fn published_observed_of(
 // goes through that single resolver; the registry never holds its own name index.
 pub type AgentRegistry = Arc<Mutex<HashMap<crate::types::InstanceId, AgentHandle>>>;
 
+/// Snapshot the exact identity of a live handle. The registry key supplies the
+/// stable configured id; the owner-scoped generation fences replacements of
+/// the same id/name within this daemon lifetime.
+pub(crate) fn instance_ref_for_id(
+    registry: &AgentRegistry,
+    instance_id: crate::types::InstanceId,
+) -> Option<crate::types::InstanceRef> {
+    let reg = lock_registry(registry);
+    reg.get(&instance_id)
+        .map(|handle| crate::types::InstanceRef::new(handle.id, handle.generation.value()))
+}
+
+/// Resolve a live handle's exact identity through the authoritative fleet
+/// name→UUID mapping. Missing/invalid mappings return None rather than
+/// fabricating an identity for a managed lifecycle event.
+pub(crate) fn instance_ref_for_name(
+    registry: &AgentRegistry,
+    home: &std::path::Path,
+    name: &str,
+) -> Option<crate::types::InstanceRef> {
+    crate::fleet::resolve_uuid(home, name).and_then(|id| instance_ref_for_id(registry, id))
+}
+
 /// Handle for an externally connected agent (not PTY-managed by daemon).
 pub struct ExternalAgentHandle {
     pub(crate) backend_command: String,

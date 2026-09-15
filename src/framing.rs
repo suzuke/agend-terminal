@@ -7,6 +7,8 @@ use std::io::{Read, Write};
 
 pub const TAG_DATA: u8 = 0;
 pub const TAG_RESIZE: u8 = 1;
+/// Exact daemon-owned instance identity sent once during TUI bridge greeting.
+pub const TAG_IDENTITY: u8 = 2;
 /// Protocol version for TUI socket handshake.
 pub const PROTOCOL_VERSION: u8 = 1;
 /// Maximum frame size — 1MB hardcoded. Sufficient for MCP responses;

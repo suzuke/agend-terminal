@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::agent::AgentRegistry;
 use crate::keybinds::Action;
-use crate::layout::{Layout, Pane, SplitDir};
+use crate::layout::{Layout, Pane, PaneReconnectOutcome, SplitDir};
 
 use super::overlay::{CloseTarget, Overlay};
 
@@ -428,6 +428,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
 #[derive(Debug, PartialEq, Eq)]
 enum ReconnectFeedback {
     Reconnected(String),
+    Appended(String),
     AlreadyConnected(String),
     Failed(String),
 }
@@ -437,6 +438,11 @@ impl ReconnectFeedback {
         match self {
             Self::Reconnected(name) => {
                 format!("Reconnected bridge for {name}. Agent process was not restarted.")
+            }
+            Self::Appended(name) => {
+                format!(
+                    "Opened a new bridge view for {name}; retained pane was not replaced because its identity was unavailable."
+                )
             }
             Self::AlreadyConnected(name) => {
                 format!("{name} is already connected. Agent process was not restarted.")
@@ -495,15 +501,10 @@ where
         rows.saturating_sub(4),
         ctx.wakeup_tx,
     ) {
-        Ok(pane) => {
-            if ctx.layout.reconnect_or_append_agent_pane(&name, pane) {
-                ReconnectFeedback::Reconnected(name)
-            } else {
-                ReconnectFeedback::Failed(format!(
-                    "focused pane for {name} disappeared before replacement"
-                ))
-            }
-        }
+        Ok(pane) => match ctx.layout.reconnect_or_append_agent_pane(&name, pane) {
+            PaneReconnectOutcome::Reconnected => ReconnectFeedback::Reconnected(name),
+            PaneReconnectOutcome::Appended => ReconnectFeedback::Appended(name),
+        },
         Err(error) => ReconnectFeedback::Failed(format!("{name}: {error:#}")),
     }
 }
@@ -546,6 +547,7 @@ mod tests {
         Pane {
             agent_name: name.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,
@@ -856,7 +858,9 @@ mod tests {
         let mut layout = Layout::new();
         let (mut disconnected, _server) = disconnected_remote_pane(7, "healthy-agent");
         let original_instance_id = crate::types::InstanceId::new();
+        let original_instance_ref = crate::types::InstanceRef::new(original_instance_id, 1);
         disconnected.instance_id = original_instance_id;
+        disconnected.instance_ref = Some(original_instance_ref);
         layout.add_tab(Tab::new("healthy-agent".to_string(), disconnected));
         let mut last_tab = 0;
         let mut names = HashMap::new();
@@ -875,6 +879,7 @@ mod tests {
             let mut fresh = test_pane(layout.next_pane_id(), name);
             fresh.fleet_instance_name = Some(name.to_string());
             fresh.instance_id = original_instance_id;
+            fresh.instance_ref = Some(original_instance_ref);
             Ok(fresh)
         });
 
@@ -902,6 +907,38 @@ mod tests {
             "bridge reconnect must emit no restart/respawn event"
         );
         std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn reconnect_legacy_name_only_pane_reports_append_without_failure() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let (disconnected, _server) = disconnected_remote_pane(7, "legacy-agent");
+        layout.add_tab(Tab::new("legacy-agent".to_string(), disconnected));
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+
+        let feedback = reconnect_focused_pane_with(&mut ctx, |name, _, _, layout, _, _, _| {
+            let mut fresh = test_pane(layout.next_pane_id(), name);
+            fresh.fleet_instance_name = Some(name.to_string());
+            Ok(fresh)
+        });
+
+        assert_eq!(feedback, ReconnectFeedback::Appended("legacy-agent".into()));
+        assert_eq!(ctx.layout.tabs.len(), 2);
+        assert!(ctx.layout.tabs[0]
+            .focused_pane()
+            .is_some_and(Pane::is_disconnected));
     }
 
     #[test]

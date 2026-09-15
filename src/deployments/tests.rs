@@ -2844,3 +2844,96 @@ fn teardown_runtime_path_names_refused_instances_3505() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #3624 症狀 1 RED：deploy 必須先 CREATE_TEAM 後 spawn。舊順序是
+/// spawn → team，TUI roster sync 按 tick 當下 `teams.list_all()` 歸組：
+/// team 建好前先出現的成員落進 standalone tab（實測 lead 落單）。
+/// 先建 team（members 用預期名單），首個 roster tick 就能看到 team；
+/// spawn 失敗的成員由既有 stale-member 機制承接（#785）。
+/// 結構性斷言（同 deploy_api_calls_not_under_flock 風格）：在真實
+/// producer `deploy_with_runtime` 內 team 呼叫點必須先於 spawn 呼叫點。
+#[test]
+fn deploy_creates_team_before_spawn_3624() {
+    let prod = prod_src();
+    let body = fn_body(prod, "pub(crate) fn deploy_with_runtime(");
+    let team_at = body
+        .find(&["create_deployment_team", "("].concat())
+        .expect("deploy creates the team");
+    let spawn_at = body
+        .find(&["spawn_instances", "("].concat())
+        .expect("deploy spawns instances");
+    assert!(
+        team_at < spawn_at,
+        "#3624: create_deployment_team must run BEFORE spawn_instances so the first roster tick already sees the team"
+    );
+}
+
+/// #3624 症狀 2 RED：deploy name 帶前後 dash（如 `eo-team-`）必須拒絕，
+/// 否則 `{deploy}-{suffix}` 拼出雙 dash 實例名（`eo-team--lead`），
+/// `create_deployment_team` 用 `{deploy}-lead` 匹配 orchestrator 失敗，
+/// team 無主（`template orchestrator not among spawned instances`）。
+#[test]
+fn deploy_rejects_leading_trailing_dash_name_3624() {
+    for bad in ["-eo-team", "eo-team-"] {
+        let home = tmp_home("dash_name_3624");
+        let yaml = "templates:\n  svc:\n    instances:\n      lead:\n        backend: claude\n";
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+        let args = serde_json::json!({
+            "template": "svc",
+            "directory": home.display().to_string(),
+            "name": bad,
+        });
+        let out = deploy(&home, "caller", &args);
+        let err = out["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("dash"),
+            "#3624: deploy name `{bad}` with leading/trailing dash must be rejected, got: {out}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// #3624 pinning（非 RED，修正前後皆應通過）：即使 spawn 全失敗，
+/// team 仍須以預期名單建好，失敗成員由 stale-member 機制承接（#785）。
+/// 走真實 producer `deploy_with_runtime` + in-process runtime（空
+/// registry → spawn 失敗），斷言 roster 內容而非手工 fixture。
+#[test]
+fn deploy_team_lists_expected_members_despite_spawn_failure_3624() {
+    let home = tmp_home("team_despite_spawn_fail_3624");
+    let yaml = r#"
+templates:
+  svc:
+    source_repo: /repos/team-project
+    instances:
+      lead:
+        backend: claude
+      dev:
+        backend: kiro-cli
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let configs = crate::api::ConfigRegistry::default();
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+    let args = serde_json::json!({
+        "template": "svc",
+        "directory": home.display().to_string(),
+    });
+    let _ = deploy_with_runtime(&home, "caller", &args, Some(&runtime));
+
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let team = fleet.teams.get("svc").expect("team 'svc' must exist");
+    let mut members = team.members.clone();
+    members.sort();
+    assert_eq!(
+        members,
+        vec!["svc-dev".to_string(), "svc-lead".to_string()],
+        "#3624: team roster must list the expected members even when spawns fail (stale-member pickup via #785)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

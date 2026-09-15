@@ -1204,25 +1204,52 @@ run_wrapper_with_deadline() {
     local rescue_pids="" rescue_attempted=0 rescue_released=0 rescue_state=none
     local rescue_unreleased=0 rescue_completion=not-attempted
     local reason soft_pause_secs soft_deadline_reached=no hard_deadline_reached=no
-    local status_path fifo_path process_path
+    local status_path fifo_path process_path completion_path completion_tmp
+    local wrapper_pid_path wrapper_pid_tmp snapshot_pid
     status_path="$(deadline_status_for "$contract")"
     fifo_path="$(deadline_fifos_for "$contract")"
     process_path="$(deadline_processes_for "$contract")"
+    completion_path="$sandbox/deadline-complete"
+    completion_tmp="${completion_path}.tmp.$$"
+    wrapper_pid_path="$sandbox/deadline-wrapper-pid"
+    wrapper_pid_tmp="${wrapper_pid_path}.tmp.$$"
     printf 'contract=%s\n' "$contract" >"$process_path"
     started_epoch="$(date +%s 2>/dev/null || echo 0)"
     (
-            cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
-            COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
-            COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
-            exec "$wrapper" >"$sandbox/out" 2>&1
+        wrapper_status=126
+        if cd "$sandbox"; then
+            COVERAGE_PRODUCER="$sandbox/producer.sh" \
+                COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+                COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
+                "$wrapper" >"$sandbox/out" 2>&1 &
+            wrapper_pid="$!"
+            printf '%s\n' "$wrapper_pid" >"$wrapper_pid_tmp" && \
+                mv -f "$wrapper_pid_tmp" "$wrapper_pid_path" 2>/dev/null
+            wait "$wrapper_pid" 2>/dev/null
+            wrapper_status="$?"
+        fi
+        # MSYS can retain a completed child in the state observed by `kill -0`
+        # until its parent reaps it. The marker is written only after `wait`,
+        # so deadline polling observes completion without mistaking that stale
+        # liveness result for a hard timeout.
+        printf '%s\n' "$wrapper_status" >"$completion_tmp" && \
+            mv -f "$completion_tmp" "$completion_path" 2>/dev/null
+        exit "$wrapper_status"
     ) &
         pid=$!
-    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$secs" ]; do
-        record_process_snapshot "$process_path" "$pid"
+    while [ ! -f "$completion_path" ] && [ "$waited" -lt "$secs" ]; do
+        snapshot_pid="$pid"
+        if [ -f "$wrapper_pid_path" ]; then
+            IFS= read -r snapshot_pid <"$wrapper_pid_path" || snapshot_pid="$pid"
+            case "$snapshot_pid" in
+                '' | *[!0-9]*) snapshot_pid="$pid" ;;
+            esac
+        fi
+        record_process_snapshot "$process_path" "$snapshot_pid"
         sleep 1
         waited=$((waited + 1))
     done
-    if kill -0 "$pid" 2>/dev/null; then
+    if [ ! -f "$completion_path" ]; then
         soft_expired=1
         soft_deadline_reached=yes
         hard_deadline=$((secs * 4))
@@ -1248,7 +1275,7 @@ run_wrapper_with_deadline() {
                 fi
                 ;;
         esac
-        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$hard_deadline" ]; do
+        while [ ! -f "$completion_path" ] && [ "$waited" -lt "$hard_deadline" ]; do
             next_rescue_pids=""
             for rescue_pid in $rescue_pids; do
                 if kill -0 "$rescue_pid" 2>/dev/null; then
@@ -1273,11 +1300,18 @@ run_wrapper_with_deadline() {
             fi
         done
         rescue_pids="$next_rescue_pids"
-        if kill -0 "$pid" 2>/dev/null; then
+        if [ ! -f "$completion_path" ]; then
             for rescue_pid in $rescue_pids; do
                 kill -9 "$rescue_pid" 2>/dev/null || true
                 wait "$rescue_pid" 2>/dev/null || true
             done
+            if [ -f "$wrapper_pid_path" ]; then
+                IFS= read -r wrapper_pid <"$wrapper_pid_path" || wrapper_pid=""
+                case "$wrapper_pid" in
+                    '' | *[!0-9]*) ;;
+                    *) [ "$wrapper_pid" -gt 1 ] && kill -9 "$wrapper_pid" 2>/dev/null || true ;;
+                esac
+            fi
             kill -9 "$pid" 2>/dev/null
             hard_stop=1
             hard_deadline_reached=yes

@@ -1735,3 +1735,29 @@ fn set_model_restart_without_codex_thread_reports_split_outcome_3538() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// Restart/TUI 交接斷層 RED：`restart_instance` 回報只有 process 層的
+/// `spawned`，不驗證 TUI 側是否接管（新 port 有無 client 連上）。20:24
+/// 事件：daemon 側 `spawned=true`、新 TUI socket 就緒，但 app 側全程無
+/// 接管、pane 沒動靜，而 `set_model restart:true` 照樣報
+/// `restart_ok:true` 誤導。修法（decision d-20260914132854706907-6）：
+/// 回報必須攜帶 `tui_handoff` 交接確認，spawn 失敗時為 false。
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn restart_report_carries_tui_handoff_false_when_spawn_fails() {
+    let home = tmp_home_for_create_instance_team("tui-handoff-red");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev:\n    backend: /definitely-missing-agent-binary-tuihandoff\n",
+    )
+    .unwrap();
+    let r = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "resume", "reason": "tui-handoff-red"}),
+    );
+    assert_eq!(
+        r["tui_handoff"], false,
+        "交接未確認時回報必須攜帶 tui_handoff:false，got: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

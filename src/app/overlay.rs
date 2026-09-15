@@ -457,15 +457,25 @@ pub(super) fn handle_key(
                     if crate::daemon::find_active_run_dir(ctx.home).is_none() {
                         *notice = Some("delete refused: no active daemon".to_string());
                     } else {
+                        // Capture the exact view identity before the daemon
+                        // delete. A name-only pane (legacy session) is not
+                        // safe to remove after a same-name replacement.
+                        let expected_ref = authoritative_instance_ref_for_delete(ctx, name);
                         match crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
                             ctx.home,
                             name,
                             None,
                         ) {
                             Ok(()) => {
-                                ctx.layout.remove_fleet_instance_views(name);
-                                *overlay = Overlay::None;
-                                outcome.needs_resize = true;
+                                match finish_successful_delete(ctx, name, expected_ref) {
+                                    DeleteCompletion::Close => {
+                                        *overlay = Overlay::None;
+                                        outcome.needs_resize = true;
+                                    }
+                                    DeleteCompletion::Keep { notice: message } => {
+                                        *notice = Some(message);
+                                    }
+                                }
                             }
                             Err(error) => {
                                 *notice = Some(error);
@@ -1065,6 +1075,46 @@ pub(super) fn handle_key(
     outcome
 }
 
+fn authoritative_instance_ref_for_delete(
+    ctx: &OverlayCtx<'_>,
+    name: &str,
+) -> Option<crate::types::InstanceRef> {
+    crate::agent::instance_ref_for_name(ctx.registry, ctx.home, name)
+        .or_else(|| ctx.layout.unique_instance_ref_for_agent(name))
+}
+
+enum DeleteCompletion {
+    Close,
+    Keep { notice: String },
+}
+
+fn finish_successful_delete(
+    ctx: &mut OverlayCtx<'_>,
+    name: &str,
+    expected_ref: Option<crate::types::InstanceRef>,
+) -> DeleteCompletion {
+    let Some(expected_ref) = expected_ref else {
+        return DeleteCompletion::Keep {
+            notice: "delete completed but instance identity is unavailable; view retained"
+                .to_string(),
+        };
+    };
+
+    ctx.layout.remove_fleet_instance_views_exact(expected_ref);
+    if !super::session::save_session(ctx.home, ctx.layout)
+        && !super::session::record_retired_ref(ctx.home, expected_ref)
+    {
+        tracing::error!(
+            name = %name,
+            "delete completed but session retirement is pending retry"
+        );
+        return DeleteCompletion::Keep {
+            notice: "delete completed; session retirement pending retry".to_string(),
+        };
+    }
+    DeleteCompletion::Close
+}
+
 fn submit_task_request(
     tx: &crossbeam_channel::Sender<super::rpc::TaskRequest>,
     arguments: serde_json::Value,
@@ -1109,6 +1159,7 @@ mod tests {
         crate::layout::Pane {
             agent_name: name.into(),
             instance_id: id,
+            instance_ref: None,
             vterm: crate::vterm::VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -1274,6 +1325,108 @@ mod tests {
     }
 
     #[test]
+    fn delete_persistence_failure_keeps_explicit_retry_state() {
+        let home = dec_home("delete_persistence_retry");
+        let expected_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 91);
+        let mut pane = close_test_pane(crate::types::InstanceId::new(), "managed", Some("managed"));
+        pane.instance_ref = Some(expected_ref);
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(crate::layout::Tab::new("managed".to_string(), pane));
+        assert!(super::super::session::save_session(&home, &layout));
+        assert!(layout.remove_fleet_instance_views_exact(expected_ref));
+        crate::store::fail_next_atomic_write_for_test(&home.join("session.json"));
+        crate::store::fail_next_atomic_write_for_test(&home.join("session.retired.json"));
+
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            reap_workers: &mut reap_workers,
+        };
+        let overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "managed".to_string(),
+            notice: None,
+        };
+        let completion = finish_successful_delete(&mut ctx, "managed", Some(expected_ref));
+
+        assert!(
+            matches!(completion, DeleteCompletion::Keep { notice } if notice.contains("pending")),
+            "failed persistence must leave an explicit retry state"
+        );
+        assert!(matches!(overlay, Overlay::ConfirmDeleteInstance { .. }));
+        assert!(home.join("session.json").exists());
+        crate::store::fail_next_atomic_write_for_test(&home.join("session.json"));
+        assert!(!super::super::session::save_session(&home, ctx.layout));
+        let retired: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join("session.retired.json"))
+                .expect("retry must persist retired identity"),
+        )
+        .expect("valid retired session JSON");
+        assert_eq!(
+            retired["instance_refs"]
+                .as_array()
+                .expect("instance_refs array")
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_without_authoritative_identity_fails_closed() {
+        let home = dec_home("delete_missing_identity");
+        let sentinel = br#"{"active_tab":0,"tabs":[]}"#;
+        std::fs::write(home.join("session.json"), sentinel).expect("write session sentinel");
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(crate::layout::Tab::new(
+            "managed".to_string(),
+            close_test_pane(crate::types::InstanceId::new(), "managed", Some("managed")),
+        ));
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            reap_workers: &mut reap_workers,
+        };
+        let overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "managed".to_string(),
+            notice: None,
+        };
+        let completion = finish_successful_delete(&mut ctx, "managed", None);
+
+        assert!(matches!(
+            completion,
+            DeleteCompletion::Keep { notice } if notice.contains("identity")
+        ));
+        assert!(matches!(overlay, Overlay::ConfirmDeleteInstance { .. }));
+        assert_eq!(
+            std::fs::read(home.join("session.json")).expect("session sentinel"),
+            sentinel
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
     fn delete_instance_without_active_daemon_is_fail_closed() {
         let home = dec_home("delete_no_daemon");
         let id = crate::types::InstanceId::new();
@@ -1399,6 +1552,54 @@ mod tests {
             2
         );
 
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_instance_removes_current_ref_when_old_name_only_view_precedes_it_3625() {
+        let home = dec_home("delete_replacement_view");
+        let current_id = crate::types::InstanceId::new();
+        let current_ref = crate::types::InstanceRef::new(current_id, 77);
+
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut old = close_test_pane(crate::types::InstanceId::new(), "managed", Some("managed"));
+        old.instance_ref = None;
+        let mut replacement = close_test_pane(current_id, "managed", Some("managed"));
+        replacement.id = 2;
+        replacement.instance_ref = Some(current_ref);
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(Tab::new("old".to_string(), old));
+        layout.add_tab(Tab::new("replacement".to_string(), replacement));
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            reap_workers: &mut reap_workers,
+        };
+
+        let expected = authoritative_instance_ref_for_delete(&ctx, "managed");
+        assert_eq!(expected, Some(current_ref));
+        let expected = match expected {
+            Some(expected) => expected,
+            None => panic!("current instance ref should be authoritative"),
+        };
+        assert!(ctx.layout.remove_fleet_instance_views_exact(expected));
+        assert!(
+            ctx.layout.find_pane_mut(1).is_some(),
+            "old scrollback remains"
+        );
+        assert!(
+            ctx.layout.find_pane_mut(2).is_none(),
+            "current view removed"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 

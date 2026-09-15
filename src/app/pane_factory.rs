@@ -241,6 +241,7 @@ fn build_pane_placeholder(
         // Filled by `attach_agent_to_pane` once the agent's authoritative UUID
         // is resolved; `Default` is the never-routed placeholder until then.
         instance_id: crate::types::InstanceId::default(),
+        instance_ref: None,
         vterm: VTerm::new(cols, rows),
         rx: fwd_rx,
         id: pane_id,
@@ -295,7 +296,7 @@ fn attach_agent_to_pane(
     // effects, same order. Splitting here is what lets the deferred path run
     // `spawn_and_subscribe` on a background worker (touches only the shareable
     // registry) while the render thread runs `apply_attachment` (pane mutation).
-    let (instance_id, rx, dump) = spawn_and_subscribe(
+    let (instance_id, instance_ref, rx, dump) = spawn_and_subscribe(
         registry,
         home,
         &name,
@@ -310,7 +311,7 @@ fn attach_agent_to_pane(
         identity,
         declared_backend,
     )?;
-    apply_attachment(pane, instance_id, rx, dump, fwd_tx, wakeup_tx);
+    apply_attachment(pane, instance_id, instance_ref, rx, dump, fwd_tx, wakeup_tx);
     Ok(())
 }
 
@@ -321,7 +322,7 @@ fn attach_agent_to_pane(
 /// subscriber receiver + the initial screen dump for the main thread to finish
 /// wiring via [`apply_attachment`]. Mutates NO `Pane`/`Layout`, so it can run off
 /// the render thread on a background worker.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn spawn_and_subscribe(
     registry: &AgentRegistry,
     home: &Path,
@@ -338,6 +339,7 @@ fn spawn_and_subscribe(
     declared_backend: Option<&Backend>,
 ) -> Result<(
     crate::types::InstanceId,
+    Option<crate::types::InstanceRef>,
     crossbeam_channel::Receiver<Vec<u8>>,
     Vec<u8>,
 )> {
@@ -451,7 +453,10 @@ fn spawn_and_subscribe(
         agent::subscribe_with_dump(handle)
     };
 
-    Ok((instance_id, rx, dump))
+    let instance_ref = matches!(identity, SpawnIdentity::Managed)
+        .then(|| agent::instance_ref_for_id(registry, instance_id))
+        .flatten();
+    Ok((instance_id, instance_ref, rx, dump))
 }
 
 /// Cheap, **main-thread** half of an attach (#render-first phase-(b)): apply the
@@ -471,12 +476,14 @@ fn spawn_and_subscribe(
 fn apply_attachment(
     pane: &mut Pane,
     instance_id: crate::types::InstanceId,
+    instance_ref: Option<crate::types::InstanceRef>,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
     dump: Vec<u8>,
     fwd_tx: crossbeam_channel::Sender<Vec<u8>>,
     wakeup_tx: &crossbeam_channel::Sender<usize>,
 ) {
     pane.instance_id = instance_id;
+    pane.instance_ref = instance_ref;
     let pane_id = pane.id;
     // #freeze-4 A1: enqueue the dump through rx (chunked, FIFO before the forwarder)
     // rather than processing it unbounded into the VTerm here.
@@ -617,6 +624,7 @@ pub(super) enum AttachOutcome {
     Ready {
         pane_id: usize,
         instance_id: crate::types::InstanceId,
+        instance_ref: Option<crate::types::InstanceRef>,
         /// True only for a direct/local shell with no fleet.yaml identity.
         unmanaged: bool,
         rx: crossbeam_channel::Receiver<Vec<u8>>,
@@ -784,6 +792,7 @@ fn finish_attach(
     registry: &AgentRegistry,
     pane_id: usize,
     instance_id: crate::types::InstanceId,
+    instance_ref: Option<crate::types::InstanceRef>,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
     dump: Vec<u8>,
     work_dir: std::path::PathBuf,
@@ -801,6 +810,7 @@ fn finish_attach(
     AttachOutcome::Ready {
         pane_id,
         instance_id,
+        instance_ref,
         unmanaged,
         rx,
         dump,
@@ -900,7 +910,7 @@ pub(super) fn run_attach(
                 SpawnIdentity::Managed,
                 Some(&resolved.backend),
             ) {
-                Ok((instance_id, rx, dump)) => {
+                Ok((instance_id, instance_ref, rx, dump)) => {
                     // Overwrite basic instructions with the fleet-aware version
                     // (same ordering as the synchronous create_pane_from_resolved).
                     let team_ctx = team_record
@@ -935,6 +945,7 @@ pub(super) fn run_attach(
                         registry,
                         pane_id,
                         instance_id,
+                        instance_ref,
                         rx,
                         dump,
                         work_dir,
@@ -976,10 +987,11 @@ pub(super) fn run_attach(
             SpawnIdentity::UnmanagedLocalShell,
             None,
         ) {
-            Ok((instance_id, rx, dump)) => finish_attach(
+            Ok((instance_id, instance_ref, rx, dump)) => finish_attach(
                 registry,
                 pane_id,
                 instance_id,
+                instance_ref,
                 rx,
                 dump,
                 work_dir,
@@ -1010,13 +1022,14 @@ pub(super) fn apply_attach_outcome(
     match outcome {
         AttachOutcome::Ready {
             instance_id,
+            instance_ref,
             rx,
             dump,
             work_dir,
             ..
         } => {
             pane.working_dir = Some(work_dir);
-            apply_attachment(pane, instance_id, rx, dump, fwd_tx, wakeup_tx);
+            apply_attachment(pane, instance_id, instance_ref, rx, dump, fwd_tx, wakeup_tx);
             // #t-98760-8 (#2343 deferred-attach regression): snap the just-
             // registered PTY to the pane's CURRENT (already render-corrected) vterm
             // size. On a restored SPLIT layout the render loop corrected this
@@ -1177,6 +1190,7 @@ pub(super) fn create_remote_pane(
     wakeup_tx: &crossbeam_channel::Sender<usize>,
 ) -> Result<Pane> {
     let mut client = BridgeClient::connect(home, name, cols, rows)?;
+    let instance_ref = client.instance_ref();
     let mut reader = client
         .take_reader()
         .ok_or_else(|| anyhow::anyhow!("bridge_client reader already taken"))?;
@@ -1226,6 +1240,7 @@ pub(super) fn create_remote_pane(
         // it from fleet.yaml for consistency; default when absent (harmless —
         // unused on the remote path).
         instance_id: crate::fleet::resolve_uuid(home, name).unwrap_or_default(),
+        instance_ref,
         vterm: VTerm::new(cols, rows),
         rx: pane_rx,
         id: pane_id,
@@ -1618,6 +1633,7 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id: pid,
                 instance_id: crate::types::InstanceId::default(),
+                instance_ref: None,
                 unmanaged: true,
                 rx: sub_rx,
                 dump: b"DUMP-XYZ".to_vec(),
@@ -1689,6 +1705,7 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id: pid,
                 instance_id: crate::types::InstanceId::default(),
+                instance_ref: None,
                 unmanaged: true,
                 rx: sub_rx,
                 dump: Vec::new(),
@@ -1764,6 +1781,7 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id: pid,
                 instance_id: crate::types::InstanceId::default(),
+                instance_ref: None,
                 unmanaged: true,
                 rx: sub_rx,
                 dump: Vec::new(),
@@ -1904,6 +1922,7 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id,
                 instance_id,
+                instance_ref: None,
                 unmanaged: true,
                 rx: sub_rx,
                 dump: Vec::new(),

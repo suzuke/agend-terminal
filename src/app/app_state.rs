@@ -147,6 +147,15 @@ pub(super) struct AppState {
     /// Successful Live state snapshots waiting for the next pre-select roster
     /// reconciliation. Non-Live outcomes never populate this queue.
     pub(super) pending_remote_roster_names: Option<std::collections::HashSet<String>>,
+    pub(super) pending_remote_roster_refs:
+        Option<std::collections::HashMap<String, crate::types::InstanceRef>>,
+    /// Exact identities from the most recent live daemon roster. Remote panes
+    /// stay untrusted when this map has no entry (legacy/fallback roster).
+    pub(super) remote_instance_refs: std::collections::HashMap<String, crate::types::InstanceRef>,
+    /// Source/sequence fence for the daemon lifecycle stream.
+    pub(super) event_source: Option<String>,
+    pub(super) event_sequence: u64,
+    pub(super) event_resync_required: bool,
     /// Placeholder forwarder senders, keyed by pane id, retained until the
     /// matching AttachOutcome is applied (or the pane is closed first).
     pub(super) pending_fwd: HashMap<usize, crossbeam_channel::Sender<Vec<u8>>>,
@@ -264,6 +273,11 @@ impl AppState {
             remote_attach_failures: std::collections::HashMap::new(),
             remote_agent_states: HashMap::new(),
             pending_remote_roster_names: None,
+            pending_remote_roster_refs: None,
+            remote_instance_refs: std::collections::HashMap::new(),
+            event_source: None,
+            event_sequence: 0,
+            event_resync_required: false,
             pending_fwd: HashMap::new(),
             needs_resize: true,
             last_remote_sync: std::time::Instant::now(),
@@ -1014,20 +1028,112 @@ impl AppState {
                 self.pending_remote_roster_names =
                     matches!(result.mode, crate::runtime::AgentListMode::Live)
                         .then_some(result.names);
+                self.pending_remote_roster_refs =
+                    matches!(result.mode, crate::runtime::AgentListMode::Live)
+                        .then_some(result.instance_refs);
+                self.remote_instance_refs =
+                    if matches!(result.mode, crate::runtime::AgentListMode::Live) {
+                        self.pending_remote_roster_refs.clone().unwrap_or_default()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
+                if matches!(result.mode, crate::runtime::AgentListMode::Live) {
+                    self.event_resync_required = false;
+                }
             }
             Ok(Err(error)) => {
                 self.remote_agent_states.clear();
                 self.pending_remote_roster_names = None;
+                self.pending_remote_roster_refs = None;
                 self.daemon_list_mode = error.mode;
                 tracing::warn!(error = %error.error, "daemon agent-state snapshot unavailable");
             }
             Err(_) => {
                 self.remote_agent_states.clear();
                 self.pending_remote_roster_names = None;
+                self.pending_remote_roster_refs = None;
                 tracing::warn!("daemon agent-state RPC worker stopped");
             }
         }
         self.dirty = true;
+    }
+
+    pub(super) fn handle_event_stream_outcome(
+        &mut self,
+        outcome: Result<rpc::EventStreamOutcome, crossbeam_channel::RecvError>,
+        deps: &AppDeps<'_>,
+    ) {
+        match outcome {
+            Ok(rpc::EventStreamOutcome::Event(event)) => {
+                if event.source.is_empty() || event.source == "unknown" || event.sequence == 0 {
+                    self.event_source = None;
+                    self.event_sequence = 0;
+                    self.event_resync_required = true;
+                    self.daemon_list_mode = crate::runtime::AgentListMode::FallbackDaemonStuck;
+                    self.request_event_refresh(deps);
+                    self.dirty = true;
+                    return;
+                }
+                if let Some(source) = self.event_source.as_deref() {
+                    if source != event.source {
+                        self.event_resync_required = true;
+                        self.event_sequence = 0;
+                        self.event_source = None;
+                        self.daemon_list_mode = crate::runtime::AgentListMode::FallbackDaemonStuck;
+                        self.request_event_refresh(deps);
+                        self.dirty = true;
+                        return;
+                    }
+                } else {
+                    self.event_source = Some(event.source.clone());
+                }
+                if event.sequence <= self.event_sequence {
+                    return;
+                }
+                if self.event_sequence != 0 && event.sequence != self.event_sequence + 1 {
+                    self.event_resync_required = true;
+                    self.request_event_refresh(deps);
+                }
+                self.event_sequence = event.sequence;
+                if !self.event_resync_required {
+                    if let crate::api::ApiEvent::InstanceDeleted {
+                        instance_ref: Some(instance_ref),
+                        ..
+                    } = event.event
+                    {
+                        self.ui
+                            .layout
+                            .remove_fleet_instance_views_exact(instance_ref);
+                    }
+                }
+                self.request_event_refresh(deps);
+            }
+            Ok(rpc::EventStreamOutcome::Disconnected(error)) => {
+                self.event_source = None;
+                self.event_sequence = 0;
+                self.event_resync_required = true;
+                self.daemon_list_mode = crate::runtime::AgentListMode::FallbackDaemonStuck;
+                tracing::warn!(error = %error, "daemon event stream unavailable");
+                self.request_event_refresh(deps);
+            }
+            Err(_) => {
+                self.event_source = None;
+                self.event_sequence = 0;
+                self.event_resync_required = true;
+                self.daemon_list_mode = crate::runtime::AgentListMode::FallbackDaemonStuck;
+                tracing::warn!("daemon event stream worker stopped");
+                self.request_event_refresh(deps);
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn request_event_refresh(&mut self, deps: &AppDeps<'_>) {
+        if deps.attached_run_dir.is_some() {
+            let _ = deps
+                .remote_state_rpc_tx
+                .try_send(rpc::AgentStateRequest::Refresh);
+        }
     }
 
     pub(super) fn handle_idle_tick(&mut self, deps: &AppDeps<'_>) {
@@ -1088,6 +1194,30 @@ impl AppState {
             reconcile_remote_roster_candidates(current, &self.known_remote_agents, mode, |name| {
                 self.ui.layout.agent_pane_is_disconnected(name)
             });
+        let mut names = names;
+        // A same-name replacement does not change the roster set. Compare the
+        // daemon's exact identity against the retained view so a new bridge is
+        // attached even when the old pane is still marked connected.
+        if matches!(mode, crate::runtime::AgentListMode::Live) {
+            for name in current {
+                let Some(expected) = self.remote_instance_refs.get(name).copied() else {
+                    continue;
+                };
+                let current_ref =
+                    self.ui
+                        .layout
+                        .find_agent_pane(name)
+                        .and_then(|(tab_idx, pane_id)| {
+                            self.ui.layout.tabs[tab_idx]
+                                .root()
+                                .find_pane(pane_id)
+                                .and_then(Pane::instance_ref)
+                        });
+                if current_ref != Some(expected) {
+                    names.to_add.insert(name.clone());
+                }
+            }
+        }
         let mut to_add: Vec<String> = names.to_add.into_iter().collect();
         to_add.sort();
         let mut pane_builder = |name: &str, layout: &mut Layout| {
@@ -1180,20 +1310,35 @@ impl AppState {
                 // leaf — preserves the existing team tab/split.
                 let already_has_pane = self.ui.layout.find_agent_pane(name).is_some();
                 match pane_builder(name, &mut self.ui.layout) {
-                    Ok(pane) => {
+                    Ok(mut pane) => {
+                        if pane.instance_ref.is_none() {
+                            pane.instance_ref = self.remote_instance_refs.get(name).copied();
+                        }
                         let tab_name = pane.agent_name.clone();
                         self.known_remote_agents.insert(tab_name.to_string());
                         self.remote_attach_failures.remove(name);
                         if already_has_pane {
                             // Reuse retained pane (same as standalone's reconnect).
-                            self.ui
+                            match self
+                                .ui
                                 .layout
-                                .reconnect_or_append_agent_pane(&tab_name, pane);
-                            tracing::info!(
-                                agent = %name,
-                                team = %team_name,
-                                "reused retained team pane for re-appeared remote agent"
-                            );
+                                .reconnect_or_append_agent_pane(&tab_name, pane)
+                            {
+                                crate::layout::PaneReconnectOutcome::Reconnected => {
+                                    tracing::info!(
+                                        agent = %name,
+                                        team = %team_name,
+                                        "reused retained team pane for re-appeared remote agent"
+                                    );
+                                }
+                                crate::layout::PaneReconnectOutcome::Appended => {
+                                    tracing::info!(
+                                        agent = %name,
+                                        team = %team_name,
+                                        "opened separate remote pane because identity was unavailable"
+                                    );
+                                }
+                            }
                         } else if let Some(idx) = self
                             .ui
                             .layout
@@ -1245,27 +1390,33 @@ impl AppState {
         // Standalone: per-agent tabs as before.
         for name in &standalone {
             match pane_builder(name, &mut self.ui.layout) {
-                Ok(pane) => {
+                Ok(mut pane) => {
+                    if pane.instance_ref.is_none() {
+                        pane.instance_ref = self.remote_instance_refs.get(name).copied();
+                    }
                     let tab_name = pane.agent_name.clone();
                     self.known_remote_agents.insert(tab_name.to_string());
                     self.remote_attach_failures.remove(name);
                     // This sync is add-only: a gone agent's pane is retained
                     // for scrollback. Reconnect that leaf in place when the
                     // agent reappears, including inside an operator split.
-                    if self
+                    match self
                         .ui
                         .layout
                         .reconnect_or_append_agent_pane(&tab_name, pane)
                     {
-                        tracing::info!(
-                            agent = %name,
-                            "reused retained pane for re-appeared remote agent (no duplicate)"
-                        );
-                    } else {
-                        tracing::info!(
-                            agent = %name,
-                            "opened tab for newly-appeared remote agent"
-                        );
+                        crate::layout::PaneReconnectOutcome::Reconnected => {
+                            tracing::info!(
+                                agent = %name,
+                                "reused retained pane for re-appeared remote agent (no duplicate)"
+                            );
+                        }
+                        crate::layout::PaneReconnectOutcome::Appended => {
+                            tracing::info!(
+                                agent = %name,
+                                "opened tab for newly-appeared remote agent"
+                            );
+                        }
                     }
                     self.needs_resize = true;
                 }
@@ -1287,6 +1438,7 @@ impl AppState {
         let Some(names) = self.pending_remote_roster_names.take() else {
             return;
         };
+        self.pending_remote_roster_refs.take();
         // A healthy Live snapshot owns this roster pass and refreshes the
         // idle-sync throttle, preventing the fallback poll from starving the
         // Live path with a competing reconciliation.
@@ -1383,6 +1535,7 @@ mod tests {
             Ok(pane_factory::AttachOutcome::Ready {
                 pane_id,
                 instance_id,
+                instance_ref: None,
                 unmanaged,
                 rx: sub_rx,
                 dump: Vec::new(),
@@ -1408,6 +1561,7 @@ mod tests {
         Ok(Pane {
             agent_name: agent.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: crate::vterm::VTerm::new(10, 10),
             rx,
             id: layout.next_pane_id(),
@@ -1467,6 +1621,7 @@ mod tests {
         state.handle_agent_state_rpc_outcome(Ok(Ok(rpc::AgentStateSnapshotResult {
             snapshot: HashMap::new(),
             names: HashSet::from(["live-agent".to_string()]),
+            instance_refs: HashMap::new(),
             mode: crate::runtime::AgentListMode::Live,
         })));
         assert_eq!(state.daemon_list_mode, crate::runtime::AgentListMode::Live);
@@ -1492,6 +1647,7 @@ mod tests {
         state.handle_agent_state_rpc_outcome(Ok(Ok(rpc::AgentStateSnapshotResult {
             snapshot: HashMap::new(),
             names: HashSet::from(["stale-agent".to_string()]),
+            instance_refs: HashMap::new(),
             mode: crate::runtime::AgentListMode::FallbackDaemonStuck,
         })));
 
@@ -1500,6 +1656,121 @@ mod tests {
             crate::runtime::AgentListMode::FallbackDaemonStuck
         );
         assert!(state.pending_remote_roster_names.is_none());
+    }
+
+    #[test]
+    fn lifecycle_stream_fences_source_order_and_non_live_snapshots() {
+        let home =
+            std::env::temp_dir().join(format!("event_stream_{}", crate::types::InstanceId::new()));
+        let fleet_path = home.join("fleet.yaml");
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let app_restart_gate = crate::api::app_restart::AppRestartGate::new();
+        let daemon_binary_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attached_run_dir = Some(home.clone());
+        let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded::<rpc::TaskRequest>();
+        let (remote_state_rpc_tx, _remote_state_rpc_rx) =
+            crossbeam_channel::unbounded::<rpc::AgentStateRequest>();
+        let deps = AppDeps {
+            home: &home,
+            fleet_path: &fleet_path,
+            registry: &registry,
+            wakeup_tx: &wakeup_tx,
+            app_restart_gate: &app_restart_gate,
+            daemon_binary_stale: &daemon_binary_stale,
+            telegram_status: TelegramStatus::NotConfigured,
+            attached_run_dir: &attached_run_dir,
+            attached_mode: false,
+            size_debug: false,
+            task_rpc_tx: &task_rpc_tx,
+            remote_state_rpc_tx: &remote_state_rpc_tx,
+        };
+        let mut state = AppState::new();
+        let event = |source: &str, sequence: u64| {
+            rpc::EventStreamOutcome::Event(crate::daemon::event_hub::DaemonEvent {
+                source: source.to_string(),
+                sequence,
+                event: crate::api::ApiEvent::TeamCreated {
+                    name: "team".to_string(),
+                    members: Vec::new(),
+                },
+            })
+        };
+
+        state.handle_event_stream_outcome(Ok(event("unknown", 1)), &deps);
+        assert!(state.event_source.is_none());
+        assert!(state.event_resync_required);
+        state.handle_agent_state_rpc_outcome(Ok(Ok(rpc::AgentStateSnapshotResult {
+            snapshot: HashMap::new(),
+            names: HashSet::new(),
+            instance_refs: HashMap::new(),
+            mode: crate::runtime::AgentListMode::Live,
+        })));
+        assert!(!state.event_resync_required);
+
+        state.handle_event_stream_outcome(Ok(event("daemon-a", 1)), &deps);
+        assert_eq!(state.event_source.as_deref(), Some("daemon-a"));
+        assert_eq!(state.event_sequence, 1);
+        assert!(!state.event_resync_required);
+
+        // Duplicate events are harmless and do not move the fence backward.
+        state.handle_event_stream_outcome(Ok(event("daemon-a", 1)), &deps);
+        assert_eq!(state.event_sequence, 1);
+        assert!(!state.event_resync_required);
+
+        // A gap forces a Live snapshot before any destructive event is trusted.
+        state.handle_event_stream_outcome(Ok(event("daemon-a", 3)), &deps);
+        assert_eq!(state.event_sequence, 3);
+        assert!(state.event_resync_required);
+
+        // A successor source is never accepted into the old stream epoch.
+        state.handle_event_stream_outcome(Ok(event("daemon-b", 4)), &deps);
+        assert!(state.event_source.is_none());
+        assert_eq!(state.event_sequence, 0);
+        assert!(state.event_resync_required);
+
+        // Fallback snapshots cannot clear the resync fence.
+        state.handle_agent_state_rpc_outcome(Ok(Ok(rpc::AgentStateSnapshotResult {
+            snapshot: HashMap::new(),
+            names: HashSet::new(),
+            instance_refs: HashMap::new(),
+            mode: crate::runtime::AgentListMode::FallbackDaemonStuck,
+        })));
+        assert!(state.event_resync_required);
+    }
+
+    #[test]
+    fn same_name_remote_replacement_cannot_overwrite_retained_pane_3625() {
+        let home = team_fixture_home("identity-replacement");
+        let mut state = AppState::new();
+        let old_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 101);
+        let new_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 102);
+        state
+            .remote_instance_refs
+            .insert("solo".to_string(), old_ref);
+        let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
+        state.place_remote_team_grouped(&["solo".to_string()], &home, &mut pane_builder);
+        state
+            .remote_instance_refs
+            .insert("solo".to_string(), new_ref);
+        state.place_remote_team_grouped(&["solo".to_string()], &home, &mut pane_builder);
+
+        assert_eq!(state.ui.layout.tabs.len(), 2);
+        assert_eq!(
+            state.ui.layout.tabs[0]
+                .root()
+                .find_pane(0)
+                .and_then(Pane::instance_ref),
+            Some(old_ref)
+        );
+        assert_eq!(
+            state.ui.layout.tabs[1]
+                .root()
+                .find_pane(1)
+                .and_then(Pane::instance_ref),
+            Some(new_ref)
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
@@ -1678,6 +1949,17 @@ mod tests {
     fn hot_reload_retained_team_pane_reconnects_in_place_3501() {
         let home = team_fixture_home("retained");
         let mut state = AppState::new();
+        // The production bridge supplies this identity during its greeting;
+        // keep the fixture's two attaches on the same incarnation so this
+        // pre-existing reconnect contract exercises the exact path.
+        state.remote_instance_refs.insert(
+            "m1".to_string(),
+            crate::types::InstanceRef::new(crate::types::InstanceId::new(), 201),
+        );
+        state.remote_instance_refs.insert(
+            "m2".to_string(),
+            crate::types::InstanceRef::new(crate::types::InstanceId::new(), 202),
+        );
         let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
         state.place_remote_team_grouped(
             &["m1".to_string(), "m2".to_string()],

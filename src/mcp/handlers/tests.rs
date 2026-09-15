@@ -4884,7 +4884,7 @@ fn deployment_runtime_some_teardown_reaches_typed_delete_owner_slice14() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            crate::api::ApiEvent::InstanceDeleted { name } if name == "slice14-lead"
+            crate::api::ApiEvent::InstanceDeleted { name, .. } if name == "slice14-lead"
         )),
         "runtime-present teardown must invoke typed DELETE and emit InstanceDeleted: {events:?}"
     );
@@ -4952,7 +4952,7 @@ fn runtime_present_mcp_no_listener_matrix_2454() {
     assert!(
         recorder.events.lock().iter().any(|event| matches!(
             event,
-            crate::api::ApiEvent::InstanceDeleted { name } if name == "matrix-agent"
+            crate::api::ApiEvent::InstanceDeleted { name, .. } if name == "matrix-agent"
         )),
         "RuntimeContext=Some team delete must cascade through the typed DELETE owner: {result}"
     );

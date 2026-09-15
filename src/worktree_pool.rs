@@ -134,6 +134,43 @@ pub(crate) fn sync_marker_contents(path: &Path) -> std::io::Result<()> {
         .sync_all()
 }
 
+/// Write the canonical managed-worktree identity marker and make its contents
+/// durable. Reuse uses the same format as lease, but only after its binding,
+/// source, and pool-path checks prove that the target is daemon-owned.
+pub(crate) fn write_managed_marker(
+    path: &Path,
+    agent: &str,
+    branch: &str,
+    source_repo: &Path,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_MANAGED_MARKER_WRITE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other(
+            "test seam: forced managed marker write failure",
+        ));
+    }
+    std::fs::write(
+        path,
+        format!(
+            "agent={agent}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+            source_repo.display(),
+            chrono::Utc::now().to_rfc3339()
+        ),
+    )
+    .and_then(|()| sync_marker_contents(path))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_MANAGED_MARKER_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: force the canonical managed-marker write helper to fail.
+#[cfg(test)]
+pub(crate) fn set_fail_managed_marker_write(fail: bool) {
+    FAIL_MANAGED_MARKER_WRITE.with(|c| c.set(fail));
+}
+
 pub fn lease(
     home: &Path,
     source_repo: &Path,
@@ -166,16 +203,7 @@ pub fn lease(
     // would refuse. The (possibly reused) worktree is deliberately NOT
     // deleted: it may hold WIP; abort-only is the safe arm.
     let marker = info.path.join(MANAGED_MARKER);
-    std::fs::write(
-        &marker,
-        format!(
-            "agent={agent}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
-            info.source_repo.display(),
-            chrono::Utc::now().to_rfc3339()
-        ),
-    )
-    .and_then(|()| sync_marker_contents(&marker))
-    .map_err(|e| {
+    write_managed_marker(&marker, agent, branch, &info.source_repo).map_err(|e| {
         LeaseError::CreateFailed(format!(
             "managed-marker write/sync failed for {agent}@{branch}: {e}"
         ))

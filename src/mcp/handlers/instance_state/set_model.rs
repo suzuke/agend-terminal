@@ -30,6 +30,14 @@ pub(crate) fn handle_set_model(
     handle_set_model_with_runtime(home, args, sender, None)
 }
 
+/// restart_ok 判定（純函數）：無 error 且 spawn 成功且 TUI 交接確認。
+/// spawn 成功但交接未確認（20:24 事件形）必須報 false，不能誤導。
+fn restart_ok_from_report(r: &Value) -> bool {
+    r.get("error").is_none_or(Value::is_null)
+        && r["spawned"] == json!(true)
+        && r["tui_handoff"] == json!(true)
+}
+
 pub(crate) fn handle_set_model_with_runtime(
     home: &Path,
     args: &Value,
@@ -289,10 +297,17 @@ pub(crate) fn handle_set_model_with_runtime(
             &json!({"instance": name, "mode": "resume", "reason": "set_model"}),
             runtime,
         );
-        let restart_ok = r.get("error").is_none_or(Value::is_null) && r["spawned"] == json!(true);
+        // restart_ok 必須含 TUI 交接確認：spawn 成功但 pane 未接管時
+        // （20:24 事件：spawned=true 但 app 側全程無接管）報 false 誤導。
+        let restart_ok = restart_ok_from_report(&r);
         resp["restart_ok"] = json!(restart_ok);
         if restart_ok {
             resp["note"] = json!("restarted — new model/effort intent active");
+        } else if r["spawned"] == json!(true) && r["tui_handoff"] != json!(true) {
+            resp["restart_error"] = json!(format!(
+                "restart spawned but the TUI did not take over ({}) — the persisted intent still applies on the next respawn; check the TUI roster sync",
+                r["tui_handoff_warning"].as_str().unwrap_or("no client connected to the new listener")
+            ));
         } else {
             resp["restart_error"] = json!(format!(
                 "restart failed ({}) — the persisted intent still applies on the next respawn",
@@ -628,5 +643,32 @@ mod tests {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod restart_ok_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    /// restart_ok 判定：spawn 成功但 tui_handoff 未確認 → false（20:24 事件形）。
+    #[test]
+    fn restart_ok_requires_tui_handoff() {
+        assert!(
+            !restart_ok_from_report(&json!({"spawned": true, "tui_handoff": false})),
+            "spawned 但未交接必須報 false"
+        );
+        assert!(
+            !restart_ok_from_report(&json!({"spawned": true})),
+            "缺 tui_handoff 欄位（舊回報）必須報 false，不可誤導為成功"
+        );
+        assert!(
+            restart_ok_from_report(&json!({"spawned": true, "tui_handoff": true})),
+            "spawned + 交接確認才報 true"
+        );
+        assert!(
+            !restart_ok_from_report(&json!({"spawned": true, "tui_handoff": true, "error": "x"})),
+            "有 error 時即使交接也報 false"
+        );
     }
 }

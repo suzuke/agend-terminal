@@ -40,6 +40,26 @@ impl std::fmt::Display for InstanceId {
     }
 }
 
+/// Exact identity of one daemon-owned instance process.
+///
+/// `InstanceId` identifies the configured instance. `generation` identifies
+/// the daemon-owned process incarnation for that instance, so a delayed event
+/// from an older same-name process cannot mutate the replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct InstanceRef {
+    pub instance_id: InstanceId,
+    pub generation: u64,
+}
+
+impl InstanceRef {
+    pub const fn new(instance_id: InstanceId, generation: u64) -> Self {
+        Self {
+            instance_id,
+            generation,
+        }
+    }
+}
+
 /// Strongly-typed agent/instance name. Wraps `String` with `Deref<str>`
 /// + `Borrow<str>` so it works transparently with `HashMap<String, _>::get`
 ///   and string comparisons. Newtype prevents accidental confusion with

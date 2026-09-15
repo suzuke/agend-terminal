@@ -14,6 +14,7 @@ pub use split::{adjust_split_ratio, find_split_border, resize_focused, Direction
 pub use tab::{DragTabTarget, Tab};
 pub use tree::{swap_panes, PaneNode, SplitDir};
 
+use crate::types::InstanceRef;
 use ratatui::layout::Rect;
 use std::collections::HashMap;
 
@@ -25,6 +26,15 @@ pub enum MovePlacement {
     /// Create a brand-new tab whose sole pane is the moved pane. Used when
     /// dragging a pane onto the tab bar's empty trailing area.
     NewTab { name: String },
+}
+
+/// Result of trying to reconnect an agent pane. A pane without an exact
+/// identity is appended as a separate view so callers do not report the
+/// fail-closed append as a reconnect failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneReconnectOutcome {
+    Reconnected,
+    Appended,
 }
 
 /// #1939: full placement of an agent's pane at removal time. Extends the
@@ -173,16 +183,58 @@ impl Layout {
         self.tabs.push(tab);
     }
 
-    /// Reconnect a retained agent pane in place, or append a tab for a new agent.
-    pub fn reconnect_or_append_agent_pane(&mut self, agent_name: &str, mut pane: Pane) -> bool {
-        let Some((_, pane_id)) = self.find_agent_pane(agent_name) else {
+    /// Reconnect a retained agent pane in place, or append a tab for a new
+    /// agent. A retained pane is replaced only when its exact process identity
+    /// matches; name-only reconnects fail closed and append a separate view.
+    pub fn reconnect_or_append_agent_pane(
+        &mut self,
+        agent_name: &str,
+        pane: Pane,
+    ) -> PaneReconnectOutcome {
+        let Some(expected) = pane.instance_ref else {
             self.push_tab_preserve_focus(Tab::new(agent_name.to_string(), pane));
+            return PaneReconnectOutcome::Appended;
+        };
+        let has_exact_match = self.tabs.iter().any(|tab| {
+            tab.root().pane_ids().into_iter().any(|id| {
+                tab.root()
+                    .find_pane(id)
+                    .is_some_and(|candidate| candidate.instance_ref == Some(expected))
+            })
+        });
+        if has_exact_match {
+            return if self.reconnect_agent_pane_exact(expected, pane) {
+                PaneReconnectOutcome::Reconnected
+            } else {
+                PaneReconnectOutcome::Appended
+            };
+        }
+        self.push_tab_preserve_focus(Tab::new(agent_name.to_string(), pane));
+        PaneReconnectOutcome::Appended
+    }
+
+    /// Reconnect a pane only when the incoming process incarnation exactly
+    /// matches the retained pane. A name match is intentionally insufficient:
+    /// the same fleet name may have been replaced while a stale attach result
+    /// is still in flight.
+    pub fn reconnect_agent_pane_exact(&mut self, expected: InstanceRef, mut pane: Pane) -> bool {
+        let Some((_, pane_id)) = self.tabs.iter().enumerate().find_map(|(tab_idx, tab)| {
+            tab.root().pane_ids().into_iter().find_map(|id| {
+                tab.root()
+                    .find_pane(id)
+                    .filter(|candidate| candidate.instance_ref == Some(expected))
+                    .map(|_| (tab_idx, id))
+            })
+        }) else {
             return false;
         };
         pane.id = pane_id;
-        let existing = self
-            .find_pane_mut(pane_id)
-            .expect("pane id returned by find_agent_pane must exist");
+        let Some(existing) = self.find_pane_mut(pane_id) else {
+            return false;
+        };
+        if existing.instance_ref != Some(expected) {
+            return false;
+        }
         *existing = pane;
         true
     }
@@ -251,6 +303,7 @@ impl Layout {
 
     /// Remove every view of an exact fleet instance name across all tabs.
     /// Target-only tabs disappear; mixed tabs retain their other panes.
+    #[allow(dead_code)]
     pub fn remove_fleet_instance_views(&mut self, name: &str) -> bool {
         let mut removed = false;
         for tab_idx in (0..self.tabs.len()).rev() {
@@ -281,6 +334,54 @@ impl Layout {
             }
         }
         removed
+    }
+
+    /// Remove only views carrying the exact process identity. The operation is
+    /// fail-closed when a pane has no identity or a generation mismatch.
+    pub fn remove_fleet_instance_views_exact(&mut self, expected: InstanceRef) -> bool {
+        let mut removed = false;
+        for tab_idx in (0..self.tabs.len()).rev() {
+            let matching_ids: Vec<usize> = self.tabs[tab_idx]
+                .root()
+                .pane_ids()
+                .into_iter()
+                .filter(|&id| {
+                    self.tabs[tab_idx]
+                        .root()
+                        .find_pane(id)
+                        .is_some_and(|pane| pane.instance_ref == Some(expected))
+                })
+                .collect();
+            if matching_ids.is_empty() {
+                continue;
+            }
+            if matching_ids.len() == self.tabs[tab_idx].root().pane_count() {
+                self.close_tab(tab_idx);
+                removed = true;
+                continue;
+            }
+            for pane_id in matching_ids {
+                if self.tabs[tab_idx].close_pane_by_id(pane_id).is_some() {
+                    removed = true;
+                }
+            }
+        }
+        removed
+    }
+
+    /// Stable identity projection used by session persistence tests and by the
+    /// session writer's identity-aware format.
+    #[cfg(test)]
+    pub(crate) fn session_identity_snapshot(&self) -> Vec<InstanceRef> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.root().pane_ids())
+            .filter_map(|id| {
+                self.tabs
+                    .iter()
+                    .find_map(|tab| tab.root().find_pane(id).and_then(Pane::instance_ref))
+            })
+            .collect()
     }
 
     /// Move a pane from one tab to another, preserving its VTerm, scrollback,
@@ -353,6 +454,33 @@ impl Layout {
             .iter()
             .enumerate()
             .find_map(|(i, t)| t.root().find_pane_id_by_agent(agent).map(|p| (i, p)))
+    }
+
+    /// Resolve an unambiguous identity from panes carrying the given agent
+    /// name. Name-only panes are ignored; conflicting exact identities fail
+    /// closed instead of guessing which same-name incarnation is current.
+    pub fn unique_instance_ref_for_agent(&self, agent: &str) -> Option<InstanceRef> {
+        let mut found = None;
+        for tab in &self.tabs {
+            for pane_id in tab.root().pane_ids() {
+                let Some(pane) = tab.root().find_pane(pane_id) else {
+                    continue;
+                };
+                if pane.agent_name.as_str() != agent
+                    && pane.fleet_instance_name.as_deref() != Some(agent)
+                {
+                    continue;
+                }
+                let Some(instance_ref) = pane.instance_ref else {
+                    continue;
+                };
+                if found.is_some_and(|previous| previous != instance_ref) {
+                    return None;
+                }
+                found = Some(instance_ref);
+            }
+        }
+        found
     }
 }
 
@@ -432,12 +560,14 @@ fn collect_resize_needs(
 mod tests {
     use super::*;
     use crate::layout::pane::PaneSource;
+    use crate::types::{InstanceId, InstanceRef};
     use crate::vterm::VTerm;
 
     fn leaf(id: usize, name: &str) -> Pane {
         Pane {
             agent_name: name.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,
@@ -458,6 +588,54 @@ mod tests {
     }
 
     #[test]
+    fn stale_delete_event_cannot_remove_same_name_replacement_3625() {
+        let old_ref = InstanceRef::new(InstanceId::new(), 11);
+        let new_ref = InstanceRef::new(InstanceId::new(), 12);
+        let mut old = leaf(1, "same-name");
+        old.instance_ref = Some(old_ref);
+        let mut replacement = leaf(2, "same-name");
+        replacement.instance_ref = Some(new_ref);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("old".into(), old));
+        layout.add_tab(Tab::new("new".into(), replacement));
+
+        assert!(layout.remove_fleet_instance_views_exact(old_ref));
+        assert!(layout.find_pane_mut(1).is_none());
+        assert!(layout.find_pane_mut(2).is_some());
+        assert!(!layout.remove_fleet_instance_views_exact(old_ref));
+    }
+
+    #[test]
+    fn stale_reconnect_cannot_overwrite_same_name_replacement_3625() {
+        let old_ref = InstanceRef::new(InstanceId::new(), 21);
+        let new_ref = InstanceRef::new(InstanceId::new(), 22);
+        let mut current = leaf(1, "same-name");
+        current.instance_ref = Some(new_ref);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("team".into(), current));
+        let mut stale = leaf(99, "same-name");
+        stale.instance_ref = Some(old_ref);
+        stale.display_name = Some("stale".into());
+
+        assert!(!layout.reconnect_agent_pane_exact(old_ref, stale));
+        assert_eq!(layout.find_pane_mut(1).unwrap().display_name, None);
+        assert!(layout.find_pane_mut(99).is_none());
+    }
+
+    #[test]
+    fn instance_ref_round_trips_in_session_payload_3625() {
+        let instance_ref = InstanceRef::new(InstanceId::new(), 31);
+        let mut pane = leaf(1, "persisted");
+        pane.instance_ref = Some(instance_ref);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("team".into(), pane));
+
+        let encoded = serde_json::to_string(&layout.session_identity_snapshot()).unwrap();
+        assert!(encoded.contains(&instance_ref.instance_id.full()));
+        assert!(encoded.contains("31"));
+    }
+
+    #[test]
     fn layout_next_tab_wraps_at_boundary() {
         let mut layout = Layout::new();
         layout.add_tab(Tab::new("t1".to_string(), leaf(1, "a")));
@@ -472,12 +650,21 @@ mod tests {
     fn replace_reappeared_agent_inside_split_without_duplicate_tab() {
         let mut layout = Layout::new();
         layout.push_tab_preserve_focus(Tab::new("team".to_string(), leaf(1, "peer")));
-        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "returning"));
+        let mut returning = leaf(2, "returning");
+        returning.instance_ref = Some(InstanceRef::new(InstanceId::new(), 41));
+        layout.tabs[0].split_focused(SplitDir::Vertical, returning);
         layout.tabs[0].focus_id = 2;
         let mut fresh = leaf(99, "returning");
+        fresh.instance_ref = layout
+            .find_pane_mut(2)
+            .as_deref()
+            .and_then(Pane::instance_ref);
         fresh.display_name = Some("fresh".to_string());
 
-        assert!(layout.reconnect_or_append_agent_pane("returning", fresh));
+        assert_eq!(
+            layout.reconnect_or_append_agent_pane("returning", fresh),
+            PaneReconnectOutcome::Reconnected
+        );
 
         assert_eq!(layout.tabs.len(), 1, "must not append a duplicate tab");
         assert_eq!(layout.tabs[0].root().pane_count(), 2, "split is preserved");
@@ -492,8 +679,43 @@ mod tests {
             "the retained leaf carries the fresh connection"
         );
 
-        assert!(!layout.reconnect_or_append_agent_pane("new", leaf(3, "new")));
+        assert_eq!(
+            layout.reconnect_or_append_agent_pane("new", leaf(3, "new")),
+            PaneReconnectOutcome::Appended
+        );
         assert_eq!(layout.tabs.len(), 2, "a new agent still appends one tab");
+    }
+
+    #[test]
+    fn name_only_reconnect_appends_without_claiming_reconnect_3625() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("legacy".to_string(), leaf(1, "legacy")));
+
+        let outcome = layout.reconnect_or_append_agent_pane("legacy", leaf(2, "legacy"));
+
+        assert_eq!(outcome, PaneReconnectOutcome::Appended);
+        assert_eq!(
+            layout.tabs.len(),
+            2,
+            "identity-less attach must not replace"
+        );
+        assert_eq!(layout.tabs[0].root().pane_count(), 1);
+        assert_eq!(layout.tabs[1].root().pane_count(), 1);
+    }
+
+    #[test]
+    fn conflicting_instance_refs_fail_closed_for_delete_lookup_3625() {
+        let first_ref = InstanceRef::new(InstanceId::new(), 51);
+        let second_ref = InstanceRef::new(InstanceId::new(), 52);
+        let mut first = leaf(1, "same-name");
+        first.instance_ref = Some(first_ref);
+        let mut second = leaf(2, "same-name");
+        second.instance_ref = Some(second_ref);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("first".to_string(), first));
+        layout.add_tab(Tab::new("second".to_string(), second));
+
+        assert_eq!(layout.unique_instance_ref_for_agent("same-name"), None);
     }
     #[test]
     fn move_pane_across_tabs_same_tab_rejected() {
