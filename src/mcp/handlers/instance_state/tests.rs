@@ -901,6 +901,16 @@ fn restart_spawn_params_carries_same_tab_resume() {
     assert!(p.get("self_kick_on_ready").is_none());
 }
 
+#[test]
+fn restart_spawn_params_carries_restart_correlation_3649() {
+    let env = HashMap::new();
+    let p = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
+    assert!(p["restart_id"]
+        .as_str()
+        .is_some_and(|restart_id| !restart_id.is_empty()));
+    assert!(p["old_instance_ref"].is_object());
+}
+
 /// must-follow ②: the self-kick flag is INDEPENDENT — set ONLY by the
 /// fresh-restart path, NEVER derived from `SpawnMode::Fresh` (initial fleet
 /// spawns / create_instance / team-spawn are Fresh too but never set it). The

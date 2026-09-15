@@ -782,6 +782,9 @@ mod tests {
         assert_eq!(calls[0].0, std::path::Path::new("/run/current"));
         assert_eq!(calls[0].1, "restart_instance");
         assert_eq!(calls[0].3, std::time::Duration::from_secs(60));
+        assert!(calls[0].2["restart_id"]
+            .as_str()
+            .is_some_and(|restart_id| !restart_id.is_empty()));
         assert_eq!(
             calls[0].2,
             serde_json::json!({

@@ -619,6 +619,7 @@ pub(super) fn handle_key(
                     home: ctx.home,
                     wakeup_tx: ctx.wakeup_tx,
                     name_counter: &mut *ctx.name_counter,
+                    restart_tx: None,
                 };
                 if super::commands::execute(&cmd, &mut cctx) {
                     outcome.needs_resize = true;

@@ -19,6 +19,16 @@ pub(super) struct CommandCtx<'a> {
     pub home: &'a Path,
     pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
+    pub restart_tx: Option<&'a crossbeam_channel::Sender<RemoteRestartRequest>>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RemoteRestartRequest {
+    pub restart_id: String,
+    pub old_instance_ref: Option<crate::types::InstanceRef>,
+    pub tab_index: usize,
+    pub pane_id: usize,
+    pub name: String,
 }
 
 /// The dynamic source feeding a command-argument position, declared per token in
@@ -827,6 +837,7 @@ mod tests {
             home: Path::new("/home"),
             wakeup_tx: &wakeup_tx,
             name_counter: &mut name_counter,
+            restart_tx: None,
         };
         let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let calls_for_restart = std::sync::Arc::clone(&calls);
@@ -863,6 +874,7 @@ mod tests {
             home: Path::new("/home"),
             wakeup_tx: &wakeup_tx,
             name_counter: &mut name_counter,
+            restart_tx: None,
         };
 
         let resized = execute_with_restart("restart agent", &mut ctx, |_home, _name| {
@@ -956,6 +968,7 @@ mod tests {
             home: &home,
             wakeup_tx: &wakeup_tx,
             name_counter: &mut name_counter,
+            restart_tx: None,
         };
 
         assert!(!execute(
@@ -965,6 +978,38 @@ mod tests {
         assert!(layout.tabs.is_empty());
         assert!(crate::agent::lock_registry(&registry).is_empty());
         std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn tui_restart_remote_command_entry_enqueues_correlated_request_3649() {
+        let registry = empty_registry();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let (restart_tx, restart_rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let (mut remote, _server) = remote_test_pane(9, "agent", "fleet-agent");
+        remote.instance_ref = Some(crate::types::InstanceRef::new(
+            crate::types::InstanceId::new(),
+            7,
+        ));
+        layout.add_tab(Tab::new("agent".to_string(), remote));
+        let mut name_counter = HashMap::new();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: Path::new("/home"),
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            restart_tx: Some(&restart_tx),
+        };
+
+        assert!(!execute("restart agent", &mut ctx));
+        let request = restart_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .expect("remote restart must be handed to the owned worker");
+        assert_eq!(request.name, "fleet-agent");
+        assert!(!request.restart_id.is_empty());
+        assert_eq!(request.old_instance_ref.map(|r| r.generation), Some(7));
+        assert_eq!((request.tab_index, request.pane_id), (0, 9));
     }
 
     #[test]
