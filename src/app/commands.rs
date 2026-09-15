@@ -1062,9 +1062,10 @@ mod tests {
     /// Source-scan, NOT live `execute` calls (`spawn`/`restart` fork real PTY
     /// processes); pure + cross-platform. Two precision measures vs a naive
     /// substring scan:
-    /// 1. Bound to the `execute` fn body (`fn execute(` → next top-level `fn`), so
-    ///    `handle_config_command`'s `Some("get")`/`Some("set")` sub-arms and the
-    ///    test module don't leak in.
+    /// 1. Bound to the command-dispatch helper's body (`fn execute_with_restart(`
+    ///    → next top-level `fn`), so the thin production entry wrapper and
+    ///    `handle_config_command`'s `Some("get")`/`Some("set")` sub-arms don't
+    ///    leak in.
     /// 2. Match a quoted keyword ONLY when immediately followed by `|` (group arm)
     ///    or `=>` (arm body). This excludes non-arm literals like
     ///    `unwrap_or(&"agent")` and `Some("get")` (both followed by `)`), which a
@@ -1073,10 +1074,14 @@ mod tests {
     fn command_specs_match_execute_arms_bidirectional() {
         use std::collections::BTreeSet;
         let src = include_str!("commands.rs");
+        assert!(
+            src.contains("execute_with_restart(cmd, ctx, super::rpc::restart_instance)"),
+            "execute must delegate to the production restart authority"
+        );
         let from_execute = src
-            .split_once("fn execute(cmd:")
+            .split_once("fn execute_with_restart<")
             .map(|(_, rest)| rest)
-            .expect("execute fn must exist");
+            .expect("execute_with_restart fn must exist");
         let exec_body = from_execute
             .split_once("\nfn ")
             .map(|(body, _)| body)
