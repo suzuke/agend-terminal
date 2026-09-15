@@ -11,6 +11,7 @@ use ratatui::layout::Rect;
 
 use crate::agent::AgentRegistry;
 use crate::layout::{DragTabTarget, Layout, MovePlacement, SplitBorderHit, SplitDir};
+use crate::team_view::TeamView;
 
 use super::overlay::Overlay;
 
@@ -47,6 +48,7 @@ pub(super) fn handle(
     state: &mut MouseState,
     fleet_path: &Path,
     registry: &AgentRegistry,
+    team_view: Option<&TeamView>,
 ) -> MouseOutcome {
     let mut out = MouseOutcome::default();
 
@@ -101,7 +103,9 @@ pub(super) fn handle(
         MouseEventKind::ScrollUp => super::scroll_focused(layout, 3),
         MouseEventKind::ScrollDown => super::scroll_focused(layout, -3),
         MouseEventKind::Down(MouseButton::Left) => {
-            handle_down(mouse, layout, state, fleet_path, registry, &mut out);
+            handle_down(
+                mouse, layout, state, fleet_path, registry, team_view, &mut out,
+            );
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             handle_drag(mouse, layout, state);
@@ -120,10 +124,11 @@ fn handle_down(
     state: &mut MouseState,
     fleet_path: &Path,
     registry: &AgentRegistry,
+    team_view: Option<&TeamView>,
     out: &mut MouseOutcome,
 ) {
     if crate::layout::is_tab_bar_row(mouse.row) {
-        match tab_bar_hit_test(layout, mouse.column) {
+        match tab_bar_hit_test_with_team(layout, mouse.column, team_view) {
             Some(TabBarClick::Tab(idx)) => {
                 out.new_last_tab = Some(layout.active);
                 layout.goto_tab(idx);
@@ -361,6 +366,14 @@ enum TabBarClick {
 /// Caching tab positions would save ~5 iterations but adds invalidation
 /// complexity. Kept as-is — n_tabs is typically 1-5.
 fn tab_bar_hit_test(layout: &Layout, col: u16) -> Option<TabBarClick> {
+    tab_bar_hit_test_with_team(layout, col, None)
+}
+
+fn tab_bar_hit_test_with_team(
+    layout: &Layout,
+    col: u16,
+    team_view: Option<&TeamView>,
+) -> Option<TabBarClick> {
     use unicode_width::UnicodeWidthStr;
     let mut x: u16 = 0;
     for (i, tab) in layout.tabs.iter().enumerate() {
@@ -368,7 +381,7 @@ fn tab_bar_hit_test(layout: &Layout, col: u16) -> Option<TabBarClick> {
             x += 1;
         } // separator space
         let is_active = i == layout.active;
-        let label = tab.tab_bar_label(is_active);
+        let label = tab.tab_bar_label_with_team(is_active, team_view);
         let tab_w = 1 + label.width() as u16; // "*" dot + label
         if col >= x && col < x + tab_w {
             return Some(TabBarClick::Tab(i));
@@ -579,6 +592,7 @@ mod tests {
     use crate::layout::{DragTabTarget, Pane, PaneSource, SplitDir, Tab};
     use crate::vterm::VTerm;
     use crossterm::event::KeyModifiers;
+    use std::collections::HashMap;
 
     fn leaf(id: usize, agent: &str) -> Pane {
         Pane {
@@ -986,6 +1000,32 @@ mod tests {
         assert_eq!(plain.tab_bar_label(false), " x ", "no notif → no badge");
     }
 
+    #[test]
+    fn authoritative_team_label_is_shared_by_render_and_hit_test() {
+        let mut lead = leaf(1, "lead");
+        lead.fleet_instance_name = Some("lead".into());
+        let mut member = leaf(2, "member");
+        member.fleet_instance_name = Some("member".into());
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("operator-renamed".into(), lead));
+        layout.tabs[0].split_focused(SplitDir::Vertical, member);
+        let config: crate::fleet::FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead, member]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let view = crate::team_view::TeamView::from_fleet(config, Some(HashMap::new()));
+        assert_eq!(
+            layout.tabs[0].tab_bar_label_with_team(true, Some(&view)),
+            " ops ",
+            "tab identity must come from the authoritative member set"
+        );
+        assert_eq!(
+            tab_bar_hit_test_with_team(&layout, 0, Some(&view)),
+            Some(TabBarClick::Tab(0)),
+            "hit-test must use the same authoritative label width"
+        );
+    }
+
     /// #777 regression: render and `tab_bar_hit_test` must agree on per-tab widths so a
     /// click never lands on the wrong tab. The old `[respawning]`/`[crashed]` badge
     /// widened a tab in render ONLY — the hit-test didn't count it, shifting every later
@@ -1056,6 +1096,7 @@ mod tests {
             &mut state,
             fleet_path,
             &empty_registry(),
+            None,
             &mut out,
         );
 
@@ -1224,6 +1265,7 @@ mod tests {
             &mut state,
             fleet_path,
             &empty_registry(),
+            None,
         );
 
         assert_eq!(
@@ -1264,6 +1306,7 @@ mod tests {
             &mut state,
             fleet_path,
             &empty_registry(),
+            None,
         );
 
         assert_eq!(
@@ -1312,6 +1355,7 @@ mod tests {
             &mut state,
             std::path::Path::new("/nonexistent/fleet.yaml"),
             &empty_registry(),
+            None,
         );
 
         assert!(
@@ -1346,6 +1390,7 @@ mod tests {
             &mut state,
             std::path::Path::new("/nonexistent/fleet.yaml"),
             &empty_registry(),
+            None,
         );
 
         assert!(
@@ -1380,6 +1425,7 @@ mod tests {
             &mut state,
             std::path::Path::new("/nonexistent/fleet.yaml"),
             &empty_registry(),
+            None,
         );
 
         let pane = layout.tabs[0].root_mut().find_pane_mut(2).unwrap();

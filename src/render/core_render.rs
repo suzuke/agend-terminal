@@ -8,6 +8,7 @@ use crate::agent::{self, AgentRegistry};
 use crate::channel::TelegramStatus;
 use crate::layout::{DragTabTarget, Layout, PaneNode};
 use crate::state::AgentState;
+use crate::team_view::{LeadBadge, TeamView};
 use ratatui::layout::{Alignment, Constraint, Direction, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -426,6 +427,7 @@ fn observed_or_raw_state(h: &agent::AgentHandle, show_observed: bool) -> AgentSt
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn render(
     frame: &mut Frame,
     layout: &mut Layout,
@@ -436,6 +438,33 @@ pub fn render(
     pending_decisions: usize,
     daemon_list_mode: crate::runtime::AgentListMode,
     remote_states: Option<&HashMap<String, Option<AgentState>>>,
+) {
+    render_with_team(
+        frame,
+        layout,
+        repeat_mode,
+        registry,
+        telegram,
+        binary_stale,
+        pending_decisions,
+        daemon_list_mode,
+        remote_states,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_team(
+    frame: &mut Frame,
+    layout: &mut Layout,
+    repeat_mode: bool,
+    registry: &AgentRegistry,
+    telegram: TelegramStatus,
+    binary_stale: bool,
+    pending_decisions: usize,
+    daemon_list_mode: crate::runtime::AgentListMode,
+    remote_states: Option<&HashMap<String, Option<AgentState>>>,
+    team_view: Option<&TeamView>,
 ) {
     let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
@@ -452,9 +481,17 @@ pub fn render(
         }
         None => build_agent_state_snapshot(layout, registry),
     };
-    render_pane_tree(frame, chunks[1], layout, repeat_mode, registry, &snapshot);
-    render_tab_bar(frame, chunks[0], layout, &snapshot);
-    render_status_bar(
+    render_pane_tree(
+        frame,
+        chunks[1],
+        layout,
+        repeat_mode,
+        registry,
+        &snapshot,
+        team_view,
+    );
+    render_tab_bar(frame, chunks[0], layout, &snapshot, team_view);
+    render_status_bar_with_team(
         frame,
         chunks[2],
         layout,
@@ -462,6 +499,7 @@ pub fn render(
         binary_stale,
         pending_decisions,
         daemon_list_mode,
+        team_view,
     );
 }
 
@@ -494,6 +532,7 @@ fn render_tab_bar(
     area: Rect,
     layout: &Layout,
     snapshot: &HashMap<String, Option<AgentState>>,
+    team_view: Option<&TeamView>,
 ) {
     let mut spans = Vec::new();
 
@@ -548,7 +587,7 @@ fn render_tab_bar(
             Span::styled("*", Style::default().fg(sc))
         };
 
-        let label = tab.tab_bar_label(is_active);
+        let label = tab.tab_bar_label_with_team(is_active, team_view);
 
         spans.push(dot);
         spans.push(Span::styled(label, style));
@@ -581,6 +620,7 @@ fn render_pane_tree(
     repeat_mode: bool,
     registry: &AgentRegistry,
     snapshot: &HashMap<String, Option<AgentState>>,
+    team_view: Option<&TeamView>,
 ) {
     let tab = match layout.tabs.get_mut(layout.active) {
         Some(t) => t,
@@ -601,7 +641,7 @@ fn render_pane_tree(
     if tab.zoomed {
         if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
             let info = render_pane(
-                frame, area, pane, true, false, registry, snapshot, false, false,
+                frame, area, pane, true, false, registry, snapshot, false, false, team_view,
             );
             let infos = vec![info];
             render_border_grid(frame, &infos);
@@ -629,6 +669,7 @@ fn render_pane_tree(
         snapshot,
         drag_source,
         drag_target,
+        team_view,
     );
     tab.pane_rects = rects;
     render_border_grid(frame, &border_infos);
@@ -648,6 +689,7 @@ fn render_node(
     snapshot: &HashMap<String, Option<AgentState>>,
     drag_source: Option<usize>,
     drag_target: Option<usize>,
+    team_view: Option<&TeamView>,
 ) {
     match node {
         PaneNode::Leaf(pane) => {
@@ -665,6 +707,7 @@ fn render_node(
                 snapshot,
                 is_drag_source,
                 is_drag_target,
+                team_view,
             );
             border_infos.push(info);
         }
@@ -687,6 +730,7 @@ fn render_node(
                 snapshot,
                 drag_source,
                 drag_target,
+                team_view,
             );
             render_node(
                 frame,
@@ -700,6 +744,7 @@ fn render_node(
                 snapshot,
                 drag_source,
                 drag_target,
+                team_view,
             );
         }
     }
@@ -724,6 +769,7 @@ fn render_pane(
     snapshot: &HashMap<String, Option<AgentState>>,
     is_drag_source: bool,
     is_drag_target: bool,
+    team_view: Option<&TeamView>,
 ) -> PaneBorderInfo {
     // #freeze-3: draining moved OUT of the render path into the render loop's
     // `drain_all_panes`, which drains EVERY tab's panes (not just the active one)
@@ -774,11 +820,12 @@ fn render_pane(
         (s, s, 1u8)
     };
 
-    let title_segments = pane_title_segments(
+    let title_segments = pane_title_segments_with_team(
         pane,
         title_style,
         state,
         crate::runtime_config::get().show_pane_state,
+        team_view,
     );
 
     // W2.6: the pane content rect is the authority for the vterm/PTY size, and
@@ -902,15 +949,44 @@ fn render_pane(
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn pane_title_segments(
     pane: &crate::layout::Pane,
     title_style: Style,
     state: Option<AgentState>,
     show_state_badge: bool,
 ) -> Vec<(String, Style)> {
+    pane_title_segments_with_team(pane, title_style, state, show_state_badge, None)
+}
+
+fn pane_title_segments_with_team(
+    pane: &crate::layout::Pane,
+    title_style: Style,
+    state: Option<AgentState>,
+    show_state_badge: bool,
+    team_view: Option<&TeamView>,
+) -> Vec<(String, Style)> {
     let mut segments = Vec::new();
     let base = format!(" {}", pane.label());
     segments.push((base, title_style));
+    if let Some(badge) = pane
+        .fleet_instance_name
+        .as_deref()
+        .zip(team_view)
+        .map(|(name, view)| view.badge(name, pane.instance_ref().as_ref()))
+    {
+        let (text, style) = match badge {
+            LeadBadge::Lead => (" [LEAD]".to_string(), title_style),
+            LeadBadge::Uncertain => (
+                " [LEAD?]".to_string(),
+                title_style.fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            LeadBadge::None => (String::new(), title_style),
+        };
+        if !text.is_empty() {
+            segments.push((text, style));
+        }
+    }
     if pane.is_disconnected() {
         segments.push((
             " [DISCONNECTED]".to_string(),
@@ -958,6 +1034,7 @@ pub(super) fn pane_title_segments(
     segments
 }
 
+#[allow(dead_code)]
 pub(super) fn render_status_bar(
     frame: &mut Frame,
     area: Rect,
@@ -966,6 +1043,29 @@ pub(super) fn render_status_bar(
     binary_stale: bool,
     pending_decisions: usize,
     daemon_list_mode: crate::runtime::AgentListMode,
+) {
+    render_status_bar_with_team(
+        frame,
+        area,
+        layout,
+        telegram,
+        binary_stale,
+        pending_decisions,
+        daemon_list_mode,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_status_bar_with_team(
+    frame: &mut Frame,
+    area: Rect,
+    layout: &Layout,
+    telegram: TelegramStatus,
+    binary_stale: bool,
+    pending_decisions: usize,
+    daemon_list_mode: crate::runtime::AgentListMode,
+    team_view: Option<&TeamView>,
 ) {
     let mut spans = Vec::new();
 
@@ -1030,6 +1130,23 @@ pub(super) fn render_status_bar(
     }
 
     if let Some(tab) = layout.active_tab() {
+        if let (Some(pane), Some(team_view)) = (tab.focused_pane(), team_view) {
+            if let Some(team) = pane
+                .fleet_instance_name
+                .as_deref()
+                .and_then(|name| team_view.team_for_member(name))
+            {
+                spans.push(Span::styled(
+                    format!(" team:{team} lead:{} ", team_view.status_label()),
+                    Style::default().fg(Color::LightCyan),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!(" team:none lead:{} ", team_view.status_label()),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
         if let Some(preset) = tab.last_layout {
             spans.push(Span::styled(
                 format!(" [{}] ", preset.name()),
@@ -1088,7 +1205,61 @@ pub(super) fn render_status_bar(
 mod tests {
     use super::*;
     use crate::layout::{Pane, PaneSource};
+    use crate::team_view::TeamView;
     use crate::vterm::VTerm;
+
+    #[test]
+    fn real_pane_title_entry_point_renders_authoritative_lead_badge() {
+        let lead_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 7);
+        let config: crate::fleet::FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead, member]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let mut roster = HashMap::new();
+        roster.insert("lead".to_string(), lead_ref);
+        let view = TeamView::from_fleet(config, Some(roster));
+        let mut pane = Pane {
+            agent_name: "lead".into(),
+            instance_id: lead_ref.instance_id,
+            instance_ref: Some(lead_ref),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: Some("lead".into()),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        let segments = pane_title_segments_with_team(
+            &pane,
+            Style::default(),
+            Some(AgentState::Idle),
+            false,
+            Some(&view),
+        );
+        assert!(
+            segments.iter().any(|(text, _)| text == " [LEAD]"),
+            "real title segmentation must include the authoritative badge: {segments:?}"
+        );
+        pane.instance_ref = Some(crate::types::InstanceRef::new(lead_ref.instance_id, 8));
+        let segments = pane_title_segments_with_team(
+            &pane,
+            Style::default(),
+            Some(AgentState::Idle),
+            false,
+            Some(&view),
+        );
+        assert!(!segments.iter().any(|(text, _)| text.contains("[LEAD]")));
+    }
 
     #[test]
     fn badge_shows_pending_count() {

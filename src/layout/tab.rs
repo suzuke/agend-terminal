@@ -119,13 +119,27 @@ impl Tab {
     /// `render_tab_bar` (the rendered span) and `tab_bar_hit_test` (its width) so the
     /// two can never drift on the label — a render-only widener the hit-test didn't
     /// count was the #777 misaligned-click bug.
+    #[allow(dead_code)]
     pub fn tab_bar_label(&self, is_active: bool) -> String {
+        self.tab_bar_label_with_team(is_active, None)
+    }
+
+    pub fn tab_bar_label_with_team(
+        &self,
+        is_active: bool,
+        team_view: Option<&crate::team_view::TeamView>,
+    ) -> String {
         let notif_badge = if self.root().has_notification() && !is_active {
             " !"
         } else {
             ""
         };
-        format!(" {}{notif_badge} ", self.name)
+        let name = team_view
+            .and_then(|view| {
+                view.authoritative_tab_name(self.root().agent_names().iter().map(String::as_str))
+            })
+            .unwrap_or(self.name.as_str());
+        format!(" {name}{notif_badge} ")
     }
 
     pub fn focused_pane(&self) -> Option<&Pane> {

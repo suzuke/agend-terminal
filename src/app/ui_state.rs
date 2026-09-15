@@ -8,6 +8,7 @@ use super::overlay::{self, Overlay, OverlayCtx};
 use crate::agent::AgentRegistry;
 use crate::keybinds::KeyHandler;
 use crate::layout::Layout;
+use crate::team_view::TeamView;
 use crossterm::event::{KeyEvent, MouseEvent};
 use std::collections::HashMap;
 use std::path::Path;
@@ -31,6 +32,7 @@ pub(super) struct UiDeps<'a> {
     pub(super) task_rpc_tx: &'a crossbeam_channel::Sender<super::rpc::TaskRequest>,
     pub(super) task_snapshot: &'a [crate::tasks::Task],
     pub(super) reap_workers: &'a mut Vec<std::thread::JoinHandle<()>>,
+    pub(super) team_view: Option<&'a TeamView>,
 }
 
 /// Signals `handle_key_event` returns to the event loop (applied independently).
@@ -101,6 +103,7 @@ impl UiState {
             &mut self.mouse_state,
             deps.fleet_path,
             deps.registry,
+            deps.team_view,
         );
         let needs_resize = out.needs_resize;
         if let Some(prev) = out.new_last_tab {
@@ -140,6 +143,7 @@ mod tests {
             task_rpc_tx: &task_rpc_tx,
             task_snapshot: &[],
             reap_workers: &mut reap_workers,
+            team_view: None,
         };
         let mut ui = UiState {
             layout: Layout::new(),
@@ -226,6 +230,7 @@ mod tests {
             task_rpc_tx: &task_rpc_tx,
             task_snapshot: &[],
             reap_workers: &mut reap_workers,
+            team_view: None,
         };
         let pane = crate::layout::Pane {
             agent_name: "label".into(),

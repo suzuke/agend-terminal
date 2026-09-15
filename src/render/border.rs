@@ -3,6 +3,7 @@
 use ratatui::style::Style;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 use super::core_render::PaneBorderInfo;
 
@@ -131,7 +132,8 @@ pub(super) fn render_pane_titles(frame: &mut Frame, infos: &[PaneBorderInfo]) {
         let buf_right = buf_area.x.saturating_add(buf_area.width);
         let buf_bottom = buf_area.y.saturating_add(buf_area.height);
         let mut x = area.x.saturating_add(1);
-        for (segment, style) in &info.title_segments {
+        let available = last_usable_x.saturating_sub(x);
+        for (segment, style) in fit_title_segments(&info.title_segments, available) {
             for g in segment.chars() {
                 let w = u16::try_from(UnicodeWidthChar::width(g).unwrap_or(0)).unwrap_or(u16::MAX);
                 if w == 0 {
@@ -145,7 +147,7 @@ pub(super) fn render_pane_titles(frame: &mut Frame, infos: &[PaneBorderInfo]) {
                 }
                 let cell = &mut buf[(x, y)];
                 cell.set_char(g);
-                cell.set_style(*style);
+                cell.set_style(style);
                 for off in 1..w {
                     let tx = x.saturating_add(off);
                     if tx >= buf_right {
@@ -153,12 +155,58 @@ pub(super) fn render_pane_titles(frame: &mut Frame, infos: &[PaneBorderInfo]) {
                     }
                     let trail = &mut buf[(tx, y)];
                     trail.set_char(' ');
-                    trail.set_style(*style);
+                    trail.set_style(style);
                 }
                 x = x.saturating_add(w);
             }
         }
     }
+}
+
+/// Fit a title to the border while reserving room for an authority badge.
+/// Lead text is deliberately retained ahead of ordinary title truncation; if
+/// the terminal is narrower than the badge itself, its deterministic prefix is
+/// rendered instead of panicking or silently dropping the authority marker.
+fn fit_title_segments(segments: &[(String, Style)], width: u16) -> Vec<(String, Style)> {
+    let Some((badge_idx, (badge, badge_style))) = segments
+        .iter()
+        .enumerate()
+        .find(|(_, (text, _))| text.contains("[LEAD"))
+    else {
+        return clip_segments(segments, width);
+    };
+    let badge_width = badge.width() as u16;
+    if width <= badge_width {
+        let text = badge.trim_start();
+        return vec![(clip_badge(text, width as usize), *badge_style)];
+    }
+    let mut fitted = clip_segments(&segments[..badge_idx], width - badge_width);
+    fitted.push((badge.clone(), *badge_style));
+    let used: u16 = fitted.iter().map(|(text, _)| text.width() as u16).sum();
+    if used < width {
+        fitted.extend(clip_segments(&segments[badge_idx + 1..], width - used));
+    }
+    fitted
+}
+
+fn clip_segments(segments: &[(String, Style)], width: u16) -> Vec<(String, Style)> {
+    let mut remaining = width as usize;
+    let mut fitted = Vec::new();
+    for (text, style) in segments {
+        if remaining == 0 {
+            break;
+        }
+        let clipped = crate::team_view::clip_badge(text, remaining);
+        remaining = remaining.saturating_sub(clipped.width());
+        if !clipped.is_empty() {
+            fitted.push((clipped, *style));
+        }
+    }
+    fitted
+}
+
+fn clip_badge(text: &str, width: usize) -> String {
+    crate::team_view::clip_badge(text, width)
 }
 
 #[cfg(test)]

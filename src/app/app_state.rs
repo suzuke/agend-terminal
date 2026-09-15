@@ -5,6 +5,7 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::team_view::TeamView;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RemoteRosterNames {
@@ -196,6 +197,11 @@ pub(super) struct AppState {
     pub(super) pending_decisions_total: usize,
     /// Existing runtime discovery mode, surfaced directly in the status bar.
     pub(super) daemon_list_mode: crate::runtime::AgentListMode,
+    /// Authoritative team metadata + live roster snapshot consumed by render.
+    pub(super) team_view: TeamView,
+    pub(super) team_view_dirty: bool,
+    pub(super) team_view_epoch: u64,
+    pub(super) last_team_view_refresh: std::time::Instant,
     /// Last daemon-confirmed task list; APP never reconstructs it from JSONL.
     pub(super) task_snapshot: Vec<crate::tasks::Task>,
     /// #freeze-4 (t-…2324) restart-flood boot phase: until the pre-restart
@@ -290,6 +296,10 @@ impl AppState {
             last_decision_sync: None,
             pending_decisions_total: 0,
             daemon_list_mode: crate::runtime::AgentListMode::Live,
+            team_view: TeamView::empty(),
+            team_view_dirty: true,
+            team_view_epoch: 0,
+            last_team_view_refresh: std::time::Instant::now(),
             task_snapshot: Vec::new(),
             booting: true,
             boot_start: std::time::Instant::now(),
@@ -649,6 +659,57 @@ impl AppState {
         }
     }
 
+    fn live_team_roster(
+        &self,
+        deps: &AppDeps<'_>,
+    ) -> Option<std::collections::HashMap<String, crate::types::InstanceRef>> {
+        if deps.attached_run_dir.is_some() {
+            if self.event_resync_required
+                || !matches!(self.daemon_list_mode, crate::runtime::AgentListMode::Live)
+            {
+                return None;
+            }
+            return Some(self.remote_instance_refs.clone());
+        }
+        let registry = crate::agent::lock_registry(deps.registry);
+        Some(
+            registry
+                .values()
+                .map(|handle| {
+                    (
+                        handle.name.to_string(),
+                        crate::types::InstanceRef::new(handle.id, handle.generation.value()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn invalidate_team_view(&mut self) {
+        self.team_view_epoch = self.team_view_epoch.wrapping_add(1);
+        self.team_view.invalidate();
+        self.team_view_dirty = true;
+        self.dirty = true;
+    }
+
+    fn refresh_team_view(&mut self, deps: &AppDeps<'_>) {
+        const TEAM_VIEW_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+        if !self.team_view_dirty && self.last_team_view_refresh.elapsed() < TEAM_VIEW_REFRESH {
+            return;
+        }
+        let previous = self.team_view.clone();
+        let roster = self.live_team_roster(deps);
+        // Event-driven refreshes must not be satisfied by the mtime+size cache:
+        // an external edit can preserve both values. The render closure never
+        // reaches the filesystem; this bounded pre-select path owns the read.
+        crate::fleet::invalidate_cache();
+        self.team_view_epoch = self.team_view_epoch.wrapping_add(1);
+        self.team_view = TeamView::load_path(deps.fleet_path, roster, Some(&previous));
+        self.last_team_view_refresh = std::time::Instant::now();
+        self.team_view_dirty = false;
+        self.dirty = true;
+    }
+
     pub(super) fn render_frame(
         &mut self,
         terminal: &mut DefaultTerminal,
@@ -743,7 +804,7 @@ impl AppState {
                         "frame.area() in draw"
                     );
                 }
-                render::render(
+                render::render_with_team(
                     frame,
                     &mut self.ui.layout,
                     repeat_mode,
@@ -753,6 +814,7 @@ impl AppState {
                     self.pending_decisions_total,
                     self.daemon_list_mode,
                     deps.attached_mode.then_some(&self.remote_agent_states),
+                    Some(&self.team_view),
                 );
                 // &mut because ScratchShell needs to drain output and maybe
                 // resize its pane's VTerm/PTY during render.
@@ -861,6 +923,7 @@ impl AppState {
             task_rpc_tx: deps.task_rpc_tx,
             task_snapshot: &self.task_snapshot,
             reap_workers,
+            team_view: Some(&self.team_view),
         };
         self.dirty = true; // input may change the display → redraw next due frame
         let ev = match ev {
@@ -1039,6 +1102,9 @@ impl AppState {
                     };
                 if matches!(result.mode, crate::runtime::AgentListMode::Live) {
                     self.event_resync_required = false;
+                    self.team_view_dirty = true;
+                } else {
+                    self.invalidate_team_view();
                 }
             }
             Ok(Err(error)) => {
@@ -1046,12 +1112,14 @@ impl AppState {
                 self.pending_remote_roster_names = None;
                 self.pending_remote_roster_refs = None;
                 self.daemon_list_mode = error.mode;
+                self.invalidate_team_view();
                 tracing::warn!(error = %error.error, "daemon agent-state snapshot unavailable");
             }
             Err(_) => {
                 self.remote_agent_states.clear();
                 self.pending_remote_roster_names = None;
                 self.pending_remote_roster_refs = None;
+                self.invalidate_team_view();
                 tracing::warn!("daemon agent-state RPC worker stopped");
             }
         }
@@ -1066,6 +1134,7 @@ impl AppState {
         match outcome {
             Ok(rpc::EventStreamOutcome::Event(event)) => {
                 if event.source.is_empty() || event.source == "unknown" || event.sequence == 0 {
+                    self.invalidate_team_view();
                     self.event_source = None;
                     self.event_sequence = 0;
                     self.event_resync_required = true;
@@ -1076,6 +1145,7 @@ impl AppState {
                 }
                 if let Some(source) = self.event_source.as_deref() {
                     if source != event.source {
+                        self.invalidate_team_view();
                         self.event_resync_required = true;
                         self.event_sequence = 0;
                         self.event_source = None;
@@ -1091,10 +1161,19 @@ impl AppState {
                     return;
                 }
                 if self.event_sequence != 0 && event.sequence != self.event_sequence + 1 {
+                    self.invalidate_team_view();
                     self.event_resync_required = true;
                     self.request_event_refresh(deps);
                 }
                 self.event_sequence = event.sequence;
+                if matches!(
+                    &event.event,
+                    crate::api::ApiEvent::TeamCreated { .. }
+                        | crate::api::ApiEvent::TeamMembersChanged { .. }
+                        | crate::api::ApiEvent::ConfigChanged { .. }
+                ) {
+                    self.invalidate_team_view();
+                }
                 if !self.event_resync_required {
                     if let crate::api::ApiEvent::InstanceDeleted {
                         instance_ref: Some(instance_ref),
@@ -1109,6 +1188,7 @@ impl AppState {
                 self.request_event_refresh(deps);
             }
             Ok(rpc::EventStreamOutcome::Disconnected(error)) => {
+                self.invalidate_team_view();
                 self.event_source = None;
                 self.event_sequence = 0;
                 self.event_resync_required = true;
@@ -1117,6 +1197,7 @@ impl AppState {
                 self.request_event_refresh(deps);
             }
             Err(_) => {
+                self.invalidate_team_view();
                 self.event_source = None;
                 self.event_sequence = 0;
                 self.event_resync_required = true;
@@ -1466,6 +1547,7 @@ impl AppState {
         deps: &AppDeps<'_>,
         reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
     ) {
+        self.refresh_team_view(deps);
         self.reconcile_pending_remote_roster(deps);
         self.request_remote_agent_state_refresh(deps);
         self.close_dead_scratch_shell(deps, reap_workers);

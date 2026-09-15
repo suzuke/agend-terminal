@@ -37,7 +37,7 @@ struct FleetCacheEntry {
     config: Arc<FleetConfig>,
 }
 
-fn invalidate_cache() {
+pub(crate) fn invalidate_cache() {
     let mut guard = FLEET_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
