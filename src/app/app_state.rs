@@ -2032,7 +2032,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_state_has_bounded_pending_cleanup_and_pre_registration_delete_buffer_3649() {
+    fn restart_state_has_bounded_active_correlation_without_broad_delete_buffer_3649() {
         let source = include_str!("app_state.rs");
         let source = &source[..source.rfind("#[cfg(test)]").unwrap_or(source.len())];
         assert!(
@@ -2040,8 +2040,12 @@ mod tests {
             "pending restart state must have an explicit bounded lifetime"
         );
         assert!(
-            source.contains("pending_restart_deletes"),
-            "deletes observed before request registration must be buffered"
+            source.contains("REMOTE_RESTART_CAPACITY"),
+            "active restart correlation must have an explicit capacity"
+        );
+        assert!(
+            !source.contains("pending_restart_deletes"),
+            "uncorrelated deletes must not be retained in a broad TTL buffer"
         );
     }
 
@@ -2074,7 +2078,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_before_restart_request_is_buffered_and_claimed_3649() {
+    fn ordinary_instance_delete_retires_immediately_3649() {
         let home = std::env::temp_dir().join(format!(
             "remote-restart-ordering-{}",
             crate::types::InstanceId::new()
@@ -2126,10 +2130,10 @@ mod tests {
             )),
             &deps,
         );
-        assert!(state
-            .pending_restart_deletes
-            .contains_key(&old_instance_ref));
-        assert!(state.ui.layout.find_agent_pane("agent").is_some());
+        assert!(
+            state.ui.layout.find_agent_pane("agent").is_none(),
+            "an uncorrelated delete must not be delayed behind restart TTL"
+        );
 
         state.handle_remote_restart_request(
             commands::RemoteRestartRequest {
@@ -2142,11 +2146,8 @@ mod tests {
             &deps,
         );
 
-        assert!(!state
-            .pending_restart_deletes
-            .contains_key(&old_instance_ref));
         assert!(state.remote_restarts.contains_key("restart-ordering"));
-        assert!(state.ui.layout.find_agent_pane("agent").is_some());
+        assert!(state.ui.layout.find_agent_pane("agent").is_none());
         state.handle_remote_restart_request(
             commands::RemoteRestartRequest {
                 restart_id: "restart-ordering".into(),
@@ -2176,6 +2177,77 @@ mod tests {
         );
         assert_eq!(state.remote_restarts.len(), 1, "conflict must be ignored");
         drop(remote_restart_worker_rx);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn registered_remote_restart_retains_pane_when_delete_arrives_3649() {
+        let home = team_fixture_home("remote-restart-registered");
+        let fleet_path = home.join("fleet.yaml");
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let app_restart_gate = crate::api::app_restart::AppRestartGate::new();
+        let daemon_binary_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attached_run_dir = None;
+        let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded::<rpc::TaskRequest>();
+        let (remote_state_rpc_tx, _remote_state_rpc_rx) =
+            crossbeam_channel::unbounded::<rpc::AgentStateRequest>();
+        let (remote_restart_request_tx, _remote_restart_request_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+        let (remote_restart_worker_tx, remote_restart_worker_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+        let deps = AppDeps {
+            home: &home,
+            fleet_path: &fleet_path,
+            registry: &registry,
+            wakeup_tx: &wakeup_tx,
+            app_restart_gate: &app_restart_gate,
+            daemon_binary_stale: &daemon_binary_stale,
+            telegram_status: TelegramStatus::NotConfigured,
+            attached_run_dir: &attached_run_dir,
+            attached_mode: false,
+            size_debug: false,
+            task_rpc_tx: &task_rpc_tx,
+            remote_state_rpc_tx: &remote_state_rpc_tx,
+            remote_restart_request_tx: &remote_restart_request_tx,
+            remote_restart_worker_tx: &remote_restart_worker_tx,
+        };
+        let old_instance_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 4);
+        let mut state = AppState::new();
+        let mut pane = test_remote_pane(&mut state.ui.layout, "agent").expect("test pane");
+        pane.instance_ref = Some(old_instance_ref);
+        state.ui.layout.add_tab(Tab::new("agent".into(), pane));
+
+        state.handle_remote_restart_request(
+            commands::RemoteRestartRequest {
+                restart_id: "registered-restart".into(),
+                old_instance_ref: Some(old_instance_ref),
+                tab_index: 0,
+                pane_id: 0,
+                name: "agent".into(),
+            },
+            &deps,
+        );
+        state.handle_event_stream_outcome(
+            Ok(rpc::EventStreamOutcome::Event(
+                crate::daemon::event_hub::DaemonEvent {
+                    source: "daemon".into(),
+                    sequence: 1,
+                    event: crate::api::ApiEvent::InstanceDeleted {
+                        name: "agent".into(),
+                        instance_ref: Some(old_instance_ref),
+                    },
+                },
+            )),
+            &deps,
+        );
+
+        assert!(state.remote_restarts.contains_key("registered-restart"));
+        assert!(
+            state.ui.layout.find_agent_pane("agent").is_some(),
+            "registered correlation must retain the pane for exact successor replacement"
+        );
+        assert!(remote_restart_worker_rx.try_recv().is_ok());
         std::fs::remove_dir_all(home).ok();
     }
 
