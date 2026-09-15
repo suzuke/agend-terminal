@@ -811,6 +811,60 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[test]
+    fn red_3630_rule3_uses_canonical_team_and_member_order() {
+        let home = tmp_home("red-3630-rule3-order");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  z-lead: {}\n  z-2: {}\n  z-1: {}\n  a-lead: {}\n  a-2: {}\n  solo: {}\nteams:\n  zeta:\n    orchestrator: z-lead\n    members: [z-lead, z-2, z-1]\n  alpha:\n    orchestrator: a-lead\n    members: [a-lead, a-2]\n",
+        )
+        .expect("write fleet.yaml");
+
+        let mut layout = Layout::new();
+        let mut next_id = 0;
+        let mut pane_builder = |sp: &SessionPane, _l: &mut Layout| -> Option<Pane> {
+            next_id += 1;
+            sp.fleet_instance_name
+                .as_deref()
+                .map(|n| test_pane(next_id, n, Some(n)))
+        };
+        let agents = vec![
+            "z-1".to_string(),
+            "solo".to_string(),
+            "a-2".to_string(),
+            "z-lead".to_string(),
+            "a-lead".to_string(),
+            "z-2".to_string(),
+        ];
+
+        assert!(place_agents_team_grouped(
+            &home,
+            &agents,
+            &mut pane_builder,
+            &mut layout
+        ));
+        assert_eq!(
+            layout
+                .tabs
+                .iter()
+                .map(|tab| tab.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "zeta", "solo"],
+            "Rule-3 tabs must use lexical canonical team order"
+        );
+        assert_eq!(
+            layout.tabs[0].root().agent_names(),
+            vec!["a-lead", "a-2"],
+            "Rule-3 members must preserve TeamConfig.members order"
+        );
+        assert_eq!(
+            layout.tabs[1].root().agent_names(),
+            vec!["z-lead", "z-2", "z-1"],
+            "Rule-3 members must preserve TeamConfig.members order after lead"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #1479: throttled save writes only when the layout changed.
     #[test]
     fn save_session_if_changed_writes_only_on_change() {

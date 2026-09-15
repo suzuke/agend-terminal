@@ -321,4 +321,38 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn red_3630_fleet_view_uses_canonical_member_order() {
+        let home = tmp_home("red-3630-order");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  z-lead: {}\n  z-2: {}\n  z-1: {}\nteams:\n  zeta:\n    orchestrator: z-lead\n    members: [z-lead, z-2, z-1]\n",
+        )
+        .unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(110, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_fleet_view(frame, &[], frame.area(), &home))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            out.push('\n');
+        }
+        let position = |name: &str| {
+            out.lines()
+                .position(|line| line.contains(&format!(" {name}")))
+                .unwrap_or_else(|| panic!("missing {name} in fleet view:\n{out}"))
+        };
+        assert!(
+            position("z-lead") < position("z-2") && position("z-2") < position("z-1"),
+            "Fleet view must preserve TeamConfig.members order:\n{out}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
