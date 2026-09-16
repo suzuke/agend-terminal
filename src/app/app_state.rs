@@ -2147,7 +2147,12 @@ mod tests {
             .position(|tab| tab.name == "svc")
             .expect("team tab exists");
         state.ui.layout.goto_tab(team_index);
-        state.ui.layout.active_tab_mut().unwrap().cycle_focus();
+        state
+            .ui
+            .layout
+            .active_tab_mut()
+            .expect("team tab exists")
+            .cycle_focus();
         let focused_before = state
             .ui
             .layout

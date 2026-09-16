@@ -175,7 +175,7 @@ mod tests {
         let fleet: FleetConfig = serde_yaml_ng::from_str(
             "teams:\n  zeta:\n    members: [lead, second, second]\n    orchestrator: ghost\n  alpha:\n    members: [shared]\n    orchestrator: shared\n",
         )
-        .unwrap();
+        .expect("valid team-order fixture");
         let plan = plan_team_order(&fleet, ["second", "lead", "shared", "extra"]);
         assert_eq!(plan.groups[0].name, "alpha");
         assert_eq!(plan.groups[1].name, "zeta");
@@ -199,7 +199,7 @@ mod tests {
         let fleet: FleetConfig = serde_yaml_ng::from_str(
             "teams:\n  svc:\n    members: [lead, absent, member]\n    orchestrator: lead\n",
         )
-        .unwrap();
+        .expect("valid team-order fixture");
         let plan = plan_team_order(&fleet, ["member", "lead"]);
         assert_eq!(plan.groups[0].members, vec!["lead", "member"]);
         assert_eq!(plan.groups[0].stale_members, vec!["absent"]);
@@ -212,7 +212,7 @@ mod tests {
         let fleet: FleetConfig = serde_yaml_ng::from_str(
             "teams:\n  zeta:\n    members: [shared, z-lead]\n    orchestrator: z-lead\n  alpha:\n    members: [shared, a-lead]\n    orchestrator: a-lead\n",
         )
-        .unwrap();
+        .expect("valid team-order fixture");
         let plan = plan_team_order(&fleet, ["shared", "z-lead", "a-lead", "extra"]);
         assert!(plan
             .groups
