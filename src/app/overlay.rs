@@ -2343,8 +2343,8 @@ mod tests {
     /// dispatcher can kill or replace a pane.
     #[test]
     fn restart_command_confirms_before_execution_3662() {
-        let source = include_str!("overlay.rs");
-        assert_restart_confirmation_order(source);
+        let source = include_str!("overlay.rs").replace("\r\n", "\n");
+        assert_restart_confirmation_order(&source);
         let crlf_source = source.replace('\n', "\r\n");
         assert_restart_confirmation_order(&crlf_source);
     }
