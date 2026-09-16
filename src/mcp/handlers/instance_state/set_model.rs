@@ -294,7 +294,12 @@ pub(crate) fn handle_set_model_with_runtime(
     if args["restart"].as_bool() == Some(true) {
         let r = super::handle_restart_instance_with_runtime(
             home,
-            &json!({"instance": name, "mode": "resume", "reason": "set_model"}),
+            &json!({
+                "instance": name,
+                "mode": "resume",
+                "reason": "set_model",
+                "skip_unsent_draft_gate": true,
+            }),
             runtime,
         );
         // restart_ok 必須含 TUI 交接確認：spawn 成功但 pane 未接管時

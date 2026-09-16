@@ -337,7 +337,14 @@ pub(crate) fn dispatch_start_instance(ctx: &HandlerCtx<'_>) -> Value {
 adapter!(dispatch_bind_topic, ha, instance::handle_bind_topic);
 /// #2454 Slice 10: D7 restart DELETE uses the same runtime-owned service.
 pub(crate) fn dispatch_restart_instance(ctx: &HandlerCtx<'_>) -> Value {
-    instance::handle_restart_instance_with_runtime(ctx.home, ctx.args, ctx.runtime)
+    // #3662: this is the public, explicit MCP ingress. Keep the unsent-draft
+    // bypass separate from `force`, whose existing meaning also permits a
+    // fresh restart through an uncommitted worktree.
+    let mut args = ctx.args.clone();
+    if let Some(object) = args.as_object_mut() {
+        object.insert("skip_unsent_draft_gate".into(), json!(true));
+    }
+    instance::handle_restart_instance_with_runtime(ctx.home, &args, ctx.runtime)
 }
 /// #3572: preserve the API-owned RuntimeContext through set_model's optional
 /// restart so DELETE/SPAWN use the same in-process lifecycle as restart_instance.

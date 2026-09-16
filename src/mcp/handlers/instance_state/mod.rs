@@ -595,10 +595,17 @@ pub(super) fn handle_restart_instance_with_runtime(
     // (`--continue` restores the conversation, not the input line). If the pane
     // has a live draft, defer the kill until the operator submits (draft clears)
     // or a grace ceiling elapses (so continuous typing can't defer forever).
-    // Mode-agnostic; `force:true` bypasses. Safe to block here: each api tool call
+    // Mode-agnostic; explicit restart callers bypass with the dedicated marker,
+    // while `force:true` retains its existing worktree-protection meaning and
+    // also bypasses this gate. Safe to block here: each api tool call
     // runs on its own `api_handler` thread (`api::serve` per-session spawn), and
     // the operator's submit arrives via the TUI write path, not this thread.
-    await_unsent_draft_or_grace(home, name, args["force"].as_bool().unwrap_or(false));
+    let skip_unsent_draft_gate = args["skip_unsent_draft_gate"].as_bool().unwrap_or(false);
+    await_unsent_draft_or_grace(
+        home,
+        name,
+        skip_unsent_draft_gate || args["force"].as_bool().unwrap_or(false),
+    );
 
     // Session-reset inbox handoff: for a FRESH restart (context-lost), requeue
     // all unconfirmed DELIVERING rows before killing the old instance. The

@@ -373,6 +373,7 @@ where
             "reason": "manual TUI :restart",
             "restart_id": restart_id,
             "old_instance_ref": old_instance_ref,
+            "skip_unsent_draft_gate": true,
         }),
         std::time::Duration::from_secs(60),
     )?;
@@ -1075,8 +1076,7 @@ mod tests {
         assert_eq!(calls[0].2["mode"], "resume");
         assert_eq!(calls[0].2["reason"], "manual TUI :restart");
         assert_eq!(
-            calls[0].2["skip_unsent_draft_gate"],
-            true,
+            calls[0].2["skip_unsent_draft_gate"], true,
             "explicit TUI restart must not wait behind the hidden draft gate"
         );
     }

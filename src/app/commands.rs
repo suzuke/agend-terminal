@@ -349,6 +349,14 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
     execute_with_restart(cmd, ctx, super::rpc::restart_instance)
 }
 
+/// Return whether a palette command is the explicit operator restart path.
+/// Keeping this predicate at the command boundary lets the overlay place the
+/// confirmation before any destructive work while leaving all other commands
+/// on their existing execution path.
+pub(super) fn is_restart_command(cmd: &str) -> bool {
+    cmd.split_whitespace().next() == Some("restart")
+}
+
 fn execute_with_restart<F>(cmd: &str, ctx: &mut CommandCtx<'_>, restart_instance: F) -> bool
 where
     F: Fn(&Path, &str) -> Result<(), String>,

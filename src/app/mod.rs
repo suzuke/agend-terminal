@@ -308,6 +308,9 @@ fn render_active_overlay(
             };
             render::render_confirm(frame, msg);
         }
+        Overlay::ConfirmRestart { command } => {
+            render::render_confirm(frame, &format!("Restart '{command}'? (y/n)"));
+        }
         Overlay::ConfirmDeleteInstance {
             name,
             input,
