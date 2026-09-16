@@ -2315,6 +2315,31 @@ mod tests {
         }
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// #3662 RED: `:restart` must ask for confirmation before the command
+    /// dispatcher can kill or replace a pane.
+    #[test]
+    fn restart_command_confirms_before_execution_3662() {
+        let source = include_str!("overlay.rs");
+        let start = source
+            .find("Overlay::Command {")
+            .expect("command overlay handler must exist");
+        let end = source[start..]
+            .find("Overlay::Decisions {")
+            .map(|offset| start + offset)
+            .expect("command overlay handler end marker");
+        let region = &source[start..end];
+        let confirm = region
+            .find("ConfirmRestart")
+            .expect("restart Enter must open a confirmation overlay");
+        let execute = region
+            .find("commands::execute")
+            .expect("command overlay must retain the execution path");
+        assert!(
+            confirm < execute,
+            "restart confirmation must be established before command execution"
+        );
+    }
 }
 
 #[cfg(test)]

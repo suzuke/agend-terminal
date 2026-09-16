@@ -1074,6 +1074,11 @@ mod tests {
         assert_eq!(calls[0].2["instance"], "fleet-agent");
         assert_eq!(calls[0].2["mode"], "resume");
         assert_eq!(calls[0].2["reason"], "manual TUI :restart");
+        assert_eq!(
+            calls[0].2["skip_unsent_draft_gate"],
+            true,
+            "explicit TUI restart must not wait behind the hidden draft gate"
+        );
     }
 
     #[test]

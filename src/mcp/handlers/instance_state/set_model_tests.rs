@@ -204,3 +204,19 @@ fn set_model_requires_at_least_one_field_3541() {
     }
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// #3662 RED: the explicit `set_model restart:true` path must mark its nested
+/// restart as immediate, without reusing `force` (which also bypasses the
+/// separate fresh-worktree protection).
+#[test]
+fn set_model_restart_marks_explicit_draft_gate_bypass_3662() {
+    let source = include_str!("set_model.rs");
+    let start = source
+        .find("if args[\"restart\"].as_bool() == Some(true)")
+        .expect("set_model restart branch must exist");
+    let region = &source[start..];
+    assert!(
+        region.contains("skip_unsent_draft_gate"),
+        "set_model restart:true must opt out of the unsent-draft wait"
+    );
+}

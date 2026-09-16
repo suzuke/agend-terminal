@@ -1691,6 +1691,25 @@ mod tests {
         );
     }
 
+    /// #3662 RED: public MCP restart ingress must mark the request explicit;
+    /// internal restart callers retain the ordinary draft gate.
+    #[test]
+    fn explicit_mcp_restart_marks_draft_gate_bypass_3662() {
+        let source = include_str!("dispatch.rs");
+        let start = source
+            .find("pub(crate) fn dispatch_restart_instance(")
+            .expect("restart dispatch must exist");
+        let end = source[start..]
+            .find("pub(crate) fn dispatch_set_model(")
+            .map(|offset| start + offset)
+            .expect("restart dispatch end marker");
+        let region = &source[start..end];
+        assert!(
+            region.contains("skip_unsent_draft_gate"),
+            "MCP restart ingress must bypass only the unsent-draft gate"
+        );
+    }
+
     // ── #2454 Slice 8: delayed async INJECT loopback RED ──────────────
 
     /// #2454 S8: runtime=Some routes through inject_input (succeeds with
