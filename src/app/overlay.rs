@@ -2344,6 +2344,13 @@ mod tests {
     #[test]
     fn restart_command_confirms_before_execution_3662() {
         let source = include_str!("overlay.rs");
+        assert_restart_confirmation_order(source);
+        let crlf_source = source.replace('\n', "\r\n");
+        assert_restart_confirmation_order(&crlf_source);
+    }
+
+    fn assert_restart_confirmation_order(source: &str) {
+        let source = source.replace("\r\n", "\n");
         let start = source
             .find("Overlay::Command {\n            ref mut input")
             .expect("command overlay handler must exist");
