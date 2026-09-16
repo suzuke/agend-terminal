@@ -64,6 +64,42 @@ pub(super) enum EventStreamOutcome {
 const EVENT_RECONNECT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 const EVENT_RECONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[derive(Debug)]
+struct EventReconnectState {
+    backoff: std::time::Duration,
+    stream_stable: bool,
+}
+
+impl Default for EventReconnectState {
+    fn default() -> Self {
+        Self {
+            backoff: EVENT_RECONNECT_INITIAL_BACKOFF,
+            stream_stable: false,
+        }
+    }
+}
+
+impl EventReconnectState {
+    fn retry_delay(&self) -> std::time::Duration {
+        self.backoff
+    }
+
+    fn advance_retry(&mut self) {
+        self.backoff = next_event_backoff(self.backoff);
+    }
+
+    fn connected(&mut self) {
+        self.stream_stable = false;
+    }
+
+    fn valid_event(&mut self) {
+        if !self.stream_stable {
+            self.stream_stable = true;
+            self.backoff = EVENT_RECONNECT_INITIAL_BACKOFF;
+        }
+    }
+}
+
 /// Subscribe on a dedicated authenticated API connection. The worker owns
 /// only the stream; AppState remains the sole owner of UI mutation.
 pub(super) fn spawn_event_worker(
@@ -91,7 +127,7 @@ fn run_event_worker(
     stop_rx: &crossbeam_channel::Receiver<()>,
     outcome_tx: &crossbeam_channel::Sender<EventStreamOutcome>,
 ) {
-    let mut backoff = EVENT_RECONNECT_INITIAL_BACKOFF;
+    let mut reconnect = EventReconnectState::default();
     let mut disconnected = false;
 
     loop {
@@ -110,10 +146,10 @@ fn run_event_worker(
                 }
                 disconnected = true;
             }
-            if !wait_for_event_retry(stop_rx, backoff) {
+            if !wait_for_event_retry(stop_rx, reconnect.retry_delay()) {
                 return;
             }
-            backoff = next_event_backoff(backoff);
+            reconnect.advance_retry();
             continue;
         };
 
@@ -130,10 +166,10 @@ fn run_event_worker(
                     }
                     disconnected = true;
                 }
-                if !wait_for_event_retry(stop_rx, backoff) {
+                if !wait_for_event_retry(stop_rx, reconnect.retry_delay()) {
                     return;
                 }
-                backoff = next_event_backoff(backoff);
+                reconnect.advance_retry();
                 continue;
             }
         };
@@ -148,7 +184,7 @@ fn run_event_worker(
             return;
         }
         disconnected = false;
-        backoff = EVENT_RECONNECT_INITIAL_BACKOFF;
+        reconnect.connected();
 
         let disconnect_reason = loop {
             if stop_rx.try_recv().is_ok() {
@@ -160,6 +196,7 @@ fn run_event_worker(
                 Ok(_) => {
                     match serde_json::from_str::<crate::daemon::event_hub::DaemonEvent>(&line) {
                         Ok(event) if event.source == stream_source => {
+                            reconnect.valid_event();
                             if !send_event_outcome(
                                 stop_rx,
                                 outcome_tx,
@@ -191,10 +228,10 @@ fn run_event_worker(
             }
             disconnected = true;
         }
-        if !wait_for_event_retry(stop_rx, backoff) {
+        if !wait_for_event_retry(stop_rx, reconnect.retry_delay()) {
             return;
         }
-        backoff = next_event_backoff(backoff);
+        reconnect.advance_retry();
     }
 }
 
@@ -789,6 +826,31 @@ mod tests {
         assert_eq!(
             next_event_backoff(EVENT_RECONNECT_MAX_BACKOFF),
             EVENT_RECONNECT_MAX_BACKOFF
+        );
+    }
+
+    #[test]
+    fn event_reconnect_preserves_backoff_across_handshake_then_eof() {
+        let mut reconnect = EventReconnectState::default();
+
+        for expected in [250, 500, 1_000, 2_000, 4_000, 5_000] {
+            // A successful handshake followed by EOF is not a stable stream;
+            // the supervisor must carry the retry state into the next attempt.
+            reconnect.connected();
+            assert_eq!(
+                reconnect.retry_delay(),
+                std::time::Duration::from_millis(expected)
+            );
+            reconnect.advance_retry();
+        }
+        reconnect.connected();
+        assert_eq!(reconnect.retry_delay(), EVENT_RECONNECT_MAX_BACKOFF);
+
+        reconnect.valid_event();
+        assert_eq!(
+            reconnect.retry_delay(),
+            EVENT_RECONNECT_INITIAL_BACKOFF,
+            "only a valid event makes the authenticated stream stable"
         );
     }
 

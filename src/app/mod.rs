@@ -398,6 +398,13 @@ pub(crate) enum RunOutcome {
     RestartRequested(Option<crate::types::InstanceId>),
 }
 
+fn disable_closed_daemon_event_receiver(
+    daemon_event_rx: &mut crossbeam_channel::Receiver<rpc::EventStreamOutcome>,
+    disabled_event_rx: &crossbeam_channel::Receiver<rpc::EventStreamOutcome>,
+) {
+    *daemon_event_rx = disabled_event_rx.clone();
+}
+
 fn run_app(
     terminal: &mut DefaultTerminal,
     fleet_override: Option<&Path>,
@@ -491,7 +498,7 @@ fn run_app(
                 let receiver_closed = outcome.is_err();
                 state.handle_event_stream_outcome(outcome, &deps);
                 if receiver_closed {
-                    daemon_event_rx = disabled_event_rx.clone();
+                    disable_closed_daemon_event_receiver(&mut daemon_event_rx, &disabled_event_rx);
                 }
             },
             default(state.select_timeout()) => state.handle_idle_tick(&deps),
@@ -1662,6 +1669,21 @@ mod tests {
             1,
             "daemon production code must own exactly one TaskSweep"
         );
+    }
+
+    #[test]
+    fn production_closed_daemon_event_receiver_is_disabled() {
+        let (closed_tx, mut daemon_event_rx) =
+            crossbeam_channel::bounded::<rpc::EventStreamOutcome>(1);
+        drop(closed_tx);
+        assert!(daemon_event_rx.recv().is_err());
+
+        let disabled_event_rx = crossbeam_channel::never::<rpc::EventStreamOutcome>();
+        disable_closed_daemon_event_receiver(&mut daemon_event_rx, &disabled_event_rx);
+        assert!(matches!(
+            daemon_event_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
     }
 
     /// The daemon owns the shadow socket after app becomes a thin client.

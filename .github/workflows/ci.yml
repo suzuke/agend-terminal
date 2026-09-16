@@ -153,6 +153,18 @@ jobs:
         timeout-minutes: 20
         run: cargo build --release
 
+      # #3661: the attached TUI must survive its daemon disappearing and
+      # reconnect to a successor without lifecycle respawn or log/CPU churn.
+      # Keep this in the required Linux CI check so the real-PTY regression is
+      # gated on every app event-stream change.
+      - name: TUI event-stream reconnect smoke (#3661)
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          cargo build --locked --bin agend-terminal --quiet
+          scripts/e2e/event-stream-reconnect.sh
+
       # #1478: the discord feature is not in the default/tray build, so nothing
       # else type-checks it — the twilight version-split that broke
       # `--features discord` (twilight-model 0.17 vs gateway/http 0.16) rode
