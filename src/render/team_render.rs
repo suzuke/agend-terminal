@@ -117,6 +117,15 @@ pub(crate) fn render_status_bar_with_team(
         }
     }
 
+    if let Some(team_view) = team_view {
+        if let Some(diagnostics) = team_view.order_plan().diagnostics_label() {
+            spans.push(Span::styled(
+                format!(" team-config:{diagnostics} "),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+    }
+
     match telegram {
         TelegramStatus::Connected => {
             spans.push(Span::styled(

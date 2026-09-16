@@ -1,6 +1,6 @@
 //! App-owned, fail-closed view of team authority and live process identity.
 
-use crate::fleet::{FleetConfig, TeamConfig};
+use crate::fleet::FleetConfig;
 use crate::types::InstanceRef;
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,7 +21,7 @@ pub(crate) enum LeadBadge {
 
 #[derive(Debug, Clone)]
 struct TeamRecord {
-    orchestrator: String,
+    orchestrator: Option<String>,
 }
 
 /// Immutable snapshot consumed by all render surfaces. The app owns one of
@@ -34,6 +34,7 @@ pub(crate) struct TeamView {
     current_roster: HashMap<String, InstanceRef>,
     last_roster: HashMap<String, InstanceRef>,
     roster_live: bool,
+    order_plan: crate::team_order::TeamOrderPlan,
 }
 
 impl TeamView {
@@ -45,6 +46,11 @@ impl TeamView {
             current_roster: HashMap::new(),
             last_roster: HashMap::new(),
             roster_live: false,
+            order_plan: crate::team_order::TeamOrderPlan {
+                groups: Vec::new(),
+                ungrouped: Vec::new(),
+                diagnostics: Vec::new(),
+            },
         }
     }
 
@@ -57,19 +63,35 @@ impl TeamView {
         config: FleetConfig,
         live_roster: Option<HashMap<String, InstanceRef>>,
     ) -> Self {
-        let Some((teams, member_team)) = validate_teams(&config.teams) else {
-            return Self {
-                status: TeamViewStatus::Unavailable,
-                teams: HashMap::new(),
-                member_team: HashMap::new(),
-                current_roster: HashMap::new(),
-                last_roster: HashMap::new(),
-                roster_live: false,
-            };
-        };
         let roster_live = live_roster.is_some();
         let current_roster = live_roster.unwrap_or_default();
-        let status = if teams.is_empty() || roster_live {
+        let order_plan =
+            crate::team_order::plan_team_order(&config, current_roster.keys().map(String::as_str));
+        let mut teams = HashMap::new();
+        let mut member_team = HashMap::new();
+        for group in &order_plan.groups {
+            let Some(team_config) = config.teams.get(&group.name) else {
+                continue;
+            };
+            teams.insert(
+                group.name.clone(),
+                TeamRecord {
+                    orchestrator: team_config.orchestrator.clone(),
+                },
+            );
+            if !group.corrupt {
+                for member in &team_config.members {
+                    member_team.insert(member.clone(), group.name.clone());
+                }
+            }
+        }
+        let has_corruption = order_plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code != "missing-orchestrator");
+        let status = if has_corruption && current_roster.is_empty() {
+            TeamViewStatus::Unavailable
+        } else if teams.is_empty() || roster_live {
             TeamViewStatus::Fresh
         } else {
             TeamViewStatus::Unavailable
@@ -81,6 +103,7 @@ impl TeamView {
             last_roster: current_roster.clone(),
             current_roster,
             roster_live,
+            order_plan,
         }
     }
 
@@ -155,7 +178,7 @@ impl TeamView {
         let Some(team) = self.teams.get(team_name) else {
             return LeadBadge::None;
         };
-        if team.orchestrator != member {
+        if team.orchestrator.as_deref() != Some(member) {
             return LeadBadge::None;
         }
         let expected = self.current_roster.get(member);
@@ -192,7 +215,7 @@ impl TeamView {
     pub(crate) fn orchestrator_for_team(&self, team: &str) -> Option<&str> {
         self.teams
             .get(team)
-            .map(|record| record.orchestrator.as_str())
+            .and_then(|record| record.orchestrator.as_deref())
     }
 
     pub(crate) fn authoritative_lead_for_members<'a, I>(&self, members: I) -> Option<&str>
@@ -242,33 +265,10 @@ impl TeamView {
             TeamViewStatus::Unavailable => "Unavailable",
         }
     }
-}
 
-fn validate_teams(
-    configs: &HashMap<String, TeamConfig>,
-) -> Option<(HashMap<String, TeamRecord>, HashMap<String, String>)> {
-    let mut teams = HashMap::new();
-    let mut member_team = HashMap::new();
-    for (name, config) in configs {
-        let orchestrator = config.orchestrator.clone()?;
-        if config.members.is_empty() || !config.members.iter().any(|member| member == &orchestrator)
-        {
-            return None;
-        }
-        let mut members = config.members.clone();
-        members.sort();
-        members.dedup();
-        if members.len() != config.members.len() {
-            return None;
-        }
-        for member in &members {
-            if member_team.insert(member.clone(), name.clone()).is_some() {
-                return None;
-            }
-        }
-        teams.insert(name.clone(), TeamRecord { orchestrator });
+    pub(crate) fn order_plan(&self) -> &crate::team_order::TeamOrderPlan {
+        &self.order_plan
     }
-    Some((teams, member_team))
 }
 
 pub(crate) fn clip_badge(text: &str, width: usize) -> String {
@@ -360,6 +360,24 @@ mod tests {
         );
         let view = TeamView::from_fleet(config, Some(HashMap::new()));
         assert_eq!(view.status(), TeamViewStatus::Unavailable);
+    }
+
+    #[test]
+    fn stale_configured_members_keep_order_without_corrupting_team_view_3630() {
+        let config: FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead, absent, member]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let mut roster = HashMap::new();
+        roster.insert("member".to_string(), id_ref(2));
+        roster.insert("lead".to_string(), id_ref(1));
+
+        let view = TeamView::from_fleet(config, Some(roster));
+        let group = &view.order_plan().groups[0];
+        assert_eq!(group.members, vec!["lead", "member"]);
+        assert_eq!(group.stale_members, vec!["absent"]);
+        assert!(!group.corrupt);
+        assert_eq!(view.status(), TeamViewStatus::Fresh);
     }
 
     #[test]

@@ -86,12 +86,9 @@ pub(super) fn render_fleet_view(
     area: Rect,
     home: &std::path::Path,
 ) {
-    let teams = crate::teams::list_all(home);
-    let mut all_instances: Vec<String> =
-        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-            .ok()
-            .map(|c| c.instance_names())
-            .unwrap_or_default();
+    let fleet =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).unwrap_or_default();
+    let mut all_instances: Vec<String> = fleet.instance_names();
     // #1200: stable sort to prevent frame-to-frame jitter (HashMap iteration order).
     all_instances.sort_unstable();
     let metrics = crate::instance_monitor::latest_metrics();
@@ -127,20 +124,30 @@ pub(super) fn render_fleet_view(
         }
     }
 
-    // #1200: sort teams + members for fully deterministic render order.
-    let mut sorted_teams = teams.clone();
-    sorted_teams.sort_by(|a, b| a.name.cmp(&b.name));
+    let plan = crate::team_order::plan_team_order(&fleet, all_instances.iter().map(String::as_str));
 
     let mut assigned: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for team in &sorted_teams {
+    for group in &plan.groups {
         lines.push(Line::from(Span::styled(
-            format!("═══ {} ═══", team.name),
+            format!("═══ {} ═══", group.name),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
-        let mut members = team.members.clone();
-        members.sort_unstable();
+        for diagnostic in plan
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.team == group.name)
+        {
+            lines.push(Line::from(Span::styled(
+                format!("⚠ {}", diagnostic.label()),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        let mut members = group.members.clone();
+        if !group.corrupt {
+            members.extend(group.stale_members.iter().cloned());
+        }
         for member in &members {
             assigned.insert(member.clone());
             lines.push(build_agent_line(member, &metrics_map, &agent_tasks, home));
@@ -352,6 +359,40 @@ mod tests {
         assert!(
             position("z-lead") < position("z-2") && position("z-2") < position("z-1"),
             "Fleet view must preserve TeamConfig.members order:\n{out}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn corrupt_team_is_visible_and_live_members_are_unassigned() {
+        let home = tmp_home("corrupt-3630");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  lead: {}\n  member: {}\n  extra: {}\nteams:\n  broken:\n    orchestrator: lead\n    members: [lead, lead, member]\n",
+        )
+        .unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(110, 14);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_fleet_view(frame, &[], frame.area(), &home))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            out.push('\n');
+        }
+        assert!(
+            out.contains("code=duplicate-member"),
+            "corruption must be visible in the Fleet view:\n{out}"
+        );
+        let unassigned = out.find("═══ unassigned ═══").expect("unassigned group");
+        assert!(
+            out[unassigned..].contains("lead") && out[unassigned..].contains("member"),
+            "live members from a corrupt team must fail closed into unassigned:\n{out}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

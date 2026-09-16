@@ -410,26 +410,19 @@ pub(super) fn restore_with_reconciliation_attached(
         return true;
     }
 
-    // Rule 1 (Attached fallback): no session.json — build tabs alphabetically
-    // from daemon registry. Matches the pre-#895 Attached restore behavior
-    // for fresh attaches with no prior layout.
-    if !agent_source.is_empty() {
-        let mut names: Vec<String> = agent_source.iter().cloned().collect();
-        names.sort();
-        for name in &names {
-            let synthetic_sp = SessionPane {
-                fleet_instance_name: Some(name.clone()),
-                instance_ref: None,
-                display_name: None,
-            };
-            if let Some(pane) = pane_builder(&synthetic_sp, layout) {
-                let tab_name = pane.agent_name.to_string();
-                layout.add_tab(Tab::new(tab_name, pane));
-            }
-        }
-        if !layout.tabs.is_empty() {
-            return true;
-        }
+    // Rule 1 (Attached fallback): no session.json — build canonical team tabs
+    // from daemon registry. The daemon supplies presence/identity only; the
+    // shared plan owns team and member ordering.
+    if !agent_source.is_empty()
+        && place_agents_team_grouped_with_identity(
+            home,
+            &agent_source.iter().cloned().collect::<Vec<_>>(),
+            &mut pane_builder,
+            layout,
+            true,
+        )
+    {
+        return true;
     }
 
     false
@@ -536,8 +529,9 @@ fn apply_session_layout_with_identity(
 /// the same fleet.yaml team share one tab, orchestrator-first; teamless agents
 /// each get their own tab). Shared by the session-restore Rule-3 path and the
 /// no-session-json `auto_start_fleet` fallback, so a hard restart (session.json
-/// absent) groups identically to a live `create_instance`. `agents` is expected
-/// pre-sorted. Returns true if any pane was placed.
+/// absent) groups identically to a live `create_instance`. The input order is
+/// only daemon presence; `TeamConfig.members` is canonical for placement.
+/// Returns true if any pane was placed.
 pub(super) fn place_agents_team_grouped(
     home: &Path,
     agents: &[String],
@@ -554,33 +548,14 @@ fn place_agents_team_grouped_with_identity(
     layout: &mut Layout,
     require_identity: bool,
 ) -> bool {
-    let teams = crate::teams::list_all(home);
-    let mut team_members: HashMap<String, Vec<String>> = HashMap::new();
-    let mut standalone = Vec::new();
-    for name in agents {
-        if let Some(team) = teams.iter().find(|t| t.members.contains(name)) {
-            team_members
-                .entry(team.name.clone())
-                .or_default()
-                .push(name.clone());
-        } else {
-            standalone.push(name.clone());
-        }
-    }
+    let fleet =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).unwrap_or_default();
+    let plan = crate::team_order::plan_team_order(&fleet, agents.iter().map(String::as_str));
 
     let mut placed_any = false;
-    for (team_name, members) in &team_members {
-        let team = teams.iter().find(|t| t.name == *team_name);
-        let orchestrator = team.and_then(|t| t.orchestrator.as_deref());
-        let mut sorted = members.clone();
-        sorted.sort_by(|a, b| {
-            let a_is_orch = orchestrator == Some(a.as_str());
-            let b_is_orch = orchestrator == Some(b.as_str());
-            b_is_orch.cmp(&a_is_orch).then(a.cmp(b))
-        });
-
+    for group in &plan.groups {
         let mut tab_created = false;
-        for name in &sorted {
+        for name in &group.members {
             let synthetic_sp = SessionPane {
                 fleet_instance_name: Some(name.clone()),
                 instance_ref: None,
@@ -591,16 +566,18 @@ fn place_agents_team_grouped_with_identity(
             {
                 placed_any = true;
                 if !tab_created {
-                    layout.add_tab(Tab::new(team_name.clone(), pane));
+                    layout.add_tab(Tab::new(group.name.clone(), pane));
                     tab_created = true;
                 } else if let Some(tab) = layout.active_tab_mut() {
-                    tab.split_focused(SplitDir::Horizontal, pane);
+                    if let Some(target_id) = tab.root().pane_ids().last().copied() {
+                        tab.split_at_pane(target_id, SplitDir::Horizontal, pane);
+                    }
                 }
             }
         }
     }
 
-    for name in &standalone {
+    for name in &plan.ungrouped {
         let synthetic_sp = SessionPane {
             fleet_instance_name: Some(name.clone()),
             instance_ref: None,
@@ -861,6 +838,51 @@ mod tests {
             layout.tabs[1].root().agent_names(),
             vec!["z-lead", "z-2", "z-1"],
             "Rule-3 members must preserve TeamConfig.members order after lead"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn attached_no_session_fallback_uses_canonical_team_and_member_order() {
+        let home = tmp_home("attached-3630-order");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  z-lead: {}\n  z-2: {}\n  z-1: {}\n  solo: {}\nteams:\n  zeta:\n    orchestrator: z-lead\n    members: [z-lead, z-2, z-1]\n",
+        )
+        .expect("write fleet.yaml");
+
+        let mut layout = Layout::new();
+        let mut next_id = 0;
+        let mut pane_builder = |sp: &SessionPane, _l: &mut Layout| -> Option<Pane> {
+            next_id += 1;
+            let mut pane = test_pane(next_id, sp.fleet_instance_name.as_deref()?, Some("zeta"));
+            pane.instance_ref = Some(crate::types::InstanceRef::new(
+                crate::types::InstanceId::new(),
+                next_id as u64,
+            ));
+            Some(pane)
+        };
+        let agents = vec!["z-1".to_string(), "solo".to_string(), "z-lead".to_string()];
+
+        assert!(place_agents_team_grouped_with_identity(
+            &home,
+            &agents,
+            &mut pane_builder,
+            &mut layout,
+            true,
+        ));
+        assert_eq!(
+            layout
+                .tabs
+                .iter()
+                .map(|tab| tab.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zeta", "solo"]
+        );
+        assert_eq!(
+            layout.tabs[0].root().agent_names(),
+            vec!["z-lead", "z-1"],
+            "attached fallback must use configured order even when daemon presence is shuffled"
         );
         std::fs::remove_dir_all(&home).ok();
     }

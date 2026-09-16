@@ -8,7 +8,7 @@ use super::*;
 
 impl AppState {
     // #3501: team-grouped placement for hot-reload — mirrors
-    // session::place_agents_team_grouped. `to_add` is already sorted.
+    // session::place_agents_team_grouped. The shared plan owns ordering.
     pub(super) fn place_remote_team_grouped(
         &mut self,
         to_add: &[String],
@@ -38,35 +38,16 @@ impl AppState {
             eligible.push(name.clone());
         }
         let to_add = &eligible;
-        let teams = crate::teams::list_all(home);
-        let mut team_members: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        let mut standalone: Vec<String> = Vec::new();
-        for name in to_add {
-            if let Some(team) = teams.iter().find(|t| t.members.contains(name)) {
-                team_members
-                    .entry(team.name.clone())
-                    .or_default()
-                    .push(name.clone());
-            } else {
-                standalone.push(name.clone());
-            }
-        }
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .unwrap_or_default();
+        let plan = crate::team_order::plan_team_order(&fleet, to_add.iter().map(String::as_str));
         // Team-grouped: each team shares one tab named after the team. Hot
         // reload deliberately searches all tabs (rather than only the active
         // tab) so a late member joins an already-open team tab. Team and
         // standalone names share the tab-name namespace, so callers should
         // avoid assigning the same name to both.
-        for (team_name, members) in &team_members {
-            let team = teams.iter().find(|t| t.name == *team_name);
-            let orchestrator = team.and_then(|t| t.orchestrator.as_deref());
-            let mut sorted = members.clone();
-            sorted.sort_by(|a, b| {
-                let a_is_orch = orchestrator == Some(a.as_str());
-                let b_is_orch = orchestrator == Some(b.as_str());
-                b_is_orch.cmp(&a_is_orch).then(a.cmp(b))
-            });
-            for name in &sorted {
+        for group in &plan.groups {
+            for name in &group.members {
                 // #3501: if the agent already has a retained pane (disconnected
                 // but not removed), reconnect in place to avoid duplicating the
                 // leaf — preserves the existing team tab/split.
@@ -92,14 +73,14 @@ impl AppState {
                                 crate::layout::PaneReconnectOutcome::Reconnected => {
                                     tracing::info!(
                                         agent = %name,
-                                        team = %team_name,
+                                        team = %group.name,
                                         "reused retained team pane for re-appeared remote agent"
                                     );
                                 }
                                 crate::layout::PaneReconnectOutcome::Appended => {
                                     tracing::info!(
                                         agent = %name,
-                                        team = %team_name,
+                                        team = %group.name,
                                         "opened separate remote pane because identity was unavailable"
                                     );
                                 }
@@ -109,13 +90,19 @@ impl AppState {
                             .layout
                             .tabs
                             .iter()
-                            .position(|tab| tab.name == *team_name)
+                            .position(|tab| tab.name == group.name)
                         {
                             let tab = &mut self.ui.layout.tabs[idx];
-                            tab.split_focused(crate::layout::SplitDir::Horizontal, pane);
+                            if let Some(target_id) = tab.root().pane_ids().last().copied() {
+                                tab.split_at_pane(
+                                    target_id,
+                                    crate::layout::SplitDir::Horizontal,
+                                    pane,
+                                );
+                            }
                             tracing::info!(
                                 agent = %name,
-                                team = %team_name,
+                                team = %group.name,
                                 "added team member pane via split"
                             );
                         } else {
@@ -126,11 +113,11 @@ impl AppState {
                             // → switch_active), which would pull the operator off
                             // whatever they are working on. The standalone arm
                             // below preserves focus for exactly this reason.
-                            let tab = crate::layout::Tab::new(team_name.clone(), pane);
+                            let tab = crate::layout::Tab::new(group.name.clone(), pane);
                             self.ui.layout.push_tab_preserve_focus(tab);
                             tracing::info!(
                                 agent = %name,
-                                team = %team_name,
+                                team = %group.name,
                                 "opened team tab for newly-appeared remote agent"
                             );
                         }
@@ -153,7 +140,7 @@ impl AppState {
             }
         }
         // Standalone: per-agent tabs as before.
-        for name in &standalone {
+        for name in &plan.ungrouped {
             match pane_builder(name, &mut self.ui.layout) {
                 Ok(mut pane) => {
                     if pane.instance_ref.is_none() {

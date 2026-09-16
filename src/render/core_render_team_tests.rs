@@ -204,3 +204,61 @@ fn focused_status_entry_point_scopes_roster_summary_to_active_team_3629() {
     );
     assert!(!text.contains("roster:3"));
 }
+
+#[test]
+fn status_entry_point_surfaces_deterministic_team_diagnostics_3630() {
+    let config: crate::fleet::FleetConfig =
+        serde_yaml_ng::from_str("teams:\n  ops:\n    members: [lead]\n    orchestrator: ghost\n")
+            .unwrap();
+    let view = TeamView::from_fleet(config, Some(HashMap::new()));
+    let mut layout = Layout::new();
+    let pane = Pane {
+        agent_name: "lead".into(),
+        instance_id: crate::types::InstanceId::default(),
+        instance_ref: None,
+        vterm: VTerm::new(10, 10),
+        rx: crossbeam_channel::bounded(1).1,
+        id: 1,
+        backend: None,
+        working_dir: None,
+        display_name: None,
+        scroll_offset: 0,
+        has_notification: false,
+        selection: None,
+        pending_notification_count: 0,
+        pending_decision_count: 0,
+        fleet_instance_name: Some("lead".into()),
+        last_input_at: None,
+        source: PaneSource::Local,
+        offthread: None,
+        _fwd_cancel: None,
+    };
+    layout.add_tab(crate::layout::Tab::new("ops".into(), pane));
+    let backend = ratatui::backend::TestBackend::new(240, 1);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            render_status_bar_with_team(
+                frame,
+                frame.area(),
+                &layout,
+                TelegramStatus::NotConfigured,
+                false,
+                0,
+                crate::runtime::AgentListMode::Live,
+                Some(&view),
+            );
+        })
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        text.contains("team-config:team=ops member=ghost code=orchestrator-not-member"),
+        "team diagnostics must be visible in the status bar: {text:?}"
+    );
+}
