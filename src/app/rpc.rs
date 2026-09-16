@@ -672,6 +672,30 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn event_worker_survives_initial_daemon_absence_for_reconnect() {
+        let home = std::env::temp_dir().join(format!(
+            "event_worker_reconnect_{}",
+            crate::types::InstanceId::new()
+        ));
+        std::fs::create_dir_all(home.join("run")).expect("create isolated test home");
+
+        let (stop_tx, outcome_rx, worker) = spawn_event_worker(&home);
+        assert!(matches!(
+            outcome_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(EventStreamOutcome::Disconnected(_))
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !worker.is_finished(),
+            "event worker must stay alive and retry after daemon absence"
+        );
+
+        stop_tx.send(()).expect("event worker stop channel open");
+        worker.join().expect("event worker stopped cleanly");
+        std::fs::remove_dir_all(home).expect("remove isolated test home");
+    }
+
+    #[test]
     fn agent_state_worker_resolves_each_request_against_successor_without_sleep() {
         let old = std::path::PathBuf::from("/run/old-generation");
         let new = std::path::PathBuf::from("/run/new-generation");
