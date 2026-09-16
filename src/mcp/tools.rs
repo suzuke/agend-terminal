@@ -1052,6 +1052,10 @@ mod tests {
                 "internal: app TUI predecessor identity; not agent-facing",
             ),
             (
+                "skip_unsent_draft_gate",
+                "internal: explicit restart ingress marker; not agent-facing",
+            ),
+            (
                 "provenance",
                 "internal: delegate_task provenance metadata, set by dispatch path",
             ),

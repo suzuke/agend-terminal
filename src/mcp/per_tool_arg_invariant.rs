@@ -496,6 +496,11 @@ const PER_TOOL_ALLOWLIST: &[(&str, &str, &str)] = &[
         "old_instance_ref",
         "internal app TUI predecessor identity; not agent-facing",
     ),
+    (
+        "restart_instance",
+        "skip_unsent_draft_gate",
+        "internal explicit restart ingress marker; not agent-facing",
+    ),
 ];
 
 fn per_tool_allow_set() -> BTreeSet<(String, String)> {
