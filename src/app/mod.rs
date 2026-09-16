@@ -455,6 +455,8 @@ fn run_app(
     let (_attach_tx, attach_rx, attach_workers) = state.restore_and_attach(&deps, restore_start)?;
     let mut reap_workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let event_rx = spawn_crossterm_event_reader();
+    let mut daemon_event_rx = daemon_event_rx;
+    let disabled_event_rx = crossbeam_channel::never::<rpc::EventStreamOutcome>();
     log_pre_render_milestone(size_debug, restore_start, attached_mode);
     let loop_result: Result<()> = loop {
         if term_requested_logged() || state.poll_restart(&deps) == LoopFlow::Break {
@@ -485,7 +487,13 @@ fn run_app(
             recv(remote_restart_outcome_rx) -> outcome => {
                 state.handle_remote_restart_outcome(outcome, &deps);
             },
-            recv(daemon_event_rx) -> outcome => state.handle_event_stream_outcome(outcome, &deps),
+            recv(daemon_event_rx) -> outcome => {
+                let receiver_closed = outcome.is_err();
+                state.handle_event_stream_outcome(outcome, &deps);
+                if receiver_closed {
+                    daemon_event_rx = disabled_event_rx.clone();
+                }
+            },
             default(state.select_timeout()) => state.handle_idle_tick(&deps),
         }
     };

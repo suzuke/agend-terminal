@@ -57,8 +57,12 @@ pub(super) type AgentStateOutcome = Result<AgentStateSnapshotResult, AgentStateE
 #[derive(Debug)]
 pub(super) enum EventStreamOutcome {
     Event(crate::daemon::event_hub::DaemonEvent),
+    Connected { source: String },
     Disconnected(String),
 }
+
+const EVENT_RECONNECT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+const EVENT_RECONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Subscribe on a dedicated authenticated API connection. The worker owns
 /// only the stream; AppState remains the sole owner of UI mutation.
@@ -76,73 +80,150 @@ pub(super) fn spawn_event_worker(
     let worker = std::thread::Builder::new()
         .name("app-event-stream".into())
         .spawn(move || {
-            let run_dir = match resolve_active_run_dir(&home) {
-                Some(run_dir) => run_dir,
-                None => {
-                    let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
-                        "no active daemon".to_string(),
-                    ));
-                    return;
-                }
-            };
-            let (mut reader, stream_source) = match open_event_stream(&run_dir) {
-                Ok(stream) => stream,
-                Err(error) => {
-                    let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(error));
-                    return;
-                }
-            };
-            loop {
-                if stop_rx.try_recv().is_ok() {
-                    return;
-                }
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) => {
-                        let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
-                            "event stream closed".to_string(),
-                        ));
-                        return;
-                    }
-                    Ok(_) => {
-                        match serde_json::from_str::<crate::daemon::event_hub::DaemonEvent>(&line) {
-                            Ok(event) if event.source == stream_source => {
-                                if outcome_tx
-                                    .try_send(EventStreamOutcome::Event(event))
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            Ok(_) => {
-                                let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
-                                    "event stream source changed".to_string(),
-                                ));
-                                return;
-                            }
-                            Err(error) => {
-                                let _ = outcome_tx.try_send(EventStreamOutcome::Disconnected(
-                                    format!("invalid event stream payload: {error}"),
-                                ));
-                                return;
-                            }
-                        }
-                    }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) => {}
-                    Err(error) => {
-                        let _ = outcome_tx
-                            .try_send(EventStreamOutcome::Disconnected(error.to_string()));
-                        return;
-                    }
-                }
-            }
+            run_event_worker(&home, &stop_rx, &outcome_tx);
         })
         .expect("spawn app event stream worker");
     (stop_tx, outcome_rx, worker)
+}
+
+fn run_event_worker(
+    home: &Path,
+    stop_rx: &crossbeam_channel::Receiver<()>,
+    outcome_tx: &crossbeam_channel::Sender<EventStreamOutcome>,
+) {
+    let mut backoff = EVENT_RECONNECT_INITIAL_BACKOFF;
+    let mut disconnected = false;
+
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            return;
+        }
+
+        let Some(run_dir) = resolve_active_run_dir(home) else {
+            if !disconnected {
+                if !send_event_outcome(
+                    stop_rx,
+                    outcome_tx,
+                    EventStreamOutcome::Disconnected("no active daemon".to_string()),
+                ) {
+                    return;
+                }
+                disconnected = true;
+            }
+            if !wait_for_event_retry(stop_rx, backoff) {
+                return;
+            }
+            backoff = next_event_backoff(backoff);
+            continue;
+        };
+
+        let (mut reader, stream_source) = match open_event_stream(&run_dir) {
+            Ok(stream) => stream,
+            Err(error) => {
+                if !disconnected {
+                    if !send_event_outcome(
+                        stop_rx,
+                        outcome_tx,
+                        EventStreamOutcome::Disconnected(error),
+                    ) {
+                        return;
+                    }
+                    disconnected = true;
+                }
+                if !wait_for_event_retry(stop_rx, backoff) {
+                    return;
+                }
+                backoff = next_event_backoff(backoff);
+                continue;
+            }
+        };
+
+        if !send_event_outcome(
+            stop_rx,
+            outcome_tx,
+            EventStreamOutcome::Connected {
+                source: stream_source.clone(),
+            },
+        ) {
+            return;
+        }
+        disconnected = false;
+        backoff = EVENT_RECONNECT_INITIAL_BACKOFF;
+
+        let disconnect_reason = loop {
+            if stop_rx.try_recv().is_ok() {
+                return;
+            }
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break "event stream closed".to_string(),
+                Ok(_) => {
+                    match serde_json::from_str::<crate::daemon::event_hub::DaemonEvent>(&line) {
+                        Ok(event) if event.source == stream_source => {
+                            if !send_event_outcome(
+                                stop_rx,
+                                outcome_tx,
+                                EventStreamOutcome::Event(event),
+                            ) {
+                                return;
+                            }
+                        }
+                        Ok(_) => break "event stream source changed".to_string(),
+                        Err(error) => break format!("invalid event stream payload: {error}"),
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => break error.to_string(),
+            }
+        };
+
+        if !disconnected {
+            if !send_event_outcome(
+                stop_rx,
+                outcome_tx,
+                EventStreamOutcome::Disconnected(disconnect_reason),
+            ) {
+                return;
+            }
+            disconnected = true;
+        }
+        if !wait_for_event_retry(stop_rx, backoff) {
+            return;
+        }
+        backoff = next_event_backoff(backoff);
+    }
+}
+
+fn send_event_outcome(
+    stop_rx: &crossbeam_channel::Receiver<()>,
+    outcome_tx: &crossbeam_channel::Sender<EventStreamOutcome>,
+    outcome: EventStreamOutcome,
+) -> bool {
+    crossbeam_channel::select! {
+        send(outcome_tx, outcome) -> result => result.is_ok(),
+        recv(stop_rx) -> _ => false,
+    }
+}
+
+fn wait_for_event_retry(
+    stop_rx: &crossbeam_channel::Receiver<()>,
+    delay: std::time::Duration,
+) -> bool {
+    matches!(
+        stop_rx.recv_timeout(delay),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+    )
+}
+
+fn next_event_backoff(current: std::time::Duration) -> std::time::Duration {
+    current
+        .checked_mul(2)
+        .unwrap_or(EVENT_RECONNECT_MAX_BACKOFF)
+        .min(EVENT_RECONNECT_MAX_BACKOFF)
 }
 
 fn open_event_stream(run_dir: &Path) -> Result<(BufReader<TcpStream>, String), String> {
@@ -693,6 +774,41 @@ mod tests {
         stop_tx.send(()).expect("event worker stop channel open");
         worker.join().expect("event worker stopped cleanly");
         std::fs::remove_dir_all(home).expect("remove isolated test home");
+    }
+
+    #[test]
+    fn event_reconnect_backoff_is_bounded() {
+        assert_eq!(
+            next_event_backoff(EVENT_RECONNECT_INITIAL_BACKOFF),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            next_event_backoff(std::time::Duration::from_secs(4)),
+            EVENT_RECONNECT_MAX_BACKOFF
+        );
+        assert_eq!(
+            next_event_backoff(EVENT_RECONNECT_MAX_BACKOFF),
+            EVENT_RECONNECT_MAX_BACKOFF
+        );
+    }
+
+    #[test]
+    fn event_outcome_send_unblocks_for_stop_when_queue_is_full() {
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let (outcome_tx, _outcome_rx) = crossbeam_channel::bounded(1);
+        outcome_tx
+            .send(EventStreamOutcome::Disconnected("full".to_string()))
+            .expect("fill bounded outcome queue");
+        let worker = std::thread::spawn(move || {
+            send_event_outcome(
+                &stop_rx,
+                &outcome_tx,
+                EventStreamOutcome::Disconnected("blocked".to_string()),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stop_tx.send(()).expect("stop channel open");
+        assert!(!worker.join().expect("blocked sender joined"));
     }
 
     #[test]
