@@ -63,6 +63,40 @@ fn is_exempted(rel_path: &str) -> bool {
         .any(|suffix| rel_path.ends_with(suffix))
 }
 
+fn first_test_only_boundary(content: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        if matches!(line.trim(), "#![cfg(test)]" | "#[cfg(test)]") {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+#[test]
+fn test_only_boundary_recognizes_inner_and_outer_attributes() {
+    let inner = "fn production() {}\n#![cfg(test)]\nfn fixture() {}\n";
+    let outer = "fn production() {}\n#[cfg(test)]\nmod tests {}\n";
+    assert_eq!(
+        first_test_only_boundary(inner),
+        Some("fn production() {}\n".len())
+    );
+    assert_eq!(
+        first_test_only_boundary(outer),
+        Some("fn production() {}\n".len())
+    );
+}
+
+#[test]
+fn test_only_boundary_ignores_comments_and_literals() {
+    let source = r##"// #![cfg(test)]
+let marker = "#[cfg(test)]";
+fn production() {}
+"##;
+    assert_eq!(first_test_only_boundary(source), None);
+}
+
 /// Sprint 23 P0 source-grep guard: every save_metadata write of a
 /// pair-relevant field must have a heartbeat_pair update within the
 /// preceding 10 lines.
@@ -87,12 +121,9 @@ fn heartbeat_pair_writes_paired_with_in_memory_update() {
         };
         // Cut off at the first real test-only module boundary so test-fixture
         // writes don't trip. External test-module files use the inner form;
-        // inline modules use the outer form.
-        let cutoff_byte = ["#![cfg(test)]", "#[cfg(test)]"]
-            .iter()
-            .filter_map(|marker| content.find(marker))
-            .min()
-            .unwrap_or(content.len());
+        // inline modules use the outer form. Whole-line matching avoids
+        // treating comments or string literals as a boundary.
+        let cutoff_byte = first_test_only_boundary(&content).unwrap_or(content.len());
         let prod = &content[..cutoff_byte];
         let lines: Vec<&str> = prod.lines().collect();
 
