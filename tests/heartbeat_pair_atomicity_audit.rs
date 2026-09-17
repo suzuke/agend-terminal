@@ -74,6 +74,59 @@ fn first_test_only_boundary(content: &str) -> Option<usize> {
     None
 }
 
+fn production_source(content: &str) -> String {
+    if first_test_only_boundary(content)
+        .is_some_and(|offset| content[offset..].starts_with("#![cfg(test)]"))
+    {
+        return content[..first_test_only_boundary(content).unwrap()].to_string();
+    }
+
+    let mut production = String::with_capacity(content.len());
+    let mut lines = content.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        if line.trim() != "#[cfg(test)]" {
+            production.push_str(line);
+            continue;
+        }
+
+        production.push('\n');
+        let mut started = false;
+        let mut brace_depth = 0usize;
+        let mut saw_brace = false;
+        while let Some(item_line) = lines.next() {
+            let trimmed = item_line.trim();
+            if !started && (trimmed.is_empty() || trimmed.starts_with("#[")) {
+                continue;
+            }
+            started = true;
+            for byte in item_line.bytes() {
+                match byte {
+                    b'{' => {
+                        brace_depth += 1;
+                        saw_brace = true;
+                    }
+                    b'}' if brace_depth > 0 => brace_depth -= 1,
+                    _ => {}
+                }
+            }
+            if (saw_brace && brace_depth == 0) || (!saw_brace && item_line.contains(';')) {
+                break;
+            }
+        }
+    }
+    production
+}
+
+fn source_code_lines(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with("//")
+        })
+        .collect()
+}
+
 #[test]
 fn test_only_boundary_recognizes_inner_and_outer_attributes() {
     let inner = "fn production() {}\n#![cfg(test)]\nfn fixture() {}\n";
@@ -95,6 +148,23 @@ let marker = "#[cfg(test)]";
 fn production() {}
 "##;
     assert_eq!(first_test_only_boundary(source), None);
+}
+
+#[test]
+fn outer_test_item_does_not_hide_later_production() {
+    let source = r#"fn before() {}
+#[cfg(test)]
+fn fixture() {
+    save_metadata("waiting_on_since");
+}
+fn after() {
+    save_metadata("waiting_on_since");
+}
+"#;
+    let production = production_source(source);
+    assert!(!production.contains("fn fixture"));
+    assert!(production.contains("fn after"));
+    assert!(production.contains("save_metadata(\"waiting_on_since\")"));
 }
 
 /// Sprint 23 P0 source-grep guard: every save_metadata write of a
@@ -123,15 +193,10 @@ fn heartbeat_pair_writes_paired_with_in_memory_update() {
         // writes don't trip. External test-module files use the inner form;
         // inline modules use the outer form. Whole-line matching avoids
         // treating comments or string literals as a boundary.
-        let cutoff_byte = first_test_only_boundary(&content).unwrap_or(content.len());
-        let prod = &content[..cutoff_byte];
-        let lines: Vec<&str> = prod.lines().collect();
+        let prod = production_source(&content);
+        let lines = source_code_lines(&prod);
 
         for (idx, line) in lines.iter().enumerate() {
-            let trim = line.trim_start();
-            if trim.starts_with("//") || trim.starts_with("///") || trim.starts_with("//!") {
-                continue;
-            }
             // Match: write of pair-relevant field via save_metadata or
             // save_metadata_batch. Quoted "last_heartbeat" or
             // "waiting_on_since" appearing on a line that ALSO contains
