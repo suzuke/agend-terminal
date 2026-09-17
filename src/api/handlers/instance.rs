@@ -123,6 +123,12 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         return json!({"ok": false, "error": e});
     }
     let env_from_params = parse_env_object(params.get("env"));
+    let restart_id = params["restart_id"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    let old_instance_ref = params
+        .get("old_instance_ref")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
     let spawn_params = crate::agent_ops::spawn::SpawnParams {
         name,
         backend: params["backend"].as_str(),
@@ -147,10 +153,11 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         layout: params["layout"].as_str().unwrap_or("tab"),
         spawner: params["spawner"].as_str().filter(|s| !s.is_empty()),
         target_pane: params["target_pane"].as_str().filter(|s| !s.is_empty()),
-        // Public create_instance requests are deliberately uncorrelated. Only
-        // the internal restart SPAWN path may carry lifecycle identity.
-        restart_id: None,
-        old_instance_ref: None,
+        // Public create_instance requests do not expose these fields in their
+        // MCP schema. Direct API access is operator-capability gated; only the
+        // daemon's internal restart path supplies lifecycle identity here.
+        restart_id,
+        old_instance_ref,
     };
     let request = match crate::agent_ops::spawn::resolve_spawn_request(ctx.home, &spawn_params) {
         Ok(request) => request,
