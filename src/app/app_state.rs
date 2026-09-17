@@ -1268,6 +1268,45 @@ impl AppState {
                                 }
                             }
                         }
+                        crate::api::ApiEvent::InstanceRestartFailed {
+                            name,
+                            restart_id,
+                            old_instance_ref: Some(old_instance_ref),
+                            error,
+                        } => {
+                            let correlated =
+                                self.remote_restarts
+                                    .get(&restart_id)
+                                    .is_some_and(|pending| {
+                                        pending.request.name == name
+                                            && pending.request.old_instance_ref
+                                                == Some(old_instance_ref)
+                                    });
+                            if correlated {
+                                for tab in &mut self.ui.layout.tabs {
+                                    for pane_id in tab.root().pane_ids() {
+                                        if let Some(pane) = tab.root_mut().find_pane_mut(pane_id) {
+                                            if pane.instance_ref == Some(old_instance_ref) {
+                                                pane.mark_disconnected();
+                                            }
+                                        }
+                                    }
+                                }
+                                self.remote_restarts.remove(&restart_id);
+                                tracing::warn!(
+                                    agent = %name,
+                                    restart_id = %restart_id,
+                                    error = %error,
+                                    "correlated remote restart failed"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    agent = %name,
+                                    restart_id = %restart_id,
+                                    "ignored uncorrelated remote restart failure"
+                                );
+                            }
+                        }
                         _ => {}
                     }
                 }

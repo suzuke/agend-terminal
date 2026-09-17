@@ -700,6 +700,26 @@ pub(super) fn handle_restart_instance_with_runtime(
         .map(|r| r["ok"].as_bool() == Some(true))
         .unwrap_or(false);
 
+    if !spawned {
+        let error = spawn_result
+            .as_ref()
+            .ok()
+            .and_then(|result| result["error"].as_str())
+            .map(str::to_string)
+            .or_else(|| spawn_result.as_ref().err().map(ToString::to_string))
+            .unwrap_or_else(|| "restart spawn failed".to_string());
+        if let Some(runtime) = runtime {
+            if let Some(notifier) = runtime.notifier.as_ref() {
+                notifier.notify(crate::api::ApiEvent::InstanceRestartFailed {
+                    name: name.to_string(),
+                    restart_id: restart_id.clone(),
+                    old_instance_ref,
+                    error,
+                });
+            }
+        }
+    }
+
     // Restart/TUI 交接確認見 restart_prep::settle_tui_handoff。
     let (tui_handoff, handoff_warning) = restart_prep::settle_tui_handoff(home, name, spawned);
 
