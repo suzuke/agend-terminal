@@ -77,10 +77,11 @@ fn advance_scan_state(state: ScanState, line: &str) -> ScanState {
     scan_line(state, line).0
 }
 
-fn scan_line(mut state: ScanState, line: &str) -> (ScanState, i32) {
+fn scan_line(mut state: ScanState, line: &str) -> (ScanState, i32, bool) {
     let bytes = line.as_bytes();
     let mut i = 0;
     let mut delta = 0;
+    let mut saw_code_brace = false;
     while i < bytes.len() {
         state = match state {
             ScanState::Normal => {
@@ -106,9 +107,11 @@ fn scan_line(mut state: ScanState, line: &str) -> (ScanState, i32) {
                     }
                 } else if bytes[i] == b'{' {
                     delta += 1;
+                    saw_code_brace = true;
                     ScanState::Normal
                 } else if bytes[i] == b'}' {
                     delta -= 1;
+                    saw_code_brace = true;
                     ScanState::Normal
                 } else {
                     ScanState::Normal
@@ -182,7 +185,7 @@ fn scan_line(mut state: ScanState, line: &str) -> (ScanState, i32) {
     if matches!(state, ScanState::LineComment) {
         state = ScanState::Normal;
     }
-    (state, delta)
+    (state, delta, saw_code_brace)
 }
 
 fn first_test_only_boundary(content: &str) -> Option<usize> {
@@ -222,22 +225,17 @@ fn production_source(content: &str) -> String {
         let mut started = false;
         let mut brace_depth = 0usize;
         let mut saw_brace = false;
+        let mut item_scan_state = ScanState::Normal;
         for item_line in lines.by_ref() {
             let trimmed = item_line.trim();
             if !started && (trimmed.is_empty() || trimmed.starts_with("#[")) {
                 continue;
             }
             started = true;
-            for byte in item_line.bytes() {
-                match byte {
-                    b'{' => {
-                        brace_depth += 1;
-                        saw_brace = true;
-                    }
-                    b'}' if brace_depth > 0 => brace_depth -= 1,
-                    _ => {}
-                }
-            }
+            let (next_scan_state, delta, line_has_brace) = scan_line(item_scan_state, item_line);
+            item_scan_state = next_scan_state;
+            saw_brace |= line_has_brace;
+            brace_depth = (brace_depth as i32 + delta).max(0) as usize;
             if (saw_brace && brace_depth == 0) || (!saw_brace && item_line.contains(';')) {
                 break;
             }
@@ -263,7 +261,7 @@ fn source_code_lines(source: &str) -> Vec<(&str, usize)> {
             function_scope = Some((function_id, brace_depth));
         }
         let scope = function_scope.map_or(0, |(function_id, _)| function_id);
-        let (next_scan_state, delta) = scan_line(scan_state, line);
+        let (next_scan_state, delta, _) = scan_line(scan_state, line);
         scan_state = next_scan_state;
         brace_depth += delta;
         if trimmed.is_empty() || trimmed.starts_with("//") {
@@ -344,6 +342,22 @@ fn after() {
     assert!(!production.contains("fn fixture"));
     assert!(production.contains("fn after"));
     assert!(production.contains("save_metadata(\"waiting_on_since\")"));
+}
+
+#[test]
+fn outer_test_item_with_noncode_braces_does_not_hide_later_production() {
+    let source = r##"#[cfg(test)]
+fn fixture() {
+    let raw = r#"{ an unmatched brace in a raw string "#;
+    /* { an unmatched brace in a block comment */
+}
+fn production() {
+    save_metadata("waiting_on_since");
+}
+"##;
+    let production = production_source(source);
+    assert!(!production.contains("fn fixture"));
+    assert!(production.contains("fn production"));
 }
 
 #[test]
@@ -435,6 +449,19 @@ fn detector_ignores_noncode_braces_when_tracking_scope() {
     assert!(
         unpaired_pair_writes("synthetic.rs", source).is_empty(),
         "non-code braces must not end the function scope early"
+    );
+}
+
+#[test]
+fn detector_documents_textual_pairing_not_instance_identity() {
+    let source = r#"fn production() {
+    heartbeat_pair::update_with(other_name, |_| {});
+    save_metadata(name, "last_heartbeat", value);
+}
+"#;
+    assert!(
+        unpaired_pair_writes("synthetic.rs", source).is_empty(),
+        "this source audit proves call pairing only; instance identity remains a runtime concern"
     );
 }
 
