@@ -165,6 +165,12 @@ impl Pane {
         matches!(&self.source, PaneSource::Remote(_, connected) if !connected.load(Ordering::Acquire))
     }
 
+    pub fn mark_disconnected(&self) {
+        if let PaneSource::Remote(_, connected) = &self.source {
+            connected.store(false, Ordering::Release);
+        }
+    }
+
     /// Max scroll-back offset for THIS pane's render path. Off-thread mode
     /// (`AGEND_OFFTHREAD_PARSE`) renders the parser thread's published snapshot and
     /// leaves the main-thread `vterm` idle (drain no-ops), so its `max_scroll()` is 0

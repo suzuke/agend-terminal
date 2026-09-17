@@ -1487,15 +1487,26 @@ impl AppState {
 
     fn reap_remote_restart_state(&mut self) {
         let now = std::time::Instant::now();
-        let expired_restarts: Vec<String> = self
+        let expired_restarts: Vec<(String, Option<crate::types::InstanceRef>)> = self
             .remote_restarts
             .iter()
             .filter(|(_, pending)| {
                 now.saturating_duration_since(pending.created_at) >= REMOTE_RESTART_PENDING_TTL
             })
-            .map(|(restart_id, _)| restart_id.clone())
+            .map(|(restart_id, pending)| (restart_id.clone(), pending.request.old_instance_ref))
             .collect();
-        for restart_id in expired_restarts {
+        for (restart_id, old_instance_ref) in expired_restarts {
+            if let Some(old_instance_ref) = old_instance_ref {
+                for tab in &mut self.ui.layout.tabs {
+                    for pane_id in tab.root().pane_ids() {
+                        if let Some(pane) = tab.root_mut().find_pane_mut(pane_id) {
+                            if pane.instance_ref == Some(old_instance_ref) {
+                                pane.mark_disconnected();
+                            }
+                        }
+                    }
+                }
+            }
             self.remote_restarts.remove(&restart_id);
             tracing::warn!(restart_id = %restart_id, "remote restart correlation expired");
         }
@@ -2209,6 +2220,20 @@ mod tests {
             state.ui.layout.add_tab(Tab::new(name.clone(), pane));
             refs.push((name, old_ref));
         }
+        let listener = std::net::TcpListener::bind((crate::ipc::LOOPBACK, 0)).expect("listener");
+        let client_stream =
+            std::net::TcpStream::connect(listener.local_addr().expect("listener address"))
+                .expect("client stream");
+        let (server_stream, _) = listener.accept().expect("server stream");
+        let client = crate::bridge_client::BridgeClient::from_stream_for_test(client_stream);
+        state.ui.layout.tabs[0]
+            .root_mut()
+            .find_pane_mut(0)
+            .expect("first pane")
+            .source = PaneSource::Remote(
+            Arc::new(Mutex::new(client)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
         for (index, (name, old_ref)) in refs.iter().enumerate() {
             assert_eq!(
                 state.register_provisional_remote_restart(
@@ -2241,6 +2266,11 @@ mod tests {
             state.ui.layout.find_agent_pane("provisional-0").is_some(),
             "provisional expiry must retain the stale pane for disconnected rendering"
         );
+        assert!(
+            state.ui.layout.agent_pane_is_disconnected("provisional-0"),
+            "provisional expiry must mark the retained pane disconnected"
+        );
+        drop(server_stream);
     }
 
     #[test]
