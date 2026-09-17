@@ -820,6 +820,7 @@ mod tests {
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: fleet_name.map(String::from),

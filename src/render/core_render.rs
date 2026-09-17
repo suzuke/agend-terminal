@@ -1107,6 +1107,7 @@ mod tests {
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -1138,6 +1139,7 @@ mod tests {
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -1172,6 +1174,7 @@ mod tests {
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -1224,6 +1227,7 @@ mod tests {
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -1258,6 +1262,7 @@ mod tests {
             backend: Some(crate::backend::Backend::ClaudeCode),
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -1300,6 +1305,7 @@ mod tests {
             backend: Some(crate::backend::Backend::ClaudeCode),
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -1324,6 +1330,42 @@ mod tests {
                 "flag-on: title must contain {want}, got: {joined}"
             );
         }
+    }
+
+    /// #3670 RED: a correlated restart failure must be visible in the affected
+    /// pane title, not only in logs or a global overlay.
+    #[test]
+    fn pane_title_shows_correlated_restart_failure_3670() {
+        let mut pane = Pane {
+            agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            restart_error: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        pane.set_restart_error("spawn failed");
+
+        let segments = pane_title_segments(&pane, Style::default(), Some(AgentState::Idle), false);
+        let joined: String = segments.iter().map(|(text, _)| text.as_str()).collect();
+        assert!(
+            joined.contains("[RESTART FAILED]") && joined.contains("spawn failed"),
+            "pane title must expose the correlated restart failure: {joined}"
+        );
     }
 
     #[test]
@@ -1353,6 +1395,7 @@ mod tests {
                 backend: None,
                 working_dir: None,
                 display_name: None,
+                restart_error: None,
                 scroll_offset: 0,
                 has_notification: false,
                 fleet_instance_name: None,
@@ -1391,6 +1434,7 @@ mod tests {
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -1473,6 +1517,7 @@ mod tests {
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -2011,6 +2056,7 @@ mod tests {
             backend: Some(crate::backend::Backend::ClaudeCode),
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -2066,6 +2112,7 @@ mod tests {
             backend: Some(crate::backend::Backend::ClaudeCode),
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -2111,6 +2158,7 @@ mod tests {
             backend: Some(crate::backend::Backend::ClaudeCode),
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -2143,6 +2191,7 @@ mod tests {
             backend: Some(crate::backend::Backend::ClaudeCode),
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
