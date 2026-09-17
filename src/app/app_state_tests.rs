@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::layout::{PaneSource, Tab};
 use std::collections::HashSet;

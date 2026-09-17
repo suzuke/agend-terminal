@@ -85,8 +85,14 @@ fn heartbeat_pair_writes_paired_with_in_memory_update() {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // Cut off at #[cfg(test)] so test-fixture writes don't trip.
-        let cutoff_byte = content.find("#[cfg(test)]").unwrap_or(content.len());
+        // Cut off at the first real test-only module boundary so test-fixture
+        // writes don't trip. External test-module files use the inner form;
+        // inline modules use the outer form.
+        let cutoff_byte = ["#![cfg(test)]", "#[cfg(test)]"]
+            .iter()
+            .filter_map(|marker| content.find(marker))
+            .min()
+            .unwrap_or(content.len());
         let prod = &content[..cutoff_byte];
         let lines: Vec<&str> = prod.lines().collect();
 

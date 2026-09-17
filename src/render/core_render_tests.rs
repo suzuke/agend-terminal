@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::layout::{Pane, PaneSource};
 use crate::vterm::VTerm;
