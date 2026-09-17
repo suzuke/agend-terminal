@@ -2254,8 +2254,7 @@ mod tests {
         );
         state
             .remote_restarts
-            .values_mut()
-            .next()
+            .get_mut("provisional-restart-0")
             .expect("provisional entry")
             .created_at = std::time::Instant::now()
             .checked_sub(REMOTE_RESTART_PENDING_TTL + std::time::Duration::from_secs(1))

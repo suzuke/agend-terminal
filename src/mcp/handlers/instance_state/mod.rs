@@ -739,10 +739,22 @@ pub(super) fn handle_restart_instance_with_runtime(
 /// agent-invocable), so the narrowness is enforced by the trigger, exactly like
 /// crash-respawn / hang-recovery (`operator_gate` module scope note). Returns
 /// whether the SPAWN succeeded so the caller can escalate a failed recovery.
-pub(crate) fn restart_instance_autonomic(home: &Path, name: &str, reason: &str) -> bool {
+pub(crate) fn restart_instance_autonomic(
+    home: &Path,
+    name: &str,
+    reason: &str,
+    old_instance_ref: Option<crate::types::InstanceRef>,
+) -> bool {
+    let restart_id = crate::types::InstanceId::new().full();
     let result = handle_restart_instance(
         home,
-        &json!({"name": name, "mode": "fresh", "reason": reason}),
+        &json!({
+            "name": name,
+            "mode": "fresh",
+            "reason": reason,
+            "restart_id": restart_id,
+            "old_instance_ref": old_instance_ref,
+        }),
     );
     result
         .get("spawned")
