@@ -1001,6 +1001,15 @@ fn pane_title_segments_with_team(
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    if let Some(error) = pane.restart_error() {
+        segments.push((
+            format!(" [RESTART FAILED: {error}]"),
+            Style::default()
+                .bg(Color::Red)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if pane.pending_notification_count > 0 {
         segments.push((
             format!(" [{}]", pane.pending_notification_count),

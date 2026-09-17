@@ -1288,13 +1288,11 @@ impl AppState {
                                         if let Some(pane) = tab.root_mut().find_pane_mut(pane_id) {
                                             if pane.instance_ref == Some(old_instance_ref) {
                                                 pane.mark_disconnected();
+                                                pane.set_restart_error(&error);
                                             }
                                         }
                                     }
                                 }
-                                self.ui.overlay = Overlay::ReconnectNotice {
-                                    message: format!("Restart '{name}' failed: {error}"),
-                                };
                                 self.remote_restarts.remove(&restart_id);
                                 tracing::warn!(
                                     agent = %name,
@@ -2247,6 +2245,16 @@ mod tests {
         assert_eq!(state.ui.layout.tabs.len(), 1);
         assert_eq!(state.ui.layout.tabs[0].root().pane_count(), 1);
         assert_eq!(state.ui.layout.tabs[0].root().pane_ids(), vec![0]);
+        assert_eq!(
+            state
+                .ui
+                .layout
+                .find_agent_pane("daemon-agent")
+                .and_then(|(_, pane_id)| state.ui.layout.tabs[0].root().find_pane(pane_id))
+                .and_then(crate::layout::Pane::restart_error),
+            None,
+            "successful replacement must clear transient restart failure text"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -2337,10 +2345,18 @@ mod tests {
 
         assert!(!state.remote_restarts.contains_key("restart-failure-3670"));
         assert!(state.ui.layout.agent_pane_is_disconnected("failed-agent"));
-        assert!(matches!(
-            &state.ui.overlay,
-            Overlay::ReconnectNotice { message } if message.contains("spawn failed")
-        ));
+        let (_, pane_id) = state
+            .ui
+            .layout
+            .find_agent_pane("failed-agent")
+            .expect("failed pane");
+        assert_eq!(
+            state.ui.layout.tabs[0]
+                .root()
+                .find_pane(pane_id)
+                .and_then(crate::layout::Pane::restart_error),
+            Some("spawn failed")
+        );
         drop(server_stream);
         std::fs::remove_dir_all(home).ok();
     }
