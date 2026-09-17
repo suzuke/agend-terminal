@@ -1645,9 +1645,9 @@ mod tests {
             .find("pub(super) fn handle_restart_instance_with_runtime(")
             .expect("runtime-aware restart handler");
         let restart_end = source[restart_start..]
-            .find("/// #t-777-3")
+            .find("#[cfg(test)]\nmod tests;")
             .map(|offset| restart_start + offset)
-            .expect("restart handler end marker");
+            .expect("restart handler test-module boundary");
         let restart_region = &source[restart_start..restart_end];
         let spawn_start = restart_region
             .find("let spawn_result")
