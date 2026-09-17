@@ -517,6 +517,80 @@ mod tests {
         std::fs::remove_dir_all(home.as_ref()).ok();
     }
 
+    /// Corrective RED for #3670: the runtime-less watchdog route reaches the
+    /// legacy DELETE and SPAWN API adapters. Both lifecycle events must retain
+    /// the same internal correlation and predecessor identity so the TUI can
+    /// replace the pane in place.
+    #[test]
+    fn runtime_less_restart_delete_spawn_carries_correlation_3670_red() {
+        struct RecordingNotifier {
+            events: Mutex<Vec<ApiEvent>>,
+        }
+
+        impl crate::api::ApiNotifier for RecordingNotifier {
+            fn notify(&self, event: ApiEvent) {
+                self.events.lock().push(event);
+            }
+        }
+
+        let name = "watchdog-correlation-3670";
+        let (mut ctx, home) = test_ctx_with_agent(name);
+        let notifier = Arc::new(RecordingNotifier {
+            events: Mutex::new(Vec::new()),
+        });
+        let notifier_trait: Arc<dyn crate::api::ApiNotifier> = notifier.clone();
+        let notifier_ref: &'static Arc<dyn crate::api::ApiNotifier> =
+            Box::leak(Box::new(notifier_trait));
+        ctx.notifier = Some(notifier_ref);
+        let old_instance_ref = agent::instance_ref_for_name(ctx.registry, ctx.home, name)
+            .expect("live watchdog predecessor identity");
+        let restart_id = "watchdog-restart-3670";
+
+        let deleted = handle_delete(
+            &json!({"name": name, "no_wait": true, "restart_id": restart_id}),
+            &ctx,
+        );
+        assert_eq!(
+            deleted["ok"], true,
+            "watchdog DELETE must succeed: {deleted}"
+        );
+        let spawned = handle_spawn(
+            &json!({
+                "name": name,
+                "backend": crate::default_shell(),
+                "mode": "fresh",
+                "restart_id": restart_id,
+                "old_instance_ref": old_instance_ref,
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            spawned["ok"], true,
+            "watchdog SPAWN must succeed: {spawned}"
+        );
+
+        let events = notifier.events.lock();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    ApiEvent::InstanceDeleted { restart_id: Some(delete_id), .. },
+                    ApiEvent::InstanceCreated {
+                        restart_id: Some(create_id),
+                        old_instance_ref: Some(create_old_ref),
+                        ..
+                    }
+                ] if delete_id == restart_id
+                    && create_id == restart_id
+                    && *create_old_ref == old_instance_ref
+            ),
+            "runtime-less restart events lost correlation: {events:?}"
+        );
+        drop(events);
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
     /// Sibling of [`test_ctx_with_agent`]: spawns a REAL, permanently-wedged
     /// agent (`stty raw -echo; sleep 30` — never drains stdin) instead of a
     /// healthy shell, so a caller can force a genuine PTY write failure
