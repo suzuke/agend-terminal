@@ -2208,6 +2208,97 @@ mod tests {
     }
 
     #[test]
+    fn correlated_restart_failure_marks_exact_remote_pane_disconnected_3670() {
+        let home = team_fixture_home("remote-restart-failure-3670");
+        let fleet_path = home.join("fleet.yaml");
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let app_restart_gate = crate::api::app_restart::AppRestartGate::new();
+        let daemon_binary_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attached_run_dir = None;
+        let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded::<rpc::TaskRequest>();
+        let (remote_state_rpc_tx, _remote_state_rpc_rx) =
+            crossbeam_channel::unbounded::<rpc::AgentStateRequest>();
+        let (remote_restart_request_tx, _remote_restart_request_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+        let (remote_restart_worker_tx, _remote_restart_worker_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+        let deps = AppDeps {
+            home: &home,
+            fleet_path: &fleet_path,
+            registry: &registry,
+            wakeup_tx: &wakeup_tx,
+            app_restart_gate: &app_restart_gate,
+            daemon_binary_stale: &daemon_binary_stale,
+            telegram_status: TelegramStatus::NotConfigured,
+            attached_run_dir: &attached_run_dir,
+            attached_mode: false,
+            size_debug: false,
+            task_rpc_tx: &task_rpc_tx,
+            remote_state_rpc_tx: &remote_state_rpc_tx,
+            remote_restart_request_tx: &remote_restart_request_tx,
+            remote_restart_worker_tx: &remote_restart_worker_tx,
+        };
+        let old_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 3670);
+        let (listener, client_stream) = {
+            let listener =
+                std::net::TcpListener::bind((crate::ipc::LOOPBACK, 0)).expect("listener");
+            let client_stream =
+                std::net::TcpStream::connect(listener.local_addr().expect("listener address"))
+                    .expect("client stream");
+            (listener, client_stream)
+        };
+        let (server_stream, _) = listener.accept().expect("server stream");
+        let client = crate::bridge_client::BridgeClient::from_stream_for_test(client_stream);
+        let mut state = AppState::new();
+        let mut pane = test_remote_pane(&mut state.ui.layout, "failed-agent").expect("test pane");
+        pane.instance_ref = Some(old_ref);
+        pane.source = PaneSource::Remote(
+            Arc::new(Mutex::new(client)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        state
+            .ui
+            .layout
+            .add_tab(Tab::new("failed-agent".into(), pane));
+
+        let mut event = |sequence, event| {
+            state.handle_event_stream_outcome(
+                Ok(rpc::EventStreamOutcome::Event(
+                    crate::daemon::event_hub::DaemonEvent {
+                        source: "daemon".into(),
+                        sequence,
+                        event,
+                    },
+                )),
+                &deps,
+            );
+        };
+        event(
+            1,
+            crate::api::ApiEvent::InstanceDeleted {
+                name: "failed-agent".into(),
+                instance_ref: Some(old_ref),
+                restart_id: Some("restart-failure-3670".into()),
+            },
+        );
+        event(
+            2,
+            crate::api::ApiEvent::InstanceRestartFailed {
+                name: "failed-agent".into(),
+                restart_id: "restart-failure-3670".into(),
+                old_instance_ref: Some(old_ref),
+                error: "spawn failed".into(),
+            },
+        );
+
+        assert!(!state.remote_restarts.contains_key("restart-failure-3670"));
+        assert!(state.ui.layout.agent_pane_is_disconnected("failed-agent"));
+        drop(server_stream);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
     fn provisional_restart_quota_is_bounded_and_expiry_retains_pane_3670() {
         let mut state = AppState::new();
         let mut refs = Vec::new();
