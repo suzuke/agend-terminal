@@ -2193,6 +2193,7 @@ mod tests {
         let mut state = AppState::new();
         let mut pane = test_remote_pane(&mut state.ui.layout, "daemon-agent").expect("test pane");
         pane.instance_ref = Some(old_ref);
+        pane.set_restart_error("stale failure");
         state.ui.layout.add_tab(Tab::new("team".into(), pane));
 
         state.handle_event_stream_outcome(
