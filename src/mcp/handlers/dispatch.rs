@@ -2021,7 +2021,10 @@ mod tests {
             return "app_thin_client_task_rpc";
         }
         if path == "src/mcp/handlers/instance_state/lifecycle.rs"
-            && function == "delete_with_runtime_or_legacy"
+            && matches!(
+                function,
+                "delete_with_runtime_or_legacy" | "delete_with_runtime_or_legacy_for_restart"
+            )
         {
             return "runtime_none_instance_delete";
         }
@@ -2141,7 +2144,9 @@ mod tests {
         assert!(spawn_route.contains("spawn_instance"));
 
         let lifecycle = include_str!("instance_state/lifecycle.rs");
-        let delete = source_region(lifecycle, "delete_with_runtime_or_legacy");
+        let delete_wrapper = source_region(lifecycle, "delete_with_runtime_or_legacy");
+        assert!(delete_wrapper.contains("delete_with_runtime_or_legacy_for_restart"));
+        let delete = source_region(lifecycle, "delete_with_runtime_or_legacy_for_restart");
         assert!(delete.contains("if let Some(context)"));
         assert!(delete.contains("agent_ops::delete_instance"));
         assert!(delete.contains("crate::api::call"));
