@@ -1996,6 +1996,89 @@ mod tests {
     }
 
     #[test]
+    fn daemon_restart_delete_then_create_retains_exact_pane_3670_red() {
+        let home = team_fixture_home("remote-restart-daemon-red");
+        let fleet_path = home.join("fleet.yaml");
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let app_restart_gate = crate::api::app_restart::AppRestartGate::new();
+        let daemon_binary_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attached_run_dir = None;
+        let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded::<rpc::TaskRequest>();
+        let (remote_state_rpc_tx, _remote_state_rpc_rx) =
+            crossbeam_channel::unbounded::<rpc::AgentStateRequest>();
+        let (remote_restart_request_tx, _remote_restart_request_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+        let (remote_restart_worker_tx, _remote_restart_worker_rx) =
+            crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+        let deps = AppDeps {
+            home: &home,
+            fleet_path: &fleet_path,
+            registry: &registry,
+            wakeup_tx: &wakeup_tx,
+            app_restart_gate: &app_restart_gate,
+            daemon_binary_stale: &daemon_binary_stale,
+            telegram_status: TelegramStatus::NotConfigured,
+            attached_run_dir: &attached_run_dir,
+            attached_mode: false,
+            size_debug: false,
+            task_rpc_tx: &task_rpc_tx,
+            remote_state_rpc_tx: &remote_state_rpc_tx,
+            remote_restart_request_tx: &remote_restart_request_tx,
+            remote_restart_worker_tx: &remote_restart_worker_tx,
+        };
+        let old_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 3670);
+        let mut state = AppState::new();
+        let mut pane = test_remote_pane(&mut state.ui.layout, "daemon-agent").expect("test pane");
+        pane.instance_ref = Some(old_ref);
+        state.ui.layout.add_tab(Tab::new("team".into(), pane));
+
+        state.handle_event_stream_outcome(
+            Ok(rpc::EventStreamOutcome::Event(
+                crate::daemon::event_hub::DaemonEvent {
+                    source: "daemon".into(),
+                    sequence: 1,
+                    event: crate::api::ApiEvent::InstanceDeleted {
+                        name: "daemon-agent".into(),
+                        instance_ref: Some(old_ref),
+                    },
+                },
+            )),
+            &deps,
+        );
+
+        // Direct MCP/watchdog restart has no TUI pre-registration. The delete
+        // leg must therefore retain the exact pane until the successor arrives.
+        assert!(
+            state.ui.layout.find_agent_pane("daemon-agent").is_some(),
+            "daemon restart delete must retain the pane for correlated successor replacement"
+        );
+
+        state.handle_event_stream_outcome(
+            Ok(rpc::EventStreamOutcome::Event(
+                crate::daemon::event_hub::DaemonEvent {
+                    source: "daemon".into(),
+                    sequence: 2,
+                    event: crate::api::ApiEvent::InstanceCreated {
+                        name: "daemon-agent".into(),
+                        instance_ref: Some(crate::types::InstanceRef::new(
+                            crate::types::InstanceId::new(),
+                            3671,
+                        )),
+                        restart_id: Some("daemon-restart-3670".into()),
+                        old_instance_ref: Some(old_ref),
+                        layout: crate::api::LayoutHint::Tab,
+                        spawner: None,
+                        target_pane: None,
+                    },
+                },
+            )),
+            &deps,
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
     fn same_name_remote_replacement_cannot_overwrite_retained_pane_3625() {
         let home = team_fixture_home("identity-replacement");
         let mut state = AppState::new();
