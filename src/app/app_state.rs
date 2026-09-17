@@ -1292,6 +1292,9 @@ impl AppState {
                                         }
                                     }
                                 }
+                                self.ui.overlay = Overlay::ReconnectNotice {
+                                    message: format!("Restart '{name}' failed: {error}"),
+                                };
                                 self.remote_restarts.remove(&restart_id);
                                 tracing::warn!(
                                     agent = %name,
@@ -2333,6 +2336,10 @@ mod tests {
 
         assert!(!state.remote_restarts.contains_key("restart-failure-3670"));
         assert!(state.ui.layout.agent_pane_is_disconnected("failed-agent"));
+        assert!(matches!(
+            &state.ui.overlay,
+            Overlay::ReconnectNotice { message } if message.contains("spawn failed")
+        ));
         drop(server_stream);
         std::fs::remove_dir_all(home).ok();
     }
