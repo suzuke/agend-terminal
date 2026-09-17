@@ -643,8 +643,13 @@ pub(super) fn handle_restart_instance_with_runtime(
 
     // Restart intentionally uses no-wait deletion: admission of the kill signal,
     // followed by the replacement spawn, is this path's existing contract.
-    let torn_down =
-        lifecycle::delete_with_runtime_or_legacy(home, name, delete_context.as_ref(), true);
+    let torn_down = lifecycle::delete_with_runtime_or_legacy_for_restart(
+        home,
+        name,
+        delete_context.as_ref(),
+        true,
+        Some(&restart_id),
+    );
     // A fresh restart destroys the session, so every transport receipt keyed
     // to it is unresolvable — the consumer that owed the acknowledgement no
     // longer exists. Left behind, the self-kick watchdog escalates it to every
@@ -702,6 +707,14 @@ pub(super) fn handle_restart_instance_with_runtime(
     let successor_instance_ref = runtime
         .and_then(|runtime| crate::agent::instance_ref_for_name(&runtime.registry, home, name));
     let mut resp = json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned, "tui_handoff": tui_handoff, "restart_id": restart_id, "old_instance_ref": old_instance_ref, "successor_instance_ref": successor_instance_ref});
+    if !spawned {
+        resp["error"] = spawn_result
+            .as_ref()
+            .ok()
+            .and_then(|result| result.get("error"))
+            .cloned()
+            .unwrap_or_else(|| json!("restart spawn failed"));
+    }
     if let Some(warning) = handoff_warning {
         resp["tui_handoff_warning"] = json!(warning);
     }

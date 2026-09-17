@@ -47,6 +47,10 @@ pub enum ApiEvent {
     InstanceDeleted {
         name: String,
         instance_ref: Option<crate::types::InstanceRef>,
+        /// Correlates the delete leg of a daemon-owned restart. Ordinary
+        /// deletions leave this unset for backwards-compatible retirement.
+        #[serde(default)]
+        restart_id: Option<String>,
     },
     TeamCreated {
         name: String,

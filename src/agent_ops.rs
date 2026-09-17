@@ -327,6 +327,19 @@ pub(crate) fn delete_instance_with_exit_status(
     context: &DeleteContext<'_>,
     skip_exit_wait: bool,
 ) -> (DeleteOutcome, bool) {
+    delete_instance_with_exit_status_for_restart(home, name, context, skip_exit_wait, None)
+}
+
+/// Delete with optional internal restart correlation carried on the lifecycle
+/// event. Public deletion callers leave this unset; restart callers provide the
+/// daemon-generated id without exposing it in the MCP schema.
+pub(crate) fn delete_instance_with_exit_status_for_restart(
+    home: &Path,
+    name: &str,
+    context: &DeleteContext<'_>,
+    skip_exit_wait: bool,
+    restart_id: Option<&str>,
+) -> (DeleteOutcome, bool) {
     // The public runtime entry owns the complete deletion fence even for an
     // external agent. External-first resolution must not bypass transport
     // invalidation: a queued job for the same name can otherwise outlive the
@@ -338,7 +351,8 @@ pub(crate) fn delete_instance_with_exit_status(
     // owed a parked operator notice — deleting the log unconditionally would
     // discard it silently.
     let _delete_fence = crate::daemon::lifecycle::DeleteFence::new(home, name, true);
-    let (outcome, observed_exit) = delete_instance_impl(home, name, context, skip_exit_wait);
+    let (outcome, observed_exit) =
+        delete_instance_impl(home, name, context, skip_exit_wait, restart_id);
     if observed_exit {
         if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
             tracing::warn!(
@@ -359,9 +373,19 @@ pub(crate) fn delete_instance_under_guard(
     context: &DeleteContext<'_>,
     skip_exit_wait: bool,
 ) -> (DeleteOutcome, bool) {
+    delete_instance_under_guard_for_restart(home, name, context, skip_exit_wait, None)
+}
+
+pub(crate) fn delete_instance_under_guard_for_restart(
+    home: &Path,
+    name: &str,
+    context: &DeleteContext<'_>,
+    skip_exit_wait: bool,
+    restart_id: Option<&str>,
+) -> (DeleteOutcome, bool) {
     // The full-delete caller already owns DeleteFence; do not nest a second
     // lifecycle or transport guard around this body.
-    delete_instance_impl(home, name, context, skip_exit_wait)
+    delete_instance_impl(home, name, context, skip_exit_wait, restart_id)
 }
 
 fn delete_instance_impl(
@@ -369,6 +393,7 @@ fn delete_instance_impl(
     name: &str,
     context: &DeleteContext<'_>,
     skip_exit_wait: bool,
+    restart_id: Option<&str>,
 ) -> (DeleteOutcome, bool) {
     // Match the API adapter's external-first behavior.  External agents have
     // no managed registry/config entry and therefore need no notifier event.
@@ -394,6 +419,7 @@ fn delete_instance_impl(
         notifier.notify(crate::api::ApiEvent::InstanceDeleted {
             name: name.to_string(),
             instance_ref,
+            restart_id: restart_id.map(str::to_string),
         });
     }
     (DeleteOutcome::Managed, observed_exit)

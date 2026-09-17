@@ -45,9 +45,29 @@ pub(crate) fn delete_with_runtime_or_legacy(
     delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
     skip_exit_wait: bool,
 ) -> Result<(), String> {
+    delete_with_runtime_or_legacy_for_restart(home, name, delete_context, skip_exit_wait, None)
+}
+
+pub(crate) fn delete_with_runtime_or_legacy_for_restart(
+    home: &Path,
+    name: &str,
+    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+    skip_exit_wait: bool,
+    restart_id: Option<&str>,
+) -> Result<(), String> {
     if let Some(context) = delete_context {
-        let (_, observed_exit) =
-            crate::agent_ops::delete_instance_under_guard(home, name, context, skip_exit_wait);
+        let (_, observed_exit) = match restart_id {
+            Some(restart_id) => crate::agent_ops::delete_instance_under_guard_for_restart(
+                home,
+                name,
+                context,
+                skip_exit_wait,
+                Some(restart_id),
+            ),
+            None => {
+                crate::agent_ops::delete_instance_under_guard(home, name, context, skip_exit_wait)
+            }
+        };
         if !observed_exit {
             return Err("child exit was not confirmed; durable teardown refused".to_string());
         }
@@ -59,6 +79,9 @@ pub(crate) fn delete_with_runtime_or_legacy(
         let mut params = json!({"name": name});
         if skip_exit_wait {
             params["no_wait"] = json!(true);
+        }
+        if let Some(restart_id) = restart_id {
+            params["restart_id"] = json!(restart_id);
         }
         let response = crate::api::call(
             home,

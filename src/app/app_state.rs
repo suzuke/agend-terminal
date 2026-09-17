@@ -127,10 +127,12 @@ struct RemoteRestartPending {
     request: commands::RemoteRestartRequest,
     successor_instance_ref: Option<crate::types::InstanceRef>,
     conflicted: bool,
+    provisional: bool,
     created_at: std::time::Instant,
 }
 
 const REMOTE_RESTART_CAPACITY: usize = 16;
+const REMOTE_RESTART_PROVISIONAL_CAPACITY: usize = 4;
 const REMOTE_RESTART_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// #2453: root owner of `run_app`'s durable render-loop state. The only
@@ -1222,14 +1224,26 @@ impl AppState {
                 if !self.event_resync_required {
                     match event.event {
                         crate::api::ApiEvent::InstanceDeleted {
+                            name,
                             instance_ref: Some(instance_ref),
+                            restart_id,
                             ..
                         } => {
-                            let retained_for_restart =
-                                self.remote_restarts.values_mut().find(|pending| {
-                                    pending.request.old_instance_ref == Some(instance_ref)
+                            let retained_for_restart = restart_id
+                                .as_deref()
+                                .map(|restart_id| {
+                                    self.register_provisional_remote_restart(
+                                        &name,
+                                        restart_id,
+                                        instance_ref,
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    self.remote_restarts.values_mut().any(|pending| {
+                                        pending.request.old_instance_ref == Some(instance_ref)
+                                    })
                                 });
-                            if retained_for_restart.is_none()
+                            if !retained_for_restart
                                 && self
                                     .ui
                                     .layout
@@ -1279,6 +1293,92 @@ impl AppState {
         self.dirty = true;
     }
 
+    fn register_provisional_remote_restart(
+        &mut self,
+        name: &str,
+        restart_id: &str,
+        old_instance_ref: crate::types::InstanceRef,
+    ) -> bool {
+        self.reap_remote_restart_state();
+        if let Some(existing) = self.remote_restarts.get_mut(restart_id) {
+            if existing.request.name == name
+                && existing.request.old_instance_ref == Some(old_instance_ref)
+            {
+                return true;
+            }
+            existing.conflicted = true;
+            tracing::warn!(
+                restart_id,
+                agent = name,
+                "conflicting provisional remote restart delete ignored"
+            );
+            return false;
+        }
+        if self.remote_restarts.values().any(|pending| {
+            pending.request.old_instance_ref == Some(old_instance_ref)
+                && pending.request.name == name
+        }) {
+            tracing::warn!(
+                restart_id,
+                agent = name,
+                "duplicate remote restart predecessor has a different correlation id"
+            );
+            return false;
+        }
+        let provisional_count = self
+            .remote_restarts
+            .values()
+            .filter(|pending| pending.provisional)
+            .count();
+        if provisional_count >= REMOTE_RESTART_PROVISIONAL_CAPACITY {
+            tracing::warn!(
+                restart_id,
+                agent = name,
+                "provisional remote restart quota is full"
+            );
+            return false;
+        }
+        let Some((tab_index, pane_id)) =
+            self.ui
+                .layout
+                .tabs
+                .iter()
+                .enumerate()
+                .find_map(|(tab_index, tab)| {
+                    tab.root().pane_ids().into_iter().find_map(|pane_id| {
+                        tab.root()
+                            .find_pane(pane_id)
+                            .filter(|pane| pane.instance_ref == Some(old_instance_ref))
+                            .map(|_| (tab_index, pane_id))
+                    })
+                })
+        else {
+            tracing::warn!(
+                restart_id,
+                agent = name,
+                "remote restart predecessor pane is unavailable"
+            );
+            return false;
+        };
+        self.remote_restarts.insert(
+            restart_id.to_string(),
+            RemoteRestartPending {
+                request: commands::RemoteRestartRequest {
+                    restart_id: restart_id.to_string(),
+                    old_instance_ref: Some(old_instance_ref),
+                    tab_index,
+                    pane_id,
+                    name: name.to_string(),
+                },
+                successor_instance_ref: None,
+                conflicted: false,
+                provisional: true,
+                created_at: std::time::Instant::now(),
+            },
+        );
+        true
+    }
+
     fn handle_event_stream_disconnected(&mut self, error: String, deps: &AppDeps<'_>) {
         if self.event_stream_disconnected {
             return;
@@ -1315,7 +1415,12 @@ impl AppState {
             }
             return;
         }
-        if self.remote_restarts.len() >= REMOTE_RESTART_CAPACITY {
+        let operator_count = self
+            .remote_restarts
+            .values()
+            .filter(|pending| !pending.provisional)
+            .count();
+        if operator_count >= REMOTE_RESTART_CAPACITY {
             tracing::warn!(restart_id = %request.restart_id, "remote restart registry is full");
             return;
         }
@@ -1326,6 +1431,7 @@ impl AppState {
                 request: request.clone(),
                 successor_instance_ref: None,
                 conflicted: false,
+                provisional: false,
                 created_at: std::time::Instant::now(),
             },
         );
@@ -1810,6 +1916,7 @@ mod tests {
                 request,
                 successor_instance_ref: None,
                 conflicted: false,
+                provisional: false,
                 created_at: std::time::Instant::now()
                     .checked_sub(REMOTE_RESTART_PENDING_TTL + std::time::Duration::from_secs(1))
                     .expect("test instant remains representable"),
@@ -1869,6 +1976,7 @@ mod tests {
                     event: crate::api::ApiEvent::InstanceDeleted {
                         name: "agent".into(),
                         instance_ref: Some(old_instance_ref),
+                        restart_id: None,
                     },
                 },
             )),
@@ -1980,6 +2088,7 @@ mod tests {
                     event: crate::api::ApiEvent::InstanceDeleted {
                         name: "agent".into(),
                         instance_ref: Some(old_instance_ref),
+                        restart_id: None,
                     },
                 },
             )),
@@ -1996,7 +2105,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_restart_delete_then_create_retains_exact_pane_3670_red() {
+    fn daemon_restart_delete_then_create_retains_exact_pane_3670() {
         let home = team_fixture_home("remote-restart-daemon-red");
         let fleet_path = home.join("fleet.yaml");
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -2028,6 +2137,7 @@ mod tests {
             remote_restart_worker_tx: &remote_restart_worker_tx,
         };
         let old_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 3670);
+        let successor_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 3671);
         let mut state = AppState::new();
         let mut pane = test_remote_pane(&mut state.ui.layout, "daemon-agent").expect("test pane");
         pane.instance_ref = Some(old_ref);
@@ -2041,6 +2151,7 @@ mod tests {
                     event: crate::api::ApiEvent::InstanceDeleted {
                         name: "daemon-agent".into(),
                         instance_ref: Some(old_ref),
+                        restart_id: Some("daemon-restart-3670".into()),
                     },
                 },
             )),
@@ -2061,10 +2172,7 @@ mod tests {
                     sequence: 2,
                     event: crate::api::ApiEvent::InstanceCreated {
                         name: "daemon-agent".into(),
-                        instance_ref: Some(crate::types::InstanceRef::new(
-                            crate::types::InstanceId::new(),
-                            3671,
-                        )),
+                        instance_ref: Some(successor_ref),
                         restart_id: Some("daemon-restart-3670".into()),
                         old_instance_ref: Some(old_ref),
                         layout: crate::api::LayoutHint::Tab,
@@ -2075,7 +2183,94 @@ mod tests {
             )),
             &deps,
         );
+        let mut successor =
+            test_remote_pane(&mut state.ui.layout, "daemon-agent").expect("successor pane");
+        successor.instance_ref = Some(successor_ref);
+        assert!(
+            state.place_correlated_remote_pane(successor).is_none(),
+            "correlated successor must replace the retained pane in place"
+        );
+        assert_eq!(state.ui.layout.tabs.len(), 1);
+        assert_eq!(state.ui.layout.tabs[0].root().pane_count(), 1);
+        assert_eq!(state.ui.layout.tabs[0].root().pane_ids(), vec![0]);
         std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn provisional_restart_quota_is_bounded_and_expiry_retains_pane_3670() {
+        let mut state = AppState::new();
+        let mut refs = Vec::new();
+        for index in 0..(REMOTE_RESTART_PROVISIONAL_CAPACITY + 1) {
+            let name = format!("provisional-{index}");
+            let old_ref =
+                crate::types::InstanceRef::new(crate::types::InstanceId::new(), (index + 1) as u64);
+            let mut pane = test_remote_pane(&mut state.ui.layout, &name).expect("test pane");
+            pane.instance_ref = Some(old_ref);
+            state.ui.layout.add_tab(Tab::new(name.clone(), pane));
+            refs.push((name, old_ref));
+        }
+        for (index, (name, old_ref)) in refs.iter().enumerate() {
+            assert_eq!(
+                state.register_provisional_remote_restart(
+                    name,
+                    &format!("provisional-restart-{index}"),
+                    *old_ref,
+                ),
+                index < REMOTE_RESTART_PROVISIONAL_CAPACITY
+            );
+        }
+        assert_eq!(
+            state
+                .remote_restarts
+                .values()
+                .filter(|pending| pending.provisional)
+                .count(),
+            REMOTE_RESTART_PROVISIONAL_CAPACITY
+        );
+        state
+            .remote_restarts
+            .values_mut()
+            .next()
+            .expect("provisional entry")
+            .created_at = std::time::Instant::now()
+            .checked_sub(REMOTE_RESTART_PENDING_TTL + std::time::Duration::from_secs(1))
+            .expect("instant arithmetic");
+        state.reap_remote_restart_state();
+        assert!(state.remote_restarts.len() < REMOTE_RESTART_PROVISIONAL_CAPACITY);
+        assert!(
+            state.ui.layout.find_agent_pane("provisional-0").is_some(),
+            "provisional expiry must retain the stale pane for disconnected rendering"
+        );
+    }
+
+    #[test]
+    fn provisional_restart_duplicate_is_idempotent_and_conflict_fails_closed_3670() {
+        let mut state = AppState::new();
+        let old_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+        let mut pane = test_remote_pane(&mut state.ui.layout, "provisional-agent").expect("pane");
+        pane.instance_ref = Some(old_ref);
+        state.ui.layout.add_tab(Tab::new("team".into(), pane));
+
+        assert!(state.register_provisional_remote_restart(
+            "provisional-agent",
+            "same-restart",
+            old_ref
+        ));
+        assert!(state.register_provisional_remote_restart(
+            "provisional-agent",
+            "same-restart",
+            old_ref
+        ));
+        assert!(!state.register_provisional_remote_restart(
+            "other-agent",
+            "same-restart",
+            crate::types::InstanceRef::new(crate::types::InstanceId::new(), 2)
+        ));
+        assert_eq!(state.remote_restarts.len(), 1);
+        assert!(
+            state.remote_restarts["same-restart"].conflicted,
+            "conflicting identity must be marked unusable"
+        );
     }
 
     #[test]

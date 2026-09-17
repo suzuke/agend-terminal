@@ -75,17 +75,21 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
         return json!({"ok": false, "error": e});
     }
     let skip_exit_wait = params["no_wait"].as_bool().unwrap_or(false);
+    let restart_id = params["restart_id"]
+        .as_str()
+        .filter(|value| !value.is_empty());
     let delete_context = crate::agent_ops::DeleteContext {
         registry: ctx.registry,
         configs: ctx.configs,
         externals: ctx.externals,
         notifier: ctx.notifier,
     };
-    let (_, observed_exit) = crate::agent_ops::delete_instance_with_exit_status(
+    let (_, observed_exit) = crate::agent_ops::delete_instance_with_exit_status_for_restart(
         ctx.home,
         name,
         &delete_context,
         skip_exit_wait,
+        restart_id,
     );
     if observed_exit {
         json!({"ok": true})
