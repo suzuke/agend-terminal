@@ -10,6 +10,7 @@ pub(crate) mod lifecycle;
 mod restart_prep;
 mod topic;
 pub(super) use instance_layout::resolve_team_layout;
+pub(crate) use restart_prep::restart_instance_autonomic;
 use restart_prep::{await_unsent_draft_or_grace, restart_spawn_params};
 #[cfg(test)]
 use restart_prep::{restart_draft_gate, DraftGate, RESTART_DRAFT_GRACE};
@@ -25,8 +26,6 @@ pub(crate) mod spawn;
 /// 64 is already far beyond any real team size; reject above it at the MCP
 /// boundary, before the allocation and the CREATE_TEAM RPC.
 const MAX_TEAM_COUNT: usize = 64;
-// Restart/TUI 交接 helper 住 restart_prep（mod.rs 受 750-LOC bound 約束）。
-
 pub(super) fn handle_create_instance(
     home: &Path,
     args: &Value,
@@ -743,43 +742,6 @@ pub(super) fn handle_restart_instance_with_runtime(
         resp["resumed_thread"] = json!(true);
     }
     resp
-}
-
-/// #t-777-3: daemon-autonomic self-heal entry — the respawn-stuck watchdog's
-/// narrow path to a **Fresh** restart. Wraps `handle_restart_instance(mode=fresh)`,
-/// which round-trips the PROVEN direct `DELETE`(no_wait)+`SPAWN` api::calls →
-/// `ApiEvent::InstanceCreated` → app pane Fresh respawn (the same path the
-/// operator's manual `restart_instance fresh` takes, working in the live
-/// app-mode daemon where the crash_tx→respawn machinery is inert).
-///
-/// **Gate-exempt BY CONSTRUCTION** (no new operator-gate surface): the inner
-/// `DELETE`/`SPAWN` are DIRECT api methods — operator-transport, which
-/// `operator_gate::check_operation_allowed` returns `Ok` for before `classify`
-/// is consulted. Reached ONLY from the per-tick hang-detection watchdog (never
-/// agent-invocable), so the narrowness is enforced by the trigger, exactly like
-/// crash-respawn / hang-recovery (`operator_gate` module scope note). Returns
-/// whether the SPAWN succeeded so the caller can escalate a failed recovery.
-pub(crate) fn restart_instance_autonomic(
-    home: &Path,
-    name: &str,
-    reason: &str,
-    old_instance_ref: Option<crate::types::InstanceRef>,
-) -> bool {
-    let restart_id = crate::types::InstanceId::new().full();
-    let result = handle_restart_instance(
-        home,
-        &json!({
-            "name": name,
-            "mode": "fresh",
-            "reason": reason,
-            "restart_id": restart_id,
-            "old_instance_ref": old_instance_ref,
-        }),
-    );
-    result
-        .get("spawned")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
