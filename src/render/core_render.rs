@@ -1363,7 +1363,7 @@ mod tests {
         let segments = pane_title_segments(&pane, Style::default(), Some(AgentState::Idle), false);
         let joined: String = segments.iter().map(|(text, _)| text.as_str()).collect();
         assert!(
-            joined.contains("[RESTART FAILED]") && joined.contains("spawn failed"),
+            joined.contains("[RESTART FAILED:") && joined.contains("spawn failed"),
             "pane title must expose the correlated restart failure: {joined}"
         );
     }
