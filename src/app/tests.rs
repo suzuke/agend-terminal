@@ -383,6 +383,11 @@ fn run_core_pipeline_matches_canonical_handler_set_3389() {
                 "auto_release",
                 "dispatch_idle",
                 "retention",
+                // #3666: busy-park redrive scan (registered between Retention
+                // and Reclaim — same watch-don't-strand family as
+                // DispatchIdle; lifecycle impact reviewed: read-only scan plus
+                // idle-gated redelivery, panic-isolated by the outer loop).
+                "busy_park_redrive",
                 "reclaim_usage_limit",
             ],
             "run_core production handler set changed; update this invariant only after reviewing the lifecycle impact"
