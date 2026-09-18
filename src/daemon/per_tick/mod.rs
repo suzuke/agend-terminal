@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 pub(crate) mod assignment_reconcile;
 pub(crate) mod backend_exit_detection;
+pub(crate) mod busy_park_redrive;
 pub(crate) mod canonical_heartbeat;
 pub(crate) mod check_schedules;
 pub(crate) mod checkout_txn_recover;
@@ -84,6 +85,7 @@ pub(crate) mod worktree_registry_sweep;
 
 pub(crate) use assignment_reconcile::AssignmentReconcileHandler;
 pub(crate) use backend_exit_detection::BackendExitDetectionHandler;
+pub(crate) use busy_park_redrive::BusyParkRedriveHandler;
 pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use ci_watch_poll::CiWatchPollHandler;
 pub(crate) use claude_self_kick::ClaudeSelfKickHandler;
@@ -553,6 +555,11 @@ pub(crate) fn build_default_handlers(
         Box::new(AutoReleaseHandler::new()),
         Box::new(DispatchIdleHandler::new()),
         Box::new(RetentionHandler::new()),
+        // #3666: redrive busy-parked task dispatches on the target's idle
+        // transition (~60s cadence, the dispatch-idle L1 scan rate). Placed
+        // next to DispatchIdleHandler (same watch-don't-strand concern); an
+        // empty park store costs one read_dir per scan.
+        Box::new(BusyParkRedriveHandler::new(6)),
         // #2127 Phase 1: reclaim board tasks from agents stuck in a non-recoverable
         // usage_limit window (operator decision d-…085112: Phase 1, grace=10min).
         // Every 30 ticks (~5min). Fires ONLY for UsageLimit/QuotaExceeded with a

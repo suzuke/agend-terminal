@@ -9,6 +9,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ### Fixed
 
+- **Busy-gated task dispatches park and redrive instead of stranding silently (#3666)** — a dispatch refused by the busy gate is now parked durably (`parked-dispatches/`, attempt-capped like the transport-level park) and auto-redelivered with the idle-hint wake when the target goes idle, instead of vanishing with no tracking. The refusal enters `dispatch_tracking` (stuck-sweep visible) and the wait-for-reply watchdog arms at delivery; `force=true` and the gate's no-interrupt semantics are unchanged.
 - **Busy-window opencode deliveries are parked and redriven instead of dropped** — an ordinary delivery that collides with an in-flight turn is now recorded as durable `Queued` and redriven FIFO when the turn completes (attempt-capped, fail-closed), instead of terminal `Failed` with no retry.
 
 ## [0.12.2] — 2026-08-17

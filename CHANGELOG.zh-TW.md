@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **被 busy gate 擋下的 task dispatch 改為暫存後重送，不再靜默丟失（#3666）** — 被拒絕的 dispatch 現在會持久暫存（`parked-dispatches/`，與 transport 層 park 同樣有 attempt 上限），並在 target 轉為 idle 時自動投遞（含 idle-hint 喚醒），不再無追蹤消失。拒絕會進入 `dispatch_tracking`（stuck-sweep 可見），wait-for-reply watchdog 自投遞時起算；`force=true` 與 gate 的不中斷語義不變。
 - **Busy window 的 opencode 投遞改為暫存後重送，不再丟棄** — 與 in-flight turn 碰撞的 ordinary delivery 現在會記為 durable `Queued`，並在 turn 結束時按 FIFO 重送（attempt 上限、fail-closed），不再是終端 `Failed` 且無重試。
 
 ## [0.12.2] — 2026-08-17

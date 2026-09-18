@@ -14,6 +14,11 @@ mod selector_gate;
 mod sha_gate;
 mod triaged_gate;
 
+// #3666: busy-parked task dispatches + idle redrive (park + scan live here;
+// the park call site is `comms_delegate::handle_delegate_task`, the redrive
+// tick is `daemon::per_tick::busy_park_redrive`).
+pub(crate) mod busy_park;
+
 // Report-path gates (handle_report_result).
 pub(crate) use evidence_gate::detect_verdict;
 pub(super) use evidence_gate::{check_evidence_gate, cross_check_and_log};

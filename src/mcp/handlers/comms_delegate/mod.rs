@@ -104,20 +104,12 @@ struct ComposedDelegate {
     plan_ack_required: u64,
 }
 
-/// Phase 3 — build inject message + force_meta from pre-check scalars.
-fn compose_delegate_message(
-    task: &str,
-    args: &Value,
-    checks: &DispatchPreChecks,
-) -> ComposedDelegate {
-    let force = checks.force;
-    let force_reason = checks.force_reason.as_deref();
+/// The non-forced `[delegate_task]` body: head line + success_criteria /
+/// context / branch blocks. Shared by the live compose below and the #3666
+/// busy-park snapshot (the park stores exactly this; the redrive appends the
+/// ` (task id: …)` suffix just as the live path does post-create).
+fn delegate_text(task: &str, args: &Value) -> String {
     let mut msg = format!("[delegate_task] {task}");
-    if force {
-        if let Some(r) = force_reason {
-            msg.push_str(&format!("\n\n⚠️ FORCED (reason: {r})"));
-        }
-    }
     if let Some(criteria) = args["success_criteria"].as_str() {
         msg.push_str(&format!("\n\nSuccess criteria: {criteria}"));
     }
@@ -126,6 +118,27 @@ fn compose_delegate_message(
     }
     if let Some(branch) = args["branch"].as_str() {
         msg.push_str(&format!("\n\nBranch: {branch}"));
+    }
+    msg
+}
+
+/// Phase 3 — build inject message + force_meta from pre-check scalars.
+fn compose_delegate_message(
+    task: &str,
+    args: &Value,
+    checks: &DispatchPreChecks,
+) -> ComposedDelegate {
+    let force = checks.force;
+    let force_reason = checks.force_reason.as_deref();
+    let mut msg = delegate_text(task, args);
+    if force {
+        if let Some(r) = force_reason {
+            // The force banner historically sits directly after the head line
+            // (before success_criteria) — insert it there so forced bodies stay
+            // byte-identical to the pre-extraction compose.
+            let head_len = format!("[delegate_task] {task}").len();
+            msg.insert_str(head_len, &format!("\n\n⚠️ FORCED (reason: {r})"));
+        }
     }
     let force_meta_json = if force {
         Some(json!({
@@ -451,7 +464,19 @@ pub(crate) fn handle_delegate_task(
     // Phase 2 — pre-send gates (busy / branch-dedup / enrich / second-reviewer / …)
     let checks = match comms_gates::run_dispatch_pre_checks(home, sender, args, target, task) {
         Ok(c) => c,
-        Err(rejection) => return rejection,
+        Err(rejection) => {
+            // #3666: a busy-gate refusal parks the intent for auto-redrive on
+            // the target's idle transition instead of dropping it silently. The
+            // gate itself still rejects (no interrupt of the busy agent);
+            // force/marker/dedup rejections are excluded by `should_park`.
+            if comms_gates::busy_park::should_park(args, &rejection) {
+                let msg_text = delegate_text(task, args);
+                return comms_gates::busy_park::park_busy_dispatch(
+                    home, sender, target, task, &msg_text, args, &rejection,
+                );
+            }
+            return rejection;
+        }
     };
 
     let composed = compose_delegate_message(task, args, &checks);
