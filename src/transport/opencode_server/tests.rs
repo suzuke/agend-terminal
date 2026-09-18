@@ -1174,7 +1174,8 @@ fn redrive_locator(port: u16) -> SessionLocator {
 #[test]
 fn busy_parked_delivery_redrives_to_completed_after_idle() {
     let (port, server, _prompt_rx) = redrive_capture_server(2);
-    let home = std::env::temp_dir().join(format!("agend-opencode-redrive-{}", Uuid::new_v4()));
+    let home =
+        std::env::temp_dir().join(format!("agend-opencode-redrive-single-{}", Uuid::new_v4()));
     let locator = redrive_locator(port);
     let mut adapter = OpenCodeNativeShared::new(&home, "agent");
     adapter
