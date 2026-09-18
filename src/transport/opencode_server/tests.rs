@@ -957,7 +957,8 @@ fn busy_collision_parks_for_redrive_while_interrupt_stays_terminal() {
 
     // A busy ordinary delivery parks durably Queued for redrive — it is NOT
     // a terminal failure.
-    let envelope = DeliveryEnvelope::new("agent", locator.clone(), DeliveryKind::Prompt, "next", None);
+    let envelope =
+        DeliveryEnvelope::new("agent", locator.clone(), DeliveryKind::Prompt, "next", None);
     let delivery_id = envelope.delivery_id;
     let error = adapter
         .deliver_blocking(envelope)
@@ -977,8 +978,13 @@ fn busy_collision_parks_for_redrive_while_interrupt_stays_terminal() {
     assert_eq!(adapter.parked[0].attempts, 1);
 
     // Steer/interrupt rejection stays terminal and never parks.
-    let envelope =
-        DeliveryEnvelope::new("agent", locator.clone(), DeliveryKind::Interrupt, "next", None);
+    let envelope = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Interrupt,
+        "next",
+        None,
+    );
     let delivery_id = envelope.delivery_id;
     let error = adapter
         .deliver_blocking(envelope)
@@ -1017,7 +1023,9 @@ fn parked_redrive_attempt_cap_fails_closed() {
         None,
     );
     adapter.in_flight = Some(in_flight.delivery_id);
-    adapter.pending.insert(in_flight.delivery_id, in_flight.clone());
+    adapter
+        .pending
+        .insert(in_flight.delivery_id, in_flight.clone());
     let in_flight_id = in_flight.delivery_id;
 
     // Same delivery id colliding while busy parks up to the cap, then fails
@@ -1206,22 +1214,23 @@ fn busy_parked_delivery_redrives_to_completed_after_idle() {
 
     // Idle completion re-drives the parked delivery through the normal
     // submit path: Queued -> ProtocolAccepted with a fresh wire identity.
-    let event = adapter.complete(first_id, "session.idle").expect("complete");
+    let event = adapter
+        .complete(first_id, "session.idle")
+        .expect("complete");
     assert!(matches!(
         event,
         BackendEvent::Completed { delivery_id: id, .. } if id == first_id
     ));
     assert_eq!(adapter.in_flight, Some(second_id));
     assert!(adapter.parked.is_empty());
-    let receipt = store
-        .latest(second_id)
-        .expect("latest")
-        .expect("receipt");
+    let receipt = store.latest(second_id).expect("latest").expect("receipt");
     assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
     assert!(receipt.protocol_request_id.is_some());
 
     // The re-driven turn completes normally.
-    let event = adapter.complete(second_id, "session.idle").expect("complete");
+    let event = adapter
+        .complete(second_id, "session.idle")
+        .expect("complete");
     assert!(matches!(
         event,
         BackendEvent::Completed { delivery_id: id, .. } if id == second_id
@@ -1251,8 +1260,7 @@ fn busy_parked_delivery_redrives_to_completed_after_idle() {
 #[test]
 fn parked_deliveries_redrive_fifo() {
     let (port, server, _prompt_rx) = redrive_capture_server(3);
-    let home =
-        std::env::temp_dir().join(format!("agend-opencode-redrive-fifo-{}", Uuid::new_v4()));
+    let home = std::env::temp_dir().join(format!("agend-opencode-redrive-fifo-{}", Uuid::new_v4()));
     let locator = redrive_locator(port);
     let mut adapter = OpenCodeNativeShared::new(&home, "agent");
     adapter
@@ -1290,17 +1298,23 @@ fn parked_deliveries_redrive_fifo() {
 
     // First completion re-drives the head of the queue only; the session is
     // busy again so the remainder stays parked in order.
-    adapter.complete(first_id, "session.idle").expect("complete");
+    adapter
+        .complete(first_id, "session.idle")
+        .expect("complete");
     assert_eq!(adapter.in_flight, Some(second_id));
     assert_eq!(adapter.parked.len(), 1);
     assert_eq!(adapter.parked[0].envelope.delivery_id, third_id);
 
     // Second completion re-drives the next parked delivery.
-    adapter.complete(second_id, "session.idle").expect("complete");
+    adapter
+        .complete(second_id, "session.idle")
+        .expect("complete");
     assert_eq!(adapter.in_flight, Some(third_id));
     assert!(adapter.parked.is_empty());
 
-    adapter.complete(third_id, "session.idle").expect("complete");
+    adapter
+        .complete(third_id, "session.idle")
+        .expect("complete");
     assert_eq!(adapter.in_flight, None);
     let store = ReceiptStore::for_instance(&home, "agent").expect("store");
     for id in [first_id, second_id, third_id] {
