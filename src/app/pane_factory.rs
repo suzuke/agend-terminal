@@ -297,7 +297,7 @@ fn attach_agent_to_pane(
     // effects, same order. Splitting here is what lets the deferred path run
     // `spawn_and_subscribe` on a background worker (touches only the shareable
     // registry) while the render thread runs `apply_attachment` (pane mutation).
-    let (instance_id, instance_ref, rx, dump) = spawn_and_subscribe(
+    let (instance_id, instance_ref, sub, dump) = spawn_and_subscribe(
         registry,
         home,
         &name,
@@ -312,7 +312,15 @@ fn attach_agent_to_pane(
         identity,
         declared_backend,
     )?;
-    apply_attachment(pane, instance_id, instance_ref, rx, dump, fwd_tx, wakeup_tx);
+    apply_attachment(
+        pane,
+        instance_id,
+        instance_ref,
+        sub,
+        dump,
+        fwd_tx,
+        wakeup_tx,
+    );
     Ok(())
 }
 
@@ -341,7 +349,7 @@ fn spawn_and_subscribe(
 ) -> Result<(
     crate::types::InstanceId,
     Option<crate::types::InstanceRef>,
-    crossbeam_channel::Receiver<Vec<u8>>,
+    agent::Subscription,
     Vec<u8>,
 )> {
     let effective_backend = declared_backend
@@ -446,7 +454,7 @@ fn spawn_and_subscribe(
     )?;
 
     // Subscribe to the agent's output
-    let (rx, dump) = {
+    let (sub, dump) = {
         let reg = agent::lock_registry(registry);
         let handle = reg
             .get(&instance_id)
@@ -457,7 +465,7 @@ fn spawn_and_subscribe(
     let instance_ref = matches!(identity, SpawnIdentity::Managed)
         .then(|| agent::instance_ref_for_id(registry, instance_id))
         .flatten();
-    Ok((instance_id, instance_ref, rx, dump))
+    Ok((instance_id, instance_ref, sub, dump))
 }
 
 /// Cheap, **main-thread** half of an attach (#render-first phase-(b)): apply the
@@ -478,7 +486,7 @@ fn apply_attachment(
     pane: &mut Pane,
     instance_id: crate::types::InstanceId,
     instance_ref: Option<crate::types::InstanceRef>,
-    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    sub: agent::Subscription,
     dump: Vec<u8>,
     fwd_tx: crossbeam_channel::Sender<Vec<u8>>,
     wakeup_tx: &crossbeam_channel::Sender<usize>,
@@ -521,18 +529,24 @@ fn apply_attachment(
     // agent is quiet). H1: pane drop triggers forwarder exit on all three paths.
     std::thread::Builder::new()
         .name(format!("{name}_fwd"))
-        .spawn(move || loop {
-            crossbeam_channel::select! {
-                recv(rx) -> msg => match msg {
-                    Ok(data) => {
-                        if fwd_tx.send(data).is_err() {
-                            break; // H1: pane closed, fwd_rx dropped
+        .spawn(move || {
+            // #3682: hold the tap's liveness token for the forwarder's whole
+            // lifetime, so a later subscribe/broadcast only reclaims this entry
+            // once the pane (and thus this consumer) is really gone.
+            let agent::Subscription { rx, live: _live } = sub;
+            loop {
+                crossbeam_channel::select! {
+                    recv(rx) -> msg => match msg {
+                        Ok(data) => {
+                            if fwd_tx.send(data).is_err() {
+                                break; // H1: pane closed, fwd_rx dropped
+                            }
+                            let _ = tx.send(pane_id);
                         }
-                        let _ = tx.send(pane_id);
-                    }
-                    Err(_) => break, // agent removed, broadcast sender dropped
-                },
-                recv(fwd_cancel_rx) -> _ => break, // #forwarder-reap: pane closed
+                        Err(_) => break, // agent removed, broadcast sender dropped
+                    },
+                    recv(fwd_cancel_rx) -> _ => break, // #forwarder-reap: pane closed
+                }
             }
         })
         .ok();
@@ -628,7 +642,7 @@ pub(super) enum AttachOutcome {
         instance_ref: Option<crate::types::InstanceRef>,
         /// True only for a direct/local shell with no fleet.yaml identity.
         unmanaged: bool,
-        rx: crossbeam_channel::Receiver<Vec<u8>>,
+        sub: agent::Subscription,
         dump: Vec<u8>,
         /// The real spawn cwd (worktree-resolved for agents) → update the pane.
         work_dir: std::path::PathBuf,
@@ -794,7 +808,7 @@ fn finish_attach(
     pane_id: usize,
     instance_id: crate::types::InstanceId,
     instance_ref: Option<crate::types::InstanceRef>,
-    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    sub: agent::Subscription,
     dump: Vec<u8>,
     work_dir: std::path::PathBuf,
     name: String,
@@ -813,7 +827,7 @@ fn finish_attach(
         instance_id,
         instance_ref,
         unmanaged,
-        rx,
+        sub,
         dump,
         work_dir,
     }
@@ -911,7 +925,7 @@ pub(super) fn run_attach(
                 SpawnIdentity::Managed,
                 Some(&resolved.backend),
             ) {
-                Ok((instance_id, instance_ref, rx, dump)) => {
+                Ok((instance_id, instance_ref, sub, dump)) => {
                     // Overwrite basic instructions with the fleet-aware version
                     // (same ordering as the synchronous create_pane_from_resolved).
                     let team_ctx = team_record
@@ -947,7 +961,7 @@ pub(super) fn run_attach(
                         pane_id,
                         instance_id,
                         instance_ref,
-                        rx,
+                        sub,
                         dump,
                         work_dir,
                         deduped_name,
@@ -988,12 +1002,12 @@ pub(super) fn run_attach(
             SpawnIdentity::UnmanagedLocalShell,
             None,
         ) {
-            Ok((instance_id, instance_ref, rx, dump)) => finish_attach(
+            Ok((instance_id, instance_ref, sub, dump)) => finish_attach(
                 registry,
                 pane_id,
                 instance_id,
                 instance_ref,
-                rx,
+                sub,
                 dump,
                 work_dir,
                 name,
@@ -1024,13 +1038,21 @@ pub(super) fn apply_attach_outcome(
         AttachOutcome::Ready {
             instance_id,
             instance_ref,
-            rx,
+            sub,
             dump,
             work_dir,
             ..
         } => {
             pane.working_dir = Some(work_dir);
-            apply_attachment(pane, instance_id, instance_ref, rx, dump, fwd_tx, wakeup_tx);
+            apply_attachment(
+                pane,
+                instance_id,
+                instance_ref,
+                sub,
+                dump,
+                fwd_tx,
+                wakeup_tx,
+            );
             // #t-98760-8 (#2343 deferred-attach regression): snap the just-
             // registered PTY to the pane's CURRENT (already render-corrected) vterm
             // size. On a restored SPLIT layout the render loop corrected this
@@ -1637,7 +1659,7 @@ mod tests {
                 instance_id: crate::types::InstanceId::default(),
                 instance_ref: None,
                 unmanaged: true,
-                rx: sub_rx,
+                sub: crate::agent::Subscription::detached(sub_rx),
                 dump: b"DUMP-XYZ".to_vec(),
                 work_dir: home.clone(),
             },
@@ -1709,7 +1731,7 @@ mod tests {
                 instance_id: crate::types::InstanceId::default(),
                 instance_ref: None,
                 unmanaged: true,
-                rx: sub_rx,
+                sub: crate::agent::Subscription::detached(sub_rx),
                 dump: Vec::new(),
                 work_dir: home.clone(),
             },
@@ -1785,7 +1807,7 @@ mod tests {
                 instance_id: crate::types::InstanceId::default(),
                 instance_ref: None,
                 unmanaged: true,
-                rx: sub_rx,
+                sub: crate::agent::Subscription::detached(sub_rx),
                 dump: Vec::new(),
                 work_dir: home.clone(),
             },
@@ -1926,7 +1948,7 @@ mod tests {
                 instance_id,
                 instance_ref: None,
                 unmanaged: true,
-                rx: sub_rx,
+                sub: crate::agent::Subscription::detached(sub_rx),
                 dump: Vec::new(),
                 work_dir: home.clone(),
             },

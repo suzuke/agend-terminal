@@ -40,10 +40,17 @@ use typed_inject::{observe_post_submit, readback_confirm_typed};
 
 pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
+/// #3682: PTY-output broadcast fan-out + subscriber liveness plumbing. Extracted
+/// to keep this grandfathered file from growing; re-exported so callers/tests see
+/// the same names as before.
+mod broadcast;
+pub use broadcast::Subscription;
+pub(crate) use broadcast::{broadcast_pty_output, retain_live_subscribers, SubscriberEntry};
+
 /// Core state for one agent — protected by a single Mutex for atomic operations.
 pub struct AgentCore {
     pub(crate) vterm: VTerm,
-    pub(crate) subscribers: Vec<crossbeam_channel::Sender<Vec<u8>>>,
+    pub(crate) subscribers: Vec<SubscriberEntry>,
     pub(crate) state: StateTracker,
     pub(crate) health: HealthTracker,
     /// #2413 Phase 1: out-of-path API-activity signal, fed by the
@@ -1692,6 +1699,10 @@ pub(crate) fn spawn_agent_with_capture_home(
         let reg = lock_registry(registry);
         if let Some(handle) = reg.get(&instance_id) {
             let (tx, rx) = crossbeam_channel::bounded(1024);
+            // #3682: the router's buffer holds the sole strong token, so its tap
+            // stays live for the agent's lifetime and is pruned the moment the
+            // router thread drops the receiver (its buffer's Disconnected retain).
+            let live = Arc::new(());
             // Lock order: registry → core (registry held here, core acquired
             // under it = the canonical direction). `core` is a short,
             // non-self-IPC temporary (subscriber push only) dropped on this
@@ -1702,8 +1713,12 @@ pub(crate) fn spawn_agent_with_capture_home(
             // (the supervisor inversion #1593 killed; the hot tick loop pinned
             // by `tick_does_not_reacquire_registry_under_core_f2`, #1530/F2), so
             // this AB-BA pair cannot form. See docs/DAEMON-LOCK-ORDERING.md.
-            handle.core.lock().subscribers.push(tx);
-            crate::daemon::router::register_agent(name, rx);
+            handle
+                .core
+                .lock()
+                .subscribers
+                .push((tx, Arc::downgrade(&live)));
+            crate::daemon::router::register_agent(name, rx, live);
         }
     }
 
@@ -1932,49 +1947,6 @@ struct PtyReadContext {
 }
 
 /// PTY read loop: feeds VTerm, broadcasts output, auto-dismisses dialogs, handles exit.
-/// Broadcast one PTY output chunk to all subscribers WITHOUT blocking.
-///
-/// The caller holds the agent's `core.lock()` (the broadcast is kept atomic
-/// with `feed_with_fg` so a concurrent `subscribe_with_dump` can't interleave a
-/// dump between process and broadcast). That makes blocking here lethal: a
-/// blocking `send` on a full `bounded(1024)` subscriber channel would hold the
-/// core lock forever and wedge every core-lock waiter — the main TUI
-/// render/input thread, the supervisor, all of it. (Observed: two agents'
-/// pty_read threads parked in a full-channel send while holding their core
-/// locks; the TUI drains those very channels but was itself parked waiting for a
-/// core lock — a deadlock cycle that froze the whole daemon.)
-///
-/// `try_send` never blocks. On `Full` the consumer is too far behind, so the
-/// chunk is dropped (best-effort mirror; the consumer resyncs from the next
-/// screen dump) and `dropped_chunks` is bumped + throttled-logged. On
-/// `Disconnected` the subscriber is removed (the `retain` returns `false`).
-fn broadcast_pty_output(
-    subscribers: &mut Vec<crossbeam_channel::Sender<Vec<u8>>>,
-    data: &[u8],
-    dropped_chunks: &mut u64,
-    agent: &str,
-) {
-    subscribers.retain(|tx| match tx.try_send(data.to_vec()) {
-        Ok(()) => true,
-        Err(crossbeam_channel::TrySendError::Full(_)) => {
-            *dropped_chunks += 1;
-            // Throttle: first drop, then powers-of-two, so a chronically-full
-            // subscriber stays visible in the log without flooding it.
-            if dropped_chunks.is_power_of_two() {
-                tracing::warn!(
-                    agent,
-                    dropped_chunks = *dropped_chunks,
-                    "pty broadcast: subscriber channel full — dropping output chunk (consumer \
-                     stalled). Mirror is best-effort; the daemon is NOT blocked (was a freeze \
-                     before this guard)."
-                );
-            }
-            true
-        }
-        Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
-    });
-}
-
 fn pty_read_loop(
     pty_reader: &mut dyn Read,
     ctx: &PtyReadContext,
@@ -3160,12 +3132,19 @@ pub fn broadcast_registry(
 
 /// Get atomic subscribe + screen dump (under core lock — no output gap).
 /// Creates a new per-subscriber channel. Each subscriber gets ALL output (broadcast).
-pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam_channel::Receiver<Vec<u8>>, Vec<u8>) {
+///
+/// #3682: also sweeps dead taps under the same lock, so a reconnect reclaims a
+/// disconnected client's entry even when the agent is quiet. The returned
+/// [`Subscription`] owns the liveness token — the caller MUST keep it alive while
+/// the receiver is in use, or the tap is pruned as dead.
+pub fn subscribe_with_dump(agent: &AgentHandle) -> (Subscription, Vec<u8>) {
     let mut core = agent.core.lock();
+    retain_live_subscribers(&mut core.subscribers);
     let dump = core.vterm.dump_screen();
     let (tx, rx) = crossbeam_channel::bounded(1024);
-    core.subscribers.push(tx);
-    (rx, dump)
+    let live = Arc::new(());
+    core.subscribers.push((tx, Arc::downgrade(&live)));
+    (Subscription { rx, live }, dump)
 }
 
 #[cfg(test)]

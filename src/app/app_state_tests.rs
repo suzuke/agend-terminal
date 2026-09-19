@@ -67,7 +67,7 @@ fn closed_before_attach_registry_survives(unmanaged: bool) -> bool {
             instance_id,
             instance_ref: None,
             unmanaged,
-            rx: sub_rx,
+            sub: crate::agent::Subscription::detached(sub_rx),
             dump: Vec::new(),
             work_dir: home.clone(),
         }),

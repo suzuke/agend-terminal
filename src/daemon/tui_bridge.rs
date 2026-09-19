@@ -396,12 +396,16 @@ fn start_client_thread(
 /// every terminal path that must be visible to the peer has to call it.
 fn forward_tui_output(
     mut write_stream: std::net::TcpStream,
-    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    sub: crate::agent::Subscription,
     run_dir: std::path::PathBuf,
     name: String,
     port: u16,
     input_done: Arc<AtomicBool>,
 ) {
+    // #3682: split the tap. `rx` is the broadcast receiver; `_live` is the
+    // liveness token, held for this thread's whole lifetime so the corresponding
+    // entry in `AgentCore::subscribers` is only pruned once this forwarder exits.
+    let crate::agent::Subscription { rx, live: _live } = sub;
     // The accept loop already armed this socket, but this thread owns the write
     // path for the rest of the connection's life and a parked write here is
     // precisely what stops retirement from ever being noticed. Fail closed.
@@ -649,7 +653,7 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         // closed for the PTY path), wedging the whole daemon. `dump` is an owned
         // Vec, so it survives the drop; intervening PTY output buffers in `rx`
         // and is sent by the tui_out thread after this initial frame.
-        let (rx, dump, pty_writer, pty_master, core, instance_ref) = {
+        let (sub, dump, pty_writer, pty_master, core, instance_ref) = {
             let reg = agent::lock_registry(registry);
             // #1441: registry is UUID-keyed; this TUI-bridge server only knows
             // the display name, so locate the live handle by name.
@@ -657,9 +661,13 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
                 Some(a) => a,
                 None => continue,
             };
-            let (rx, dump) = agent::subscribe_with_dump(agent);
+            // #3682: `sub` owns the tap's liveness token; it is moved into the
+            // output forwarder below and dropped when that thread exits (peer
+            // disconnect / retirement / input-done), which is what lets a later
+            // accept reclaim this client's entry even for a quiet agent.
+            let (sub, dump) = agent::subscribe_with_dump(agent);
             (
-                rx,
+                sub,
                 dump,
                 Arc::clone(&agent.pty_writer),
                 Arc::clone(&agent.pty_master),
@@ -707,7 +715,7 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
                     let _census = crate::thread_census::register("tui_out");
                     forward_tui_output(
                         write_stream,
-                        rx,
+                        sub,
                         retire_dir,
                         retire_name,
                         port,
@@ -1642,7 +1650,7 @@ mod tests {
         let forwarder = std::thread::spawn(move || {
             super::forward_tui_output(
                 pair.server,
-                rx,
+                crate::agent::Subscription::detached(rx),
                 dir,
                 "agent".to_string(),
                 4242,
@@ -1694,7 +1702,7 @@ mod tests {
         let forwarder = std::thread::spawn(move || {
             super::forward_tui_output(
                 pair.server,
-                rx,
+                crate::agent::Subscription::detached(rx),
                 dir,
                 "agent".to_string(),
                 4242,
@@ -1738,7 +1746,14 @@ mod tests {
         let dir = run_dir.clone();
         let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
         let forwarder = std::thread::spawn(move || {
-            super::forward_tui_output(pair.server, rx, dir, "agent".to_string(), 4242, out_flag);
+            super::forward_tui_output(
+                pair.server,
+                crate::agent::Subscription::detached(rx),
+                dir,
+                "agent".to_string(),
+                4242,
+                out_flag,
+            );
             let _ = done_tx.send(());
         });
 
@@ -1820,7 +1835,14 @@ mod tests {
         let dir = run_dir.clone();
         let (out_done_tx, out_done_rx) = crossbeam_channel::bounded::<()>(1);
         let output = std::thread::spawn(move || {
-            super::forward_tui_output(pair.server, rx, dir, "agent".to_string(), 4242, out_flag);
+            super::forward_tui_output(
+                pair.server,
+                crate::agent::Subscription::detached(rx),
+                dir,
+                "agent".to_string(),
+                4242,
+                out_flag,
+            );
             let _ = out_done_tx.send(());
         });
 
@@ -1881,7 +1903,7 @@ mod tests {
         let forwarder = std::thread::spawn(move || {
             super::forward_tui_output(
                 pair.server,
-                rx,
+                crate::agent::Subscription::detached(rx),
                 dir,
                 "agent".to_string(),
                 4242,
@@ -2130,8 +2152,10 @@ mod tests {
 
         // The fix marker: the lock block now captures `dump` into the outer
         // binding (was a 4-tuple without `dump` pre-fix), proving the dump is
-        // moved out of the lock scope before it is written.
-        let bind_needle = ["let (rx, dump, pty_writer", ", pty_master, core"].concat();
+        // moved out of the lock scope before it is written. (#3682 renamed the
+        // leading tap element `rx` → `sub`, now a `Subscription`; the shape the
+        // marker keys on is unchanged.)
+        let bind_needle = ["let (sub, dump, pty_writer", ", pty_master, core"].concat();
         let bstart = prod
             .find(&bind_needle)
             .expect("dump-capture binding present (fix marker)");

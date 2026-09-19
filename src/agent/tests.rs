@@ -5705,7 +5705,8 @@ fn broadcast_full_channel_does_not_block_and_drops() {
     // go. The OLD blocking `send` would deadlock here; `try_send` drops instead.
     let (tx, _rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
     tx.send(vec![0u8]).expect("prime the single slot");
-    let mut subs = vec![tx];
+    let live = std::sync::Arc::new(());
+    let mut subs = vec![(tx, std::sync::Arc::downgrade(&live))];
     let mut dropped = 0u64;
     // If this blocks, the test harness hangs — that IS the failure signal.
     broadcast_pty_output(&mut subs, b"more output", &mut dropped, "agent-x");
@@ -5724,7 +5725,8 @@ fn broadcast_full_channel_does_not_block_and_drops() {
 fn broadcast_removes_disconnected_subscriber() {
     let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
     drop(rx); // consumer gone → Disconnected
-    let mut subs = vec![tx];
+    let live = std::sync::Arc::new(());
+    let mut subs = vec![(tx, std::sync::Arc::downgrade(&live))];
     let mut dropped = 0u64;
     broadcast_pty_output(&mut subs, b"x", &mut dropped, "agent-x");
     assert!(subs.is_empty(), "a disconnected subscriber must be removed");
@@ -5734,7 +5736,8 @@ fn broadcast_removes_disconnected_subscriber() {
 #[test]
 fn broadcast_delivers_to_healthy_subscriber() {
     let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
-    let mut subs = vec![tx];
+    let live = std::sync::Arc::new(());
+    let mut subs = vec![(tx, std::sync::Arc::downgrade(&live))];
     let mut dropped = 0u64;
     broadcast_pty_output(&mut subs, b"hello", &mut dropped, "agent-x");
     assert_eq!(subs.len(), 1, "a healthy subscriber is kept");
@@ -5743,6 +5746,52 @@ fn broadcast_delivers_to_healthy_subscriber() {
         rx.try_recv().ok(),
         Some(b"hello".to_vec()),
         "output must be delivered"
+    );
+}
+
+/// #3682: a TUI client that connects and disconnects leaves a dead `Sender`
+/// behind. With NO PTY output ever produced (a quiet agent), the only other
+/// removal site — `broadcast_pty_output`'s `retain` — never runs, so the dead
+/// tap lingers forever. A subsequent connect MUST reclaim it (subscribe-time
+/// liveness sweep).
+#[test]
+fn subscribe_prunes_dead_subscriber_without_pty_output_3682() {
+    let id = crate::types::InstanceId::new();
+    let handle = mk_test_handle("quiet-liveness-3682", id);
+
+    // Client 1 connects, then disconnects. This handle emits no PTY output, so
+    // the broadcast-time prune never runs.
+    let (sub, _dump) = subscribe_with_dump(&handle);
+    assert_eq!(handle.core.lock().subscribers.len(), 1);
+    drop(sub);
+
+    // Client 2 connects — this event ALONE must reclaim client 1's dead tap.
+    let (_sub2, _dump2) = subscribe_with_dump(&handle);
+    assert_eq!(
+        handle.core.lock().subscribers.len(),
+        1,
+        "a dead tap from a disconnected client must be pruned at subscribe time \
+         even when the agent produced zero PTY output"
+    );
+}
+
+/// #3682 guard: the subscribe-time sweep must reclaim ONLY dead taps — a live
+/// subscriber (its `Subscription` still held) must survive the sweep.
+#[test]
+fn subscribe_sweep_keeps_live_subscriber_3682() {
+    let id = crate::types::InstanceId::new();
+    let handle = mk_test_handle("live-liveness-3682", id);
+
+    let (sub1, _d1) = subscribe_with_dump(&handle);
+    let (_sub2, _d2) = subscribe_with_dump(&handle);
+    assert_eq!(handle.core.lock().subscribers.len(), 2);
+
+    drop(sub1); // only the first consumer disconnects
+    let (_sub3, _d3) = subscribe_with_dump(&handle);
+    assert_eq!(
+        handle.core.lock().subscribers.len(),
+        2,
+        "the sweep must drop the one dead tap and keep both live ones"
     );
 }
 

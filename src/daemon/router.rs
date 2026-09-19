@@ -49,6 +49,10 @@ fn apply_mirror_cap(buf: &mut String) {
 pub struct AgentSubscription {
     pub name: String,
     pub rx: crossbeam_channel::Receiver<Vec<u8>>,
+    /// #3682: liveness token for the matching broadcast tap. Held here for the
+    /// agent's lifetime so the tap is never seen as dead while the router is
+    /// subscribed; dropped with the buffer (below) on sender disconnect.
+    pub live: std::sync::Arc<()>,
 }
 
 /// Global registration channel for new agent subscriptions.
@@ -57,11 +61,16 @@ static REGISTRATION_TX: OnceLock<crossbeam_channel::Sender<AgentSubscription>> =
 
 /// Register a new agent's PTY subscriber with the router.
 /// Called from agent spawn site (caller holds L1/L2 — safe, not router thread).
-pub fn register_agent(name: &str, rx: crossbeam_channel::Receiver<Vec<u8>>) {
+pub fn register_agent(
+    name: &str,
+    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    live: std::sync::Arc<()>,
+) {
     if let Some(tx) = REGISTRATION_TX.get() {
         let _ = tx.try_send(AgentSubscription {
             name: name.to_string(),
             rx,
+            live,
         });
     }
 }
@@ -73,6 +82,8 @@ struct AgentBuffer {
     active: bool,
     last_output_at: Instant,
     input_id: Option<u64>,
+    /// #3682: anchors the broadcast tap's `Weak` while this buffer is registered.
+    _live: std::sync::Arc<()>,
 }
 
 /// Spawn the router observer thread.
@@ -106,6 +117,7 @@ fn run_loop(home: PathBuf, reg_rx: crossbeam_channel::Receiver<AgentSubscription
                     active: false,
                     last_output_at: Instant::now(),
                     input_id: None,
+                    _live: sub.live,
                 },
             );
         }
@@ -437,6 +449,7 @@ mod tests {
             active: true,
             last_output_at: Instant::now() - Duration::from_secs(10),
             input_id: Some(42),
+            _live: std::sync::Arc::new(()),
         }
     }
 
