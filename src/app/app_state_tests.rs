@@ -6,6 +6,8 @@ use std::collections::HashSet;
 
 #[path = "app_state/tests/event_stream_tests.rs"]
 mod event_stream_tests;
+#[path = "app_state/tests/retirement_tests.rs"]
+mod retirement_tests;
 #[path = "app_state/tests/appstate_team_order_tests.rs"]
 mod team_order_tests;
 

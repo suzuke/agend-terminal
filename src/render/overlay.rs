@@ -320,7 +320,7 @@ pub fn render_notice(frame: &mut Frame, message: &str) {
         frame,
         notice_area,
         Color::Cyan,
-        " Bridge Reconnect (press any key to close) ",
+        " Notice (press any key to close) ",
     );
     frame.render_widget(
         Paragraph::new(Span::styled(
