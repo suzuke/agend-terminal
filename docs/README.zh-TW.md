@@ -93,6 +93,7 @@ artifact 內提到的 issue/PR，或執行 `git log -- <former-path>`。歷史�
 | Architecture-14 台帳 | [EN](ARCHITECTURE-14-LEDGER.md) | [中文](ARCHITECTURE-14-LEDGER.zh-TW.md) | 現行 convergence outcome 與 evidence |
 | Daemon Lock Ordering | [EN](DAEMON-LOCK-ORDERING.md) | [中文](DAEMON-LOCK-ORDERING.zh-TW.md) | Lock hierarchy 與 deadlock prevention |
 | Hung-State 契約 | [EN](HUNG-STATE-TRANSITIONS.md) | [中文](HUNG-STATE-TRANSITIONS.zh-TW.md) | Detection transition 與 productive-output gate |
+| 偵測規則 Spike | [EN](DETECTION-RULES-SPIKE-3647.md) | [中文](DETECTION-RULES-SPIKE-3647.zh-TW.md) | Issue #3647 的畫面偵測規則資料化設計 |
 | Recovery Stages | [EN](RECOVERY-STAGES.md) | [中文](RECOVERY-STAGES.zh-TW.md) | 分階段 automatic recovery |
 | Backend Matrix | [EN](BACKEND-CAPABILITY-MATRIX.md) | [中文](BACKEND-CAPABILITY-MATRIX.zh-TW.md) | Backend signal、provider、resume 與 MCP |
 | MCP Tools | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | Tool registry 與 bridge/proxy 契約 |

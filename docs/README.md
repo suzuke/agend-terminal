@@ -99,6 +99,7 @@ believed then, not a current contract.
 | Architecture-14 Ledger | [EN](ARCHITECTURE-14-LEDGER.md) | [中文](ARCHITECTURE-14-LEDGER.zh-TW.md) | Current convergence outcomes and evidence |
 | Daemon Lock Ordering | [EN](DAEMON-LOCK-ORDERING.md) | [中文](DAEMON-LOCK-ORDERING.zh-TW.md) | Lock hierarchy and deadlock prevention |
 | Hung-State Contract | [EN](HUNG-STATE-TRANSITIONS.md) | [中文](HUNG-STATE-TRANSITIONS.zh-TW.md) | Detection transitions and productive-output gate |
+| Detection Rules Spike | [EN](DETECTION-RULES-SPIKE-3647.md) | [中文](DETECTION-RULES-SPIKE-3647.zh-TW.md) | Data-driven screen-detection design for issue #3647 |
 | Recovery Stages | [EN](RECOVERY-STAGES.md) | [中文](RECOVERY-STAGES.zh-TW.md) | Staged automatic recovery |
 | Backend Matrix | [EN](BACKEND-CAPABILITY-MATRIX.md) | [中文](BACKEND-CAPABILITY-MATRIX.zh-TW.md) | Backend signals, providers, resume, and MCP |
 | MCP Tools | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | Tool registry and bridge/proxy contract |
