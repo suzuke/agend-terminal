@@ -537,3 +537,156 @@ fn team_cascade_delete_cleans_each_exact_ref_3627() {
         "the target-only team tab must close once every member is retired"
     );
 }
+
+// ── #3627 review hardening ───────────────────────────────────────────────
+
+fn poll_snapshot(
+    state: &mut AppState,
+    deps: &AppDeps<'_>,
+    snapshot: rpc::AgentStateSnapshotResult,
+) {
+    state.handle_agent_state_rpc_outcome(Ok(Ok(snapshot)));
+    state.reconcile_pending_remote_roster(deps);
+}
+
+/// A retirement flush can fail while an unrelated overlay is open. The notice
+/// must be queued and then delivered once the overlay clears — never lost.
+#[test]
+fn retirement_notice_queued_while_overlay_open_surfaces_after_3627() {
+    let deps = RetirementDeps::with_fleet_and_home("notice-queued", VALID_FLEET, true);
+    let reference = new_ref(71);
+    let mut state = state_with_pane("agent", reference);
+    state.ui.overlay = Overlay::Help;
+
+    state.handle_event_stream_outcome(Ok(delete_event(1, "agent", reference)), &deps.deps());
+
+    assert!(state.ui.layout.find_agent_pane("agent").is_none());
+    assert!(
+        matches!(state.ui.overlay, Overlay::Help),
+        "an already-open overlay must not be clobbered"
+    );
+    assert!(
+        state.pending_retirement_notice.is_some(),
+        "the retryable notice must be queued, not silently dropped"
+    );
+
+    // The operator closes the overlay: the queued notice is delivered.
+    state.ui.overlay = Overlay::None;
+    state.promote_pending_retirement_notice();
+    match &state.ui.overlay {
+        Overlay::ReconnectNotice { message } => assert!(
+            message.contains("retry"),
+            "queued notice must still name the retry: {message}"
+        ),
+        _ => panic!("queued retirement notice must surface once the overlay clears"),
+    }
+    assert!(state.pending_retirement_notice.is_none());
+}
+
+/// A daemon that drops `instance_ref` fields must not be read as "every ref is
+/// gone" — that would mis-retire panes after two polls. Fail toward retention.
+#[test]
+fn poll_fallback_retains_when_snapshot_lacks_refs_3627() {
+    let deps = RetirementDeps::new("snapshot-no-refs");
+    let reference = new_ref(81);
+    let mut state = state_with_pane("solo", reference);
+
+    // (a) Names present, every ref missing (daemon downgrade/regression).
+    for _ in 0..3 {
+        let mut snapshot = live_result(&[("ghost", new_ref(82))]);
+        snapshot.instance_refs.clear();
+        poll_snapshot(&mut state, &deps.deps(), snapshot);
+    }
+    assert!(
+        state.ui.layout.find_agent_pane("solo").is_some(),
+        "a ref-less snapshot cannot prove any exact ref is absent"
+    );
+    assert!(state.retirement_candidates.is_empty());
+
+    // (b) Partial refs: one unparseable live name is still not trustworthy.
+    let parseable = new_ref(83);
+    for _ in 0..3 {
+        let mut snapshot = live_result(&[("ghost", parseable), ("opaque", new_ref(84))]);
+        snapshot.instance_refs.remove("opaque");
+        poll_snapshot(&mut state, &deps.deps(), snapshot);
+    }
+    assert!(
+        state.ui.layout.find_agent_pane("solo").is_some(),
+        "a partially-ref'd snapshot must not be treated as authoritative"
+    );
+    assert!(state.retirement_candidates.is_empty());
+}
+
+/// Hard restart: a retired pane still present in the on-disk session (because
+/// the flush failed and only the retired ref was durably recorded) must not be
+/// revived by the real session reload path.
+#[test]
+fn hard_restart_does_not_revive_retired_pane_3627() {
+    let deps = RetirementDeps::new("hard-restart");
+    let stale = new_ref(91);
+    let live = new_ref(92);
+
+    // Pre-crash session.json still holds BOTH panes.
+    let mut seeded = Layout::new();
+    let mut stale_pane = test_remote_pane(&mut seeded, "gone").expect("stale pane");
+    stale_pane.instance_ref = Some(stale);
+    let mut live_pane = test_remote_pane(&mut seeded, "kept").expect("live pane");
+    live_pane.instance_ref = Some(live);
+    seeded.add_tab(Tab::new("team".into(), stale_pane));
+    seeded.tabs[0].split_focused(crate::layout::SplitDir::Vertical, live_pane);
+    assert!(session::save_session(&deps.home, &seeded));
+
+    let session_path = deps.home.join("session.json");
+    crate::store::fail_next_atomic_write_for_test(&session_path);
+    let mut state = AppState::new();
+    state.ui.layout = seeded;
+    state.handle_event_stream_outcome(Ok(delete_event(1, "gone", stale)), &deps.deps());
+
+    // The flush failed, so the stale leaf is still on disk — but the retired
+    // ref is recorded durably.
+    let on_disk = std::fs::read_to_string(&session_path).expect("session.json remains");
+    assert!(
+        on_disk.contains(&stale.instance_id.full()),
+        "a failed flush leaves the stale leaf on disk for this test to exercise"
+    );
+    assert!(
+        deps.home.join("session.retired.json").exists(),
+        "the retired ref must be durably recorded when the session flush fails"
+    );
+
+    // HARD RESTART: reload the real session layout with a registry that STILL
+    // names the retired instance (worst case). The retired ref must not return.
+    let agent_source: std::collections::HashSet<String> = ["gone".to_string(), "kept".to_string()]
+        .into_iter()
+        .collect();
+    let mut reloaded = Layout::new();
+    let mut builder =
+        |sp: &crate::app::session::SessionPane, layout: &mut Layout| match sp.instance_ref {
+            Some(reference) if reference == stale => {
+                let mut pane = test_remote_pane(layout, "gone").expect("stale builder");
+                pane.instance_ref = Some(stale);
+                Some(pane)
+            }
+            Some(reference) if reference == live => {
+                let mut pane = test_remote_pane(layout, "kept").expect("live builder");
+                pane.instance_ref = Some(live);
+                Some(pane)
+            }
+            // Rule-3 synthetic entries carry no ref; no successor to build here.
+            _ => None,
+        };
+    assert!(crate::app::session::apply_session_layout_for_test(
+        &deps.home,
+        &agent_source,
+        &mut builder,
+        &mut reloaded,
+    ));
+    assert!(
+        reloaded.find_agent_pane("gone").is_none(),
+        "a retired ref must not be revived from session.json after a hard restart"
+    );
+    assert!(
+        reloaded.find_agent_pane("kept").is_some(),
+        "the live sibling pane must still restore"
+    );
+}

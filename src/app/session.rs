@@ -443,6 +443,18 @@ fn apply_session_layout(
     apply_session_layout_with_identity(home, agent_source, pane_builder, layout, false)
 }
 
+/// #3627 test seam: let a sibling test module drive the REAL session reload
+/// path (retired-ref drop included) without widening the production surface.
+#[cfg(test)]
+pub(super) fn apply_session_layout_for_test(
+    home: &Path,
+    agent_source: &HashSet<String>,
+    pane_builder: &mut PaneBuilder<'_>,
+    layout: &mut Layout,
+) -> bool {
+    apply_session_layout(home, agent_source, pane_builder, layout)
+}
+
 fn apply_session_layout_with_identity(
     home: &Path,
     agent_source: &HashSet<String>,
