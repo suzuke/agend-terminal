@@ -389,6 +389,15 @@ fn render_active_overlay(
         Overlay::ScratchShell { pane } => {
             render::render_scratch_shell(frame, pane, registry);
         }
+        Overlay::Organizer {
+            scope,
+            plan,
+            applied,
+            notice,
+            ..
+        } => {
+            render::render_organizer(frame, plan, &scope.label(), *applied, notice.as_deref());
+        }
         Overlay::None => {}
     }
 }

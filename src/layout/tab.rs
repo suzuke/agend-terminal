@@ -4,6 +4,17 @@ use super::pane::Pane;
 use super::preset::{build_preset, flatten_tree_into, LayoutPreset};
 use super::split::{center, overlaps_x, overlaps_y, Direction};
 use super::tree::{remove_from_tree, split_in_tree, PaneNode, SplitDir};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// #3631: process-wide monotonic source for stable tab identity. A tab's identity
+/// must survive reordering / index shifts; indices are NOT identity. Session
+/// restore rebinds to a fresh id on each boot (runtime identity only), which is
+/// correct — persisted identity is via the panes' `InstanceRef`, not the tab id.
+static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_tab_id() -> u64 {
+    NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DragTabTarget {
@@ -16,6 +27,10 @@ pub enum DragTabTarget {
 
 /// A tab containing a tree of panes.
 pub struct Tab {
+    /// #3631: stable runtime identity, independent of the tab's index in
+    /// `Layout::tabs`. The Organizer rehomes panes by matching on this (and
+    /// pane ids), never on a positional index that shifts mid-operation.
+    pub id: u64,
     pub name: String,
     pub(super) root: Option<PaneNode>,
     pub focus_id: usize,
@@ -39,6 +54,7 @@ impl Tab {
     pub fn new(name: String, pane: Pane) -> Self {
         let id = pane.id;
         Self {
+            id: next_tab_id(),
             name,
             root: Some(PaneNode::Leaf(Box::new(pane))),
             focus_id: id,
@@ -56,6 +72,7 @@ impl Tab {
     pub fn with_root(name: String, root: PaneNode) -> Self {
         let first_id = root.first_pane().id;
         Self {
+            id: next_tab_id(),
             name,
             root: Some(root),
             focus_id: first_id,

@@ -1708,4 +1708,116 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// #3631 isolated-home smoke: arrange → retire → recreate → restart.
+    ///
+    /// Exercises the full Team Organizer lifecycle against a real `session.json`
+    /// in a throwaway home: panes are scattered, arranged into one team tab,
+    /// one member is retired and recreated under a new identity, the session is
+    /// saved, and a restart re-consolidates the team deterministically while
+    /// preserving the local shell.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn smoke_arrange_retire_recreate_restart_3631() {
+        use crate::layout::organizer::{self, OrganizerScope};
+        use crate::types::{InstanceId, InstanceRef};
+
+        let home = tmp_home("organizer-smoke-3631");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev-1: {}\n  dev-2: {}\nteams:\n  ops:\n    members: [dev-1, dev-2]\n    orchestrator: dev-1\n",
+        )
+        .expect("write fleet.yaml");
+
+        let ref1 = InstanceRef::new(InstanceId::new(), 1);
+        let ref2 = InstanceRef::new(InstanceId::new(), 2);
+        let mut p1 = test_pane(1, "dev-1", Some("dev-1"));
+        p1.instance_ref = Some(ref1);
+        let mut p2 = test_pane(2, "dev-2", Some("dev-2"));
+        p2.instance_ref = Some(ref2);
+
+        // Scattered: each member alone in its own tab, plus a local shell.
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("scatter-1".into(), p1));
+        layout.add_tab(Tab::new("scatter-2".into(), p2));
+        layout.add_tab(Tab::new("local".into(), test_pane(3, "shell", None)));
+        layout.active = 1;
+
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("fleet loads");
+        let plan = organizer::plan(&layout, &fleet, &OrganizerScope::AllTeams);
+        organizer::apply(&mut layout, &plan).expect("arrange applies");
+        let ops = layout
+            .tabs
+            .iter()
+            .find(|tab| tab.name == "ops")
+            .expect("team tab");
+        assert_eq!(ops.root().agent_names(), vec!["dev-1", "dev-2"]);
+        assert!(save_session(&home, &layout), "commit saves session");
+
+        // Retire dev-2, then recreate it under a fresh identity.
+        assert!(layout.remove_fleet_instance_views_exact(ref2));
+        assert!(record_retired_ref(&home, ref2));
+        let new_ref2 = InstanceRef::new(InstanceId::new(), 20);
+        let mut recreated = test_pane(20, "dev-2", Some("dev-2"));
+        recreated.instance_ref = Some(new_ref2);
+        layout.add_tab(Tab::new("recreated".into(), recreated));
+        assert!(save_session(&home, &layout));
+
+        // Restart: reconcile the saved arrangement against the live roster.
+        let agent_source: HashSet<String> = ["dev-1".to_string(), "dev-2".to_string()]
+            .into_iter()
+            .collect();
+        let mut restored = Layout::new();
+        let mut next_id = 100usize;
+        let mut pb = |sp: &SessionPane, _l: &mut Layout| -> Option<Pane> {
+            next_id += 1;
+            match sp.fleet_instance_name.as_deref() {
+                Some("dev-1") => {
+                    let mut pane = test_pane(next_id, "dev-1", Some("dev-1"));
+                    pane.instance_ref = Some(InstanceRef::new(ref1.instance_id, 31));
+                    Some(pane)
+                }
+                Some("dev-2") => {
+                    let mut pane = test_pane(next_id, "dev-2", Some("dev-2"));
+                    pane.instance_ref = Some(InstanceRef::new(new_ref2.instance_id, 32));
+                    Some(pane)
+                }
+                Some(_) => None,
+                None => Some(test_pane(next_id, "shell", None)),
+            }
+        };
+        assert!(
+            apply_session_layout(&home, &agent_source, &mut pb, &mut restored),
+            "restart restores the saved layout"
+        );
+        let restored_panes: usize = restored
+            .tabs
+            .iter()
+            .map(|tab| tab.root().pane_count())
+            .sum();
+        assert_eq!(
+            restored_panes, 3,
+            "restart restores dev-1, the recreated dev-2, and the local shell"
+        );
+        assert!(
+            restored
+                .tabs
+                .iter()
+                .any(|tab| tab.root().agent_names().contains(&"shell".to_string())),
+            "the local shell survives a restart"
+        );
+
+        // Re-running the Organizer re-consolidates the recreated member.
+        let plan = organizer::plan(&restored, &fleet, &OrganizerScope::AllTeams);
+        organizer::apply(&mut restored, &plan).expect("re-arrange applies");
+        let ops = restored
+            .tabs
+            .iter()
+            .find(|tab| tab.name == "ops")
+            .expect("team tab after restart");
+        assert_eq!(ops.root().agent_names(), vec!["dev-1", "dev-2"]);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

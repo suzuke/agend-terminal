@@ -1,5 +1,6 @@
 //! Tab and pane layout management — tree-based nested splits.
 
+pub mod organizer;
 pub mod pane;
 pub mod preset;
 pub mod split;
@@ -76,6 +77,10 @@ pub struct Layout {
     /// returns to its original position. Bounded by distinct agent names.
     #[allow(dead_code)] // retained for serialized-layout compatibility tests
     removed_pane_memory: HashMap<String, RemovedPanePlacement>,
+    /// #3631: pane-id-keyed structural snapshot of the last Team Organizer
+    /// transaction, consumed by `:arrange undo`. Deliberately NOT the
+    /// name-keyed `removed_pane_memory` above.
+    pub organizer_undo: Option<organizer::LayoutSnapshot>,
 }
 
 pub const TAB_BAR_HEIGHT: u16 = 1;
@@ -94,6 +99,7 @@ impl Layout {
             tab_reorder_source: None,
             tab_reorder_target: None,
             removed_pane_memory: HashMap::new(),
+            organizer_undo: None,
         }
     }
 
@@ -104,6 +110,15 @@ impl Layout {
         self.tabs
             .iter_mut()
             .find_map(|t| t.root_mut().find_pane_mut(id))
+    }
+
+    /// #3631: every pane id currently displayed, in tab order. Used by the Team
+    /// Organizer to validate a pane-id-keyed plan/snapshot before mutating.
+    pub fn all_pane_ids(&self) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.root().pane_ids())
+            .collect()
     }
 
     /// #1431/#1939: record where `agent`'s pane currently sits (tab + parent

@@ -106,6 +106,12 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         args: &[ArgSource::Preset],
     },
     CommandSpec {
+        keyword: "arrange",
+        usage: "arrange [current|<team>|all|undo]",
+        desc: "Team Organizer: preview/apply team tabs (undo reverts)",
+        args: &[ArgSource::Free],
+    },
+    CommandSpec {
         keyword: "send",
         usage: "send <agent> <message>",
         desc: "Send a message to one agent",
@@ -355,6 +361,15 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
 /// on their existing execution path.
 pub(super) fn is_restart_command(cmd: &str) -> bool {
     cmd.split_whitespace().next() == Some("restart")
+}
+
+/// #3631: whether the palette line opens the Team Organizer. The Organizer is a
+/// modal preview (`arrange` / `arrange all` / `arrange <team>`) or an immediate
+/// transaction revert (`arrange undo`); it is intercepted by the command-palette
+/// overlay BEFORE the generic execute path, which is why the arm below is a
+/// deliberate no-op (the Organizer must not run headlessly).
+pub(super) fn is_arrange_command(cmd: &str) -> bool {
+    cmd.split_whitespace().next() == Some("arrange")
 }
 
 fn execute_with_restart<F>(cmd: &str, ctx: &mut CommandCtx<'_>, restart_instance: F) -> bool
@@ -690,6 +705,10 @@ where
             tab.apply_layout(preset);
             return true;
         }
+        // #3631: handled by the command-palette overlay (`is_arrange_command`)
+        // so the Organizer preview/undo runs against live TUI state. Reaching
+        // here headlessly is a no-op — never mutate the layout without a preview.
+        "arrange" => return false,
         "send" => {
             if parts.len() >= 3
                 && !agent::send_to_registry(ctx.registry, ctx.home, "user", parts[1], parts[2])
@@ -1194,6 +1213,7 @@ mod tests {
             ("kill", &[Agent]),
             ("restart", &[Agent]),
             ("layout", &[Preset]),
+            ("arrange", &[Free]),
             ("send", &[Agent, Free]),
             ("broadcast", &[Free]),
             ("status", &[]),

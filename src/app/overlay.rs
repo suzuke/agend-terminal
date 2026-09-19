@@ -8,7 +8,10 @@ use std::path::Path;
 
 use crate::agent::AgentRegistry;
 use crate::backend::Backend;
+use crate::layout::organizer::{OrganizerPlan, OrganizerScope};
 use crate::layout::{Layout, Pane, SplitDir, Tab};
+
+mod organizer_ui;
 
 /// An item in the new-tab selection menu.
 pub struct MenuItem {
@@ -163,6 +166,18 @@ pub(super) enum Overlay {
     /// overlay. Pane is boxed because it's much larger than any other variant.
     ScratchShell {
         pane: Box<Pane>,
+    },
+    /// #3631: transactional Team Organizer. `plan` is a pure preview computed
+    /// from `scope`; nothing in the layout changes until Enter. `applied` marks a
+    /// committed transaction so a failed session save can be retried, and `u`
+    /// reverts via the snapshot held on the layout.
+    Organizer {
+        scope: OrganizerScope,
+        scopes: Vec<OrganizerScope>,
+        selected: usize,
+        plan: OrganizerPlan,
+        applied: bool,
+        notice: Option<String>,
     },
 }
 
@@ -643,7 +658,10 @@ pub(super) fn handle_key(
             // candidate, so muscle memory / scripts behave identically).
             KeyCode::Enter => {
                 let cmd = input.clone();
-                if super::commands::is_restart_command(&cmd) {
+                if super::commands::is_arrange_command(&cmd) {
+                    *overlay = organizer_ui::open_arrange_overlay(&cmd, ctx, &mut outcome)
+                        .unwrap_or(Overlay::None);
+                } else if super::commands::is_restart_command(&cmd) {
                     *overlay = Overlay::ConfirmRestart { command: cmd };
                 } else {
                     *overlay = Overlay::None;
@@ -693,6 +711,10 @@ pub(super) fn handle_key(
             }
             _ => {}
         },
+        Overlay::Organizer { .. } => {
+            let org = organizer_ui::handle_organizer_key(overlay, key, ctx);
+            outcome.needs_resize = outcome.needs_resize || org.needs_resize;
+        }
         Overlay::Decisions {
             ref mut items,
             ref mut selected,
@@ -2372,6 +2394,9 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod organizer_tests;
 
 #[cfg(test)]
 mod review_repro_app_tui;
