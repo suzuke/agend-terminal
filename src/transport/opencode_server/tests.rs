@@ -1557,8 +1557,7 @@ fn restore_unknown_status_clears_gate_as_ambiguous_without_recurrence() {
         }
     });
 
-    let home =
-        std::env::temp_dir().join(format!("agend-opencode-restore-unknown-{}", Uuid::new_v4()));
+    let home = std::env::temp_dir().join(format!("agend-oc-unknown-clear-{}", Uuid::new_v4()));
     let locator = SessionLocator::opencode(
         format!("http://127.0.0.1:{port}"),
         Some("session-1".to_string()),
@@ -1651,10 +1650,7 @@ fn restore_unknown_status_reopens_gate_for_a_fresh_delivery() {
         }
     });
 
-    let home = std::env::temp_dir().join(format!(
-        "agend-opencode-restore-unknown-reopen-{}",
-        Uuid::new_v4()
-    ));
+    let home = std::env::temp_dir().join(format!("agend-oc-unknown-reopen-{}", Uuid::new_v4()));
     let locator = SessionLocator::opencode(
         format!("http://127.0.0.1:{port}"),
         Some("session-1".to_string()),
