@@ -3,6 +3,7 @@ use crate::framing::{self, TAG_DATA, TAG_RESIZE};
 use portable_pty::PtySize;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Output of the synchronous TUI prep step. Carries the bound TCP
@@ -399,6 +400,7 @@ fn forward_tui_output(
     run_dir: std::path::PathBuf,
     name: String,
     port: u16,
+    input_done: Arc<AtomicBool>,
 ) {
     // The accept loop already armed this socket, but this thread owns the write
     // path for the rest of the connection's life and a parked write here is
@@ -424,6 +426,18 @@ fn forward_tui_output(
             // retained pane observe EOF, flip `connected` false, and become a
             // reconnect candidate.
             if is_retired(&run_dir, &name, port) {
+                close_client(&write_stream);
+                break;
+            }
+            // #3681: the input thread is the only side that observes the peer's
+            // EOF. An IDLE writer parked in `recv_timeout` never writes (so the
+            // failed-write arm never fires) and never reads (so it never sees
+            // EOF), the agent being alive keeps `rx` connected, and an unchanged
+            // port keeps it unretired — so without this signal the thread lives
+            // until process exit, one leaked OS thread per reconnect. Sharing the
+            // rate-limited slot with `is_retired` keeps the existing
+            // one-check-per-RETIREMENT_POLL bound and adds no syscall.
+            if input_done.load(Ordering::Acquire) {
                 close_client(&write_stream);
                 break;
             }
@@ -536,7 +550,25 @@ fn forward_tui_input(
     close_client(&reader);
 }
 
+/// #3681: marks this connection's input side as finished the moment the input
+/// thread stops — every exit path, including a panic. The output forwarder
+/// consults the same flag (`forward_tui_output`) and exits, which is what stops
+/// an idle forwarder leaking an OS thread per reconnect. RAII rather than a
+/// post-call `store` so a panic in `forward_tui_input` (or anything else on the
+/// thread) still fires the signal: the leaked-thread symptom must not depend on
+/// a clean return.
+struct InDone(Arc<AtomicBool>);
+
+impl Drop for InDone {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry: &AgentRegistry) {
+    // #3681 observability: register the bridge so doctor/thread-dump counts see
+    // it. Guard drops when the loop returns (retirement).
+    let _census = crate::thread_census::register("tui_accept");
     let TuiListenerMeta {
         listener,
         cookie,
@@ -621,6 +653,12 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
             continue;
         }
 
+        // #3681: shared "input side is done" signal for this connection. Created
+        // before either thread so every refusal path below can raise it; the
+        // input thread raises it via an RAII guard (panic-safe) and the output
+        // forwarder watches it.
+        let input_done = Arc::new(AtomicBool::new(false));
+
         let write_stream = match stream.try_clone() {
             Ok(s) => s,
             Err(_) => continue,
@@ -628,6 +666,7 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         let n = name.to_string();
         let retire_dir = run_dir.clone();
         let retire_name = n.clone();
+        let out_input_done = Arc::clone(&input_done);
         // No leak: every exit path shuts the connection down and drops this
         // thread's handle. Shutting down is the load-bearing half, because this
         // thread does NOT hold the only handle — the input thread below holds
@@ -637,17 +676,29 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         // fire-and-forget: per-client TUI output forwarder. Loop exits when the
         // broadcast subscriber rx drops (agent removed via delete_transaction),
         // when a frame write fails (client disconnect or the bounded write
-        // budget), or when this bridge is retired. No graceful join needed —
-        // each client connection is independent. (§12.5 wants this marker within
-        // 10 lines of the spawn, so it stays last in this block.)
+        // budget), when this bridge is retired, or when the input thread raises
+        // `input_done` (#3681). No graceful join needed — each client connection
+        // is independent. (§12.5 wants this marker within 10 lines of the spawn,
+        // so it stays last in this block.)
         if let Err(e) = start_client_thread(&stream, || {
             std::thread::Builder::new()
                 .name(format!("{n}_tui_out"))
                 .spawn(move || {
-                    forward_tui_output(write_stream, rx, retire_dir, retire_name, port);
+                    let _census = crate::thread_census::register("tui_out");
+                    forward_tui_output(
+                        write_stream,
+                        rx,
+                        retire_dir,
+                        retire_name,
+                        port,
+                        out_input_done,
+                    );
                 })
                 .map(|_| ())
         }) {
+            // #3681: no input thread is up, but raise the signal regardless so a
+            // partially-started connection is never left half-alive.
+            input_done.store(true, Ordering::Release);
             tracing::warn!(agent = %n, error = %e, "TUI output thread refused; client closed");
             continue;
         }
@@ -661,11 +712,13 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
             Ok(handle) => handle,
             Err(e) => {
                 tracing::warn!(agent = name, error = %e, "TUI client handle unavailable");
+                input_done.store(true, Ordering::Release);
                 close_client(&read_stream);
                 continue;
             }
         };
         let n = name.to_string();
+        let in_input_done = Arc::clone(&input_done);
         // fire-and-forget: per-client TUI input forwarder. Loop exits on socket
         // disconnect, on an undefined frame, or on a PTY write failure — and
         // `forward_tui_input` closes the connection on every one of them, because
@@ -676,6 +729,12 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
             std::thread::Builder::new()
                 .name(format!("{n}_tui_in"))
                 .spawn(move || {
+                    let _census = crate::thread_census::register("tui_in");
+                    // RAII: raise "input done" on EVERY exit from this thread,
+                    // including a panic — not only after `forward_tui_input`
+                    // returns. This is the signal that stops the output forwarder
+                    // leaking one OS thread per reconnect (#3681).
+                    let _done = InDone(in_input_done);
                     forward_tui_input(
                         read_stream,
                         |data| {
@@ -707,6 +766,7 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
                 })
                 .map(|_| ())
         }) {
+            input_done.store(true, Ordering::Release);
             tracing::warn!(agent = name, error = %e, "TUI input thread refused; client closed");
             continue;
         }
@@ -747,7 +807,8 @@ fn modal_state_touches_in_production(prod: &str) -> Vec<(usize, String)> {
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     /// Select the complete source that the modal-state guard scans. Test-only
@@ -1560,7 +1621,14 @@ mod tests {
         let dir = run_dir.clone();
         let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
         let forwarder = std::thread::spawn(move || {
-            super::forward_tui_output(pair.server, rx, dir, "agent".to_string(), 4242);
+            super::forward_tui_output(
+                pair.server,
+                rx,
+                dir,
+                "agent".to_string(),
+                4242,
+                Arc::new(AtomicBool::new(false)),
+            );
             let _ = done_tx.send(());
         });
 
@@ -1605,7 +1673,14 @@ mod tests {
 
         let dir = run_dir.clone();
         let forwarder = std::thread::spawn(move || {
-            super::forward_tui_output(pair.server, rx, dir, "agent".to_string(), 4242);
+            super::forward_tui_output(
+                pair.server,
+                rx,
+                dir,
+                "agent".to_string(),
+                4242,
+                Arc::new(AtomicBool::new(false)),
+            );
         });
 
         // Retire this bridge: the successor republishes the name on a new port.
@@ -1622,6 +1697,83 @@ mod tests {
         );
     }
 
+    /// #3681: the leak. An idle output forwarder with a live agent, an open
+    /// subscriber channel, and an UNCHANGED port (so neither the retirement arm
+    /// nor `Disconnected` can fire) must still exit when the connection's input
+    /// side is done. Before the fix the forwarder parked in `recv_timeout`
+    /// forever — one leaked OS thread per TUI reconnect, until the macOS
+    /// 16384-thread cap wedged the daemon.
+    ///
+    /// `tx` stays alive for the whole test, so an exit through the
+    /// `Disconnected` arm (the wrong reason) is impossible; only the shared flag
+    /// changes.
+    #[test]
+    fn input_done_flag_closes_an_idle_output_forwarder() {
+        let run_dir = scratch_run_dir("input-done");
+        publish_port(&run_dir, "agent", 4242);
+        let pair = socket_pair();
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+
+        let input_done = Arc::new(AtomicBool::new(false));
+        let out_flag = Arc::clone(&input_done);
+        let dir = run_dir.clone();
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        let forwarder = std::thread::spawn(move || {
+            super::forward_tui_output(pair.server, rx, dir, "agent".to_string(), 4242, out_flag);
+            let _ = done_tx.send(());
+        });
+
+        // The input thread observed the peer's EOF: same port (not retired),
+        // channel still open, only the shared flag changes.
+        input_done.store(true, Ordering::Release);
+
+        // Bounded wait so an unfixed forwarder fails this test instead of
+        // hanging it: on the old code the thread never exits (that is the bug).
+        let exited = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let closed = peer_sees_eof(pair.peer, Duration::from_secs(2));
+        drop(tx);
+        let _ = forwarder.join();
+        std::fs::remove_dir_all(&run_dir).ok();
+
+        assert!(
+            exited,
+            "an idle forwarder whose input side is done must exit, or every reconnect \
+             strands an OS thread (#3681)"
+        );
+        assert!(
+            closed,
+            "the exiting forwarder must close the client socket, not merely drop its handle \
+             (the input thread holds another on the same connection) (#3681)"
+        );
+    }
+
+    /// #3681: the signal must be raised on EVERY exit from the input thread,
+    /// including a panic — the leaked-thread symptom must not depend on a clean
+    /// return. Pins the RAII guard directly, both for a normal drop and for an
+    /// unwinding panic.
+    #[test]
+    fn input_done_guard_raises_the_flag_on_drop_and_on_panic() {
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(super::InDone(Arc::clone(&flag)));
+        assert!(
+            flag.load(Ordering::Acquire),
+            "a normal return must raise the input-done flag"
+        );
+
+        let panicked = Arc::new(AtomicBool::new(false));
+        let guard_flag = Arc::clone(&panicked);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = super::InDone(guard_flag);
+            panic!("simulated input-thread panic");
+        }));
+        assert!(result.is_err(), "precondition: the closure must panic");
+        assert!(
+            panicked.load(Ordering::Acquire),
+            "a panicking input thread must still raise the flag via RAII, or the output \
+             forwarder leaks one OS thread (#3681)"
+        );
+    }
+
     /// #3373 follow-up: the generation's subscriber dropping is a terminal path
     /// too, and the peer must see it. Dropping the forwarder's handle is not
     /// enough — the input thread holds another handle on the same connection.
@@ -1634,7 +1786,14 @@ mod tests {
 
         let dir = run_dir.clone();
         let forwarder = std::thread::spawn(move || {
-            super::forward_tui_output(pair.server, rx, dir, "agent".to_string(), 4242);
+            super::forward_tui_output(
+                pair.server,
+                rx,
+                dir,
+                "agent".to_string(),
+                4242,
+                Arc::new(AtomicBool::new(false)),
+            );
         });
 
         // The agent is deleted: its broadcast senders go away.
