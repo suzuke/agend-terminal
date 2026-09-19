@@ -39,14 +39,25 @@ const ROLLOVER_JOURNAL_VERSION: u8 = 1;
 /// failed closed after this many park events — never retried forever.
 const MAX_PARKED_REDRIVE_ATTEMPTS: u32 = 3;
 
+/// A parked delivery that never sees a completion event (a lost SSE stream, or
+/// an in-flight turn installed by an unknown restore status) must not stay
+/// parked forever. Once the oldest intent has waited this long the resident
+/// event loop forces one re-drive round: a still-claimed in-flight turn bumps
+/// every intent's attempt counter, so a queue that never drains reaches
+/// `MAX_PARKED_REDRIVE_ATTEMPTS` and fails closed instead of hanging.
+const PARKED_REDRIVE_AGING: Duration = Duration::from_secs(120);
+
 /// An ordinary delivery parked while another turn held the session, waiting
 /// for `complete()` to re-drive it. `attempts` counts park events (the
 /// initial busy collision is 1); the cap is enforced in `deliver_blocking`
-/// and defensively in `redrive_parked`.
+/// and defensively in `redrive_parked`. `parked_at` is refreshed on every
+/// re-park so the aging sweep grants each attempt the full
+/// `PARKED_REDRIVE_AGING` window.
 #[derive(Debug, Clone)]
 struct ParkedDelivery {
     envelope: DeliveryEnvelope,
     attempts: u32,
+    parked_at: Instant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -996,12 +1007,13 @@ impl OpenCodeNativeShared {
                 );
                 store.record(failed)?;
                 return Err(anyhow::anyhow!(
-                    "OpenCode session already has an ordinary turn in flight"
+                    "OpenCode parked redrive attempts exhausted; delivery failed closed"
                 ));
             }
             self.parked.push_back(ParkedDelivery {
                 envelope: envelope.clone(),
                 attempts,
+                parked_at: Instant::now(),
             });
             let mut queued = DeliveryReceipt::for_state(&envelope, DeliveryState::Queued);
             queued.detail = Some(format!(
@@ -1564,12 +1576,17 @@ impl OpenCodeNativeShared {
                 )?;
             }
             _ => {
-                self.update_state(
+                // A status that is neither an active turn (busy/retry) nor a
+                // proven completion (idle) is not target evidence. Installing
+                // an in-flight gate on it would suspend the session forever
+                // (no completion event is ever guaranteed) and re-install it
+                // on every SSE reconnect. Fail closed to operator
+                // reconciliation instead, exactly like a missing history
+                // proof: the gate is cleared and the queue can drain.
+                return self.mark_ambiguous_and_clear(
                     delivery_id,
-                    DeliveryState::ObservedInSession,
-                    "OpenCode restored a target-confirmed delivery with unknown status",
-                    Some("restore/session.status"),
-                )?;
+                    "OpenCode restored a target-confirmed delivery with unknown session status",
+                );
             }
         }
         Ok(())
@@ -1922,6 +1939,7 @@ impl OpenCodeNativeShared {
                     self.parked.push_back(ParkedDelivery {
                         envelope: parked.envelope,
                         attempts,
+                        parked_at: Instant::now(),
                     });
                 }
                 continue;
@@ -1967,6 +1985,7 @@ impl OpenCodeNativeShared {
                         self.parked.push_back(ParkedDelivery {
                             envelope: parked.envelope,
                             attempts,
+                            parked_at: Instant::now(),
                         });
                     }
                 }
@@ -1979,6 +1998,24 @@ impl OpenCodeNativeShared {
             }
         }
         Ok(())
+    }
+
+    /// Aging escape hatch for the parked queue. `redrive_parked` is otherwise
+    /// only reachable from `complete()`; if no completion event ever arrives
+    /// (lost stream, or an in-flight turn installed by an unknown restore
+    /// status) the queue would wait forever. Once the head intent has aged
+    /// past `PARKED_REDRIVE_AGING`, force one re-drive round: a still-claimed
+    /// in-flight turn bumps every parked intent's attempt counter, so the
+    /// queue drains or fails closed at the cap. Re-parking refreshes
+    /// `parked_at`, so each attempt waits a full window.
+    fn sweep_parked_aging(&mut self) -> anyhow::Result<()> {
+        let Some(head) = self.parked.front() else {
+            return Ok(());
+        };
+        if head.parked_at.elapsed() < PARKED_REDRIVE_AGING {
+            return Ok(());
+        }
+        self.redrive_parked()
     }
 
     fn poll_event_blocking(&mut self) -> anyhow::Result<Option<BackendEvent>> {
@@ -2135,6 +2172,11 @@ fn resident_event_loop(adapter: Arc<Mutex<OpenCodeNativeShared>>, stop: Arc<Atom
                     std::thread::sleep(Duration::from_millis(250));
                 }
             }
+        }
+        // A stuck in-flight turn may never emit a completion event, so the
+        // parked queue needs an escape that does not depend on one.
+        if let Err(error) = adapter.lock().sweep_parked_aging() {
+            tracing::debug!(error = %error, "OpenCode parked-delivery aging sweep failed");
         }
     }
 }

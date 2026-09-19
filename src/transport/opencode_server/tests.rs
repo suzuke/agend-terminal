@@ -1063,7 +1063,8 @@ fn parked_redrive_attempt_cap_fails_closed() {
         .expect_err("cap exhausts fail-closed");
     assert_eq!(
         error.to_string(),
-        "OpenCode session already has an ordinary turn in flight"
+        "OpenCode parked redrive attempts exhausted; delivery failed closed",
+        "the fail-closed signal must be distinguishable from the park signal"
     );
     assert_eq!(
         store
@@ -1089,6 +1090,7 @@ fn parked_redrive_attempt_cap_fails_closed() {
     adapter.parked.push_back(ParkedDelivery {
         envelope: stale,
         attempts: MAX_PARKED_REDRIVE_ATTEMPTS + 1,
+        parked_at: Instant::now(),
     });
     adapter
         .complete(in_flight_id, "session.idle")
@@ -1523,6 +1525,284 @@ fn restore_idle_without_target_history_proof_is_ambiguous() {
     );
     server.join().expect("server");
     let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn restore_unknown_status_clears_gate_as_ambiguous_without_recurrence() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+    let port = listener.local_addr().expect("address").port();
+    let delivery_id = Uuid::new_v4();
+    let wire_message_id = opencode_message_id(delivery_id);
+    let expected_wire = wire_message_id.clone();
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let (header, _) = read_http_request(&stream);
+            let request_line = header.lines().next().unwrap_or_default();
+            if request_line.starts_with("GET /session/session-1/message?limit=100 ") {
+                json_response(
+                    &mut stream,
+                    "200 OK",
+                    json!([{"info": {"id": expected_wire}}]),
+                );
+            } else if request_line.starts_with("GET /session/status ") {
+                json_response(
+                    &mut stream,
+                    "200 OK",
+                    json!({"session-1": {"type": "starting"}}),
+                );
+            } else {
+                panic!("unexpected request: {request_line}");
+            }
+        }
+    });
+
+    let home =
+        std::env::temp_dir().join(format!("agend-opencode-restore-unknown-{}", Uuid::new_v4()));
+    let locator = SessionLocator::opencode(
+        format!("http://127.0.0.1:{port}"),
+        Some("session-1".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    let mut envelope = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "restore me",
+        None,
+    );
+    envelope.delivery_id = delivery_id;
+    let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+    store.record_queued(&envelope).expect("queued");
+    let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+    accepted.protocol_request_id = Some(wire_message_id);
+    store.record(accepted).expect("accepted");
+
+    let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+    adapter.locator = Some(locator);
+    adapter.pending.insert(delivery_id, envelope);
+    adapter.in_flight = Some(delivery_id);
+    adapter.restore_pending_state().expect("restore");
+    assert_eq!(
+        adapter.in_flight, None,
+        "an unknown status must not install a permanent in-flight gate"
+    );
+    assert!(!adapter.pending.contains_key(&delivery_id));
+    assert!(!adapter.target_confirmed.contains(&delivery_id));
+    assert_eq!(
+        store
+            .latest(delivery_id)
+            .expect("latest")
+            .expect("receipt")
+            .state,
+        DeliveryState::Ambiguous
+    );
+
+    // An SSE reconnect reruns restore. The Ambiguous receipt is terminal, so
+    // it is never a restore candidate and the bogus gate cannot reappear.
+    adapter.restore_pending_state().expect("restore rerun");
+    assert_eq!(
+        adapter.in_flight, None,
+        "a reconnect rerun must not re-install the gate"
+    );
+    assert!(!adapter.pending.contains_key(&delivery_id));
+
+    server.join().expect("server");
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn restore_unknown_status_reopens_gate_for_a_fresh_delivery() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+    let port = listener.local_addr().expect("address").port();
+    let restored_id = Uuid::new_v4();
+    let restored_wire = opencode_message_id(restored_id);
+    let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let (header, body) = read_http_request(&stream);
+            let request_line = header.lines().next().unwrap_or_default();
+            if request_line.starts_with("GET /session/session-1/message?limit=100 ") {
+                json_response(
+                    &mut stream,
+                    "200 OK",
+                    json!([{"info": {"id": restored_wire}}]),
+                );
+            } else if request_line.starts_with("GET /session/status ") {
+                json_response(
+                    &mut stream,
+                    "200 OK",
+                    json!({"session-1": {"type": "starting"}}),
+                );
+            } else if request_line.starts_with("POST /session/session-1/prompt_async ") {
+                let prompt = serde_json::from_slice::<Value>(&body).expect("prompt json");
+                prompt_tx.send(prompt).expect("prompt capture");
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("prompt response");
+                stream.flush().expect("prompt flush");
+            } else {
+                panic!("unexpected request: {request_line}");
+            }
+        }
+    });
+
+    let home = std::env::temp_dir().join(format!(
+        "agend-opencode-restore-unknown-reopen-{}",
+        Uuid::new_v4()
+    ));
+    let locator = SessionLocator::opencode(
+        format!("http://127.0.0.1:{port}"),
+        Some("session-1".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    let mut restored = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "restore me",
+        None,
+    );
+    restored.delivery_id = restored_id;
+    let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+    store.record_queued(&restored).expect("queued");
+    let mut accepted = DeliveryReceipt::for_state(&restored, DeliveryState::ProtocolAccepted);
+    accepted.protocol_request_id = Some(opencode_message_id(restored_id));
+    store.record(accepted).expect("accepted");
+
+    let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+    adapter.locator = Some(locator.clone());
+    adapter.pending.insert(restored_id, restored);
+    adapter.in_flight = Some(restored_id);
+    adapter.restore_pending_state().expect("restore");
+    assert_eq!(adapter.in_flight, None);
+
+    // The gate is open, so the next delivery submits instead of parking
+    // forever behind a phantom in-flight turn.
+    adapter.ready = true;
+    let fresh = DeliveryEnvelope::new(
+        "agent",
+        locator,
+        DeliveryKind::Prompt,
+        "after restore",
+        None,
+    );
+    let fresh_id = fresh.delivery_id;
+    let receipt = adapter
+        .deliver_blocking(fresh)
+        .expect("fresh delivery submits");
+    assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
+    assert_eq!(adapter.in_flight, Some(fresh_id));
+    assert!(adapter.parked.is_empty());
+    assert_eq!(
+        store
+            .latest(fresh_id)
+            .expect("latest")
+            .expect("receipt")
+            .state,
+        DeliveryState::ProtocolAccepted
+    );
+    let prompt = prompt_rx.recv().expect("prompt captured");
+    assert_eq!(
+        prompt.pointer("/parts/0/text").and_then(Value::as_str),
+        Some("after restore")
+    );
+
+    server.join().expect("server");
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn parked_queue_ages_to_fail_closed_without_completion_event() {
+    let home = std::env::temp_dir().join(format!("agend-opencode-park-aging-{}", Uuid::new_v4()));
+    let locator = SessionLocator::opencode(
+        "http://127.0.0.1:4096".to_string(),
+        Some("session-1".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+    adapter.locator = Some(locator.clone());
+    adapter.ready = true;
+    // A turn that claims the session but will never emit a completion event.
+    let stuck = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "stuck",
+        None,
+    );
+    adapter.in_flight = Some(stuck.delivery_id);
+    adapter.pending.insert(stuck.delivery_id, stuck);
+
+    let parked = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "queued",
+        None,
+    );
+    let parked_id = parked.delivery_id;
+    assert!(adapter.deliver_blocking(parked).is_err());
+    assert_eq!(adapter.parked.len(), 1);
+    assert_eq!(adapter.parked[0].attempts, 1);
+
+    // A young park is a legitimately busy collision: the sweep must not
+    // steal an attempt from it.
+    adapter.sweep_parked_aging().expect("young sweep");
+    assert_eq!(adapter.parked.len(), 1);
+    assert_eq!(adapter.parked[0].attempts, 1);
+
+    let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+    // Without any completion event, each aging window advances exactly one
+    // attempt; the queue stays bounded and fails closed at the cap.
+    for expected in 2..=MAX_PARKED_REDRIVE_ATTEMPTS {
+        age_parked(&mut adapter);
+        adapter.sweep_parked_aging().expect("aging sweep");
+        assert_eq!(
+            adapter.parked.len(),
+            1,
+            "still parked at attempt {expected}"
+        );
+        assert_eq!(adapter.parked[0].attempts, expected);
+        assert_eq!(
+            store
+                .latest(parked_id)
+                .expect("latest")
+                .expect("receipt")
+                .state,
+            DeliveryState::Queued
+        );
+    }
+    age_parked(&mut adapter);
+    adapter.sweep_parked_aging().expect("final sweep");
+    assert!(
+        adapter.parked.is_empty(),
+        "aging must reach the fail-closed cap"
+    );
+    assert_eq!(
+        store
+            .latest(parked_id)
+            .expect("latest")
+            .expect("receipt")
+            .state,
+        DeliveryState::Failed
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+fn age_parked(adapter: &mut OpenCodeNativeShared) {
+    let aged = Instant::now()
+        .checked_sub(PARKED_REDRIVE_AGING + Duration::from_secs(1))
+        .expect("representable instant");
+    for parked in adapter.parked.iter_mut() {
+        parked.parked_at = aged;
+    }
 }
 
 fn read_http_request(mut stream: &TcpStream) -> (String, Vec<u8>) {
