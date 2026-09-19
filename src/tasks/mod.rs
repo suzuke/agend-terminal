@@ -5,6 +5,7 @@ mod activity;
 pub mod auto_close;
 mod board_router;
 mod board_sweep;
+mod board_unretire;
 pub(crate) mod governance;
 mod handler;
 pub mod lifecycle;

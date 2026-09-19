@@ -1603,6 +1603,16 @@ pub(crate) fn projected_state_at(board: &Path) -> anyhow::Result<TaskBoardState>
         .map_err(|error| anyhow::anyhow!("task catalog is unreadable: {error:?}"))
 }
 
+/// #3668: strictly fold a board straight from disk. The catalog deliberately
+/// excludes `boards-retired/`, so [`projected_state_at`] cannot see a retired
+/// board (its path has no `boards/` parent). This read-only view exists ONLY so
+/// `board_unretire` can disclose which non-terminal tasks a reversal would
+/// reactivate; routing and mutation keep using the catalog authority.
+pub(crate) fn disk_state_at(board: &Path) -> anyhow::Result<TaskBoardState> {
+    replay_strict_at_incumbent(board)
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.path.display(), error.cause))
+}
+
 // Test-only compatibility names keep the historical behavioral suite useful
 // without restoring a production replay authority path.
 #[cfg(test)]

@@ -63,6 +63,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         "update" => handle_update(home, instance_name, emitter, args),
         "sweep" => handle_sweep(home, args),
         "board_sweep" => super::board_sweep::handle(home, args),
+        "board_unretire" => super::board_unretire::handle(home, args),
         "health" => handle_health(home),
         "activity" => handle_activity(home, args),
         "metadata_set" => handle_metadata_set(home, instance_name, emitter, args),
@@ -85,6 +86,7 @@ pub(crate) fn handle_with_live_instances(
     match args["action"].as_str() {
         Some("sweep") => handle_sweep_with_live_instances(home, args, live_instances),
         Some("board_sweep") => super::board_sweep::handle(home, args),
+        Some("board_unretire") => super::board_unretire::handle(home, args),
         Some("health") => handle_health_with_live_instances(home, Some(live_instances)),
         _ => handle(home, instance_name, args),
     }
