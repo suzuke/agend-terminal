@@ -565,6 +565,26 @@ impl Drop for InDone {
     }
 }
 
+/// #3681: the body of a connection's input thread. Owns the RAII "input done"
+/// guard, so the signal fires on EVERY exit — peer EOF, a malformed frame, a
+/// failed PTY write, or a panic — not only after `forward_tui_input` returns.
+///
+/// Extracted from the accept loop so production and the wiring test share this
+/// exact binding: deleting `let _done = InDone(...)` here must break
+/// `input_thread_completion_ends_the_idle_output_forwarder`, the end-to-end pin
+/// that an idle output forwarder cannot outlive its input side.
+fn run_tui_input(
+    reader: std::net::TcpStream,
+    input_done: Arc<AtomicBool>,
+    name: String,
+    write_data: impl FnMut(&[u8]) -> bool,
+    resize: impl FnMut(u16, u16),
+) {
+    let _done = InDone(input_done);
+    forward_tui_input(reader, write_data, resize);
+    tracing::info!(agent = %name, "TUI client disconnected");
+}
+
 pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry: &AgentRegistry) {
     // #3681 observability: register the bridge so doctor/thread-dump counts see
     // it. Guard drops when the loop returns (retirement).
@@ -730,13 +750,13 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
                 .name(format!("{n}_tui_in"))
                 .spawn(move || {
                     let _census = crate::thread_census::register("tui_in");
-                    // RAII: raise "input done" on EVERY exit from this thread,
-                    // including a panic — not only after `forward_tui_input`
-                    // returns. This is the signal that stops the output forwarder
-                    // leaking one OS thread per reconnect (#3681).
-                    let _done = InDone(in_input_done);
-                    forward_tui_input(
+                    // #3681: `run_tui_input` owns the RAII "input done" guard, so
+                    // production and the wiring test share ONE binding of the
+                    // signal that ends the idle output forwarder.
+                    run_tui_input(
                         read_stream,
+                        in_input_done,
+                        n,
                         |data| {
                             // CR-2026-06-14: route through the bounded
                             // `write_to_pty` (write_with_timeout) instead of a
@@ -762,7 +782,6 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
                             c.vterm.resize(cols, rows);
                         },
                     );
-                    tracing::info!(agent = %n, "TUI client disconnected");
                 })
                 .map(|_| ())
         }) {
@@ -1771,6 +1790,80 @@ mod tests {
             panicked.load(Ordering::Acquire),
             "a panicking input thread must still raise the flag via RAII, or the output \
              forwarder leaks one OS thread (#3681)"
+        );
+    }
+
+    /// #3681 wiring-level regression (reviewer-identified coverage gap): the
+    /// guard binding used to be covered only in isolation, so deleting the input
+    /// thread's `let _done = InDone(...)` line left every test green. This drives
+    /// the REAL per-connection path instead — production `forward_tui_output` for
+    /// the output side and production `run_tui_input` (which owns the guard) for
+    /// the input side — over a loopback pair with the port unchanged and the
+    /// subscriber channel kept open. It ends the input side by EOF and never
+    /// touches the flag itself.
+    ///
+    /// RED: remove the `InDone` binding inside `run_tui_input` and the idle
+    /// forwarder never exits; `exited` stays false after the bounded wait.
+    #[test]
+    fn input_thread_completion_ends_the_idle_output_forwarder() {
+        let run_dir = scratch_run_dir("wiring");
+        publish_port(&run_dir, "agent", 4242);
+        let pair = socket_pair();
+        // Kept alive for the whole test: the forwarder must NOT exit through the
+        // subscriber-`Disconnected` arm, only through the input-done signal.
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+
+        let input_done = Arc::new(AtomicBool::new(false));
+
+        // Output side: the real forwarder, watching the shared flag.
+        let out_flag = Arc::clone(&input_done);
+        let dir = run_dir.clone();
+        let (out_done_tx, out_done_rx) = crossbeam_channel::bounded::<()>(1);
+        let output = std::thread::spawn(move || {
+            super::forward_tui_output(pair.server, rx, dir, "agent".to_string(), 4242, out_flag);
+            let _ = out_done_tx.send(());
+        });
+
+        // Input side: the real input body, which owns the RAII guard. Its reader
+        // is the pair's second server handle — the same clone the accept loop
+        // hands the input thread.
+        let in_flag = Arc::clone(&input_done);
+        let reader = pair._server_input_side;
+        let input = std::thread::spawn(move || {
+            super::run_tui_input(
+                reader,
+                in_flag,
+                "agent".to_string(),
+                |_: &[u8]| true,
+                |_: u16, _: u16| {},
+            );
+        });
+
+        // End the input side the way a disappearing client does: EOF on the
+        // peer's write half. No manual flag store anywhere in this test.
+        let peer_writer = pair.peer.try_clone().unwrap();
+        peer_writer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        // The forwarder must exit on its own within the bound. This is the
+        // assertion that fails if the guard binding is removed.
+        let exited = out_done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        // The input EOF already closes the connection; assert the peer sees it.
+        let closed = peer_sees_eof(pair.peer, Duration::from_secs(2));
+        // Release the channel so the RED path (flag never set) can still exit on
+        // `Disconnected` instead of hanging the join below.
+        drop(tx);
+        let _ = input.join();
+        let _ = output.join();
+        std::fs::remove_dir_all(&run_dir).ok();
+
+        assert!(
+            exited,
+            "the input thread ending must end the idle output forwarder through the shared \
+             flag — deleting run_tui_input's InDone guard must fail this test (#3681)"
+        );
+        assert!(
+            closed,
+            "the connection must be closed so the peer observes EOF (#3681)"
         );
     }
 
