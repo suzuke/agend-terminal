@@ -35,8 +35,9 @@ pub(crate) fn post_merge_receipt_and_watch(
         // without digging through the daemon log.
         Err(reason) => return json!({"skipped": reason}),
     };
-    let expiry =
-        chrono::Utc::now() + chrono::TimeDelta::try_hours(1).unwrap_or(chrono::TimeDelta::zero());
+    let expiry = chrono::Utc::now()
+        + chrono::TimeDelta::try_hours(crate::merge_receipt::RECEIPT_TTL_HOURS)
+            .unwrap_or(chrono::TimeDelta::zero());
     let receipt = crate::merge_receipt::MergeReceipt {
         repo: repo.to_string(),
         merge_sha: merge_commit.to_string(),

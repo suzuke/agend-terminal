@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Bounded lifetime of a merge receipt. Once the assignee's binding has been
+/// released, the receipt is the sole completion authority, so the window must
+/// outlast a normal settle-after-CI cycle (CI queue + retries + operator
+/// latency) without becoming an indefinite grant.
+pub(crate) const RECEIPT_TTL_HOURS: i64 = 7 * 24;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MergeReceipt {
     pub repo: String,
@@ -31,6 +37,16 @@ fn task_completion_settlement_path(home: &Path, receipt: &MergeReceipt) -> PathB
     receipts_dir(home).join(format!("{key}.task-completion"))
 }
 
+/// Remove a receipt JSON together with its `.task-completion` sidecar. An
+/// expired or malformed receipt must not leave the sidecar behind: the sidecar
+/// is keyed off the same hash, so its sibling name is derivable from the JSON
+/// path alone. Only invalid receipts reach here, so a live receipt's sidecar is
+/// never touched.
+fn remove_receipt_and_sidecar(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("task-completion"));
+}
+
 fn load_valid(path: &Path) -> Option<MergeReceipt> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return None;
@@ -38,7 +54,7 @@ fn load_valid(path: &Path) -> Option<MergeReceipt> {
     let receipt: MergeReceipt = match serde_json::from_str(&content) {
         Ok(r) => r,
         Err(_) => {
-            let _ = std::fs::remove_file(path);
+            remove_receipt_and_sidecar(path);
             return None;
         }
     };
@@ -59,19 +75,19 @@ fn load_valid(path: &Path) -> Option<MergeReceipt> {
     let created = match chrono::DateTime::parse_from_rfc3339(&receipt.created_at) {
         Ok(created) => created,
         Err(_) => {
-            let _ = std::fs::remove_file(path);
+            remove_receipt_and_sidecar(path);
             return None;
         }
     };
     let expires = match chrono::DateTime::parse_from_rfc3339(&receipt.expires_at) {
         Ok(expires) => expires,
         Err(_) => {
-            let _ = std::fs::remove_file(path);
+            remove_receipt_and_sidecar(path);
             return None;
         }
     };
     if expires <= created || chrono::Utc::now() > expires {
-        let _ = std::fs::remove_file(path);
+        remove_receipt_and_sidecar(path);
         return None;
     }
     Some(receipt)
@@ -117,8 +133,20 @@ pub(crate) fn find_for_task_completion(
     let mut matched = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("json") => {}
+            Some("task-completion") => {
+                // A sidecar whose receipt JSON is gone is an orphan left by an
+                // older expiry path. With no sibling `.json` its key can never
+                // be read again, so collect it now instead of letting it
+                // accumulate forever. A live receipt's sidecar always has its
+                // JSON sibling and is left untouched.
+                if !path.with_extension("json").exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
+            _ => continue,
         }
         let Some(receipt) = load_valid(&path) else {
             continue;
@@ -248,6 +276,60 @@ mod tests {
         std::fs::write(&malformed, b"{not-json").unwrap();
         assert!(find_for_task_completion(&home, "t-any", "dev").is_none());
         assert!(!malformed.exists(), "malformed receipt must be quarantined");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn expired_receipt_scan_collects_its_task_completion_sidecar() {
+        let home = tmp_home("expired-sidecar-gc");
+        let mut expired = valid_receipt("t-expired-sidecar", "dev", 'e');
+        let created = chrono::Utc::now() - chrono::TimeDelta::hours(2);
+        expired.created_at = created.to_rfc3339();
+        expired.expires_at = (created + chrono::TimeDelta::hours(1)).to_rfc3339();
+        persist(&home, &expired).unwrap();
+        settle_task_completion(&home, &expired).unwrap();
+        let sidecar = task_completion_settlement_path(&home, &expired);
+        assert!(sidecar.exists(), "sidecar fixture must be written");
+
+        assert!(find_for_task_completion(&home, "t-expired-sidecar", "dev").is_none());
+        assert!(
+            !sidecar.exists(),
+            "expired receipt scan must collect its task-completion sidecar"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn valid_receipt_scan_preserves_its_task_completion_sidecar() {
+        let home = tmp_home("valid-sidecar-preserve");
+        let receipt = valid_receipt("t-keep-sidecar", "dev", 'f');
+        persist(&home, &receipt).unwrap();
+        settle_task_completion(&home, &receipt).unwrap();
+        let sidecar = task_completion_settlement_path(&home, &receipt);
+        assert!(sidecar.exists());
+
+        assert!(find_for_task_completion(&home, "t-keep-sidecar", "dev").is_none());
+        assert!(
+            sidecar.exists(),
+            "a live receipt's settlement sidecar must survive the scan"
+        );
+        assert!(find(&home, &receipt.repo, &receipt.merge_sha, &receipt.task_id).is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn orphan_task_completion_sidecar_without_receipt_is_collected_on_scan() {
+        let home = tmp_home("orphan-sidecar");
+        let receipt = valid_receipt("t-orphan-sidecar", "dev", '1');
+        settle_task_completion(&home, &receipt).unwrap();
+        let sidecar = task_completion_settlement_path(&home, &receipt);
+        assert!(sidecar.exists(), "orphan fixture must exist");
+
+        assert!(find_for_task_completion(&home, "t-nobody", "dev").is_none());
+        assert!(
+            !sidecar.exists(),
+            "a sidecar with no receipt JSON must be collected"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

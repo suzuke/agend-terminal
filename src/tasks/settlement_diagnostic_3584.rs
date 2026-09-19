@@ -37,7 +37,8 @@ fn receipt(id: &str) -> crate::merge_receipt::MergeReceipt {
         merge_authority: "lead".into(),
         pr_number: 1,
         created_at: now.to_rfc3339(),
-        expires_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
+        expires_at: (now + chrono::Duration::hours(crate::merge_receipt::RECEIPT_TTL_HOURS))
+            .to_rfc3339(),
     }
 }
 fn done(home: &Home, id: &str) -> Value {
@@ -612,6 +613,45 @@ fn valid_unbound_report_consumes_completion_not_ci_proof_3584() {
 }
 
 #[test]
+fn receipt_beyond_legacy_ttl_still_settles_released_binding_3584() {
+    // Drive the real post-merge creation path, then age the receipt past the
+    // pre-fix 1h TTL while preserving the lifetime that path chose. With no
+    // live binding the receipt is the sole completion authority, so `task done`
+    // must succeed inside the bounded settle-after-CI window.
+    let home = Home::new();
+    let id = task(&home);
+    let repo = "suzuke/agend-terminal";
+    let sha = "a".repeat(40);
+    let persisted = crate::mcp::handlers::ci::post_merge_receipt_and_watch(
+        &home.0,
+        repo,
+        &sha,
+        1,
+        "fix/evidence",
+        "lead",
+        Some(&id),
+    );
+    assert_eq!(persisted["receipt"], "persisted", "{persisted}");
+    let saved = crate::merge_receipt::find(&home.0, repo, &sha, &id).unwrap();
+    let lifetime = chrono::DateTime::parse_from_rfc3339(&saved.expires_at).unwrap()
+        - chrono::DateTime::parse_from_rfc3339(&saved.created_at).unwrap();
+    assert!(
+        lifetime > chrono::Duration::hours(1),
+        "post-merge receipt must outlive the old 1h TTL: {lifetime}"
+    );
+
+    let aged_created = chrono::Utc::now() - chrono::Duration::hours(2);
+    let mut aged = saved;
+    aged.created_at = aged_created.to_rfc3339();
+    aged.expires_at = (aged_created + lifetime).to_rfc3339();
+    crate::merge_receipt::persist(&home.0, &aged).unwrap();
+
+    let accepted = done(&home, &id);
+    assert_eq!(accepted["status"], "done", "{accepted}");
+    assert!(crate::merge_receipt::find_for_task_completion(&home.0, &id, "dev").is_none());
+}
+
+#[test]
 fn post_merge_absent_link_skips_explicit_task_persists_3584() {
     let home = Home::new();
     let id = task(&home);
@@ -640,5 +680,8 @@ fn post_merge_absent_link_skips_explicit_task_persists_3584() {
     let saved = crate::merge_receipt::find(&home.0, &proof.repo, &proof.merge_sha, &id).unwrap();
     let lifetime = chrono::DateTime::parse_from_rfc3339(&saved.expires_at).unwrap()
         - chrono::DateTime::parse_from_rfc3339(&saved.created_at).unwrap();
-    assert!((3599..=3600).contains(&lifetime.num_seconds()));
+    assert!(
+        lifetime > chrono::TimeDelta::days(6) && lifetime <= chrono::TimeDelta::days(7),
+        "receipt must carry the bounded settle-after-CI TTL, not the old 1h window: {lifetime}"
+    );
 }
