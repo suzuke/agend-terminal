@@ -264,14 +264,24 @@ mod review_assignment_marker_tests {
 
     impl ScmProvider for ProvisionalPrMock {
         fn pr_view(&self, _repo: &str, _pr: u64, fields: &[&str]) -> anyhow::Result<PrSummary> {
+            if let Some(hook) = &self.before_return {
+                hook();
+            }
+            // #3675: the fork-head pin reads `state` (a different field set from
+            // the provisional-hydration read). Model an OPEN PR carrying the
+            // configured head so the pin branch is deterministic.
+            if fields.contains(&"state") {
+                return Ok(PrSummary {
+                    state: Some("OPEN".into()),
+                    is_cross_repository: Some(true),
+                    ..self.summary.clone()
+                });
+            }
             assert_eq!(
                 fields,
                 &["number", "headRefOid", "headRefName", "author"],
                 "provisional hydration must request every persisted identity field"
             );
-            if let Some(hook) = &self.before_return {
-                hook();
-            }
             Ok(self.summary.clone())
         }
 
@@ -591,8 +601,12 @@ mod review_assignment_marker_tests {
         std::fs::remove_dir_all(source.parent().unwrap()).ok();
     }
 
-    /// RED #56: an authoritative exact-head mismatch must be surfaced from the
-    /// public dispatch entry before any reviewer workspace state is committed.
+    /// RED #56: an exact head that cannot be materialized locally must be
+    /// surfaced from the public dispatch entry before any reviewer workspace
+    /// state is committed. #3675: the head now has a managed acquisition path,
+    /// so an authoritative-but-unfetchable head fails closed as
+    /// `provider_fetch_failed` (was `expected_head_mismatch` pre-#3675) with the
+    /// same zero-side-effect guarantee.
     #[test]
     #[serial_test::serial]
     #[cfg(unix)]
@@ -613,9 +627,9 @@ mod review_assignment_marker_tests {
         }));
 
         let out = run_review_dispatch_with_head(&home, wrong_head);
-        assert_eq!(out["code"], "expected_head_mismatch", "{out}");
+        assert_eq!(out["code"], "provider_fetch_failed", "{out}");
         assert_eq!(out["expected_head"], wrong_head, "{out}");
-        assert!(out["actual_head"].as_str().is_some(), "{out}");
+        assert!(out["raw"].as_str().is_some(), "{out}");
         assert!(crate::binding::read(&home, "reviewer").is_none());
         assert!(crate::daemon::assignment_authority::active_branches(&home).is_empty());
         assert!(
@@ -1733,5 +1747,544 @@ mod review_assignment_marker_tests {
             "same-task replacement must preserve the owned task"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // #3675 — external (fork) PR head acquisition through the formal
+    // review-assignment dispatch entry.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Git helper for the fork fixtures (bypass env + explicit cwd).
+    #[cfg(unix)]
+    fn git_in(cwd: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git")
+    }
+
+    #[cfg(unix)]
+    fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+        String::from_utf8_lossy(&git_in(cwd, args).stdout)
+            .trim()
+            .to_string()
+    }
+
+    /// Source repo whose `origin` is a local bare repo, left on `main`. Its fork
+    /// head is pushed only to `refs/pull/<N>/head` on `origin`, so the commit is
+    /// genuinely absent from the source repository.
+    #[cfg(unix)]
+    fn setup_fork_review_repo(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let parent = tmp_home(&format!("{label}-repo"));
+        let source = parent.join("source-repo");
+        std::fs::create_dir_all(&source).unwrap();
+        assert!(git_in(&source, &["init", "-b", "main"]).status.success());
+        assert!(git_in(
+            &source,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        )
+        .status
+        .success());
+        let origin = parent.join("origin.git");
+        assert!(
+            git_in(&parent, &["init", "--bare", origin.to_str().unwrap()])
+                .status
+                .success()
+        );
+        assert!(git_in(
+            &source,
+            &["remote", "add", "origin", origin.to_str().unwrap()]
+        )
+        .status
+        .success());
+        assert!(git_in(&source, &["push", "origin", "main"])
+            .status
+            .success());
+        (source, origin)
+    }
+
+    /// Push a fork head for `pr` from a separate peer clone. Returns
+    /// `(pushed_head, later_head)`; only `pushed_head` reaches `origin` (as
+    /// `refs/pull/<pr>/head`), `later_head` exists only in the peer.
+    #[cfg(unix)]
+    fn push_fork_pull_head(parent: &Path, origin: &Path, pr: u64) -> (String, String) {
+        let peer = parent.join(format!("fork-peer-{pr}"));
+        assert!(git_in(
+            parent,
+            &[
+                "clone",
+                "--no-hardlinks",
+                origin.to_str().unwrap(),
+                peer.to_str().unwrap(),
+            ],
+        )
+        .status
+        .success());
+        assert!(git_in(&peer, &["config", "user.name", "test"])
+            .status
+            .success());
+        assert!(git_in(&peer, &["config", "user.email", "t@t"])
+            .status
+            .success());
+        assert!(git_in(&peer, &["checkout", "-b", "fork-work"])
+            .status
+            .success());
+        std::fs::write(peer.join("fork.txt"), "fork head\n").unwrap();
+        assert!(git_in(&peer, &["add", "fork.txt"]).status.success());
+        assert!(git_in(&peer, &["commit", "-m", "fork head"])
+            .status
+            .success());
+        let pushed = git_stdout(&peer, &["rev-parse", "HEAD"]);
+        let refspec = format!("refs/heads/fork-work:refs/pull/{pr}/head");
+        assert!(git_in(&peer, &["push", "origin", &refspec])
+            .status
+            .success());
+        std::fs::write(peer.join("fork2.txt"), "later\n").unwrap();
+        assert!(git_in(&peer, &["add", "fork2.txt"]).status.success());
+        assert!(git_in(&peer, &["commit", "-m", "later"]).status.success());
+        let later = git_stdout(&peer, &["rev-parse", "HEAD"]);
+        (pushed, later)
+    }
+
+    #[cfg(unix)]
+    fn agend_refs(source: &Path) -> String {
+        git_stdout(
+            source,
+            &["for-each-ref", "--format=%(refname)", "refs/agend/"],
+        )
+    }
+
+    /// Provider double for the fork-head pin. The provisional-hydration read
+    /// (fields with `headRefOid` and no `state`) always returns `head`; the
+    /// `#3675` pin read (fields with `state`) walks `pin_heads` (last repeated)
+    /// and can be made to fail outright.
+    struct ForkPrMock {
+        head: String,
+        branch: String,
+        number: u64,
+        pin_heads: Vec<String>,
+        pin_state: String,
+        fail_pin: bool,
+        pin_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ForkPrMock {
+        fn new(head: &str, branch: &str, number: u64) -> Self {
+            Self {
+                head: head.to_string(),
+                branch: branch.to_string(),
+                number,
+                pin_heads: Vec::new(),
+                pin_state: "OPEN".to_string(),
+                fail_pin: false,
+                pin_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn pin_calls(&self) -> usize {
+            self.pin_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ScmProvider for ForkPrMock {
+        fn pr_view(&self, _repo: &str, _pr: u64, fields: &[&str]) -> anyhow::Result<PrSummary> {
+            if fields.contains(&"state") {
+                if self.fail_pin {
+                    anyhow::bail!("simulated SCM provider outage");
+                }
+                let i = self
+                    .pin_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = if self.pin_heads.is_empty() {
+                    self.head.clone()
+                } else {
+                    self.pin_heads[i.min(self.pin_heads.len() - 1)].clone()
+                };
+                return Ok(PrSummary {
+                    number: self.number,
+                    head_ref: Some(self.branch.clone()),
+                    head_ref_oid: Some(head),
+                    state: Some(self.pin_state.clone()),
+                    is_cross_repository: Some(true),
+                    ..Default::default()
+                });
+            }
+            assert_eq!(
+                fields,
+                &["number", "headRefOid", "headRefName", "author"],
+                "provisional hydration must request every persisted identity field"
+            );
+            Ok(PrSummary {
+                number: self.number,
+                head_ref: Some(self.branch.clone()),
+                head_ref_oid: Some(self.head.clone()),
+                author_login: Some("octocat".into()),
+                ..Default::default()
+            })
+        }
+
+        fn pr_checks(&self, _repo: &str, _pr: u64) -> anyhow::Result<Vec<crate::scm::CheckState>> {
+            unimplemented!()
+        }
+
+        fn pr_list(
+            &self,
+            _repo: &str,
+            _filter: &crate::scm::ListFilter,
+            _fields: &[&str],
+            _cwd: Option<&Path>,
+        ) -> anyhow::Result<Vec<PrSummary>> {
+            unimplemented!()
+        }
+
+        fn pr_merge(
+            &self,
+            _repo: &str,
+            _pr: u64,
+            _opts: &crate::scm::MergeOpts,
+        ) -> anyhow::Result<crate::scm::MergeOutcome> {
+            unimplemented!()
+        }
+
+        fn issue_view(
+            &self,
+            _repo: &str,
+            _number: u64,
+            _fields: &[&str],
+        ) -> anyhow::Result<crate::scm::IssueSummary> {
+            unimplemented!()
+        }
+
+        fn compare(
+            &self,
+            _repo: &str,
+            _base: &str,
+            _head: &str,
+        ) -> anyhow::Result<crate::scm::CompareResult> {
+            unimplemented!()
+        }
+    }
+
+    /// #3675 GREEN: a formal review dispatch whose reviewed head is absent
+    /// locally must fetch the external PR head (via the namespaced
+    /// `refs/pull/<N>/head` refspec), verify it, and provision the disposable
+    /// reviewer worktree at the exact head — touching neither canonical refs nor
+    /// a dirty source working tree.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn review_dispatch_fetches_missing_fork_head_3675() {
+        let home = tmp_home("3675-fork-success");
+        let (source, origin) = setup_fork_review_repo("3675-fork-success");
+        let (head, _later) = push_fork_pull_head(source.parent().unwrap(), &origin, 42);
+        let head_commit = format!("{head}^{{commit}}");
+        assert!(
+            crate::git_helpers::git_cmd(&source, &["cat-file", "-e", &head_commit]).is_err(),
+            "fixture precondition: fork head must be absent locally"
+        );
+        seed_review_dispatch_home(&home, &source, &head);
+        let mock = Arc::new(ForkPrMock::new(&head, "feat/x", 42));
+        let _scm = crate::scm::set_test_scm_provider(mock.clone());
+
+        std::fs::write(source.join("uncommitted.txt"), "keep me\n").unwrap();
+        let heads_before = git_stdout(
+            &source,
+            &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+        );
+        let remotes_before = git_stdout(
+            &source,
+            &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
+        );
+
+        let out = run_review_dispatch_with_head(&home, &head);
+        assert!(
+            out.get("error").is_none(),
+            "fork review dispatch failed: {out}"
+        );
+        assert_eq!(out["review_assignment"], true, "{out}");
+
+        let binding = crate::binding::read(&home, "reviewer").expect("reviewer binding");
+        let review_branch = binding["branch"].as_str().expect("review branch");
+        assert!(review_branch.starts_with("review/pr42-"), "{binding}");
+        assert_eq!(binding["provisioned_head"], head, "{binding}");
+        assert_eq!(binding["expected_head"], head, "{binding}");
+        let worktree = std::path::PathBuf::from(binding["worktree"].as_str().unwrap());
+        assert_eq!(
+            crate::git_helpers::git_cmd(&worktree, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim(),
+            head,
+            "reviewer worktree must land on the fetched fork head"
+        );
+        assert!(
+            mock.pin_calls() >= 2,
+            "the pin and the post-fetch re-pin must both run"
+        );
+        assert!(
+            agend_refs(&source).trim().is_empty(),
+            "the transient synthetic ref must not leak: {}",
+            agend_refs(&source)
+        );
+
+        let mut expected_heads: Vec<String> = heads_before.lines().map(str::to_string).collect();
+        expected_heads.push(format!("refs/heads/{review_branch}"));
+        let mut actual_heads: Vec<String> = git_stdout(
+            &source,
+            &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+        )
+        .lines()
+        .map(str::to_string)
+        .collect();
+        expected_heads.sort();
+        actual_heads.sort();
+        assert_eq!(
+            actual_heads, expected_heads,
+            "only the review branch may be added to canonical refs/heads"
+        );
+        assert_eq!(
+            git_stdout(
+                &source,
+                &["for-each-ref", "--format=%(refname)", "refs/remotes/"]
+            ),
+            remotes_before,
+            "remote-tracking refs must not change"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("uncommitted.txt")).unwrap(),
+            "keep me\n",
+            "a dirty source working tree must be untouched"
+        );
+
+        let _ = crate::worktree_pool::release_full(&home, "reviewer", false);
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
+    }
+
+    /// #3675 fail-closed: a fetched object that is not the reviewed head deletes
+    /// the synthetic ref and provisions nothing.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn review_dispatch_object_mismatch_deletes_synthetic_ref_3675() {
+        let home = tmp_home("3675-fork-object");
+        let (source, origin) = setup_fork_review_repo("3675-fork-object");
+        let (_pushed, later) = push_fork_pull_head(source.parent().unwrap(), &origin, 42);
+        // Expected = `later` (peer-only); origin's refs/pull/42/head is `_pushed`.
+        seed_review_dispatch_home(&home, &source, &later);
+        let _scm =
+            crate::scm::set_test_scm_provider(Arc::new(ForkPrMock::new(&later, "feat/x", 42)));
+
+        let out = run_review_dispatch_with_head(&home, &later);
+        assert_eq!(out["code"], "object_mismatch", "{out}");
+        assert_eq!(out["expected_head"], later, "{out}");
+        assert!(out["actual_head"].as_str().is_some(), "{out}");
+        assert!(crate::binding::read(&home, "reviewer").is_none());
+        assert!(crate::daemon::assignment_authority::active_branches(&home).is_empty());
+        assert!(review_refs_with_heads(&source, "review/pr42-").is_empty());
+        assert!(
+            agend_refs(&source).trim().is_empty(),
+            "synthetic ref must be deleted on object mismatch: {}",
+            agend_refs(&source)
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
+    }
+
+    /// #3675 fail-closed: a head that moves between the pin and the post-fetch
+    /// re-pin is refused as `head_drifted`, deleting the synthetic ref.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn review_dispatch_head_drift_rejects_3675() {
+        let home = tmp_home("3675-fork-drift");
+        let (source, origin) = setup_fork_review_repo("3675-fork-drift");
+        let (pushed, later) = push_fork_pull_head(source.parent().unwrap(), &origin, 42);
+        seed_review_dispatch_home(&home, &source, &pushed);
+        let mut mock = ForkPrMock::new(&pushed, "feat/x", 42);
+        // Pin #1 → expected; re-pin #2 → the head has moved.
+        mock.pin_heads = vec![pushed.clone(), later.clone()];
+        let mock = Arc::new(mock);
+        let _scm = crate::scm::set_test_scm_provider(mock.clone());
+
+        let out = run_review_dispatch_with_head(&home, &pushed);
+        assert_eq!(out["code"], "head_drifted", "{out}");
+        assert_eq!(out["expected_head"], pushed, "{out}");
+        assert_eq!(out["actual_head"], later, "{out}");
+        assert!(mock.pin_calls() >= 2, "drift is detected by the re-pin");
+        assert!(crate::binding::read(&home, "reviewer").is_none());
+        assert!(crate::daemon::assignment_authority::active_branches(&home).is_empty());
+        assert!(review_refs_with_heads(&source, "review/pr42-").is_empty());
+        assert!(
+            agend_refs(&source).trim().is_empty(),
+            "synthetic ref must be deleted on drift: {}",
+            agend_refs(&source)
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
+    }
+
+    /// #3675 fail-closed: a provider failure before any fetch leaves zero
+    /// mutation.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn review_dispatch_provider_failure_rejects_3675() {
+        let home = tmp_home("3675-fork-provider");
+        let (source, origin) = setup_fork_review_repo("3675-fork-provider");
+        let (pushed, _later) = push_fork_pull_head(source.parent().unwrap(), &origin, 42);
+        seed_review_dispatch_home(&home, &source, &pushed);
+        let mut mock = ForkPrMock::new(&pushed, "feat/x", 42);
+        mock.fail_pin = true;
+        let _scm = crate::scm::set_test_scm_provider(Arc::new(mock));
+
+        let out = run_review_dispatch_with_head(&home, &pushed);
+        assert_eq!(out["code"], "provider_fetch_failed", "{out}");
+        assert!(crate::binding::read(&home, "reviewer").is_none());
+        assert!(crate::daemon::assignment_authority::active_branches(&home).is_empty());
+        assert!(review_refs_with_heads(&source, "review/pr42-").is_empty());
+        assert!(
+            agend_refs(&source).trim().is_empty(),
+            "a provider failure happens before any fetch: {}",
+            agend_refs(&source)
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
+    }
+
+    /// #3675 non-regression: a locally-present reviewed head is provisioned
+    /// without ever consulting the provider pin (byte-identical fast path).
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn review_dispatch_local_head_never_pins_3675() {
+        let home = tmp_home("3675-local-no-pin");
+        let (source, head) = setup_review_dispatch_repo("3675-local-no-pin");
+        seed_review_dispatch_home(&home, &source, &head);
+        let mock = Arc::new(ForkPrMock::new(&head, "feat/x", 42));
+        let _scm = crate::scm::set_test_scm_provider(mock.clone());
+
+        let out = run_review_dispatch_with_head(&home, &head);
+        assert!(
+            out.get("error").is_none(),
+            "local-head review dispatch failed: {out}"
+        );
+        assert_eq!(
+            mock.pin_calls(),
+            0,
+            "a locally-present head must never hit the SCM provider"
+        );
+        let binding = crate::binding::read(&home, "reviewer").expect("reviewer binding");
+        assert_eq!(binding["provisioned_head"], head, "{binding}");
+
+        let _ = crate::worktree_pool::release_full(&home, "reviewer", false);
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
+    }
+
+    /// Mark a routed task terminal so a released disposable review branch is
+    /// reapable (a live task intentionally preserves it).
+    #[cfg(unix)]
+    fn finish_review_task(home: &Path, task_id: &str) {
+        use crate::task_events::{DoneSource, InstanceName, TaskEvent, TaskId};
+        let emitter = InstanceName::from("fork-review-test");
+        crate::task_events::append(
+            home,
+            &emitter,
+            TaskEvent::Done {
+                task_id: TaskId::from(task_id),
+                by: emitter.clone(),
+                source: DoneSource::OperatorManual {
+                    authored_at: "2026-09-19T00:00:00Z".to_string(),
+                    result: None,
+                },
+            },
+        )
+        .expect("finish task");
+    }
+
+    /// #3675 release: after a fork-head review dispatch, releasing the reviewer
+    /// deletes the generated review branch and leaves `main` untouched.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn review_dispatch_release_removes_fork_review_branch_3675() {
+        let home = tmp_home("3675-fork-release");
+        let (source, origin) = setup_fork_review_repo("3675-fork-release");
+        let (head, _later) = push_fork_pull_head(source.parent().unwrap(), &origin, 42);
+        seed_review_dispatch_home(&home, &source, &head);
+        {
+            let _scm =
+                crate::scm::set_test_scm_provider(Arc::new(ForkPrMock::new(&head, "feat/x", 42)));
+            let out = run_review_dispatch_with_head(&home, &head);
+            assert!(
+                out.get("error").is_none(),
+                "fork review dispatch failed: {out}"
+            );
+        }
+        let binding = crate::binding::read(&home, "reviewer").expect("reviewer binding");
+        let review_branch = binding["branch"].as_str().unwrap().to_string();
+        let main_before = git_stdout(&source, &["rev-parse", "refs/heads/main"]);
+        // A live review task would legitimately preserve the branch; the
+        // retention design only reaps once the task is terminal.
+        finish_review_task(&home, "t-rev-1");
+        // Point origin at a GitHub-shaped URL so the release's open-PR probe
+        // reaches the (mocked) SCM provider instead of failing closed on an
+        // unparseable local-path remote.
+        assert!(git_in(
+            &source,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/owner/repo.git",
+            ],
+        )
+        .status
+        .success());
+
+        // The subject PR head is `feat/x`; no open PR is headed at the generated
+        // review branch, so release must delete it.
+        let provider =
+            crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Branches(vec![
+                "feat/x".to_string(),
+            ]));
+        let _scm = crate::scm::set_test_scm_provider(provider.clone());
+        let released = crate::mcp::handlers::worktree::handle_release_worktree(
+            &home,
+            &json!({"instance": "reviewer"}),
+            &None,
+        );
+        assert!(
+            released.get("error").is_none(),
+            "release failed: {released}"
+        );
+        let review_ref = format!("refs/heads/{review_branch}");
+        assert!(
+            !crate::git_helpers::git_ok(&source, &["rev-parse", "--verify", &review_ref]),
+            "the generated review branch must be gone after release: {released}"
+        );
+        assert!(crate::binding::read(&home, "reviewer").is_none());
+        assert_eq!(
+            git_stdout(&source, &["rev-parse", "refs/heads/main"]),
+            main_before,
+            "release must not touch main"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
     }
 }

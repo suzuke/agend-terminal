@@ -283,19 +283,17 @@ pub(super) fn validate_expected_head(
         }));
     }
     let src = Path::new(source_path);
-    let verify = crate::git_helpers::git_cmd(
-        src,
-        &["rev-parse", "--verify", &format!("{expected}^{{commit}}")],
-    );
-    if verify.is_err() {
-        return Some(json!({
-            "error": format!(
-                "expected_head {expected} does not exist as a commit in the repository"
-            ),
-            "code": "expected_head_mismatch",
-            "expected_head": expected,
-            "actual_head": "",
-        }));
+    // #3675: a local hit is unchanged (no network). On a local miss, a
+    // `(repository, pr_number)` context lets the shared helper fetch the
+    // external (fork) PR head into a verified, transiently-ref'd object before
+    // the existing branch/HEAD comparison below runs. Every failure is a
+    // structured, fail-closed response.
+    let repository = args["repository"].as_str().filter(|s| !s.is_empty());
+    let pr_number = args["pr_number"].as_u64();
+    if let Err(error) = crate::mcp::handlers::dispatch_hook::pr_head_pin::ensure_commit_available(
+        src, expected, repository, pr_number,
+    ) {
+        return Some(error.checkout_value());
     }
     let branch_ref = format!("refs/heads/{branch}");
     let branch_exists = crate::git_helpers::git_cmd(src, &["rev-parse", "--verify", &branch_ref]);

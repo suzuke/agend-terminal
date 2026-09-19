@@ -18,24 +18,11 @@ pub(super) fn resolve(
             None,
         ));
     }
-    let commit = format!("{expected}^{{commit}}");
-    let output = crate::git_helpers::git_bypass(source, &["rev-parse", "--verify", &commit])
-        .map_err(|failure| {
-            error(
-                ErrorCode::ExpectedHeadMismatch,
-                Stage::ValidateExpectedHead,
-                format!("expected_head '{expected}' does not resolve to a commit"),
-                Some(failure.to_string()),
-            )
-        })?;
-    if !output.status.success() {
-        return Err(error(
-            ErrorCode::ExpectedHeadMismatch,
-            Stage::ValidateExpectedHead,
-            format!("expected_head '{expected}' does not resolve to a commit"),
-            Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
-        ));
-    }
+    // #3675: the availability check is shared with the checkout side. With no
+    // `(repository, pr_number)` context this is exactly the prior local
+    // `rev-parse --verify` (local-hit fast path, no network I/O).
+    super::pr_head_pin::ensure_commit_available(source, expected, None, None)
+        .map_err(super::pr_head_pin::PrHeadError::into_dispatch_error)?;
     Ok(Some(expected.to_ascii_lowercase()))
 }
 

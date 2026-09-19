@@ -11,6 +11,8 @@ mod exact_head;
 mod from_ref;
 mod lifecycle_permit;
 mod live_binding;
+// #3675: shared external-PR-head availability helper (dispatch + checkout sides).
+pub(crate) mod pr_head_pin;
 mod provider_neutral_slug;
 mod rebase_dispatch;
 mod source_repo_resolution;
@@ -687,7 +689,7 @@ fn resolve_source_repo(
 /// long after the proxy returned `accepted_in_progress` (false success),
 /// swallowing a later bind failure. Worst path is ≤2 sequential best-effort
 /// fetches, so 12s each stays under the proxy ceiling.
-const DISPATCH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+pub(crate) const DISPATCH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// #781 Piece 6: shared auto-create-branch helper (decision tree formerly inlined
 /// Back-compat tuple view of [`ensure_branch_exists_provisioned`]: `(auto_created,

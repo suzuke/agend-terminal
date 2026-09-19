@@ -148,6 +148,13 @@ pub enum ErrorCode {
     InvalidExpectedHead,
     /// `expected_head` did not resolve or differed from the bound HEAD.
     ExpectedHeadMismatch,
+    /// #3675: the external-PR-head pin (`ScmProvider::pr_view`) or the managed
+    /// `git fetch` of `refs/pull/<N>/head` failed.
+    ProviderFetchFailed,
+    /// #3675: the fetched PR head object did not equal `expected_head`.
+    ObjectMismatch,
+    /// #3675: the PR head moved during managed acquisition.
+    HeadDrifted,
     /// `from_ref` arg rejected by `validate_branch` charset rules.
     InvalidFromRef,
     /// `branch` arg rejected by `validate_branch` charset / option-injection

@@ -293,10 +293,12 @@ fn review_workspace_branch(
     format!("review/pr{pr_number}-{head8}-{slot}-{}", &assignment8[..8])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn provision_review_workspace(
     home: &Path,
     target: &str,
     task_id: &str,
+    repo_slug: &str,
     pr_number: u64,
     reviewed_head: &str,
     slot: crate::review_receipt::ReviewSlot,
@@ -311,6 +313,10 @@ fn provision_review_workspace(
             "branch": branch,
             "bind": true,
             "task_id": task_id,
+            // #3675: pin the exact PR so a locally-absent fork head can be
+            // fetched by the checkout precondition.
+            "repository": repo_slug,
+            "pr_number": pr_number,
             "from_ref": reviewed_head,
             "expected_head": reviewed_head,
             "checkout_purpose": "disposable_review",
@@ -461,6 +467,7 @@ fn dispatch_review_assignment_via_store_impl(
             home,
             target,
             task_id,
+            repo_slug,
             pr_number,
             reviewed_head,
             slot,
