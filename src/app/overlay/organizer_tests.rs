@@ -202,3 +202,60 @@ fn arrange_preview_cancel_changes_nothing() {
     );
     std::fs::remove_dir_all(home).ok();
 }
+
+/// #3631 blocking-4: `:arrange <unknown-team>` must surface a visible error and
+/// must NOT silently fall back to arranging the current team.
+#[test]
+fn arrange_unknown_team_is_a_visible_error() {
+    let home = org_home("organizer-unknown");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev-1: {}\nteams:\n  ops:\n    members: [dev-1]\n    orchestrator: dev-1\n",
+    )
+    .expect("fleet.yaml");
+
+    let mut layout = Layout::new();
+    layout.add_tab(Tab::new(
+        "scatter".into(),
+        org_pane(1, "dev-1", Some("dev-1")),
+    ));
+
+    let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let (wakeup_tx, _rx) = crossbeam_channel::unbounded();
+    let mut name_counter = HashMap::new();
+    let mut reap_workers = Vec::new();
+    let mut ctx = OverlayCtx {
+        layout: &mut layout,
+        registry: &registry,
+        home: &home,
+        fleet_path: &home,
+        wakeup_tx: &wakeup_tx,
+        name_counter: &mut name_counter,
+        task_rpc_tx: &test_task_channel().0,
+        restart_request_tx: None,
+        reap_workers: &mut reap_workers,
+    };
+    let mut overlay = Overlay::Command {
+        input: "arrange ghost".into(),
+        selected: 0,
+    };
+    handle_key(&mut overlay, press(KeyCode::Enter), &mut ctx);
+
+    match &overlay {
+        Overlay::ReconnectNotice { message } => {
+            assert!(
+                message.contains("unknown team") && message.contains("ghost"),
+                "expected an explicit unknown-team error, got {message:?}"
+            );
+        }
+        other => panic!(
+            "expected a ReconnectNotice, got a non-notice overlay: {}",
+            matches!(other, Overlay::Organizer { .. })
+        ),
+    }
+    assert!(
+        matches!(ctx.layout.tabs[0].name.as_str(), "scatter"),
+        "an unknown team must not rearrange the layout"
+    );
+    std::fs::remove_dir_all(home).ok();
+}

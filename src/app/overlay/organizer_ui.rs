@@ -24,25 +24,26 @@ fn persist_session(home: &Path, layout: &Layout) -> bool {
     super::super::session::save_session(home, layout)
 }
 
-/// Build the Organizer preview overlay for `scope`.
-fn organizer_overlay(layout: &Layout, home: &Path, scope: OrganizerScope) -> Overlay {
+/// Build the Organizer preview overlay for the already-validated scope at
+/// `selected` in `scopes`.
+fn organizer_overlay(
+    layout: &Layout,
+    home: &Path,
+    scopes: Vec<OrganizerScope>,
+    selected: usize,
+) -> Overlay {
     let fleet = load_fleet_config(home);
-    let scopes = organizer::available_scopes(layout, &fleet);
-    let selected = scopes.iter().position(|s| *s == scope).unwrap_or(0);
-    let active = scopes.get(selected).cloned().unwrap_or(scope);
-    let plan = organizer::plan(layout, &fleet, &active);
-    let notice = plan.groups.is_empty().then(|| {
-        format!(
-            "nothing to arrange for {} (scope: {})",
-            active.label(),
-            layout
-                .active_tab()
-                .map(|t| t.name.as_str())
-                .unwrap_or("no tab")
-        )
-    });
+    let scope = scopes
+        .get(selected)
+        .cloned()
+        .unwrap_or(OrganizerScope::CurrentTeam);
+    let plan = organizer::plan(layout, &fleet, &scope);
+    let notice = plan
+        .groups
+        .is_empty()
+        .then(|| format!("nothing to arrange for {}", scope.label()));
     Overlay::Organizer {
-        scope: active,
+        scope,
         scopes,
         selected,
         plan,
@@ -62,38 +63,40 @@ pub(super) fn open_arrange_overlay(
     if parts.first() != Some(&"arrange") {
         return None;
     }
-    match parts.as_slice() {
-        ["arrange", "undo"] => {
-            let message = match organizer::undo(ctx.layout) {
-                Ok(()) => {
-                    outcome.needs_resize = true;
-                    if persist_session(ctx.home, ctx.layout) {
-                        "arrange undone".to_string()
-                    } else {
-                        "undone, but session save FAILED".to_string()
-                    }
+    if let ["arrange", "undo"] = parts.as_slice() {
+        let message = match organizer::undo(ctx.layout) {
+            Ok(()) => {
+                outcome.needs_resize = true;
+                if persist_session(ctx.home, ctx.layout) {
+                    "arrange undone".to_string()
+                } else {
+                    "undone, but session save FAILED".to_string()
                 }
-                Err(error) => error.message(),
-            };
-            Some(Overlay::ReconnectNotice { message })
+            }
+            Err(error) => error.message(),
+        };
+        return Some(Overlay::ReconnectNotice { message });
+    }
+
+    // Resolve the requested scope against the scopes that actually exist. An
+    // unknown team must be a VISIBLE error — never a silent fallback onto the
+    // current team (that would arrange the wrong team).
+    let requested = match parts.as_slice() {
+        ["arrange"] | ["arrange", "current"] => OrganizerScope::CurrentTeam,
+        ["arrange", "all"] => OrganizerScope::AllTeams,
+        ["arrange", name] => OrganizerScope::Team((*name).to_string()),
+        _ => {
+            return Some(Overlay::ReconnectNotice {
+                message: "usage: arrange [current|<team>|all|undo]".to_string(),
+            })
         }
-        ["arrange"] | ["arrange", "current"] => Some(organizer_overlay(
-            ctx.layout,
-            ctx.home,
-            OrganizerScope::CurrentTeam,
-        )),
-        ["arrange", "all"] => Some(organizer_overlay(
-            ctx.layout,
-            ctx.home,
-            OrganizerScope::AllTeams,
-        )),
-        ["arrange", name] => Some(organizer_overlay(
-            ctx.layout,
-            ctx.home,
-            OrganizerScope::Team((*name).into()),
-        )),
-        _ => Some(Overlay::ReconnectNotice {
-            message: "usage: arrange [current|<team>|all|undo]".to_string(),
+    };
+    let fleet = load_fleet_config(ctx.home);
+    let scopes = organizer::available_scopes(ctx.layout, &fleet);
+    match scopes.iter().position(|scope| *scope == requested) {
+        Some(selected) => Some(organizer_overlay(ctx.layout, ctx.home, scopes, selected)),
+        None => Some(Overlay::ReconnectNotice {
+            message: format!("unknown team '{}' (no live members)", requested.label()),
         }),
     }
 }

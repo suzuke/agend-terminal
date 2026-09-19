@@ -19,7 +19,7 @@
 
 use super::pane::Pane;
 use super::preset::{build_preset, LayoutPreset};
-use super::tab::Tab;
+use super::tab::{DragTabTarget, Tab};
 use super::tree::{PaneNode, SplitDir};
 use super::Layout;
 use crate::fleet::FleetConfig;
@@ -212,12 +212,17 @@ pub fn apply(layout: &mut Layout, plan: &OrganizerPlan) -> Result<(), OrganizerE
     }
 
     let snapshot = capture(layout);
+    // #3631: capture each pane's transient tab-level UI state (zoom / in-progress
+    // drag / selection anchor) by STABLE PANE ID before anything is moved, so a
+    // rehomed pane or a rebuilt tab keeps it. `Pane::selection` (the text
+    // highlight) rides along with the moved Pane object itself.
+    let ui = capture_ui_state(layout);
+    let orig_active = layout.active;
     let orig_active_id = layout.tabs.get(layout.active).map(|tab| tab.id);
     let orig_focus_id = layout.tabs.get(layout.active).map(|tab| tab.focus_id);
 
-    // Every pane in a group that is not already sitting in the group's reused
-    // tab must be extracted and rebuilt. A group with a reused tab whose id set
-    // already matches is left completely untouched (custom geometry preserved).
+    // A group whose reused tab already holds exactly its pane set is left
+    // verbatim; every other group's panes are extracted and rebuilt.
     let mut moved: HashSet<usize> = HashSet::new();
     for group in &plan.groups {
         let current_ids: Vec<usize> = group
@@ -240,7 +245,11 @@ pub fn apply(layout: &mut Layout, plan: &OrganizerPlan) -> Result<(), OrganizerE
     let mut anchors: HashMap<usize, usize> = HashMap::new();
     let mut built: Vec<(usize, usize, Tab)> = Vec::new();
 
-    for mut tab in std::mem::take(&mut layout.tabs) {
+    // #3631: the guard owns the pre-apply tabs, so a panic mid-rebuild restores
+    // the not-yet-processed tabs instead of leaving `layout.tabs` empty. Only
+    // `commit` publishes the fully built replacement (single assignment).
+    let mut guard = PendingTabsGuard::new(layout);
+    while let Some(mut tab) = guard.pop_front() {
         let tab_ids = tab.root().pane_ids();
         let tab_moved = tab_ids.iter().any(|id| moved.contains(id));
         if !tab_moved {
@@ -252,26 +261,28 @@ pub fn apply(layout: &mut Layout, plan: &OrganizerPlan) -> Result<(), OrganizerE
                 anchors.entry(group_idx).or_insert(new_tabs.len());
             }
         }
-        let root = tab.root.take().expect("root is always Some");
+        let Some(root) = tab.root.take() else {
+            continue; // invariant: every tab keeps a root
+        };
         let (remaining, removed) = extract_panes(root, &moved);
         for pane in removed {
             pool.insert(pane.id, pane);
         }
-        match remaining {
-            None => {}
-            Some(root) => {
-                tab.root = Some(root);
-                if tab.root().find_pane(tab.focus_id).is_none() {
-                    tab.focus_id = tab.root().first_pane().id;
-                }
-                if tab.dragging_pane.is_some_and(|id| moved.contains(&id)) {
-                    tab.clear_drag();
-                }
-                if tab.selecting_pane.is_some_and(|id| moved.contains(&id)) {
-                    tab.selecting_pane = None;
-                }
-                new_tabs.push(tab);
+        if let Some(root) = remaining {
+            tab.root = Some(root);
+            // The pane this tab was focused on left (which, when zoomed, is the
+            // zoomed pane): repoint focus and drop the now-meaningless zoom.
+            if tab.root().find_pane(tab.focus_id).is_none() {
+                tab.focus_id = tab.root().first_pane().id;
+                tab.zoomed = false;
             }
+            if tab.dragging_pane.is_some_and(|id| moved.contains(&id)) {
+                tab.clear_drag();
+            }
+            if tab.selecting_pane.is_some_and(|id| moved.contains(&id)) {
+                tab.selecting_pane = None;
+            }
+            new_tabs.push(tab);
         }
     }
 
@@ -286,6 +297,7 @@ pub fn apply(layout: &mut Layout, plan: &OrganizerPlan) -> Result<(), OrganizerE
         }
         let root = build_group_tree(panes, group.preset);
         let mut tab = Tab::with_root(group.name.clone(), root);
+        tab.last_layout = Some(group.preset);
         if let Some(reuse) = group.reuse_tab_id {
             if !new_tabs.iter().any(|existing| existing.id == reuse) {
                 tab.id = reuse;
@@ -313,6 +325,17 @@ pub fn apply(layout: &mut Layout, plan: &OrganizerPlan) -> Result<(), OrganizerE
         *offset += 1;
     }
 
+    // Re-apply the captured transient UI state now that final tab order (and so
+    // drag-target-tab indices) is known.
+    let index_of_tab: HashMap<u64, usize> = new_tabs
+        .iter()
+        .enumerate()
+        .map(|(idx, tab)| (tab.id, idx))
+        .collect();
+    for tab in new_tabs.iter_mut() {
+        apply_ui_state(tab, &ui, &index_of_tab);
+    }
+
     let active = orig_active_id
         .and_then(|id| new_tabs.iter().position(|tab| tab.id == id))
         .or_else(|| {
@@ -322,12 +345,140 @@ pub fn apply(layout: &mut Layout, plan: &OrganizerPlan) -> Result<(), OrganizerE
                     .position(|tab| tab.root().find_pane(id).is_some())
             })
         })
-        .unwrap_or_else(|| layout.active.min(new_tabs.len().saturating_sub(1)));
+        .unwrap_or_else(|| orig_active.min(new_tabs.len().saturating_sub(1)));
 
-    layout.tabs = new_tabs;
+    guard.commit(new_tabs);
     layout.active = active;
     layout.organizer_undo = Some(snapshot);
     Ok(())
+}
+
+/// RAII keeper of the pre-apply tabs. [`commit`](PendingTabsGuard::commit) hands
+/// ownership of the rebuilt tabs to the layout; if the apply scope unwinds first,
+/// `Drop` puts the not-yet-processed tabs back so `layout.tabs` is never empty.
+struct PendingTabsGuard<'a> {
+    layout: &'a mut Layout,
+    pending: Vec<Tab>,
+    armed: bool,
+}
+
+impl<'a> PendingTabsGuard<'a> {
+    fn new(layout: &'a mut Layout) -> Self {
+        let pending = std::mem::take(&mut layout.tabs);
+        Self {
+            layout,
+            pending,
+            armed: true,
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<Tab> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            Some(self.pending.remove(0))
+        }
+    }
+
+    fn commit(mut self, tabs: Vec<Tab>) {
+        self.armed = false;
+        self.layout.tabs = tabs;
+    }
+}
+
+impl Drop for PendingTabsGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.layout.tabs = std::mem::take(&mut self.pending);
+        }
+    }
+}
+
+/// Transient per-pane tab-level UI state captured before a reorder, keyed by the
+/// pane that owns it so it can be re-applied after tabs are rebuilt.
+#[derive(Default)]
+struct UiStateCapture {
+    /// Focused pane of a zoomed tab (zoom belongs to the pane it was showing).
+    zoomed_pane: Option<usize>,
+    /// Pane the mouse was mid-selecting in some tab.
+    selecting_pane: Option<usize>,
+    /// In-progress title-bar drag (one globally).
+    dragging: Option<DraggingCapture>,
+}
+
+struct DraggingCapture {
+    pane_id: usize,
+    target_pane: Option<usize>,
+    /// Drop-target tab captured by STABLE id (or "new tab"), so it survives the
+    /// reorder instead of going stale on an index.
+    target_tab: Option<TabTargetCapture>,
+}
+
+enum TabTargetCapture {
+    Existing(u64),
+    NewTab,
+}
+
+fn capture_ui_state(layout: &Layout) -> UiStateCapture {
+    let mut capture = UiStateCapture::default();
+    for tab in &layout.tabs {
+        if capture.zoomed_pane.is_none() && tab.zoomed {
+            capture.zoomed_pane = Some(tab.focus_id);
+        }
+        if capture.selecting_pane.is_none() {
+            capture.selecting_pane = tab.selecting_pane;
+        }
+        if capture.dragging.is_none() {
+            if let Some(pane_id) = tab.dragging_pane {
+                let target_tab = tab.drag_target_tab.map(|target| match target {
+                    DragTabTarget::ExistingTab(idx) => layout
+                        .tabs
+                        .get(idx)
+                        .map(|t| TabTargetCapture::Existing(t.id))
+                        .unwrap_or(TabTargetCapture::NewTab),
+                    DragTabTarget::NewTab => TabTargetCapture::NewTab,
+                });
+                capture.dragging = Some(DraggingCapture {
+                    pane_id,
+                    target_pane: tab.drag_target,
+                    target_tab,
+                });
+            }
+        }
+    }
+    capture
+}
+
+fn apply_ui_state(tab: &mut Tab, ui: &UiStateCapture, index_of_tab: &HashMap<u64, usize>) {
+    if let Some(zoomed) = ui.zoomed_pane {
+        if tab.root().find_pane(zoomed).is_some() {
+            tab.zoomed = true;
+            tab.focus_id = zoomed;
+        }
+    }
+    if let Some(selecting) = ui.selecting_pane {
+        if tab.root().find_pane(selecting).is_some() {
+            tab.selecting_pane = Some(selecting);
+        }
+    }
+    if let Some(dragging) = &ui.dragging {
+        if tab.root().find_pane(dragging.pane_id).is_some() {
+            tab.dragging_pane = Some(dragging.pane_id);
+            tab.drag_target = dragging
+                .target_pane
+                .filter(|target| tab.root().find_pane(*target).is_some());
+            tab.drag_target_tab = dragging
+                .target_tab
+                .as_ref()
+                .and_then(|target| match target {
+                    TabTargetCapture::Existing(id) => index_of_tab
+                        .get(id)
+                        .copied()
+                        .map(DragTabTarget::ExistingTab),
+                    TabTargetCapture::NewTab => Some(DragTabTarget::NewTab),
+                });
+        }
+    }
 }
 
 /// Undo the last [`apply`] by replaying its pane-id snapshot. Fail-closed: if
@@ -352,6 +503,10 @@ pub fn capture(layout: &Layout) -> LayoutSnapshot {
                 focus_id: tab.focus_id,
                 zoomed: tab.zoomed,
                 last_layout: tab.last_layout,
+                selecting_pane: tab.selecting_pane,
+                dragging_pane: tab.dragging_pane,
+                drag_target: tab.drag_target,
+                drag_target_tab: tab.drag_target_tab,
                 root: capture_node(tab.root()),
             })
             .collect(),
@@ -364,10 +519,15 @@ fn restore(layout: &mut Layout, snapshot: &LayoutSnapshot) -> Result<(), Organiz
     if current != target {
         return Err(OrganizerError::PaneSetChanged);
     }
+    // #3631: move every Pane into a pool (VTerm/selection intact) while the
+    // guard keeps `layout.tabs` non-empty until the rebuilt tabs are published.
+    let mut guard = PendingTabsGuard::new(layout);
     let mut pool: HashMap<usize, Pane> = HashMap::new();
-    for mut tab in std::mem::take(&mut layout.tabs) {
+    while let Some(mut tab) = guard.pop_front() {
         let mut panes = Vec::new();
-        super::preset::flatten_tree_into(tab.root.take().expect("root is always Some"), &mut panes);
+        if let Some(root) = tab.root.take() {
+            super::preset::flatten_tree_into(root, &mut panes);
+        }
         for pane in panes {
             pool.insert(pane.id, pane);
         }
@@ -381,9 +541,13 @@ fn restore(layout: &mut Layout, snapshot: &LayoutSnapshot) -> Result<(), Organiz
         tab.focus_id = tab_snapshot.focus_id;
         tab.zoomed = tab_snapshot.zoomed;
         tab.last_layout = tab_snapshot.last_layout;
+        tab.selecting_pane = tab_snapshot.selecting_pane;
+        tab.dragging_pane = tab_snapshot.dragging_pane;
+        tab.drag_target = tab_snapshot.drag_target;
+        tab.drag_target_tab = tab_snapshot.drag_target_tab;
         tabs.push(tab);
     }
-    layout.tabs = tabs;
+    guard.commit(tabs);
     layout.active = snapshot.active.min(layout.tabs.len().saturating_sub(1));
     Ok(())
 }
@@ -412,6 +576,10 @@ struct TabSnapshot {
     focus_id: usize,
     zoomed: bool,
     last_layout: Option<LayoutPreset>,
+    selecting_pane: Option<usize>,
+    dragging_pane: Option<usize>,
+    drag_target: Option<usize>,
+    drag_target_tab: Option<DragTabTarget>,
     root: NodeSnapshot,
 }
 
@@ -751,6 +919,10 @@ mod tests {
             before,
             "failed apply rolls back to identical state"
         );
+        assert!(
+            !layout.tabs.is_empty(),
+            "a rejected apply must never leave an empty layout"
+        );
     }
 
     #[test]
@@ -930,5 +1102,140 @@ mod tests {
     fn no_snapshot_undo_is_rejected() {
         let mut layout = Layout::new();
         assert_eq!(undo(&mut layout), Err(OrganizerError::NoSnapshot));
+    }
+
+    /// #3631 acceptance 4: a pane that is *rehomed* keeps its zoom, in-progress
+    /// selection anchor, drag state, and text selection.
+    #[test]
+    fn moved_pane_keeps_zoom_selection_and_drag_state() {
+        let fleet = fleet(OPS);
+        let mut lead = pane(1, "lead", Some("lead"));
+        lead.selection = Some(crate::layout::Selection {
+            start: (0, 0),
+            end: (2, 0),
+        });
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("scatter-lead".into(), lead));
+        layout.add_tab(Tab::new("scatter-dev".into(), pane(2, "dev", Some("dev"))));
+        // `add_tab` clears the outgoing tab's transient input, so seed the state
+        // after the layout exists (as it would be at real apply time).
+        layout.tabs[0].zoomed = true;
+        layout.tabs[0].focus_id = 1;
+        layout.tabs[0].selecting_pane = Some(1);
+        layout.tabs[0].dragging_pane = Some(1);
+        layout.active = 0;
+
+        let plan = plan(&layout, &fleet, &OrganizerScope::AllTeams);
+        apply(&mut layout, &plan).unwrap();
+
+        let ops = layout
+            .tabs
+            .iter()
+            .find(|tab| tab.name == "ops")
+            .expect("team tab built");
+        assert!(ops.root().find_pane(1).is_some() && ops.root().find_pane(2).is_some());
+        assert!(ops.zoomed, "zoom survives a rehome");
+        assert_eq!(ops.focus_id, 1, "the zoomed pane keeps focus");
+        assert_eq!(ops.selecting_pane, Some(1), "selection anchor survives");
+        assert_eq!(ops.dragging_pane, Some(1), "drag state survives");
+        assert!(
+            ops.root().find_pane(1).unwrap().selection.is_some(),
+            "text selection rides with the moved Pane"
+        );
+    }
+
+    /// #3631 acceptance 4 + undo completeness: undo is a perfect inverse for the
+    /// transient tab-level state too.
+    #[test]
+    fn undo_restores_transient_tab_state() {
+        let fleet = fleet(OPS);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new(
+            "scatter-lead".into(),
+            pane(1, "lead", Some("lead")),
+        ));
+        let lead_tab_id = layout.tabs[0].id;
+        layout.add_tab(Tab::new("scatter-dev".into(), pane(2, "dev", Some("dev"))));
+        // Seed transient state after `add_tab` (which clears the outgoing tab).
+        layout.tabs[0].zoomed = true;
+        layout.tabs[0].selecting_pane = Some(1);
+        layout.tabs[0].dragging_pane = Some(1);
+        layout.tabs[0].drag_target = Some(1);
+        layout.tabs[0].last_layout = Some(LayoutPreset::Tiled);
+        layout.active = 0;
+
+        let plan = plan(&layout, &fleet, &OrganizerScope::AllTeams);
+        apply(&mut layout, &plan).unwrap();
+        undo(&mut layout).unwrap();
+
+        let restored = layout
+            .tabs
+            .iter()
+            .find(|tab| tab.id == lead_tab_id)
+            .expect("original tab restored by snapshot");
+        assert!(restored.zoomed);
+        assert_eq!(restored.selecting_pane, Some(1));
+        assert_eq!(restored.dragging_pane, Some(1));
+        assert_eq!(restored.drag_target, Some(1));
+        assert_eq!(restored.last_layout, Some(LayoutPreset::Tiled));
+        assert_eq!(layout.active, 0);
+    }
+
+    /// #3631 blocking-2: a panic inside the apply scope must not leave
+    /// `layout.tabs` empty — the guard restores the unprocessed tabs on unwind.
+    #[test]
+    fn pending_tabs_guard_restores_on_unwind() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("a".into(), pane(1, "a", None)));
+        layout.add_tab(Tab::new("b".into(), pane(2, "b", None)));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = PendingTabsGuard::new(&mut layout);
+            let _first = guard.pop_front();
+            panic!("simulated mid-apply panic");
+        }));
+
+        assert!(result.is_err(), "the simulated panic must propagate");
+        assert_eq!(
+            layout.tabs.len(),
+            1,
+            "the guard restores the unprocessed tab instead of leaving 0 tabs"
+        );
+        assert!(layout.tabs[0].root().find_pane(2).is_some());
+    }
+
+    /// #3631 documented limitation: a team tab that has to be MERGED/REBUILT is
+    /// laid out by its preset, so a source tab's custom split ratio cannot be
+    /// carried across the merge (only untouched / already-correct tabs keep their
+    /// geometry — see `already_arranged_team_tab_is_kept_verbatim`).
+    #[test]
+    fn merged_team_tab_geometry_follows_the_preset() {
+        let fleet = fleet(OPS);
+        let mut dev_tab = Tab::new("mixed".into(), pane(2, "dev", Some("dev")));
+        dev_tab.split_focused(SplitDir::Horizontal, pane(9, "shell", None));
+        if let PaneNode::Split { ratio, .. } = dev_tab.root_mut() {
+            *ratio = 0.4;
+        }
+        let mut layout = Layout::new();
+        layout.add_tab(dev_tab);
+        layout.add_tab(Tab::new("lead".into(), pane(1, "lead", Some("lead"))));
+
+        let plan = plan(&layout, &fleet, &OrganizerScope::AllTeams);
+        apply(&mut layout, &plan).unwrap();
+
+        let ops = layout
+            .tabs
+            .iter()
+            .find(|tab| tab.name == "ops")
+            .expect("team tab built");
+        match ops.root() {
+            PaneNode::Split { ratio, .. } => {
+                assert!(
+                    (ratio - 0.5).abs() < f32::EPSILON,
+                    "merged tab uses the preset ratio, not the source's 0.4"
+                );
+            }
+            PaneNode::Leaf(_) => panic!("two-pane team tab must be split"),
+        }
     }
 }
