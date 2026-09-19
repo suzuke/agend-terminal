@@ -766,6 +766,8 @@ mod tests {
         let mut local = Tab::with_root("local".into(), root);
         local.focus_id = 4;
         local.selecting_pane = Some(4);
+        local.dragging_pane = Some(4);
+        local.zoomed = true;
         let local_id = local.id;
         layout.add_tab(local);
         layout.active = 2;
@@ -780,6 +782,8 @@ mod tests {
             .expect("local tab is untouched and keeps its identity");
         assert_eq!(kept.root().pane_ids(), vec![4, 5]);
         assert_eq!(kept.selecting_pane, Some(4));
+        assert_eq!(kept.dragging_pane, Some(4), "drag state is preserved");
+        assert!(kept.zoomed, "zoom state is preserved");
         assert_eq!(kept.focus_id, 4);
         match kept.root() {
             PaneNode::Split { ratio, .. } => assert!((ratio - 0.3).abs() < f32::EPSILON),
