@@ -1719,13 +1719,12 @@ fn restore_unknown_status_reopens_gate_for_a_fresh_delivery() {
 
 #[test]
 fn parked_queue_ages_to_fail_closed_without_completion_event() {
+    // The status probe can never prove the claimed turn is active (unknown),
+    // so the bounded aging must advance attempts and fail closed. Three
+    // sweeps reach the probe: attempts 2, attempts 3, then the cap.
+    let (port, server) = status_probe_server(vec!["starting", "starting", "starting"]);
     let home = std::env::temp_dir().join(format!("agend-opencode-park-aging-{}", Uuid::new_v4()));
-    let locator = SessionLocator::opencode(
-        "http://127.0.0.1:4096".to_string(),
-        Some("session-1".to_string()),
-        "opencode".to_string(),
-        "secret".to_string(),
-    );
+    let locator = redrive_locator(port);
     let mut adapter = OpenCodeNativeShared::new(&home, "agent");
     adapter.locator = Some(locator.clone());
     adapter.ready = true;
@@ -1753,7 +1752,7 @@ fn parked_queue_ages_to_fail_closed_without_completion_event() {
     assert_eq!(adapter.parked[0].attempts, 1);
 
     // A young park is a legitimately busy collision: the sweep must not
-    // steal an attempt from it.
+    // steal an attempt from it (and must not probe).
     adapter.sweep_parked_aging().expect("young sweep");
     assert_eq!(adapter.parked.len(), 1);
     assert_eq!(adapter.parked[0].attempts, 1);
@@ -1793,7 +1792,142 @@ fn parked_queue_ages_to_fail_closed_without_completion_event() {
             .state,
         DeliveryState::Failed
     );
+    server.join().expect("server");
     let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn aging_sweep_spares_a_genuinely_busy_turn_until_completion() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+    let port = listener.local_addr().expect("address").port();
+    let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        // Call 1: the aging sweep probes a genuinely busy turn.
+        // Call 2: the real completion event then re-drives the parked prompt.
+        for step in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let (header, body) = read_http_request(&stream);
+            let request_line = header.lines().next().unwrap_or_default();
+            if step == 0 {
+                assert!(
+                    request_line.starts_with("GET /session/status "),
+                    "unexpected probe request: {request_line}"
+                );
+                json_response(
+                    &mut stream,
+                    "200 OK",
+                    json!({"session-1": {"type": "busy"}}),
+                );
+            } else {
+                assert!(
+                    request_line.starts_with("POST /session/session-1/prompt_async "),
+                    "unexpected redrive request: {request_line}"
+                );
+                let prompt = serde_json::from_slice::<Value>(&body).expect("prompt json");
+                prompt_tx.send(prompt).expect("prompt capture");
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("prompt response");
+                stream.flush().expect("prompt flush");
+            }
+        }
+    });
+
+    let home = std::env::temp_dir().join(format!("agend-opencode-park-busy-{}", Uuid::new_v4()));
+    let locator = redrive_locator(port);
+    let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+    adapter.locator = Some(locator.clone());
+    adapter.ready = true;
+    // A turn that is genuinely still running; its completion event will come.
+    let long_turn = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "long turn",
+        None,
+    );
+    let long_id = long_turn.delivery_id;
+    adapter.in_flight = Some(long_id);
+    adapter.pending.insert(long_id, long_turn);
+
+    let parked = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "queued",
+        None,
+    );
+    let parked_id = parked.delivery_id;
+    assert!(adapter.deliver_blocking(parked).is_err());
+    assert_eq!(adapter.parked.len(), 1);
+    assert_eq!(adapter.parked[0].attempts, 1);
+
+    // Aged past the window, but the probe proves the turn is still busy: the
+    // sweep must not consume an attempt or fail the delivery closed.
+    age_parked(&mut adapter);
+    adapter.sweep_parked_aging().expect("busy sweep");
+    assert_eq!(
+        adapter.parked.len(),
+        1,
+        "a busy turn keeps its queue parked"
+    );
+    assert_eq!(
+        adapter.parked[0].attempts, 1,
+        "a busy turn must not consume an attempt"
+    );
+    assert!(
+        adapter.parked[0].parked_at.elapsed() < PARKED_REDRIVE_AGING,
+        "the busy probe must refresh the aging window"
+    );
+    assert_eq!(adapter.in_flight, Some(long_id));
+
+    // The completion event arrives: redrive proceeds normally.
+    adapter.complete(long_id, "session.idle").expect("complete");
+    assert_eq!(adapter.in_flight, Some(parked_id));
+    assert!(adapter.parked.is_empty());
+    let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+    assert_eq!(
+        store
+            .latest(parked_id)
+            .expect("latest")
+            .expect("receipt")
+            .state,
+        DeliveryState::ProtocolAccepted
+    );
+    let prompt = prompt_rx.recv().expect("prompt captured");
+    assert_eq!(
+        prompt.pointer("/parts/0/text").and_then(Value::as_str),
+        Some("queued")
+    );
+    server.join().expect("server");
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// Deterministic `/session/status` probe server: answers each accepted
+/// connection with the next status type from `types` (`{"session-1": {"type":
+/// <type>}}`), then exits.
+fn status_probe_server(types: Vec<&'static str>) -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+    let port = listener.local_addr().expect("address").port();
+    let server = thread::spawn(move || {
+        for status_type in types {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let (header, _) = read_http_request(&stream);
+            let request_line = header.lines().next().unwrap_or_default();
+            assert!(
+                request_line.starts_with("GET /session/status "),
+                "unexpected probe request: {request_line}"
+            );
+            json_response(
+                &mut stream,
+                "200 OK",
+                json!({"session-1": {"type": status_type}}),
+            );
+        }
+    });
+    (port, server)
 }
 
 fn age_parked(adapter: &mut OpenCodeNativeShared) {

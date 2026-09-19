@@ -2003,11 +2003,24 @@ impl OpenCodeNativeShared {
     /// Aging escape hatch for the parked queue. `redrive_parked` is otherwise
     /// only reachable from `complete()`; if no completion event ever arrives
     /// (lost stream, or an in-flight turn installed by an unknown restore
-    /// status) the queue would wait forever. Once the head intent has aged
-    /// past `PARKED_REDRIVE_AGING`, force one re-drive round: a still-claimed
-    /// in-flight turn bumps every parked intent's attempt counter, so the
-    /// queue drains or fails closed at the cap. Re-parking refreshes
-    /// `parked_at`, so each attempt waits a full window.
+    /// status) the queue would wait forever.
+    ///
+    /// Once the head intent has aged past `PARKED_REDRIVE_AGING` the sweep
+    /// asks `/session/status` what the claimed turn is really doing, so a
+    /// genuinely long-running turn is not failed closed:
+    ///
+    /// - `busy`/`retry`: still active. Do not consume an attempt; refresh
+    ///   every intent's aging window so they keep waiting for the completion
+    ///   event that will eventually arrive.
+    /// - `idle`: the turn finished even though no completion event reached us.
+    ///   Clear the stale gate (Completed when history already proved the
+    ///   delivery, else Ambiguous) and re-drive.
+    /// - unknown/unprobeable: the turn cannot be proven active, so allow the
+    ///   bounded aging to advance attempts toward `MAX_PARKED_REDRIVE_ATTEMPTS`
+    ///   and fail closed rather than hang forever.
+    ///
+    /// Without a claimed in-flight turn there is nothing to probe and redrive
+    /// is already safe.
     fn sweep_parked_aging(&mut self) -> anyhow::Result<()> {
         let Some(head) = self.parked.front() else {
             return Ok(());
@@ -2015,7 +2028,57 @@ impl OpenCodeNativeShared {
         if head.parked_at.elapsed() < PARKED_REDRIVE_AGING {
             return Ok(());
         }
-        self.redrive_parked()
+        if self.in_flight.is_none() {
+            return self.redrive_parked();
+        }
+        match self.probe_turn_active() {
+            Some(true) => {
+                self.refresh_parked_aging();
+                Ok(())
+            }
+            Some(false) => {
+                if let Some(delivery_id) = self.in_flight {
+                    if self.target_confirmed.contains(&delivery_id) {
+                        return self
+                            .complete(delivery_id, "session.status/aging-sweep")
+                            .map(|_| ());
+                    }
+                    self.mark_ambiguous_and_clear(
+                        delivery_id,
+                        "OpenCode aging sweep found the session idle without in-session proof",
+                    )?;
+                }
+                self.redrive_parked()
+            }
+            None => self.redrive_parked(),
+        }
+    }
+
+    /// Truthful turn state for the claimed in-flight delivery: `Some(true)`
+    /// for an active turn, `Some(false)` for an idle session, `None` when the
+    /// status is unknown or could not be probed. Mirrors the restore/event
+    /// classification through `session_status_type`.
+    fn probe_turn_active(&self) -> Option<bool> {
+        let locator = self.locator.as_ref()?;
+        let session_id = locator.session_id.as_deref()?;
+        let status = request(locator, "GET", "/session/status", Value::Null)
+            .ok()
+            .and_then(|response| response_json(response, "session status").ok())?;
+        match session_status_type(&status, session_id).as_deref() {
+            Some("busy") | Some("retry") => Some(true),
+            Some("idle") => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Restart every parked intent's aging window. Called after a probe proves
+    /// the claimed turn is still active, so a legitimate long turn is not
+    /// charged an attempt.
+    fn refresh_parked_aging(&mut self) {
+        let now = Instant::now();
+        for parked in self.parked.iter_mut() {
+            parked.parked_at = now;
+        }
     }
 
     fn poll_event_blocking(&mut self) -> anyhow::Result<Option<BackendEvent>> {
