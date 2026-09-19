@@ -117,6 +117,7 @@ mod tests {
         hub.notify(ApiEvent::InstanceDeleted {
             name: "worker".to_string(),
             instance_ref: Some(InstanceRef::new(InstanceId::new(), 7)),
+            restart_id: None,
         });
         hub.notify(ApiEvent::TeamCreated {
             name: "team".to_string(),

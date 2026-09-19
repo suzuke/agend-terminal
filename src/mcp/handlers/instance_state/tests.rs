@@ -1964,5 +1964,9 @@ fn restart_report_carries_tui_handoff_false_when_spawn_fails() {
         r["tui_handoff"], false,
         "交接未確認時回報必須攜帶 tui_handoff:false，got: {r}"
     );
+    assert!(
+        r["error"].as_str().is_some_and(|error| !error.is_empty()),
+        "spawn failure must be terminal and carry an error: {r}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }

@@ -5,17 +5,18 @@
 //! locator says it is managed, attaches the TUI to the same session, and uses
 //! `prompt_async` for daemon delivery.  It deliberately has no PTY fallback.
 
+mod http;
+
 use super::{
     AgentDeliveryTransport, BackendEvent, DeliveryEnvelope, DeliveryKind, DeliveryReceipt,
     DeliveryState, ReceiptStore, SessionLocator, TransportCapability, TransportMode,
 };
-use base64::Engine as _;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::io::Read;
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,17 +25,29 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-const IO_TIMEOUT: Duration = Duration::from_secs(10);
+use http::*;
+
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(8);
-const MAX_HEADERS: usize = 64 * 1024;
-const MAX_BODY: usize = 16 * 1024 * 1024;
-const MAX_ERROR_DETAIL: usize = 2048;
 const OPENCODE_MESSAGE_ID_PREFIX: &str = "msg_";
 const OPENCODE_MESSAGE_ID_HEX_LEN: usize = 12;
 const OPENCODE_MESSAGE_ID_RANDOM_LEN: usize = 14;
 const OPENCODE_MESSAGE_ID_TIMESTAMP_MASK: u64 = (1_u64 << 48) - 1;
 const OPENCODE_MESSAGE_ID_TIMESTAMP_HALF_RANGE: u64 = 1_u64 << 47;
 const ROLLOVER_JOURNAL_VERSION: u8 = 1;
+/// Busy-parked ordinary deliveries are re-driven FIFO when the in-flight turn
+/// completes. A parked delivery that keeps colliding with a busy session is
+/// failed closed after this many park events — never retried forever.
+const MAX_PARKED_REDRIVE_ATTEMPTS: u32 = 3;
+
+/// An ordinary delivery parked while another turn held the session, waiting
+/// for `complete()` to re-drive it. `attempts` counts park events (the
+/// initial busy collision is 1); the cap is enforced in `deliver_blocking`
+/// and defensively in `redrive_parked`.
+#[derive(Debug, Clone)]
+struct ParkedDelivery {
+    envelope: DeliveryEnvelope,
+    attempts: u32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RolloverJournal {
@@ -59,324 +72,6 @@ enum RolloverPhase {
         target_session_id: String,
         wire_message_id: String,
     },
-}
-
-#[derive(Debug, Clone)]
-struct Endpoint {
-    host: String,
-    port: u16,
-}
-
-impl Endpoint {
-    fn parse(locator: &SessionLocator) -> anyhow::Result<Self> {
-        let raw = locator
-            .endpoint_url
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("OpenCode NativeShared endpoint URL is missing"))?;
-        let rest = raw.strip_prefix("http://").ok_or_else(|| {
-            anyhow::anyhow!("OpenCode endpoint must use http:// loopback transport")
-        })?;
-        let (authority, suffix) = rest.split_once('/').unwrap_or((rest, ""));
-        if authority.is_empty() || !suffix.is_empty() || rest.contains('?') || rest.contains('#') {
-            return Err(anyhow::anyhow!(
-                "OpenCode endpoint URL has an invalid authority"
-            ));
-        }
-        let (host, port) = authority.rsplit_once(':').ok_or_else(|| {
-            anyhow::anyhow!("OpenCode endpoint URL must include an explicit port")
-        })?;
-        let host = host.trim_matches(['[', ']']);
-        // A fixed numeric loopback endpoint is intentional: accepting a
-        // hostname would make DNS rebinding part of the credential boundary.
-        if host != "127.0.0.1" {
-            return Err(anyhow::anyhow!(
-                "OpenCode NativeShared refuses non-loopback host {host:?}"
-            ));
-        }
-        let port = port
-            .parse::<u16>()
-            .map_err(|_| anyhow::anyhow!("OpenCode endpoint port is invalid"))?;
-        if port == 0 {
-            return Err(anyhow::anyhow!("OpenCode endpoint port must be non-zero"));
-        }
-        Ok(Self {
-            host: host.to_string(),
-            port,
-        })
-    }
-
-    fn address(&self) -> anyhow::Result<SocketAddr> {
-        (self.host.as_str(), self.port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("OpenCode loopback endpoint did not resolve"))
-    }
-}
-
-#[derive(Debug)]
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
-fn basic_auth(locator: &SessionLocator) -> Option<String> {
-    let username = locator.username.as_deref()?;
-    let password = locator.password.as_deref()?;
-    let encoded =
-        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
-    Some(format!("Basic {encoded}"))
-}
-
-fn connect(endpoint: &Endpoint) -> anyhow::Result<TcpStream> {
-    let stream = TcpStream::connect_timeout(&endpoint.address()?, IO_TIMEOUT)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    Ok(stream)
-}
-
-fn write_request(
-    stream: &mut TcpStream,
-    endpoint: &Endpoint,
-    locator: &SessionLocator,
-    method: &str,
-    path: &str,
-    body: &[u8],
-    accept: &str,
-) -> anyhow::Result<()> {
-    if !path.starts_with('/') || path.contains('\r') || path.contains('\n') {
-        return Err(anyhow::anyhow!("OpenCode request path is invalid"));
-    }
-    let auth = basic_auth(locator)
-        .map(|value| format!("Authorization: {value}\r\n"))
-        .unwrap_or_default();
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {}:{}\r\nAccept: {accept}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n{auth}\r\n",
-        endpoint.host,
-        endpoint.port,
-        body.len(),
-    );
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(body)?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn read_headers(stream: &mut TcpStream) -> anyhow::Result<(u16, HashMap<String, String>, Vec<u8>)> {
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    let header_end = loop {
-        let read = stream.read(&mut chunk)?;
-        if read == 0 {
-            return Err(anyhow::anyhow!(
-                "OpenCode HTTP server closed before headers"
-            ));
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-        if bytes.len() > MAX_HEADERS {
-            return Err(anyhow::anyhow!(
-                "OpenCode HTTP headers exceed the size limit"
-            ));
-        }
-        if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            break position;
-        }
-    };
-    let body_start = header_end + 4;
-    let header_text = std::str::from_utf8(&bytes[..header_end])?;
-    let mut lines = header_text.split("\r\n");
-    let status = lines
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .ok_or_else(|| anyhow::anyhow!("OpenCode HTTP status line is invalid"))?
-        .parse::<u16>()?;
-    let mut headers = HashMap::new();
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-        }
-    }
-    Ok((status, headers, bytes[body_start..].to_vec()))
-}
-
-fn read_exact_more(
-    stream: &mut TcpStream,
-    bytes: &mut Vec<u8>,
-    amount: usize,
-) -> anyhow::Result<()> {
-    while bytes.len() < amount {
-        let mut chunk = [0_u8; 4096];
-        let read = stream.read(&mut chunk)?;
-        if read == 0 {
-            return Err(anyhow::anyhow!("OpenCode HTTP body ended early"));
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-        if bytes.len() > MAX_BODY {
-            return Err(anyhow::anyhow!("OpenCode HTTP body exceeds the size limit"));
-        }
-    }
-    Ok(())
-}
-
-fn read_chunked_body(stream: &mut TcpStream, mut raw: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-    let mut body = Vec::new();
-    loop {
-        let size_end = loop {
-            if let Some(position) = raw.windows(2).position(|window| window == b"\r\n") {
-                break position;
-            }
-            let mut chunk = [0_u8; 4096];
-            let read = stream.read(&mut chunk)?;
-            if read == 0 {
-                return Err(anyhow::anyhow!("OpenCode chunked body ended before size"));
-            }
-            raw.extend_from_slice(&chunk[..read]);
-        };
-        let size_line = std::str::from_utf8(&raw[..size_end])?;
-        let size_text = size_line.split(';').next().unwrap_or_default().trim();
-        let size = usize::from_str_radix(size_text, 16)
-            .map_err(|_| anyhow::anyhow!("OpenCode chunk size is invalid"))?;
-        raw.drain(..size_end + 2);
-        if size == 0 {
-            return Ok(body);
-        }
-        let required = size
-            .checked_add(2)
-            .ok_or_else(|| anyhow::anyhow!("OpenCode chunk size overflow"))?;
-        read_exact_more(stream, &mut raw, required)?;
-        body.extend_from_slice(&raw[..size]);
-        if body.len() > MAX_BODY {
-            return Err(anyhow::anyhow!("OpenCode HTTP body exceeds the size limit"));
-        }
-        if &raw[size..size + 2] != b"\r\n" {
-            return Err(anyhow::anyhow!("OpenCode chunk is missing its trailer"));
-        }
-        raw.drain(..required);
-    }
-}
-
-fn read_body(
-    stream: &mut TcpStream,
-    headers: &HashMap<String, String>,
-    initial: Vec<u8>,
-) -> anyhow::Result<Vec<u8>> {
-    if let Some(length) = headers.get("content-length") {
-        let length = length.parse::<usize>()?;
-        if length > MAX_BODY {
-            return Err(anyhow::anyhow!("OpenCode HTTP body exceeds the size limit"));
-        }
-        let mut body = initial;
-        read_exact_more(stream, &mut body, length)?;
-        body.truncate(length);
-        return Ok(body);
-    }
-    if headers
-        .get("transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
-    {
-        return read_chunked_body(stream, initial);
-    }
-    let mut body = initial;
-    let mut chunk = [0_u8; 4096];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => {
-                body.extend_from_slice(&chunk[..read]);
-                if body.len() > MAX_BODY {
-                    return Err(anyhow::anyhow!("OpenCode HTTP body exceeds the size limit"));
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                break
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(body)
-}
-
-fn request(
-    locator: &SessionLocator,
-    method: &str,
-    path: &str,
-    body: Value,
-) -> anyhow::Result<HttpResponse> {
-    let endpoint = Endpoint::parse(locator)?;
-    let mut stream = connect(&endpoint)?;
-    let body = serde_json::to_vec(&body)?;
-    write_request(
-        &mut stream,
-        &endpoint,
-        locator,
-        method,
-        path,
-        &body,
-        "application/json",
-    )?;
-    let (status, headers, initial) = read_headers(&mut stream)?;
-    let body = if matches!(status, 204 | 304) {
-        Vec::new()
-    } else {
-        read_body(&mut stream, &headers, initial)?
-    };
-    Ok(HttpResponse { status, body })
-}
-
-fn response_json(response: HttpResponse, operation: &str) -> anyhow::Result<Value> {
-    if !(200..300).contains(&response.status) {
-        return Err(anyhow::anyhow!(response_error_detail(&response, operation)));
-    }
-    if response.body.is_empty() {
-        return Ok(Value::Null);
-    }
-    Ok(serde_json::from_slice(&response.body)?)
-}
-
-fn response_error_detail(response: &HttpResponse, operation: &str) -> String {
-    let body = response_body_detail(&response.body);
-    if body.is_empty() {
-        format!("OpenCode {operation} returned HTTP {}", response.status)
-    } else {
-        format!(
-            "OpenCode {operation} returned HTTP {}: {body}",
-            response.status
-        )
-    }
-}
-
-fn response_body_detail(body: &[u8]) -> String {
-    if body.is_empty() {
-        return String::new();
-    }
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return String::new();
-    };
-    let message = value
-        .pointer("/data/message")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("message").and_then(Value::as_str));
-    message.map(truncate_error_detail).unwrap_or_default()
-}
-
-fn truncate_error_detail(value: &str) -> String {
-    let value = value.trim();
-    if value.len() <= MAX_ERROR_DETAIL {
-        return value.to_string();
-    }
-    let mut end = MAX_ERROR_DETAIL;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &value[..end])
-}
-
-fn not_found(response: &HttpResponse) -> bool {
-    response.status == 404
 }
 
 #[derive(Debug, Default)]
@@ -1175,6 +870,9 @@ pub(crate) struct OpenCodeNativeShared {
     backend_version: Option<String>,
     in_flight: Option<Uuid>,
     pending: HashMap<Uuid, DeliveryEnvelope>,
+    /// Ordinary deliveries parked by a busy collision, in arrival order.
+    /// `complete()` re-drives them FIFO through the normal submit path.
+    parked: VecDeque<ParkedDelivery>,
     /// Delivery IDs that have been observed in a message-specific event or
     /// session history. Session-level status is never enough by itself.
     target_confirmed: HashSet<Uuid>,
@@ -1194,6 +892,7 @@ impl OpenCodeNativeShared {
             backend_version: None,
             in_flight: None,
             pending: HashMap::new(),
+            parked: VecDeque::new(),
             target_confirmed: HashSet::new(),
             events: VecDeque::new(),
             stream: None,
@@ -1277,16 +976,53 @@ impl OpenCodeNativeShared {
             ));
         }
         if self.in_flight.is_some() {
-            let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
-            failed.detail = Some(
-                "OpenCode ordinary turn is already in flight; no durable queue accepted this delivery"
-                    .to_string(),
-            );
-            store.record(failed)?;
+            // The session is busy, but the durable Queued row above already
+            // accepted this delivery: park the intent for FIFO re-drive when
+            // the in-flight turn completes instead of failing terminally.
+            let prior = self
+                .parked
+                .iter()
+                .find(|parked| parked.envelope.delivery_id == envelope.delivery_id)
+                .map(|parked| parked.attempts)
+                .unwrap_or(0);
+            let attempts = prior + 1;
+            self.parked
+                .retain(|parked| parked.envelope.delivery_id != envelope.delivery_id);
+            if attempts > MAX_PARKED_REDRIVE_ATTEMPTS {
+                let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
+                failed.detail = Some(
+                    "OpenCode ordinary turn is already in flight; parked redrive attempts exhausted"
+                        .to_string(),
+                );
+                store.record(failed)?;
+                return Err(anyhow::anyhow!(
+                    "OpenCode session already has an ordinary turn in flight"
+                ));
+            }
+            self.parked.push_back(ParkedDelivery {
+                envelope: envelope.clone(),
+                attempts,
+            });
+            let mut queued = DeliveryReceipt::for_state(&envelope, DeliveryState::Queued);
+            queued.detail = Some(format!(
+                "OpenCode ordinary turn is in flight; parked for redrive (attempt {attempts})"
+            ));
+            store.record(queued)?;
             return Err(anyhow::anyhow!(
                 "OpenCode session already has an ordinary turn in flight"
             ));
         }
+        self.submit_prompt_async(&store, &envelope)
+    }
+
+    /// The post-gate half of `deliver_blocking`: attach, rollover check, and
+    /// `prompt_async` submit. Shared by fresh deliveries and parked re-drives
+    /// so both face identical validation.
+    fn submit_prompt_async(
+        &mut self,
+        store: &ReceiptStore,
+        envelope: &DeliveryEnvelope,
+    ) -> anyhow::Result<DeliveryReceipt> {
         let locator = self
             .locator
             .clone()
@@ -1301,12 +1037,12 @@ impl OpenCodeNativeShared {
             previous_wire_message_id.as_deref(),
             self.message_id_timestamp(),
         ) {
-            return self.begin_rollover(&store, &envelope, &session_id);
+            return self.begin_rollover(store, envelope, &session_id);
         }
         let wire_message_id = match self.next_message_id(previous_wire_message_id.as_deref()) {
             Ok(message_id) => message_id,
             Err(error) => {
-                let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
+                let mut failed = DeliveryReceipt::for_state(envelope, DeliveryState::Failed);
                 failed.detail = Some(error.to_string());
                 store.record(failed)?;
                 return Err(error);
@@ -1317,20 +1053,20 @@ impl OpenCodeNativeShared {
             &locator,
             "POST",
             &path,
-            Self::prompt_body(&locator, &envelope, &wire_message_id),
+            Self::prompt_body(&locator, envelope, &wire_message_id),
         );
         let response = match response {
             Ok(response) if (200..300).contains(&response.status) => response,
             Ok(response) => {
                 let detail = response_error_detail(&response, "prompt_async");
                 let error = anyhow::anyhow!(detail.clone());
-                let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
+                let mut failed = DeliveryReceipt::for_state(envelope, DeliveryState::Failed);
                 failed.detail = Some(detail);
                 store.record(failed)?;
                 return Err(error);
             }
             Err(error) => {
-                let mut ambiguous = DeliveryReceipt::for_state(&envelope, DeliveryState::Ambiguous);
+                let mut ambiguous = DeliveryReceipt::for_state(envelope, DeliveryState::Ambiguous);
                 ambiguous.detail = Some(
                     "OpenCode prompt_async outcome is ambiguous; reconcile before retry"
                         .to_string(),
@@ -1341,8 +1077,8 @@ impl OpenCodeNativeShared {
         };
         let _ = response;
         self.record_accepted(
-            &store,
-            &envelope,
+            store,
+            envelope,
             wire_message_id,
             session_id,
             "OpenCode prompt_async accepted",
@@ -2137,10 +1873,112 @@ impl OpenCodeNativeShared {
         self.in_flight = None;
         self.pending.remove(&delivery_id);
         self.target_confirmed.remove(&delivery_id);
+        self.redrive_parked()?;
         Ok(BackendEvent::Completed {
             delivery_id,
             event: method.to_string(),
         })
+    }
+
+    /// Re-drive busy-parked deliveries FIFO through the normal submit path.
+    /// Each intent is removed from `parked` BEFORE attempting so a delivery
+    /// is never submitted twice; a re-drive that collides busy again is
+    /// re-parked with `attempts + 1` and failed closed past the cap. Only the
+    /// intents parked before this call are retried — intents re-parked by
+    /// this round wait for the next completion — so the loop always ends.
+    fn redrive_parked(&mut self) -> anyhow::Result<()> {
+        if self.parked.is_empty() {
+            return Ok(());
+        }
+        // Parked intents only exist after a successful attach in this adapter
+        // lifetime; without a locator there is nothing safe to submit, so
+        // leave the queue intact for the next completion.
+        if self.locator.is_none() {
+            return Ok(());
+        }
+        let store = ReceiptStore::for_instance(&self.home, &self.instance)?;
+        let redrive_count = self.parked.len();
+        for _ in 0..redrive_count {
+            let Some(parked) = self.parked.pop_front() else {
+                break;
+            };
+            if self.in_flight.is_some() {
+                let attempts = parked.attempts + 1;
+                if attempts > MAX_PARKED_REDRIVE_ATTEMPTS {
+                    let mut failed =
+                        DeliveryReceipt::for_state(&parked.envelope, DeliveryState::Failed);
+                    failed.detail = Some(
+                        "OpenCode ordinary turn is already in flight; parked redrive attempts exhausted"
+                            .to_string(),
+                    );
+                    store.record(failed)?;
+                } else {
+                    let mut queued =
+                        DeliveryReceipt::for_state(&parked.envelope, DeliveryState::Queued);
+                    queued.detail = Some(format!(
+                        "OpenCode ordinary turn is in flight; parked for redrive (attempt {attempts})"
+                    ));
+                    store.record(queued)?;
+                    self.parked.push_back(ParkedDelivery {
+                        envelope: parked.envelope,
+                        attempts,
+                    });
+                }
+                continue;
+            }
+            if parked.attempts > MAX_PARKED_REDRIVE_ATTEMPTS {
+                let mut failed =
+                    DeliveryReceipt::for_state(&parked.envelope, DeliveryState::Failed);
+                failed.detail = Some(
+                    "OpenCode ordinary turn is already in flight; parked redrive attempts exhausted"
+                        .to_string(),
+                );
+                store.record(failed)?;
+                continue;
+            }
+            if let Some(latest) = store.latest(parked.envelope.delivery_id)? {
+                if latest.state.is_terminal() {
+                    continue;
+                }
+            }
+            match self.submit_prompt_async(&store, &parked.envelope) {
+                Ok(_) => {}
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("already has an ordinary turn in flight") =>
+                {
+                    let attempts = parked.attempts + 1;
+                    if attempts > MAX_PARKED_REDRIVE_ATTEMPTS {
+                        let mut failed =
+                            DeliveryReceipt::for_state(&parked.envelope, DeliveryState::Failed);
+                        failed.detail = Some(
+                            "OpenCode ordinary turn is already in flight; parked redrive attempts exhausted"
+                                .to_string(),
+                        );
+                        store.record(failed)?;
+                    } else {
+                        let mut queued =
+                            DeliveryReceipt::for_state(&parked.envelope, DeliveryState::Queued);
+                        queued.detail = Some(format!(
+                            "OpenCode ordinary turn is in flight; parked for redrive (attempt {attempts})"
+                        ));
+                        store.record(queued)?;
+                        self.parked.push_back(ParkedDelivery {
+                            envelope: parked.envelope,
+                            attempts,
+                        });
+                    }
+                }
+                Err(_) => {
+                    // Any other submit outcome (Failed/Ambiguous/Completed) is
+                    // already recorded durably by the submit path; the intent
+                    // stays dropped and the loop moves to the next parked
+                    // delivery while the session is still idle.
+                }
+            }
+        }
+        Ok(())
     }
 
     fn poll_event_blocking(&mut self) -> anyhow::Result<Option<BackendEvent>> {

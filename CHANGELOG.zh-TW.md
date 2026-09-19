@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Busy window 的 opencode 投遞改為暫存後重送，不再丟棄** — 與 in-flight turn 碰撞的 ordinary delivery 現在會記為 durable `Queued`，並在 turn 結束時按 FIFO 重送（attempt 上限、fail-closed），不再是終端 `Failed` 且無重試。
+
 ## [0.12.2] — 2026-08-17
 
 ### Fixed

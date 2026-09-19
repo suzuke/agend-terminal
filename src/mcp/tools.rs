@@ -703,6 +703,16 @@ mod tests {
     }
 
     #[test]
+    fn create_instance_schema_hides_restart_identity_3670() {
+        let definition = def_create_instance();
+        let props = definition["inputSchema"]["properties"]
+            .as_object()
+            .expect("create_instance properties");
+        assert!(!props.contains_key("restart_id"));
+        assert!(!props.contains_key("old_instance_ref"));
+    }
+
+    #[test]
     fn reply_has_message_id_param_2622() {
         // #2622 PR-3 reviewer5 r0: handle_reply reads args["message_id"] and
         // implements the targeted-channel-routing path, but the schema never

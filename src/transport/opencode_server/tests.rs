@@ -1,5 +1,5 @@
 use super::*;
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::net::TcpListener;
 use std::thread;
 
@@ -934,7 +934,7 @@ fn session_only_events_do_not_regress_or_complete_a_delivery() {
 }
 
 #[test]
-fn busy_collision_and_interrupt_are_terminal_failures_not_fake_queue_entries() {
+fn busy_collision_parks_for_redrive_while_interrupt_stays_terminal() {
     let home = std::env::temp_dir().join(format!("agend-opencode-collision-{}", Uuid::new_v4()));
     let locator = SessionLocator::opencode(
         "http://127.0.0.1:4096".to_string(),
@@ -955,17 +955,386 @@ fn busy_collision_and_interrupt_are_terminal_failures_not_fake_queue_entries() {
     adapter.in_flight = Some(in_flight.delivery_id);
     adapter.pending.insert(in_flight.delivery_id, in_flight);
 
-    for kind in [DeliveryKind::Prompt, DeliveryKind::Interrupt] {
-        let envelope = DeliveryEnvelope::new("agent", locator.clone(), kind, "next", None);
-        let delivery_id = envelope.delivery_id;
-        assert!(adapter.deliver_blocking(envelope).is_err());
-        let receipt = ReceiptStore::for_instance(&home, "agent")
-            .expect("store")
+    // A busy ordinary delivery parks durably Queued for redrive — it is NOT
+    // a terminal failure.
+    let envelope =
+        DeliveryEnvelope::new("agent", locator.clone(), DeliveryKind::Prompt, "next", None);
+    let delivery_id = envelope.delivery_id;
+    let error = adapter
+        .deliver_blocking(envelope)
+        .expect_err("busy ordinary delivery parks");
+    assert_eq!(
+        error.to_string(),
+        "OpenCode session already has an ordinary turn in flight"
+    );
+    let receipt = ReceiptStore::for_instance(&home, "agent")
+        .expect("store")
+        .latest(delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert_eq!(receipt.state, DeliveryState::Queued);
+    assert_eq!(adapter.parked.len(), 1);
+    assert_eq!(adapter.parked[0].envelope.delivery_id, delivery_id);
+    assert_eq!(adapter.parked[0].attempts, 1);
+
+    // Steer/interrupt rejection stays terminal and never parks.
+    let envelope = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Interrupt,
+        "next",
+        None,
+    );
+    let delivery_id = envelope.delivery_id;
+    let error = adapter
+        .deliver_blocking(envelope)
+        .expect_err("interrupt stays terminal");
+    assert_eq!(
+        error.to_string(),
+        "OpenCode NativeShared requires an explicit prompt operation"
+    );
+    let receipt = ReceiptStore::for_instance(&home, "agent")
+        .expect("store")
+        .latest(delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert_eq!(receipt.state, DeliveryState::Failed);
+    assert_eq!(adapter.parked.len(), 1);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn parked_redrive_attempt_cap_fails_closed() {
+    let home = std::env::temp_dir().join(format!("agend-opencode-park-cap-{}", Uuid::new_v4()));
+    let locator = SessionLocator::opencode(
+        "http://127.0.0.1:4096".to_string(),
+        Some("session-1".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+    adapter.locator = Some(locator.clone());
+    adapter.ready = true;
+    let in_flight = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "first",
+        None,
+    );
+    adapter.in_flight = Some(in_flight.delivery_id);
+    adapter
+        .pending
+        .insert(in_flight.delivery_id, in_flight.clone());
+    let in_flight_id = in_flight.delivery_id;
+
+    // Same delivery id colliding while busy parks up to the cap, then fails
+    // closed — all without touching the network (the busy gate precedes it).
+    let envelope = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "retry me",
+        None,
+    );
+    let delivery_id = envelope.delivery_id;
+    for _ in 0..MAX_PARKED_REDRIVE_ATTEMPTS {
+        let error = adapter
+            .deliver_blocking(envelope.clone())
+            .expect_err("busy collision parks");
+        assert_eq!(
+            error.to_string(),
+            "OpenCode session already has an ordinary turn in flight"
+        );
+    }
+    let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+    assert_eq!(
+        store
             .latest(delivery_id)
             .expect("latest")
-            .expect("receipt");
-        assert_eq!(receipt.state, DeliveryState::Failed);
+            .expect("receipt")
+            .state,
+        DeliveryState::Queued
+    );
+    assert_eq!(adapter.parked.len(), 1);
+    assert_eq!(adapter.parked[0].attempts, MAX_PARKED_REDRIVE_ATTEMPTS);
+    let error = adapter
+        .deliver_blocking(envelope)
+        .expect_err("cap exhausts fail-closed");
+    assert_eq!(
+        error.to_string(),
+        "OpenCode session already has an ordinary turn in flight"
+    );
+    assert_eq!(
+        store
+            .latest(delivery_id)
+            .expect("latest")
+            .expect("receipt")
+            .state,
+        DeliveryState::Failed
+    );
+    assert!(adapter.parked.is_empty());
+
+    // The redrive path enforces the same cap without submitting: an
+    // over-attempt intent found in the queue is failed closed on completion.
+    let stale = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "stale park",
+        None,
+    );
+    let stale_id = stale.delivery_id;
+    store.record_queued(&stale).expect("queued");
+    adapter.parked.push_back(ParkedDelivery {
+        envelope: stale,
+        attempts: MAX_PARKED_REDRIVE_ATTEMPTS + 1,
+    });
+    adapter
+        .complete(in_flight_id, "session.idle")
+        .expect("complete");
+    assert_eq!(
+        store
+            .latest(stale_id)
+            .expect("latest")
+            .expect("receipt")
+            .state,
+        DeliveryState::Failed
+    );
+    assert!(adapter.parked.is_empty());
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// Mock OpenCode server for redrive tests: answers health + session lookup,
+/// accepts the event stream, and captures `prompt_async` bodies in order.
+fn redrive_capture_server(
+    prompt_count: usize,
+) -> (
+    u16,
+    thread::JoinHandle<Vec<String>>,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+    let port = listener.local_addr().expect("address").port();
+    let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut texts = Vec::new();
+        for _ in 0..(3 + prompt_count) {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let (header, body) = read_http_request(&stream);
+            let request_line = header.lines().next().unwrap_or_default().to_string();
+            if request_line.starts_with("GET /global/health ") {
+                json_response(
+                    &mut stream,
+                    "200 OK",
+                    json!({"healthy": true, "version": "1.17.5"}),
+                );
+            } else if request_line.starts_with("GET /session/session-1 ") {
+                json_response(&mut stream, "200 OK", json!({"id": "session-1"}));
+            } else if request_line.starts_with("GET /event ") {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+                )
+                .expect("event headers");
+                stream.flush().expect("event flush");
+            } else if request_line.starts_with("POST /session/session-1/prompt_async ") {
+                let prompt = serde_json::from_slice::<Value>(&body).expect("prompt json");
+                let text = prompt
+                    .pointer("/parts/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                texts.push(text);
+                prompt_tx.send(body).expect("prompt capture");
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .expect("prompt response");
+                stream.flush().expect("prompt flush");
+            } else {
+                panic!("unexpected request: {request_line}");
+            }
+        }
+        texts
+    });
+    (port, server, prompt_rx)
+}
+
+fn redrive_locator(port: u16) -> SessionLocator {
+    let mut locator = SessionLocator::opencode(
+        format!("http://127.0.0.1:{port}"),
+        Some("session-1".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    locator.managed = false;
+    locator
+}
+
+#[test]
+fn busy_parked_delivery_redrives_to_completed_after_idle() {
+    let (port, server, _prompt_rx) = redrive_capture_server(2);
+    let home =
+        std::env::temp_dir().join(format!("agend-opencode-redrive-single-{}", Uuid::new_v4()));
+    let locator = redrive_locator(port);
+    let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+    adapter
+        .start_or_attach_blocking(locator.clone(), None)
+        .expect("attach");
+
+    let first = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "first",
+        None,
+    );
+    let first_id = first.delivery_id;
+    let receipt = adapter.deliver_blocking(first).expect("first prompt");
+    assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
+    assert_eq!(adapter.in_flight, Some(first_id));
+
+    let second = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "second",
+        None,
+    );
+    let second_id = second.delivery_id;
+    assert!(adapter.deliver_blocking(second).is_err());
+    let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+    assert_eq!(
+        store
+            .latest(second_id)
+            .expect("latest")
+            .expect("receipt")
+            .state,
+        DeliveryState::Queued
+    );
+
+    // Idle completion re-drives the parked delivery through the normal
+    // submit path: Queued -> ProtocolAccepted with a fresh wire identity.
+    let event = adapter
+        .complete(first_id, "session.idle")
+        .expect("complete");
+    assert!(matches!(
+        event,
+        BackendEvent::Completed { delivery_id: id, .. } if id == first_id
+    ));
+    assert_eq!(adapter.in_flight, Some(second_id));
+    assert!(adapter.parked.is_empty());
+    let receipt = store.latest(second_id).expect("latest").expect("receipt");
+    assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
+    assert!(receipt.protocol_request_id.is_some());
+
+    // The re-driven turn completes normally.
+    let event = adapter
+        .complete(second_id, "session.idle")
+        .expect("complete");
+    assert!(matches!(
+        event,
+        BackendEvent::Completed { delivery_id: id, .. } if id == second_id
+    ));
+    assert_eq!(
+        store
+            .latest(second_id)
+            .expect("latest")
+            .expect("receipt")
+            .state,
+        DeliveryState::Completed
+    );
+    assert_eq!(
+        store
+            .latest(first_id)
+            .expect("latest")
+            .expect("receipt")
+            .state,
+        DeliveryState::Completed
+    );
+
+    let texts = server.join().expect("server");
+    assert_eq!(texts, vec!["first".to_string(), "second".to_string()]);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn parked_deliveries_redrive_fifo() {
+    let (port, server, _prompt_rx) = redrive_capture_server(3);
+    let home = std::env::temp_dir().join(format!("agend-opencode-redrive-fifo-{}", Uuid::new_v4()));
+    let locator = redrive_locator(port);
+    let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+    adapter
+        .start_or_attach_blocking(locator.clone(), None)
+        .expect("attach");
+
+    let first = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "first",
+        None,
+    );
+    let first_id = first.delivery_id;
+    adapter.deliver_blocking(first).expect("first prompt");
+    let second = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "second",
+        None,
+    );
+    let second_id = second.delivery_id;
+    let third = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "third",
+        None,
+    );
+    let third_id = third.delivery_id;
+    assert!(adapter.deliver_blocking(second).is_err());
+    assert!(adapter.deliver_blocking(third).is_err());
+    assert_eq!(adapter.parked.len(), 2);
+
+    // First completion re-drives the head of the queue only; the session is
+    // busy again so the remainder stays parked in order.
+    adapter
+        .complete(first_id, "session.idle")
+        .expect("complete");
+    assert_eq!(adapter.in_flight, Some(second_id));
+    assert_eq!(adapter.parked.len(), 1);
+    assert_eq!(adapter.parked[0].envelope.delivery_id, third_id);
+
+    // Second completion re-drives the next parked delivery.
+    adapter
+        .complete(second_id, "session.idle")
+        .expect("complete");
+    assert_eq!(adapter.in_flight, Some(third_id));
+    assert!(adapter.parked.is_empty());
+
+    adapter
+        .complete(third_id, "session.idle")
+        .expect("complete");
+    assert_eq!(adapter.in_flight, None);
+    let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+    for id in [first_id, second_id, third_id] {
+        assert_eq!(
+            store.latest(id).expect("latest").expect("receipt").state,
+            DeliveryState::Completed,
+            "delivery {id} must complete"
+        );
     }
+
+    let texts = server.join().expect("server");
+    assert_eq!(
+        texts,
+        vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string()
+        ]
+    );
     let _ = std::fs::remove_dir_all(home);
 }
 

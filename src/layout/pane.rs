@@ -44,6 +44,9 @@ pub struct Pane {
     pub working_dir: Option<PathBuf>,
     /// User-defined display name (shown in pane border). agent_name is used if None.
     pub display_name: Option<String>,
+    /// Bounded terminal error from the most recent correlated daemon restart.
+    /// Kept on the pane so the failure remains visible until replacement.
+    pub restart_error: Option<String>,
     /// Scroll offset (lines from bottom). 0 = live view.
     pub scroll_offset: usize,
     /// True when an unread `[from:...]` message was detected.
@@ -163,6 +166,26 @@ impl Pane {
 
     pub fn is_disconnected(&self) -> bool {
         matches!(&self.source, PaneSource::Remote(_, connected) if !connected.load(Ordering::Acquire))
+    }
+
+    pub fn mark_disconnected(&self) {
+        if let PaneSource::Remote(_, connected) = &self.source {
+            connected.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn set_restart_error(&mut self, error: &str) {
+        const MAX_RESTART_ERROR_CHARS: usize = 160;
+        let sanitized: String = error
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(MAX_RESTART_ERROR_CHARS)
+            .collect();
+        self.restart_error = Some(sanitized);
+    }
+
+    pub fn restart_error(&self) -> Option<&str> {
+        self.restart_error.as_deref()
     }
 
     /// Max scroll-back offset for THIS pane's render path. Off-thread mode
@@ -577,6 +600,7 @@ mod tests {
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -707,6 +731,7 @@ mod tests {
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,

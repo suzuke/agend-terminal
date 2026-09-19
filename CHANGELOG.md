@@ -7,6 +7,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+### Fixed
+
+- **Busy-window opencode deliveries are parked and redriven instead of dropped** — an ordinary delivery that collides with an in-flight turn is now recorded as durable `Queued` and redriven FIFO when the turn completes (attempt-capped, fail-closed), instead of terminal `Failed` with no retry.
+
 ## [0.12.2] — 2026-08-17
 
 ### Fixed

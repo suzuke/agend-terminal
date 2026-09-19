@@ -811,6 +811,12 @@ mod tests {
     }
 
     #[test]
+    fn capability_agent_cannot_invoke_restart_lifecycle_adapters_3670() {
+        assert!(!capability_allows(P::Agent, method::DELETE));
+        assert!(!capability_allows(P::Agent, method::SPAWN));
+    }
+
+    #[test]
     fn capability_agent_cannot_invoke_usage_limit_takeover_at_request_gate() {
         for instance in ["", "forged-operator"] {
             let params = json!({

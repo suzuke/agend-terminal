@@ -47,6 +47,19 @@ pub enum ApiEvent {
     InstanceDeleted {
         name: String,
         instance_ref: Option<crate::types::InstanceRef>,
+        /// Correlates the delete leg of a daemon-owned restart. Ordinary
+        /// deletions leave this unset for backwards-compatible retirement.
+        #[serde(default)]
+        restart_id: Option<String>,
+    },
+    /// A daemon-owned restart could not create its successor. The TUI uses
+    /// the exact predecessor identity to retain the pane as disconnected
+    /// immediately instead of waiting for correlation expiry.
+    InstanceRestartFailed {
+        name: String,
+        restart_id: String,
+        old_instance_ref: Option<crate::types::InstanceRef>,
+        error: String,
     },
     TeamCreated {
         name: String,

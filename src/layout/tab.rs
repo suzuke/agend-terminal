@@ -152,15 +152,19 @@ impl Tab {
             .filter(|_| all_have_identity)
             .and_then(|view| {
                 let lead = view.authoritative_lead_for_members(members.iter().copied())?;
+                // #3672: lead-absent (no pane in this tab belongs to the
+                // lead) draws nothing. The old fallthrough called
+                // `view.badge(lead, None)`, which by definition returns
+                // `Uncertain` and drew ` [LEAD?]` — but a tab that simply
+                // isn't the lead's tab carries no uncertainty about the
+                // lead's identity. `badge()` itself (including its
+                // anti-spoofing `None` arm) is untouched.
                 let pane = pane_ids.iter().find_map(|id| {
                     self.root()
                         .find_pane(*id)
                         .filter(|pane| pane.fleet_instance_name.as_deref() == Some(lead))
-                });
-                let badge = match pane {
-                    Some(pane) => view.badge(lead, pane.instance_ref.as_ref()),
-                    None => view.badge(lead, None),
-                };
+                })?;
+                let badge = view.badge(lead, pane.instance_ref.as_ref());
                 match badge {
                     crate::team_view::LeadBadge::Lead => Some(" [LEAD]"),
                     crate::team_view::LeadBadge::Uncertain => Some(" [LEAD?]"),
@@ -512,6 +516,7 @@ mod tests {
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -581,6 +586,10 @@ mod tests {
         );
     }
 
+    /// #3629 (superseded by #3672): a team tab without its lead used to draw
+    /// ` [LEAD?]` to expose uncertainty. #3672 reclassifies lead-absent as
+    /// do-not-draw — a tab that simply isn't the lead's tab (e.g. a moved-out
+    /// member tab) shows the team name with no lead badge.
     #[test]
     fn member_only_team_tab_shows_uncertain_badge_when_lead_is_offline_3629() {
         let member_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 2);
@@ -599,8 +608,39 @@ mod tests {
 
         assert_eq!(
             tab.tab_bar_label_with_team(true, Some(&view)),
-            " ops [LEAD?] ",
-            "a team tab without its online lead must expose uncertainty"
+            " ops ",
+            "#3672: a team tab without its lead draws no lead badge"
+        );
+    }
+    /// #3672 RED: a tab with no pane belonging to the lead must draw NO
+    /// lead badge — the lead-absent case (e.g. a moved-out member tab) is
+    /// not uncertainty about the lead's identity, it is simply not the
+    /// lead's tab. The old call-site `None => view.badge(lead, None)` arm
+    /// returned `Uncertain` by definition and drew ` [LEAD?]`.
+    #[test]
+    fn lead_absent_tab_draws_no_lead_badge_3672() {
+        let member_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 2);
+        let mut pane = leaf(1, "member");
+        pane.fleet_instance_name = Some("member".into());
+        pane.instance_ref = Some(member_ref);
+        let mut tab = tab_with_pane("member", 1, (0, 0, 20, 10));
+        tab.root = Some(PaneNode::Leaf(Box::new(pane)));
+        let config: crate::fleet::FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead, member]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let mut roster = std::collections::HashMap::new();
+        roster.insert("member".to_string(), member_ref);
+        // Roster ALSO knows the lead (fresh identity) — the tab still has
+        // no pane belonging to it, so no badge may be drawn.
+        let lead_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+        roster.insert("lead".to_string(), lead_ref);
+        let view = crate::team_view::TeamView::from_fleet(config, Some(roster));
+
+        assert_eq!(
+            tab.tab_bar_label_with_team(true, Some(&view)),
+            " ops ",
+            "#3672: a tab without the lead draws no lead badge"
         );
     }
     #[test]

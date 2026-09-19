@@ -423,6 +423,18 @@ mod set_model_success_3573;
 mod tests {
     use super::*;
 
+    fn normalize_source_line_endings(source: &str) -> String {
+        source.replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn source_line_ending_normalization_handles_lf_and_crlf_2454() {
+        let lf = "#[cfg(test)]\nmod tests;";
+        let crlf = "#[cfg(test)]\r\nmod tests;";
+        assert_eq!(normalize_source_line_endings(lf), lf);
+        assert_eq!(normalize_source_line_endings(crlf), lf);
+    }
+
     fn release_fixture(tag: &str) -> (std::path::PathBuf, crate::worktree_pool::WorktreeLease) {
         let root = std::env::temp_dir().join(format!(
             "agend-mcp-proxy-release-{}-{tag}",
@@ -1640,14 +1652,15 @@ mod tests {
     /// real-ingress characterization above free of a flaky PTY seam.
     #[test]
     fn restart_instance_runtime_spawn_is_not_socket_fallback_2454() {
-        let source = include_str!("../../mcp/handlers/instance_state/mod.rs");
+        let source =
+            normalize_source_line_endings(include_str!("../../mcp/handlers/instance_state/mod.rs"));
         let restart_start = source
             .find("pub(super) fn handle_restart_instance_with_runtime(")
             .expect("runtime-aware restart handler");
         let restart_end = source[restart_start..]
-            .find("/// #t-777-3")
+            .find("#[cfg(test)]\nmod tests;")
             .map(|offset| restart_start + offset)
-            .expect("restart handler end marker");
+            .expect("restart handler test-module boundary");
         let restart_region = &source[restart_start..restart_end];
         let spawn_start = restart_region
             .find("let spawn_result")

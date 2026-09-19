@@ -10,6 +10,7 @@ pub(crate) mod lifecycle;
 mod restart_prep;
 mod topic;
 pub(super) use instance_layout::resolve_team_layout;
+pub(crate) use restart_prep::restart_instance_autonomic;
 use restart_prep::{await_unsent_draft_or_grace, restart_spawn_params};
 #[cfg(test)]
 use restart_prep::{restart_draft_gate, DraftGate, RESTART_DRAFT_GRACE};
@@ -25,8 +26,6 @@ pub(crate) mod spawn;
 /// 64 is already far beyond any real team size; reject above it at the MCP
 /// boundary, before the allocation and the CREATE_TEAM RPC.
 const MAX_TEAM_COUNT: usize = 64;
-// Restart/TUI 交接 helper 住 restart_prep（mod.rs 受 750-LOC bound 約束）。
-
 pub(super) fn handle_create_instance(
     home: &Path,
     args: &Value,
@@ -643,8 +642,13 @@ pub(super) fn handle_restart_instance_with_runtime(
 
     // Restart intentionally uses no-wait deletion: admission of the kill signal,
     // followed by the replacement spawn, is this path's existing contract.
-    let torn_down =
-        lifecycle::delete_with_runtime_or_legacy(home, name, delete_context.as_ref(), true);
+    let torn_down = lifecycle::delete_with_runtime_or_legacy_for_restart(
+        home,
+        name,
+        delete_context.as_ref(),
+        true,
+        Some(&restart_id),
+    );
     // A fresh restart destroys the session, so every transport receipt keyed
     // to it is unresolvable — the consumer that owed the acknowledgement no
     // longer exists. Left behind, the self-kick watchdog escalates it to every
@@ -695,6 +699,26 @@ pub(super) fn handle_restart_instance_with_runtime(
         .map(|r| r["ok"].as_bool() == Some(true))
         .unwrap_or(false);
 
+    if !spawned {
+        let error = spawn_result
+            .as_ref()
+            .ok()
+            .and_then(|result| result["error"].as_str())
+            .map(str::to_string)
+            .or_else(|| spawn_result.as_ref().err().map(ToString::to_string))
+            .unwrap_or_else(|| "restart spawn failed".to_string());
+        if let Some(runtime) = runtime {
+            if let Some(notifier) = runtime.notifier.as_ref() {
+                notifier.notify(crate::api::ApiEvent::InstanceRestartFailed {
+                    name: name.to_string(),
+                    restart_id: restart_id.clone(),
+                    old_instance_ref,
+                    error,
+                });
+            }
+        }
+    }
+
     // Restart/TUI 交接確認見 restart_prep::settle_tui_handoff。
     let (tui_handoff, handoff_warning) = restart_prep::settle_tui_handoff(home, name, spawned);
 
@@ -702,6 +726,14 @@ pub(super) fn handle_restart_instance_with_runtime(
     let successor_instance_ref = runtime
         .and_then(|runtime| crate::agent::instance_ref_for_name(&runtime.registry, home, name));
     let mut resp = json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned, "tui_handoff": tui_handoff, "restart_id": restart_id, "old_instance_ref": old_instance_ref, "successor_instance_ref": successor_instance_ref});
+    if !spawned {
+        resp["error"] = spawn_result
+            .as_ref()
+            .ok()
+            .and_then(|result| result.get("error"))
+            .cloned()
+            .unwrap_or_else(|| json!("restart spawn failed"));
+    }
     if let Some(warning) = handoff_warning {
         resp["tui_handoff_warning"] = json!(warning);
     }
@@ -710,31 +742,6 @@ pub(super) fn handle_restart_instance_with_runtime(
         resp["resumed_thread"] = json!(true);
     }
     resp
-}
-
-/// #t-777-3: daemon-autonomic self-heal entry — the respawn-stuck watchdog's
-/// narrow path to a **Fresh** restart. Wraps `handle_restart_instance(mode=fresh)`,
-/// which round-trips the PROVEN direct `DELETE`(no_wait)+`SPAWN` api::calls →
-/// `ApiEvent::InstanceCreated` → app pane Fresh respawn (the same path the
-/// operator's manual `restart_instance fresh` takes, working in the live
-/// app-mode daemon where the crash_tx→respawn machinery is inert).
-///
-/// **Gate-exempt BY CONSTRUCTION** (no new operator-gate surface): the inner
-/// `DELETE`/`SPAWN` are DIRECT api methods — operator-transport, which
-/// `operator_gate::check_operation_allowed` returns `Ok` for before `classify`
-/// is consulted. Reached ONLY from the per-tick hang-detection watchdog (never
-/// agent-invocable), so the narrowness is enforced by the trigger, exactly like
-/// crash-respawn / hang-recovery (`operator_gate` module scope note). Returns
-/// whether the SPAWN succeeded so the caller can escalate a failed recovery.
-pub(crate) fn restart_instance_autonomic(home: &Path, name: &str, reason: &str) -> bool {
-    let result = handle_restart_instance(
-        home,
-        &json!({"name": name, "mode": "fresh", "reason": reason}),
-    );
-    result
-        .get("spawned")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

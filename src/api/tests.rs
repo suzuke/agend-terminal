@@ -214,6 +214,7 @@ fn notifier_receives_instance_deleted() {
     rec.notify(ApiEvent::InstanceDeleted {
         name: "agent-1".into(),
         instance_ref: None,
+        restart_id: None,
     });
     let events = rec.take();
     assert_eq!(events.len(), 1);
@@ -221,6 +222,25 @@ fn notifier_receives_instance_deleted() {
         panic!("wrong variant")
     };
     assert_eq!(name, "agent-1");
+}
+
+#[test]
+fn instance_deleted_without_restart_id_deserializes_as_uncorrelated() {
+    let event: ApiEvent = serde_json::from_value(json!({
+        "InstanceDeleted": {
+            "name": "agent-legacy",
+            "instance_ref": null
+        }
+    }))
+    .expect("legacy delete event must remain readable");
+    assert_eq!(
+        event,
+        ApiEvent::InstanceDeleted {
+            name: "agent-legacy".into(),
+            instance_ref: None,
+            restart_id: None,
+        }
+    );
 }
 
 #[test]
@@ -301,6 +321,7 @@ fn none_notifier_instance_deleted_no_panic() {
         n.notify(ApiEvent::InstanceDeleted {
             name: "x".into(),
             instance_ref: None,
+            restart_id: None,
         });
     }
 }
@@ -366,6 +387,7 @@ fn panicking_notifier_unwinds_safely() {
         n.notify(ApiEvent::InstanceDeleted {
             name: "x".into(),
             instance_ref: None,
+            restart_id: None,
         });
     });
     assert!(result.is_err(), "expected panic to propagate");
@@ -386,6 +408,7 @@ fn notifier_multiple_events_accumulate() {
     rec.notify(ApiEvent::InstanceDeleted {
         name: "a".into(),
         instance_ref: None,
+        restart_id: None,
     });
     let events = rec.take();
     assert_eq!(events.len(), 2);
