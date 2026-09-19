@@ -1869,6 +1869,7 @@ mod review_assignment_marker_tests {
     /// (fields with `headRefOid` and no `state`) always returns `head`; the
     /// `#3675` pin read (fields with `state`) walks `pin_heads` (last repeated)
     /// and can be made to fail outright.
+    #[cfg(unix)]
     struct ForkPrMock {
         head: String,
         branch: String,
@@ -1879,6 +1880,7 @@ mod review_assignment_marker_tests {
         pin_calls: std::sync::atomic::AtomicUsize,
     }
 
+    #[cfg(unix)]
     impl ForkPrMock {
         fn new(head: &str, branch: &str, number: u64) -> Self {
             Self {
@@ -1897,6 +1899,7 @@ mod review_assignment_marker_tests {
         }
     }
 
+    #[cfg(unix)]
     impl ScmProvider for ForkPrMock {
         fn pr_view(&self, _repo: &str, _pr: u64, fields: &[&str]) -> anyhow::Result<PrSummary> {
             if fields.contains(&"state") {
