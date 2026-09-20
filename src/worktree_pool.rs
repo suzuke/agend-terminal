@@ -17,6 +17,11 @@ pub(crate) use branch_cleanup::{
     record_retention_obligation, retention_key, retention_lane_key, RETENTION_TAG,
 };
 
+// #3694: the pre-removal ignored-cache sweep is deadline-bounded (extracted to
+// keep this anti-monolith file under its 2500-LOC ceiling).
+mod build_cache;
+use build_cache::clean_ignored_build_cache;
+
 pub(crate) struct NestedDirtDiscard<'a> {
     pub expected_digest: &'a str,
     pub audit_reason: &'a str,
@@ -608,27 +613,6 @@ fn mark_release_incomplete(
     out.stage = Some(stage);
     out.path = Some(path.display().to_string());
     out.bytes_remaining = Some(remaining_bytes(path));
-}
-
-fn clean_ignored_build_cache(worktree: &Path) -> Result<(), (PathBuf, String)> {
-    let target = worktree.join("target");
-    let metadata = match std::fs::symlink_metadata(&target) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err((target, error.to_string())),
-    };
-    // A target directory is only a disposable cache when Git confirms the
-    // repository ignores it. An unignored target stays part of the ordinary
-    // WIP-preservation + worktree-removal transaction.
-    if !crate::git_helpers::git_ok(worktree, &["check-ignore", "-q", "--", "target/"]) {
-        return Ok(());
-    }
-    let result = if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        std::fs::remove_file(&target)
-    } else {
-        std::fs::remove_dir_all(&target)
-    };
-    result.map_err(|error| (target, error.to_string()))
 }
 
 fn source_repo_from_binding(binding: &serde_json::Value, wt_path: &Path) -> PathBuf {

@@ -39,6 +39,32 @@ pub(crate) fn tool_timeout(tool: &str) -> Duration {
     }
 }
 
+/// #3694: soft deadline after which a still-running `release_worktree` returns
+/// the daemon-owned `release_in_flight` ticket, *before* its 60s SLOW hard
+/// budget elapses.
+///
+/// `release_worktree` is the one tool whose real upper bound (`git worktree
+/// remove --force`, bounded by `git_helpers::LOCAL_GIT_TIMEOUT` = 60s, plus the
+/// bounded pre-removal cache sweep) matches its proxy band. Returning the
+/// ticket at the hard cut is legal (the worker is never joined/killed — see
+/// `handle_mcp_tool_counted`) but reads to the caller as a bare transport
+/// timeout for a tool that advertises `release_in_flight`. Emitting the ticket
+/// at this deadline makes the advertised "returns `release_in_flight` before
+/// the proxy timeout" (`tools.rs`) true while still giving normal releases the
+/// full window to finish synchronously. Strictly below `SLOW_TOOL_TIMEOUT`.
+pub(crate) const RELEASE_IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// #3694: the proxy wait for a tool call. For `release_worktree` only, clamp to
+/// [`RELEASE_IN_FLIGHT_TIMEOUT`] so a long release yields its in-flight ticket
+/// before the hard SLOW budget; every other tool keeps its full band.
+pub(crate) fn effective_wait_budget(tool: &str, timeout: Duration) -> Duration {
+    if tool == "release_worktree" {
+        timeout.min(RELEASE_IN_FLIGHT_TIMEOUT)
+    } else {
+        timeout
+    }
+}
+
 /// R3#1 candidate 2 (timeout-IN_PROGRESS): does a TIMEOUT on this tool need to
 /// be hidden from the agent as "accepted, completing in background" rather than
 /// surfaced as a retryable error?
@@ -324,7 +350,7 @@ fn handle_mcp_tool_counted(
         });
 
     match handle {
-        Ok(_) => match rx.recv_timeout(timeout) {
+        Ok(_) => match rx.recv_timeout(effective_wait_budget(tool, timeout)) {
             Ok(result) => json!({"ok": true, "result": result}),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 timeout_response(tool, action.as_deref(), timeout, key)
@@ -483,7 +509,6 @@ mod tests {
     fn fast_tools_get_short_timeout() {
         assert_eq!(tool_timeout("list_instances"), Duration::from_secs(5));
         assert_eq!(tool_timeout("health"), Duration::from_secs(5));
-        assert_eq!(tool_timeout("release_worktree"), Duration::from_secs(5));
     }
 
     #[test]
@@ -495,6 +520,42 @@ mod tests {
         assert_eq!(tool_timeout("deployment"), Duration::from_secs(60));
         assert_eq!(tool_timeout("ci"), Duration::from_secs(60));
         assert_eq!(tool_timeout("repo"), Duration::from_secs(60));
+        // #3694: release_worktree's real work is `git worktree remove --force`,
+        // bounded by LOCAL_GIT_TIMEOUT (60s). It sat in the FAST 5s band, which
+        // false-timed out every oversized release and stranded marker-less
+        // orphans (#3692). Deliberately reclassified to SLOW — this assertion
+        // move is the fix, not a relaxation.
+        assert_eq!(tool_timeout("release_worktree"), Duration::from_secs(60));
+    }
+
+    /// #3694: a still-running release yields its `release_in_flight` ticket at
+    /// the soft deadline, strictly before the 60s SLOW hard budget, while every
+    /// other tool keeps its full band.
+    #[test]
+    fn release_wait_budget_clamps_to_in_flight_deadline() {
+        // Couple the reclassification (#3694 item 1) to the early-return (item
+        // 2): the band `release_worktree` now resolves to is the 60s SLOW band,
+        // and the proxy clamps it down to the in-flight deadline.
+        assert_eq!(tool_timeout("release_worktree"), SLOW_TOOL_TIMEOUT);
+        assert_eq!(
+            effective_wait_budget("release_worktree", tool_timeout("release_worktree")),
+            RELEASE_IN_FLIGHT_TIMEOUT
+        );
+        assert!(
+            RELEASE_IN_FLIGHT_TIMEOUT < tool_timeout("release_worktree"),
+            "the in-flight ticket must fire before the hard budget"
+        );
+        // A caller-supplied shorter budget (tests, future per-call bounds) is
+        // never widened by the clamp.
+        assert_eq!(
+            effective_wait_budget("release_worktree", Duration::from_millis(100)),
+            Duration::from_millis(100)
+        );
+        // Non-release tools are untouched.
+        assert_eq!(
+            effective_wait_budget("repo", SLOW_TOOL_TIMEOUT),
+            SLOW_TOOL_TIMEOUT
+        );
     }
 
     #[test]

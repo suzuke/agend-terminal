@@ -47,11 +47,6 @@ impl ToolClass {
         side_effect_on_timeout: false,
         read_only_disk_skip: false,
     };
-    pub const FAST_SIDE_EFFECT: Self = Self {
-        timeout: ToolTimeoutClass::Fast,
-        side_effect_on_timeout: true,
-        read_only_disk_skip: false,
-    };
     pub const FAST_READ_ONLY: Self = Self {
         timeout: ToolTimeoutClass::Fast,
         side_effect_on_timeout: false,
@@ -551,7 +546,14 @@ static ALL_TOOLS: [ToolEntry; 34] = [
         name: "release_worktree",
         definition: super::tools::def_release_worktree,
         handler: super::handlers::dispatch::dispatch_release_worktree,
-        class: ToolClass::FAST_SIDE_EFFECT,
+        // #3694: NOT Fast. The real work is `git worktree remove --force`,
+        // bounded by `git_helpers::LOCAL_GIT_TIMEOUT` (60s), plus the bounded
+        // pre-removal ignored-cache sweep. The old Fast (5s) band false-timed
+        // out every oversized release; the proxy then returned
+        // `accepted_in_progress` while the worker was still mid-remove, so an
+        // instance restart/delete at that point stranded a marker-less,
+        // gitdir_dangling orphan (#3692). SLOW matches the real upper bound.
+        class: ToolClass::SLOW_SIDE_EFFECT,
     },
     ToolEntry {
         name: "binding_state",
