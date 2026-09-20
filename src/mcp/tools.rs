@@ -330,13 +330,13 @@ pub(crate) fn def_team() -> Value {
 }
 
 pub(crate) fn def_schedule() -> Value {
-    json!({"name": "schedule", "description": "Manage schedules. Instance reminders or daemon-owned jobs. Actions: create, list, update, delete, runs, complete, resolve_recovery.",
+    json!({"name": "schedule", "description": "Manage schedules. Instance reminders or daemon-owned jobs. Actions: create, list, update, delete, runs, complete, deliver, resolve_recovery.",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["create", "list", "update", "delete", "runs", "complete", "resolve_recovery"]},
+            "action": {"type": "string", "enum": ["create", "list", "update", "delete", "runs", "complete", "deliver", "resolve_recovery"]},
             "id": {"type": "string"},
-            "run_id": {"type": "string", "description": "Job run to complete or resolve recovery."},
+            "run_id": {"type": "string", "description": "Job run to complete, deliver, or resolve recovery."},
             "cleanup_confirmed": {"type": "boolean", "description": "resolve_recovery only: operator confirms worker/tools stopped, delivery reconciled, and worker deleted. Never authorizes automatic retry."},
-            "attempt_id": {"type": "integer", "minimum": 1, "description": "Current attempt number required for complete."},
+            "attempt_id": {"type": "integer", "minimum": 1, "description": "Current attempt number required for complete and deliver."},
             "result": {"type": "string", "description": "Completion result and artifact locations."},
             "job": {"type": "object", "additionalProperties": false, "description": "Create a daemon-owned job instead of targeting an instance. Mode is immutable; updates affect future runs. No automatic replacement after spawn intent; manual recovery is required even after successful execution when descendant cleanup cannot be proven.", "properties": {
                 "backends": {"type": "array", "minItems": 1, "uniqueItems": true, "description": "Ordered candidates for failures before spawn intent only; never fallback after an attempt may have launched.", "items": {"type": "string", "enum": ["claude", "codex", "kiro-cli", "opencode", "antigravity-cli", "grok"]}},
@@ -349,11 +349,19 @@ pub(crate) fn def_schedule() -> Value {
                     "channel": {"type": "string", "enum": ["telegram"]},
                     "chat_id": {"type": "integer", "description": "Must match the configured fleet Telegram group."},
                     "topic_id": {"type": "integer", "minimum": 1, "description": "Existing topic; omitted means the configured group without a thread."}
-                }, "required": ["channel", "chat_id"]}
+                }, "required": ["channel", "chat_id"]},
+                "worker_topic": {"type": "object", "additionalProperties": false, "description": "Opt-in: the existing Telegram topic where the worker delivers business output via schedule action=deliver. No topic is created and no registry row is owned. topic_id is required.", "properties": {
+                    "channel": {"type": "string", "enum": ["telegram"]},
+                    "chat_id": {"type": "integer", "description": "Must match the configured fleet Telegram group; never derived from the creator or worker."},
+                    "topic_id": {"type": "integer", "minimum": 1, "description": "Required: an existing topic id."}
+                }, "required": ["channel", "chat_id", "topic_id"]},
+                "auto_cleanup": {"type": "boolean", "description": "Opt-in: when true, a Succeeded Run whose worker this daemon spawned and can prove fully contained (child reaped, process group gone, no external residue) is cleaned up automatically. Default false keeps today's manual recovery."}
             }, "required": ["backends", "artifact_directory"]},
             "cron": {"type": "string", "description": "5- or 6-field cron expression (recurring). 5-field layout: `min hour day-of-month month day-of-week`; 6-field prepends seconds. Day-of-week uses Quartz convention: 1=Sun, 2=Mon, 3=Tue, 4=Wed, 5=Thu, 6=Fri, 7=Sat (NOT Unix 0-6). Example: every Wed+Sat at 15:00 → `0 15 * * 4,7`."},
             "run_at": {"type": "string", "description": "ISO 8601 one-shot instant."},
-            "message": {"type": "string"}, "instance": {"type": "string", "description": "Name of the existing instance to deliver the scheduled message to."},
+            "message": {"type": "string", "description": "Message body for create, or the business delivery content for deliver. For deliver, provide this or message_from_file."},
+            "message_from_file": {"type": "string", "description": "deliver only: absolute path to a UTF-8 text file whose contents are delivered (overrides message). Use for large content that should not be an inline argument."},
+            "instance": {"type": "string", "description": "Name of the existing instance to deliver the scheduled message to."},
             "label": {"type": "string"},
             "timezone": {"type": "string", "description": "IANA zone name."},
             "enabled": {"type": "boolean"},
@@ -1328,7 +1336,8 @@ mod tests {
             ("schedule", "result", "schedule_jobs complete receipt"),
             ("schedule", "cron", "schedules.rs trigger_from_args"),
             ("schedule", "run_at", "schedules.rs trigger_from_args one-shot"),
-            ("schedule", "message", "schedules.rs create/update"),
+            ("schedule", "message", "schedules.rs create/update; schedule_jobs deliver content (#3658)"),
+            ("schedule", "message_from_file", "mcp/handlers/schedule.rs handle_job_deliver resolves file content before schedule_jobs::deliver (#3658)"),
             ("schedule", "instance", "schedules.rs create target / list filter"),
             ("schedule", "label", "schedules.rs create/update"),
             ("schedule", "timezone", "schedules.rs cron eval zone"),

@@ -17,6 +17,19 @@ pub struct JobConfig {
     pub output_context: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification: Option<JobNotification>,
+    /// Opt-in: let the daemon auto-clean a `Succeeded` Run whose worker it spawned
+    /// in this same lifecycle and can prove fully contained (child reaped, whole
+    /// process group gone, no external registry residue). Absent (default) keeps
+    /// today's behaviour: every launched worker requires an operator recovery step.
+    #[serde(default)]
+    pub auto_cleanup: bool,
+    /// Opt-in: the existing Telegram topic where the worker delivers business
+    /// output through `schedule action=deliver`. Reuses the notification endpoint
+    /// shape and its explicit-group validation; unlike `notification` the topic is
+    /// required, no topic is ever created, and the transport owns no registry row
+    /// (so worker teardown can never delete the shared topic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_topic: Option<JobNotification>,
 }
 /// Explicit endpoint; credentials remain in the existing channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,6 +42,12 @@ pub enum JobNotification {
     },
 }
 impl JobNotification {
+    /// The topic this endpoint resolves to, when one is configured.
+    pub fn topic_id(&self) -> Option<i32> {
+        match self {
+            Self::Telegram { topic_id, .. } => *topic_id,
+        }
+    }
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::Telegram { chat_id, topic_id } => {
@@ -101,12 +120,21 @@ impl JobConfig {
         if let Some(notification) = &self.notification {
             notification.validate()?;
         }
+        if let Some(worker_topic) = &self.worker_topic {
+            worker_topic.validate()?;
+            if worker_topic.topic_id().is_none() {
+                return Err("job.worker_topic requires an explicit existing topic_id".into());
+            }
+        }
         Ok(())
     }
     pub fn validate_for_home(&self, home: &std::path::Path) -> Result<(), String> {
         self.validate()?;
         if let Some(notification) = &self.notification {
             notification.validate_for_home(home)?;
+        }
+        if let Some(worker_topic) = &self.worker_topic {
+            worker_topic.validate_for_home(home)?;
         }
         Ok(())
     }

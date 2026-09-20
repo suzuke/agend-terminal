@@ -3,6 +3,7 @@
 //! queue: losing ownership would permit a second worker to publish results.
 pub(crate) mod config;
 mod controller;
+pub(crate) mod delivery;
 pub(crate) mod notification;
 pub(crate) mod runtime;
 #[cfg(test)]
@@ -48,6 +49,24 @@ pub(crate) enum NotificationState {
     Unknown,
 }
 
+/// Outcome of the worker's opt-in business delivery (`schedule action=deliver`).
+/// Kept separate from execution success so a Run is never recorded as delivered
+/// without the transport actually accepting every chunk.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeliveryState {
+    /// No delivery configured, or the worker had nothing to deliver.
+    #[default]
+    NotRequested,
+    /// A send is in flight (or was interrupted); not yet a success.
+    Sending,
+    /// Every chunk was accepted; `receipts` holds one transport id per chunk.
+    Sent { receipts: Vec<String> },
+    /// The transport refused or failed; `error` is the reason. Retry with
+    /// `deliver` after fixing the cause.
+    Failed { error: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Run {
     pub id: String,
@@ -75,6 +94,8 @@ pub(crate) struct Run {
     pub notification: NotificationState,
     pub notification_receipt: Option<String>,
     pub notification_error: Option<String>,
+    #[serde(default)]
+    pub delivery: DeliveryState,
 }
 impl Run {
     fn active(&self) -> bool {
@@ -223,6 +244,7 @@ pub(crate) fn admit_due(
             },
             notification_receipt: None,
             notification_error: None,
+            delivery: DeliveryState::NotRequested,
         });
         Ok(())
     })
@@ -290,9 +312,137 @@ fn complete_as(
             !run.recovery_required && matches!(run.phase, Phase::Running | Phase::Dispatching),
             "attempt is not accepting completion"
         );
+        anyhow::ensure!(
+            !matches!(
+                run.delivery,
+                DeliveryState::Sending | DeliveryState::Failed { .. }
+            ),
+            "business delivery must succeed (or be skipped) before completion"
+        );
         run.result = Some(result.into());
         run.phase = Phase::Succeeded;
         run.cleanup_pending = true;
+        run.revision += 1;
+        Ok(())
+    })
+}
+
+/// Worker-invoked business delivery. The daemon never derives the destination
+/// from the creator or worker: it uses only the validated `job.worker_topic`.
+/// Completion is refused while a delivery is in flight or has failed, so a
+/// worker only finishes after delivery is either skipped or fully accepted.
+pub(crate) fn deliver(
+    home: &Path,
+    caller: &str,
+    args: &serde_json::Value,
+    content: &str,
+) -> serde_json::Value {
+    let result = (|| -> anyhow::Result<DeliveryState> {
+        let id = args["run_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing run_id"))?;
+        let number = args["attempt_id"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("missing attempt_id"))?;
+        anyhow::ensure!(
+            !content.trim().is_empty(),
+            "nonempty delivery content required"
+        );
+        anyhow::ensure!(content.len() <= 1_048_576, "delivery content exceeds 1 MiB");
+        let uuid = crate::fleet::resolve_uuid(home, caller)
+            .ok_or_else(|| anyhow::anyhow!("unknown delivery caller"))?
+            .full();
+        // Validate the explicit endpoint against the fleet BEFORE the durable
+        // claim and outside the state lock. An illegal/undeclared group is
+        // rejected here and never recorded as an attempt.
+        let endpoint = read(home)?
+            .runs
+            .into_iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.config.worker_topic)
+            .ok_or_else(|| {
+                anyhow::anyhow!("this job has no business delivery endpoint configured")
+            })?;
+        endpoint
+            .validate_for_home(home)
+            .map_err(anyhow::Error::msg)?;
+        let Some(run) = claim_delivery(home, id, number, caller, &uuid)? else {
+            return Ok(DeliveryState::Sent { receipts: vec![] });
+        };
+        let outcome = match delivery::send(home, &run, content) {
+            Ok(receipts) => DeliveryState::Sent { receipts },
+            Err(error) => DeliveryState::Failed {
+                error: error.to_string(),
+            },
+        };
+        finish_delivery(home, id, &outcome)?;
+        Ok(outcome)
+    })();
+    match result {
+        Ok(DeliveryState::Sent { receipts }) => {
+            serde_json::json!({"status":"delivered","receipts":receipts})
+        }
+        Ok(DeliveryState::Failed { error }) => {
+            serde_json::json!({"error":error,"code":"delivery_failed","delivery":"failed"})
+        }
+        Ok(_) => serde_json::json!({"error":"unexpected delivery state","code":"delivery_failed"}),
+        Err(error) => serde_json::json!({"error":error.to_string()}),
+    }
+}
+
+/// Durably mark a delivery in flight, returning the Run snapshot to send. Fails
+/// closed on ambiguity: a stale `Sending` must be inspected rather than blindly
+/// re-sent. `Ok(None)` means the transport already accepted this Run's content.
+fn claim_delivery(
+    home: &Path,
+    id: &str,
+    number: u64,
+    caller: &str,
+    uuid: &str,
+) -> anyhow::Result<Option<Run>> {
+    mutate(home, |state| {
+        let run = state
+            .runs
+            .iter_mut()
+            .find(|r| r.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown run"))?;
+        let a = run
+            .attempt
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no active attempt"))?;
+        anyhow::ensure!(
+            a.name == caller && a.uuid.as_deref() == Some(uuid) && u64::from(a.number) == number,
+            "stale or unauthorized attempt"
+        );
+        anyhow::ensure!(
+            !run.recovery_required && matches!(run.phase, Phase::Running | Phase::Dispatching),
+            "attempt is not accepting delivery"
+        );
+        anyhow::ensure!(
+            run.config.worker_topic.is_some(),
+            "this job has no business delivery endpoint configured"
+        );
+        match &run.delivery {
+            DeliveryState::Sent { .. } => return Ok(None),
+            DeliveryState::Sending => anyhow::bail!(
+                "a previous delivery attempt is unresolved; inspect runs before retrying"
+            ),
+            DeliveryState::NotRequested | DeliveryState::Failed { .. } => {}
+        }
+        run.delivery = DeliveryState::Sending;
+        run.revision += 1;
+        Ok(Some(run.clone()))
+    })
+}
+
+fn finish_delivery(home: &Path, id: &str, outcome: &DeliveryState) -> anyhow::Result<()> {
+    mutate(home, |state| {
+        let run = state
+            .runs
+            .iter_mut()
+            .find(|r| r.id == id)
+            .ok_or_else(|| anyhow::anyhow!("run disappeared during delivery"))?;
+        run.delivery = outcome.clone();
         run.revision += 1;
         Ok(())
     })

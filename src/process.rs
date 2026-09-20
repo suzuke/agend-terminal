@@ -159,6 +159,25 @@ pub fn process_group_id(pid: u32) -> Option<u32> {
     (pgid > 0).then_some(pgid as u32)
 }
 
+/// True when at least one process still belongs to process group `pgid`.
+///
+/// `kill(-pgid, 0)` succeeds when any member exists; `EPERM` still means a
+/// member exists (owned by another user), so both count as alive. `ESRCH`
+/// (no such group) is the only "fully reaped" answer. `pgid == 0` is never a
+/// real tracked group — `kill(0, 0)` targets the caller's whole group, so it is
+/// rejected explicitly, mirroring `is_pid_alive`'s pid-0 guard.
+#[cfg(unix)]
+pub fn is_process_group_alive(pgid: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(-(pgid as i32), 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Kill an entire process group when `pid` is its process-group leader. On Unix,
 /// sends SIGTERM to -pgid (all processes in the isolated group), then waits
 /// briefly and escalates to SIGKILL if still alive. If the process belongs to a
@@ -365,5 +384,30 @@ mod tests {
     fn process_start_token_pid_zero_is_none() {
         // pid 0 is never a real tracked process — mirrors is_pid_alive's guard.
         assert_eq!(process_start_token(0), None);
+    }
+
+    #[test]
+    fn is_process_group_alive_reports_membership_and_rejects_pgid_zero() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        // pgid 0 is never a real tracked group (kill(0,0) hits the caller's group).
+        assert!(!is_process_group_alive(0));
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn isolated sleeper");
+        let pgid = child.id();
+        assert!(is_process_group_alive(pgid), "leader's group must be alive");
+        child.kill().expect("kill isolated sleeper");
+        let _ = child.wait();
+        assert!(
+            crate::admin::cleanup_zombies::poll_until_dead(pgid, std::time::Duration::from_secs(5)),
+            "leader must be reaped"
+        );
+        assert!(
+            !is_process_group_alive(pgid),
+            "a one-member group must be gone after the leader is reaped"
+        );
     }
 }

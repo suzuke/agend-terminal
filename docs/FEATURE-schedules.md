@@ -66,7 +66,9 @@ Set `job` instead of `instance` to create a worker when the schedule becomes due
 
 `backends` is a nonempty, unique ordered list of canonical managed backend names: `claude`, `codex`, `kiro-cli`, `opencode`, `antigravity-cli`, or `grok`. Raw commands and shell backends are rejected. `artifact_directory` must be absolute. Defaults and bounds are: `timeout_secs` 3600 (60–86400), `max_attempts` 3 (1–10), and `retry_delay_secs` 60 (1–3600). Unknown Job fields are rejected. `backends`, `max_attempts`, and `retry_delay_secs` govern only failures before spawn intent, not usage limits or failures after launch.
 
-`output_context` holds fixed business delivery instructions, not credentials or an automatically provisioned channel endpoint. Workers must use the authorized destination configuration available to their tools. Each attempt has its own workspace; persistent transcripts, summaries, and delivery records belong in `artifact_directory`. When the daemon cannot prove all descendant processes have stopped, it preserves the worker workspace and records `recovery_required` instead of automatically deleting it.
+`output_context` holds fixed business delivery instructions, not credentials or an automatically provisioned channel endpoint. Workers must use the authorized destination configuration available to their tools. Each attempt has its own workspace; persistent transcripts, summaries, and delivery records belong in `artifact_directory`.
+
+`job.auto_cleanup` (default `false`) opts a Job into automatic cleanup of a successful Run whose worker the daemon both spawned and can prove fully contained — the child was observed to exit and the whole isolated process group has been reaped, with no external registry residue. When the daemon cannot prove all descendant processes have stopped, it preserves the worker workspace and records `recovery_required` instead of automatically deleting it. The proof only exists in the daemon lifecycle that spawned the worker: after a daemon restart, or when only an `Intent` journal row, a still-running worker, or an external registry entry remains, the Run still requires manual recovery.
 
 Optional `job.notification` sends one completion or recovery-required status notice independently of business delivery:
 
@@ -76,7 +78,21 @@ Optional `job.notification` sends one completion or recovery-required status not
 
 Replace the example chat ID with the configured fleet Telegram group and the topic ID with an existing topic. Omitting `topic_id` sends without a thread. The daemon validates the explicit group at configuration and send time; it does not derive the destination from the creator/worker or create topics. Credentials stay in the existing channel environment configuration. The returned Telegram message ID is saved in the Run. A send interrupted by a crash or an ambiguous transport error becomes `unknown` and is not blindly retried. Notification state is separate from execution success and cleanup; inspect `runs` to reconcile an unknown outcome. This first notification endpoint supports Telegram only; Telegram/LINE podcast delivery still follows the task's business instructions.
 
-Job admission has a durable per-schedule watermark. Missed cron occurrences coalesce to the latest due occurrence rather than creating a backlog. If a Run is still active, a later occurrence is recorded as an overlap skip. Jobs bypass legacy one-shot message replay and target-orphan handling. A launched attempt is never replaced automatically, even when its backend process exits: tools or other descendants may still be running. Usage limits, timeout, crash, and post-launch failures require manual recovery. While `recovery_required` or cleanup remains pending, later occurrences stay blocked as overlap skips.
+Optional `job.worker_topic` gives the worker a business-delivery channel to an existing Telegram topic, bypassing the status-notice length budget:
+
+```json
+"worker_topic": {"channel": "telegram", "chat_id": -1001234567890, "topic_id": 12153}
+```
+
+`topic_id` is required. The daemon validates the explicit group against the fleet configuration and never derives the destination from the creator or worker; it does not create a topic and owns no registry row, so worker teardown can never delete the shared topic. Unlike `job.notification`, delivery has no status-notice length cap: the content is split into transport-sized chunks and the full text is sent. A worker delivers with:
+
+```json
+{"action":"deliver","run_id":"<run-id>","attempt_id":1,"message_from_file":"/absolute/path/summary.md"}
+```
+
+The worker passes the output as `message` or `message_from_file`. Completion is refused while a delivery is in flight or has failed, so the worker finishes only after its output is fully accepted or deliberately skipped (a Run with nothing to deliver simply completes without delivering). The Run records the delivery outcome separately from execution: `sent` with one receipt per chunk, `failed` with the reason, or `not_requested`. A Run is never recorded as delivered unless the transport accepted every chunk. When unset, the worker spawns with topic binding `skip` exactly as before.
+
+Job admission has a durable per-schedule watermark. Missed cron occurrences coalesce to the latest due occurrence rather than creating a backlog. If a Run is still active, a later occurrence is recorded as an overlap skip. Jobs bypass legacy one-shot message replay and target-orphan handling. A launched attempt is never replaced automatically, even when its backend process exits: tools or other descendants may still be running. Usage limits, timeout, crash, and post-launch failures require manual recovery. While `recovery_required` or cleanup remains pending, later occurrences stay blocked as overlap skips — unless `job.auto_cleanup` enabled a contained success to clear that hold.
 
 Inspect executions with `{"action":"runs","id":"<schedule-id>"}`. Successful completion requires the current worker to call:
 
@@ -84,7 +100,7 @@ Inspect executions with `{"action":"runs","id":"<schedule-id>"}`. Successful com
 {"action":"complete","run_id":"<run-id>","attempt_id":1,"result":"Completed; artifacts: /absolute/path/podcast-artifacts/..."}
 ```
 
-The daemon checks the current attempt and caller identity and persists a completion receipt. Idle state, process exit, message admission, and task status alone do not prove success. Task settlement follows the receipt; failures in follow-up steps do not rerun successful work. A successful Run remains successful even if `cleanup_pending` and `recovery_required` require manual cleanup. In this first version, normal success also requires that manual recovery step before later Runs can start.
+The daemon checks the current attempt and caller identity and persists a completion receipt. Idle state, process exit, message admission, and task status alone do not prove success. Task settlement follows the receipt; failures in follow-up steps do not rerun successful work. A successful Run remains successful even if `cleanup_pending` and `recovery_required` require manual cleanup. Without `job.auto_cleanup`, normal success also requires that manual recovery step before later Runs can start.
 
 To resolve recovery:
 

@@ -35,7 +35,7 @@ impl JobRuntime for Fake {
             Observation::Running
         })
     }
-    fn stop(&self, _: &Attempt) -> anyhow::Result<bool> {
+    fn stop(&self, _: &Run, _: &Attempt) -> anyhow::Result<bool> {
         *self.stops.lock().unwrap() += 1;
         Ok(!*self.refuse_stop.lock().unwrap())
     }
@@ -478,7 +478,7 @@ fn completion_and_stop_race_has_one_winner() {
             self.0.wait();
             Ok(Observation::UsageLimited)
         }
-        fn stop(&self, _: &Attempt) -> anyhow::Result<bool> {
+        fn stop(&self, _: &Run, _: &Attempt) -> anyhow::Result<bool> {
             panic!("this tick must only decide whether to enter Stopping")
         }
         fn dispatch(&self, _: &Run, _: &Attempt) -> anyhow::Result<()> {
@@ -571,7 +571,7 @@ fn conservative_recovery_requires_confirmation_and_never_retries() {
         fn dispatch(&self, _: &Run, _: &Attempt) -> anyhow::Result<()> {
             panic!("no redispatch")
         }
-        fn stop(&self, _: &Attempt) -> anyhow::Result<bool> {
+        fn stop(&self, _: &Run, _: &Attempt) -> anyhow::Result<bool> {
             anyhow::bail!("recovery_required: no containment")
         }
     }
@@ -641,4 +641,178 @@ fn conservative_recovery_requires_confirmation_and_never_retries() {
         assert_eq!(resolved.attempt, run.attempt);
         assert!(resolve_recovery(h, &args).get("error").is_some());
     }
+}
+
+#[test]
+fn cleared_cleanup_makes_later_occurrences_admissible() {
+    let h = home();
+    let s = schedule(&h);
+    admit_due(&h, &s, now()).unwrap();
+    let rt = Fake::default();
+    let clock = now().timestamp();
+    advance_to_running(&h, &rt, clock);
+    let run = read(&h).unwrap().runs[0].clone();
+    let a = run.attempt.as_ref().unwrap();
+    complete_as(
+        &h,
+        &run.id,
+        u64::from(a.number),
+        &a.name,
+        a.uuid.as_deref().unwrap(),
+        "done",
+    )
+    .unwrap();
+    // While cleanup is pending the Succeeded run still counts as active.
+    admit_due(&h, &s, now() + chrono::Duration::minutes(1)).unwrap();
+    assert_eq!(read(&h).unwrap().runs.len(), 1);
+    assert_eq!(read(&h).unwrap().overlap_skips[&s.id], 1);
+    // Once the controller clears cleanup_pending, a later occurrence is admitted.
+    tick(&h, &rt, clock + 1).unwrap();
+    let run = read(&h).unwrap().runs[0].clone();
+    assert!(!run.cleanup_pending);
+    assert_eq!(run.phase, Phase::Succeeded);
+    admit_due(&h, &s, now() + chrono::Duration::minutes(2)).unwrap();
+    assert_eq!(read(&h).unwrap().runs.len(), 2);
+    std::fs::remove_dir_all(h).unwrap();
+}
+
+fn telegram_home() -> std::path::PathBuf {
+    let h = std::env::temp_dir().join(format!("job-delivery-tests-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&h).unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&h),
+        "instances: {}\nchannel:\n  type: telegram\n  bot_token_env: JOB_DELIVERY_UNUSED_TEST_TOKEN\n  group_id: -100123\n").unwrap();
+    h
+}
+
+fn delivery_schedule(
+    home: &Path,
+    topic_id: Option<i32>,
+    chat_id: i64,
+) -> crate::schedules::Schedule {
+    let worker_topic = match topic_id {
+        Some(topic_id) => {
+            serde_json::json!({"channel":"telegram","chat_id":chat_id,"topic_id":topic_id})
+        }
+        None => serde_json::json!({"channel":"telegram","chat_id":chat_id}),
+    };
+    serde_json::from_value(serde_json::json!({
+        "id":"delivery-schedule","target":"","message":"deliver report","created_at":"2026-01-01T00:00:00Z","timezone":"UTC",
+        "trigger":{"kind":"cron","expr":"* * * * *"},
+        "job":{"backends":["codex"],"artifact_directory":home.join("artifacts"),"worker_topic":worker_topic}
+    }))
+    .unwrap()
+}
+
+/// Drive one Run to `Running` with a durable worker identity so
+/// `fleet::resolve_uuid` resolves the caller.
+fn active_delivery_run(h: &Path, s: &crate::schedules::Schedule) -> (Run, Attempt) {
+    admit_due(h, s, now()).unwrap();
+    let old = read(h).unwrap().runs[0].clone();
+    let uuid = crate::types::InstanceId::new().full();
+    let name = format!("job-{}-1", &old.id[2..18]);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(h),
+        format!("instances:\n  {name}:\n    id: {uuid}\n    backend: codex\n    created_by: system:schedule_job\nchannel:\n  type: telegram\n  bot_token_env: JOB_DELIVERY_UNUSED_TEST_TOKEN\n  group_id: -100123\n"),
+    )
+    .unwrap();
+    let attempt = Attempt {
+        number: 1,
+        name,
+        uuid: Some(uuid),
+        backend: "codex".into(),
+        started_at: now().timestamp(),
+    };
+    let mut active = old.clone();
+    active.phase = Phase::Running;
+    active.attempt = Some(attempt.clone());
+    replace(h, &old, active).unwrap();
+    (read(h).unwrap().runs[0].clone(), attempt)
+}
+
+#[test]
+fn failed_business_delivery_is_recorded_and_blocks_completion() {
+    let h = telegram_home();
+    let s = delivery_schedule(&h, Some(42), -100123);
+    let (run, a) = active_delivery_run(&h, &s);
+    let out = deliver(
+        &h,
+        &a.name,
+        &serde_json::json!({"run_id":run.id,"attempt_id":a.number}),
+        &"摘要".repeat(6000),
+    );
+    assert!(out.get("error").is_some(), "{out}");
+    let after = read(&h).unwrap().runs[0].clone();
+    assert!(
+        matches!(after.delivery, DeliveryState::Failed { .. }),
+        "transport failure must be recorded as non-success, got {:?}",
+        after.delivery
+    );
+    assert!(complete_as(
+        &h,
+        &run.id,
+        u64::from(a.number),
+        &a.name,
+        a.uuid.as_deref().unwrap(),
+        "done"
+    )
+    .is_err());
+    std::fs::remove_dir_all(h).unwrap();
+}
+
+#[test]
+fn deliver_without_worker_topic_is_refused_without_recording() {
+    let h = telegram_home();
+    let s = schedule(&h);
+    let (run, a) = active_delivery_run(&h, &s);
+    let out = deliver(
+        &h,
+        &a.name,
+        &serde_json::json!({"run_id":run.id,"attempt_id":a.number}),
+        "hello",
+    );
+    assert!(
+        out["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("no business delivery endpoint")),
+        "{out}"
+    );
+    assert_eq!(
+        read(&h).unwrap().runs[0].delivery,
+        DeliveryState::NotRequested
+    );
+    std::fs::remove_dir_all(h).unwrap();
+}
+
+#[test]
+fn deliver_rejects_a_stale_attempt() {
+    let h = telegram_home();
+    let s = delivery_schedule(&h, Some(42), -100123);
+    let (run, a) = active_delivery_run(&h, &s);
+    let out = deliver(
+        &h,
+        &a.name,
+        &serde_json::json!({"run_id":run.id,"attempt_id":999}),
+        "hello",
+    );
+    assert!(
+        out["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("stale or unauthorized")),
+        "{out}"
+    );
+    std::fs::remove_dir_all(h).unwrap();
+}
+
+#[test]
+fn worker_topic_requires_an_explicit_existing_topic_and_matching_group() {
+    let h = telegram_home();
+    // Missing topic_id is rejected at admission.
+    let missing = delivery_schedule(&h, None, -100123);
+    let error = admit_due(&h, &missing, now()).unwrap_err().to_string();
+    assert!(error.contains("explicit existing topic_id"), "{error}");
+    // A group that is not the configured fleet group is rejected.
+    let wrong = delivery_schedule(&h, Some(42), -999);
+    let error = admit_due(&h, &wrong, now()).unwrap_err().to_string();
+    assert!(error.contains("Telegram group"), "{error}");
+    std::fs::remove_dir_all(h).unwrap();
 }

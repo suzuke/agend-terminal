@@ -7,44 +7,57 @@ use std::path::Path;
 
 pub(crate) fn send(home: &Path, run: &Run) -> anyhow::Result<String> {
     send_with(home, run, |endpoint, text| {
-        let credentials = crate::channel::telegram::resolve_channel_only_from(home)?;
-        let JobNotification::Telegram { chat_id, topic_id } = endpoint;
-        // Resolve again at the send boundary: fleet reload must not redirect an
-        // already admitted Run to a different group.
-        anyhow::ensure!(
-            *chat_id == credentials.group_id,
-            "notification group changed"
-        );
-        let state = crate::channel::telegram::TelegramState::new(
-            &credentials.token,
-            *chat_id,
-            Default::default(),
-            home.into(),
-            Default::default(),
-            None,
-        );
-        let adapter = crate::channel::telegram::TelegramChannel::new(std::sync::Arc::new(
-            parking_lot::Mutex::new(state),
-        ));
-        let binding = match topic_id {
-            Some(topic_id) => BindingRef::new(
-                "telegram",
-                None,
-                crate::channel::telegram::TelegramBindingPayload {
-                    topic_id: *topic_id,
-                },
-            ),
-            None => BindingRef::new("telegram", None, ()),
-        };
-        // Channel::send awaits Telegram's response and returns its message id.
-        // No instance binding or create_topic path is involved.
-        let sent = adapter.send(&binding, OutMsg::text(text))?;
-        anyhow::ensure!(
-            sent.id.parse::<i32>().is_ok_and(|id| id > 0),
-            "Telegram returned no valid message id"
-        );
-        Ok(sent.id)
+        send_telegram_text(home, endpoint, text)
     })
+}
+
+/// Send one plain-text message to an explicit endpoint. Reuses the notification
+/// safety properties: resolve credentials at the send boundary, refuse a group
+/// that drifted from the admitted endpoint, and create no topic or binding (so
+/// teardown can never delete a shared topic). Shared by status notifications and
+/// the worker's business delivery.
+pub(crate) fn send_telegram_text(
+    home: &Path,
+    endpoint: &JobNotification,
+    text: &str,
+) -> anyhow::Result<String> {
+    let credentials = crate::channel::telegram::resolve_channel_only_from(home)?;
+    let JobNotification::Telegram { chat_id, topic_id } = endpoint;
+    // Resolve again at the send boundary: fleet reload must not redirect an
+    // already admitted message to a different group.
+    anyhow::ensure!(
+        *chat_id == credentials.group_id,
+        "notification group changed"
+    );
+    let state = crate::channel::telegram::TelegramState::new(
+        &credentials.token,
+        *chat_id,
+        Default::default(),
+        home.into(),
+        Default::default(),
+        None,
+    );
+    let adapter = crate::channel::telegram::TelegramChannel::new(std::sync::Arc::new(
+        parking_lot::Mutex::new(state),
+    ));
+    let binding = match topic_id {
+        Some(topic_id) => BindingRef::new(
+            "telegram",
+            None,
+            crate::channel::telegram::TelegramBindingPayload {
+                topic_id: *topic_id,
+            },
+        ),
+        None => BindingRef::new("telegram", None, ()),
+    };
+    // Channel::send awaits Telegram's response and returns its message id.
+    // No instance binding or create_topic path is involved.
+    let sent = adapter.send(&binding, OutMsg::text(text))?;
+    anyhow::ensure!(
+        sent.id.parse::<i32>().is_ok_and(|id| id > 0),
+        "Telegram returned no valid message id"
+    );
+    Ok(sent.id)
 }
 
 fn send_with(

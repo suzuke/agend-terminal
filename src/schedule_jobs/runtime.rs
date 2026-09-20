@@ -16,7 +16,7 @@ pub(crate) enum Observation {
 pub(crate) trait JobRuntime {
     fn start(&self, run: &Run, attempt: &Attempt) -> Result<String>;
     fn observe(&self, attempt: &Attempt) -> Result<Observation>;
-    fn stop(&self, attempt: &Attempt) -> Result<bool>;
+    fn stop(&self, run: &Run, attempt: &Attempt) -> Result<bool>;
     fn dispatch(&self, run: &Run, attempt: &Attempt) -> Result<()>;
 }
 
@@ -28,6 +28,26 @@ struct ProcessJournal {
     phase: ProcessPhase,
     pid: Option<u32>,
     start_token: Option<u64>,
+    /// Process-group id recorded at spawn. A PTY child is its own session/group
+    /// leader (`pgid == pid`), so a later `kill(-pgid, 0)` proves whether the
+    /// whole isolated group has been reaped. Absent on platforms without process
+    /// groups, which keeps containment unprovable there (conservative).
+    #[serde(default)]
+    pgid: Option<u32>,
+}
+
+/// Best-effort pgid for a newly spawned child. `None` on non-unix, which makes
+/// containment proof fail closed.
+fn spawn_pgid(pid: Option<u32>) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        pid.and_then(crate::process::process_group_id)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
 }
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 enum ProcessPhase {
@@ -108,6 +128,78 @@ impl ManagedRuntime {
             anyhow::ensure!(expected == &id.full(), "job worker UUID changed");
         }
         Ok(Some(id))
+    }
+
+    /// Either the worker was never launched (the original conservative path), or
+    /// this is an opt-in, already-successful Run whose containment is provable in
+    /// this daemon lifecycle. Everything else stays `recovery_required`.
+    fn cleanup_precondition(&self, run: &Run, attempt: &Attempt) -> Result<()> {
+        match self.ensure_never_launched(attempt) {
+            Ok(()) => return Ok(()),
+            Err(error) if !error.to_string().contains("recovery_required") => return Err(error),
+            Err(_) => {}
+        }
+        if run.config.auto_cleanup
+            && run.phase == super::Phase::Succeeded
+            && self.provable_containment(attempt)?
+        {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "recovery_required: launched job cleanup requires descendant containment proof; instance and artifacts retained"
+        );
+    }
+
+    /// Proof that a launched worker's whole isolated process group is already
+    /// gone AND that no durable or in-memory state can still resurrect it.
+    ///
+    /// The proof is deliberately same-lifecycle-only: the live child handle lives
+    /// in the in-memory registry, which is empty after a daemon restart, so a
+    /// restarted daemon can never satisfy it. All of the following must hold:
+    /// - the worker is absent from the external registry;
+    /// - a reserved identity + live child handle exist in THIS registry;
+    /// - the durable journal is `Running` and matches this identity (a mere
+    ///   `Intent` row never proves the process exited);
+    /// - the child has actually exited (`try_wait` reaps and reports it);
+    /// - the recorded process group has been fully reaped.
+    fn provable_containment(&self, attempt: &Attempt) -> Result<bool> {
+        if crate::agent::lock_external(&self.externals).contains_key(&attempt.name) {
+            return Ok(false);
+        }
+        let Some(id) = self.identity(attempt)? else {
+            return Ok(false);
+        };
+        let child = crate::agent::lock_registry(&self.registry)
+            .get(&id)
+            .map(|handle| Arc::clone(&handle.child));
+        let Some(child) = child else {
+            return Ok(false);
+        };
+        let Some(journal) = read_journal(&self.home, &attempt.name)? else {
+            return Ok(false);
+        };
+        if journal.phase != ProcessPhase::Running
+            || attempt.uuid.as_deref() != Some(journal.uuid.as_str())
+        {
+            return Ok(false);
+        }
+        // Reap + observe the direct child. `try_wait` caches the exit status, so
+        // reaching it here is the "child is waitable and has ended" evidence.
+        if child.lock().try_wait()?.is_none() {
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        {
+            let Some(pgid) = journal.pgid else {
+                return Ok(false);
+            };
+            Ok(!crate::process::is_process_group_alive(pgid))
+        }
+        #[cfg(not(unix))]
+        {
+            // No process-group primitive: descendant containment is unprovable.
+            Ok(false)
+        }
     }
 }
 
@@ -265,6 +357,7 @@ impl JobRuntime for ManagedRuntime {
                 phase: ProcessPhase::Intent,
                 pid: None,
                 start_token: None,
+                pgid: None,
             },
         )?;
         crate::agent_ops::spawn::spawn_instance(
@@ -291,6 +384,7 @@ impl JobRuntime for ManagedRuntime {
                 phase: ProcessPhase::Running,
                 pid,
                 start_token: pid.and_then(crate::process::process_start_token),
+                pgid: spawn_pgid(pid),
             },
         )?;
         Ok(id)
@@ -323,16 +417,17 @@ impl JobRuntime for ManagedRuntime {
         })
     }
 
-    fn stop(&self, attempt: &Attempt) -> Result<bool> {
+    fn stop(&self, run: &Run, attempt: &Attempt) -> Result<bool> {
         let identity = self.identity(attempt)?;
         // Fast rejection only; authoritative proof is repeated inside DeleteFence.
-        self.ensure_never_launched(attempt)?;
+        self.cleanup_precondition(run, attempt)?;
         #[cfg(test)]
         tests::before_stop(self, attempt);
-        // No spawn intent was ever written: only a pre-launch reservation can
-        // reach deletion. The shared permit rechecks its identity before effects.
+        // Either a pre-launch reservation, or an opt-in contained success whose
+        // whole process group is already reaped. The shared permit rechecks its
+        // identity before effects.
         let precondition = || {
-            self.ensure_never_launched(attempt)
+            self.cleanup_precondition(run, attempt)
                 .map_err(|error| error.to_string())
         };
         crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_precondition(
@@ -357,9 +452,18 @@ impl JobRuntime for ManagedRuntime {
             "cannot dispatch without reserved worker identity"
         );
         let prompt = format!(
-            "Execute scheduled job {} (run {}, attempt {}).\n{}\n\nPersistent artifacts and checkpoints: {}\nOutput context: {}\nTask: {}\nResume existing checkpoints and record delivery per destination before retrying. Save results outside the disposable instance workspace. When ALL requested work is complete, call schedule with action=complete, run_id={}, attempt_id={}, result=<nonempty result summary>. Do not report completion merely because work was queued.",
+            "Execute scheduled job {} (run {}, attempt {}).\n{}\n\nPersistent artifacts and checkpoints: {}\nOutput context: {}\nTask: {}\nResume existing checkpoints and record delivery per destination before retrying. Save results outside the disposable instance workspace.{}\nWhen ALL requested work is complete, call schedule with action=complete, run_id={}, attempt_id={}, result=<nonempty result summary>. Do not report completion merely because work was queued.",
             run.schedule_id, run.id, attempt.number, run.message, run.config.artifact_directory.display(),
-            run.config.output_context, run.task_id.as_deref().unwrap_or("pending"), run.id, attempt.number,
+            run.config.output_context, run.task_id.as_deref().unwrap_or("pending"),
+            if run.config.worker_topic.is_some() {
+                format!(
+                    "\nBusiness delivery endpoint is configured. Deliver the final output with schedule action=deliver, run_id={}, attempt_id={}, message=<full content> or message_from_file=<absolute path>; this channel has no status-notice length cap and MUST succeed before you complete. If this Run genuinely has no deliverable content, skip deliver and say so in the result.",
+                    run.id, attempt.number
+                )
+            } else {
+                String::new()
+            },
+            run.id, attempt.number,
         );
         let mut message = crate::inbox::InboxMessage::new_system(OWNER, "task", prompt);
         if let Some(task) = &run.task_id {
@@ -521,6 +625,8 @@ mod tests {
                 retry_delay_secs: 1,
                 output_context: String::new(),
                 notification: None,
+                auto_cleanup: false,
+                worker_topic: None,
             },
             phase: super::super::Phase::Starting,
             revision: 0,
@@ -538,6 +644,7 @@ mod tests {
             notification: super::super::NotificationState::NotRequested,
             notification_receipt: None,
             notification_error: None,
+            delivery: super::super::DeliveryState::NotRequested,
         };
         super::super::mutate(home, |state| {
             state.runs.push(run.clone());
@@ -568,6 +675,7 @@ mod tests {
                 phase: ProcessPhase::Intent,
                 pid: None,
                 start_token: None,
+                pgid: None,
             },
         )
         .unwrap();
@@ -577,7 +685,7 @@ mod tests {
             .to_string()
             .contains("recovery_required"));
         assert!(runtime
-            .stop(&attempt)
+            .stop(&run, &attempt)
             .unwrap_err()
             .to_string()
             .contains("recovery_required"));
@@ -616,6 +724,7 @@ mod tests {
                 phase: ProcessPhase::Intent,
                 pid: None,
                 start_token: None,
+                pgid: None,
             },
         )
         .unwrap();
@@ -633,7 +742,7 @@ mod tests {
             .to_string()
             .contains("recovery_required"));
         assert!(restarted
-            .stop(&attempt)
+            .stop(&run, &attempt)
             .unwrap_err()
             .to_string()
             .contains("recovery_required"));
@@ -656,6 +765,7 @@ mod tests {
                 phase: ProcessPhase::Running,
                 pid: Some(pid),
                 start_token: crate::process::process_start_token(pid),
+                pgid: None,
             },
         )
         .unwrap();
@@ -665,7 +775,7 @@ mod tests {
             .to_string()
             .contains("recovery_required"));
         assert!(runtime
-            .stop(&attempt)
+            .stop(&run, &attempt)
             .unwrap_err()
             .to_string()
             .contains("recovery_required"));
@@ -675,7 +785,7 @@ mod tests {
     #[test]
     fn legacy_stopped_receipt_never_authorizes_cleanup() {
         let home = TempHome::new();
-        let (runtime, _, attempt) = reserved_fixture(home.path());
+        let (runtime, run, attempt) = reserved_fixture(home.path());
         let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
         let id = register_worker(home.path(), &attempt, &workspace).unwrap();
         write_journal(
@@ -686,12 +796,13 @@ mod tests {
                 phase: ProcessPhase::Stopped,
                 pid: None,
                 start_token: None,
+                pgid: None,
             },
         )
         .unwrap();
         let before = std::fs::read(crate::fleet::fleet_yaml_path(home.path())).unwrap();
         assert!(runtime
-            .stop(&attempt)
+            .stop(&run, &attempt)
             .unwrap_err()
             .to_string()
             .contains("recovery_required"));
@@ -704,21 +815,21 @@ mod tests {
     #[test]
     fn never_launched_reservation_can_be_cleaned() {
         let home = TempHome::new();
-        let (runtime, _, attempt) = reserved_fixture(home.path());
+        let (runtime, run, attempt) = reserved_fixture(home.path());
         let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
         register_worker(home.path(), &attempt, &workspace).unwrap();
-        assert!(runtime.stop(&attempt).unwrap());
+        assert!(runtime.stop(&run, &attempt).unwrap());
         assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_none());
     }
 
     #[test]
     fn launched_uuid_without_journal_still_requires_recovery() {
         let home = TempHome::new();
-        let (runtime, _, mut attempt) = reserved_fixture(home.path());
+        let (runtime, run, mut attempt) = reserved_fixture(home.path());
         let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
         attempt.uuid = Some(register_worker(home.path(), &attempt, &workspace).unwrap());
         assert!(runtime
-            .stop(&attempt)
+            .stop(&run, &attempt)
             .unwrap_err()
             .to_string()
             .contains("recovery_required"));
@@ -832,7 +943,7 @@ mod tests {
             "fixture requires a surviving sibling group member after leader reap"
         );
         let home = TempHome::new();
-        let (runtime, _, attempt) = reserved_fixture(home.path());
+        let (runtime, run, attempt) = reserved_fixture(home.path());
         let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
         let id = register_worker(home.path(), &attempt, &workspace).unwrap();
         std::fs::create_dir_all(home.path().join("schedule_job_processes")).unwrap();
@@ -844,7 +955,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let result = runtime.stop(&attempt);
+        let result = runtime.stop(&run, &attempt);
         assert!(
             result.is_err(),
             "leader-only receipt allowed cleanup while its sibling group member is alive"
@@ -914,7 +1025,7 @@ mod tests {
         let child = Arc::clone(&crate::agent::lock_registry(&runtime.registry)[&parsed].child);
         assert!(child.lock().try_wait().unwrap().is_none());
         assert!(runtime
-            .stop(&attempt)
+            .stop(&run, &attempt)
             .unwrap_err()
             .to_string()
             .contains("recovery_required"));
@@ -928,10 +1039,247 @@ mod tests {
         assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_none());
     }
 
+    /// Spawn a live `sh` worker through the real runtime and return its id.
+    #[cfg(unix)]
+    fn spawn_live_worker(runtime: &ManagedRuntime, run: &mut Run, attempt: &mut Attempt) -> String {
+        attempt.backend = "sh".into();
+        run.attempt = Some(attempt.clone());
+        let id = runtime.start(run, attempt).unwrap();
+        attempt.uuid = Some(id.clone());
+        run.attempt = Some(attempt.clone());
+        id
+    }
+
+    #[cfg(unix)]
+    fn registry_child(runtime: &ManagedRuntime, id: &str) -> Arc<ChildHandle> {
+        let parsed = crate::types::InstanceId::parse(id).unwrap();
+        Arc::clone(&crate::agent::lock_registry(&runtime.registry)[&parsed].child)
+    }
+
+    #[cfg(unix)]
+    type ChildHandle = parking_lot::Mutex<Box<dyn portable_pty::Child + Send>>;
+
+    #[cfg(unix)]
+    fn wait_exited(child: &Arc<ChildHandle>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.lock().try_wait().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "worker did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Model a worker that reaped its own tools: kill any survivors left in the
+    /// isolated group and wait until the group is empty. (A bare `sh` spawns an
+    /// interactive platform shell as a descendant, so killing only the leader is
+    /// NOT containment — which is exactly what the proof must reject.)
+    #[cfg(unix)]
+    fn reap_group(journal: &ProcessJournal) {
+        let Some(pgid) = journal.pgid else {
+            return;
+        };
+        unsafe {
+            libc::kill(-(pgid as i32), libc::SIGKILL);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::process::is_process_group_alive(pgid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process group {pgid} never reaped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_successful_worker_is_auto_cleaned() {
+        let home = TempHome::new();
+        let (runtime, mut run, mut attempt) = reserved_fixture(home.path());
+        run.config.auto_cleanup = true;
+        let id = spawn_live_worker(&runtime, &mut run, &mut attempt);
+        let child = registry_child(&runtime, &id);
+        assert!(child.lock().try_wait().unwrap().is_none());
+        // The worker exits on its own; the job path keeps its handle as evidence.
+        child.lock().kill().unwrap();
+        wait_exited(&child);
+        let journal = read_journal(home.path(), &attempt.name).unwrap().unwrap();
+        reap_group(&journal);
+        run.phase = super::super::Phase::Succeeded;
+        assert!(runtime.stop(&run, &attempt).unwrap());
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_cleanup_off_retains_a_contained_worker_for_recovery() {
+        let home = TempHome::new();
+        let (runtime, mut run, mut attempt) = reserved_fixture(home.path());
+        let id = spawn_live_worker(&runtime, &mut run, &mut attempt);
+        let child = registry_child(&runtime, &id);
+        child.lock().kill().unwrap();
+        wait_exited(&child);
+        let journal = read_journal(home.path(), &attempt.name).unwrap().unwrap();
+        reap_group(&journal);
+        run.phase = super::super::Phase::Succeeded;
+        // auto_cleanup is false in the fixture: today's behaviour is unchanged
+        // even though containment is now provable.
+        assert!(runtime
+            .stop(&run, &attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required"));
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
+        crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_expected_identity(
+            home.path(),
+            &attempt.name,
+            Some(&crate::agent_ops::DeleteContext {
+                registry: &runtime.registry,
+                configs: &runtime.configs,
+                externals: &runtime.externals,
+                notifier: None,
+            }),
+            Some((OWNER, Some(&id))),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_worker_is_not_contained_even_with_auto_cleanup() {
+        let home = TempHome::new();
+        let (runtime, mut run, mut attempt) = reserved_fixture(home.path());
+        run.config.auto_cleanup = true;
+        let id = spawn_live_worker(&runtime, &mut run, &mut attempt);
+        let child = registry_child(&runtime, &id);
+        run.phase = super::super::Phase::Succeeded;
+        assert!(runtime
+            .stop(&run, &attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required"));
+        assert!(child.lock().try_wait().unwrap().is_none());
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
+        // Clean up while the worker is still alive so teardown kills its group.
+        crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_expected_identity(
+            home.path(),
+            &attempt.name,
+            Some(&crate::agent_ops::DeleteContext {
+                registry: &runtime.registry,
+                configs: &runtime.configs,
+                externals: &runtime.externals,
+                notifier: None,
+            }),
+            Some((OWNER, Some(&id))),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn restarted_daemon_cannot_prove_containment() {
+        let home = TempHome::new();
+        let (runtime, mut run, mut attempt) = reserved_fixture(home.path());
+        let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
+        let id = register_worker(home.path(), &attempt, &workspace).unwrap();
+        attempt.uuid = Some(id.clone());
+        run.attempt = Some(attempt.clone());
+        run.phase = super::super::Phase::Succeeded;
+        run.config.auto_cleanup = true;
+        write_journal(
+            home.path(),
+            &attempt.name,
+            &ProcessJournal {
+                uuid: id.clone(),
+                phase: ProcessPhase::Running,
+                pid: Some(std::process::id()),
+                start_token: None,
+                pgid: None,
+            },
+        )
+        .unwrap();
+        drop(runtime);
+        // A fresh daemon has no in-memory child handle, so containment fails closed.
+        let registry = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let externals = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let restarted = ManagedRuntime::new(home.path(), &registry, &configs, &externals);
+        assert!(restarted
+            .stop(&run, &attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required"));
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
+    }
+
+    #[test]
+    fn intent_journal_cannot_prove_containment() {
+        let home = TempHome::new();
+        let (runtime, mut run, mut attempt) = reserved_fixture(home.path());
+        let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
+        let id = register_worker(home.path(), &attempt, &workspace).unwrap();
+        attempt.uuid = Some(id.clone());
+        run.attempt = Some(attempt.clone());
+        run.phase = super::super::Phase::Succeeded;
+        run.config.auto_cleanup = true;
+        write_journal(
+            home.path(),
+            &attempt.name,
+            &ProcessJournal {
+                uuid: id,
+                phase: ProcessPhase::Intent,
+                pid: None,
+                start_token: None,
+                pgid: None,
+            },
+        )
+        .unwrap();
+        assert!(runtime
+            .stop(&run, &attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required"));
+        assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_some());
+    }
+
+    #[test]
+    fn external_registry_residue_blocks_containment() {
+        let home = TempHome::new();
+        let (runtime, mut run, mut attempt) = reserved_fixture(home.path());
+        let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
+        let id = register_worker(home.path(), &attempt, &workspace).unwrap();
+        attempt.uuid = Some(id.clone());
+        run.attempt = Some(attempt.clone());
+        run.phase = super::super::Phase::Succeeded;
+        run.config.auto_cleanup = true;
+        write_journal(
+            home.path(),
+            &attempt.name,
+            &ProcessJournal {
+                uuid: id,
+                phase: ProcessPhase::Running,
+                pid: Some(std::process::id()),
+                start_token: None,
+                pgid: None,
+            },
+        )
+        .unwrap();
+        crate::agent::lock_external(&runtime.externals).insert(
+            attempt.name.clone(),
+            crate::agent::ExternalAgentHandle {
+                backend_command: "foreign".into(),
+                pid: std::process::id(),
+            },
+        );
+        assert!(runtime
+            .stop(&run, &attempt)
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required"));
+    }
+
     #[test]
     fn stop_rechecks_spawn_intent_after_deletion_fence_admission() {
         let home = TempHome::new();
-        let (runtime, _, attempt) = reserved_fixture(home.path());
+        let (runtime, run, attempt) = reserved_fixture(home.path());
         let workspace = crate::paths::workspace_dir(home.path()).join(&attempt.name);
         let id = register_worker(home.path(), &attempt, &workspace).unwrap();
         *STOP_HOOK.lock() = Some((
@@ -949,12 +1297,13 @@ mod tests {
                         phase: ProcessPhase::Intent,
                         pid: None,
                         start_token: None,
+                        pgid: None,
                     },
                 )
                 .unwrap();
             }),
         ));
-        let result = runtime.stop(&attempt);
+        let result = runtime.stop(&run, &attempt);
         assert!(
             result.is_err(),
             "spawn intent arriving after quick check was destructively deleted"

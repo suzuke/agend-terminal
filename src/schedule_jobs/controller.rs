@@ -90,7 +90,7 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
         }
         if run.cleanup_pending {
             let stopped = match &run.attempt {
-                Some(attempt) => runtime.stop(attempt),
+                Some(attempt) => runtime.stop(run, attempt),
                 None => Ok(true),
             };
             match stopped {
@@ -208,7 +208,7 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
                 .attempt
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("stopping without attempt"))?;
-            if !runtime.stop(attempt)? {
+            if !runtime.stop(run, attempt)? {
                 return Ok(());
             }
             next.previous_attempts.push(attempt.clone());

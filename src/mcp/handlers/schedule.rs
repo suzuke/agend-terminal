@@ -45,6 +45,25 @@ pub(super) fn handle_job_complete(home: &Path, args: &Value, instance_name: &str
     crate::schedule_jobs::complete(home, instance_name, args)
 }
 
+pub(super) fn handle_job_deliver(home: &Path, args: &Value, instance_name: &str) -> Value {
+    let content = if let Some(path) = args["message_from_file"].as_str().filter(|s| !s.is_empty()) {
+        match super::read_message_file(path) {
+            Ok(content) => content,
+            Err(error) => return serde_json::json!({"error": error}),
+        }
+    } else {
+        match args["message"].as_str() {
+            Some(text) if !text.is_empty() => text.to_string(),
+            _ => {
+                return serde_json::json!({
+                    "error": "missing 'message' or 'message_from_file'"
+                })
+            }
+        }
+    };
+    crate::schedule_jobs::deliver(home, instance_name, args, &content)
+}
+
 pub(super) fn handle_job_resolve_recovery(home: &Path, args: &Value) -> Value {
     crate::schedule_jobs::resolve_recovery(home, args)
 }
