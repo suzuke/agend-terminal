@@ -86,6 +86,10 @@ pub(crate) struct Run {
     pub next_attempt_at: i64,
     pub deadline: i64,
     pub cleanup_pending: bool,
+    /// Epoch seconds when the bounded auto-cleanup retry window started. Set on
+    /// the first cleanup tick of an opt-in successful Run; `None` otherwise.
+    #[serde(default)]
+    pub cleanup_started_at: Option<i64>,
     #[serde(default)]
     pub recovery_required: bool,
     #[serde(default)]
@@ -234,6 +238,7 @@ pub(crate) fn admit_due(
             next_attempt_at: now.timestamp(),
             deadline: now.timestamp().saturating_add(config.timeout_secs as i64),
             cleanup_pending: false,
+            cleanup_started_at: None,
             recovery_required: false,
             recovery_resolution: None,
             task_settled: false,

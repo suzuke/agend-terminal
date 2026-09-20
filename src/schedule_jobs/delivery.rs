@@ -89,6 +89,7 @@ mod tests {
                 output_context: String::new(),
                 notification: None,
                 auto_cleanup: false,
+                cleanup_retry_secs: 60,
                 worker_topic: content_topic.map(|topic_id| JobNotification::Telegram {
                     chat_id: -100123,
                     topic_id: Some(topic_id),
@@ -104,6 +105,7 @@ mod tests {
             next_attempt_at: 1,
             deadline: 100,
             cleanup_pending: false,
+            cleanup_started_at: None,
             recovery_required: false,
             recovery_resolution: None,
             task_settled: false,

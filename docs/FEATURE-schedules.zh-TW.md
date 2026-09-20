@@ -68,7 +68,7 @@ agent 或操作者想在 PR merge 後 30 分鐘做一次 cleanup，這類只會�
 
 `output_context` 是固定的業務推送指示，不是憑證，也不會自動建立通道目的地。Worker 必須使用其工具可存取且已獲授權的目的地設定。每次嘗試有獨立工作目錄；逐字稿、摘要及推送紀錄應保存在 `artifact_directory`。
 
-`job.auto_cleanup`（預設 `false`）讓 Job 選擇性自動清理已成功、且 daemon 能證明完全受控的 Run——child 已觀察到結束，整個隔離的 process group 已回收，外部 registry 沒有殘留。無法證明所有子孫程序都已停止時，daemon 保留 worker 工作目錄並記錄 `recovery_required`，不自動刪除。這份證明只存在於啟動該 worker 的 daemon 生命週期內：daemon 重啟後，或只剩 `Intent` journal、worker 仍在執行、外部 registry 仍有該名字時，該 Run 仍需人工復原。
+`job.auto_cleanup`（預設 `false`）讓 Job 選擇性自動清理已成功、且 daemon 能證明完全受控的 Run——child 已觀察到結束，整個隔離的 process group 已回收，外部 registry 沒有殘留。啟用後任務訊息也會指示 worker 在工作（及已設定的業務推送）完成後自行結束 session，使 worker 自己退出。由於 worker 可能需要一點時間才結束，清理會隨每個 daemon tick 在有界視窗內重試（`job.cleanup_retry_secs`，預設 60，範圍 0–600；`0` 等同立即回退）：在視窗內結束的 worker 會自動清理，只有超過視窗仍無法證明的 Run 才回退為 `recovery_required`。這份證明只存在於啟動該 worker 的 daemon 生命週期內：daemon 重啟後，或只剩 `Intent` journal、worker 仍在執行、外部 registry 仍有該名字時，該 Run 無法自動清理，仍需人工復原。未啟用 `auto_cleanup` 時，worker 訊息與復原行為完全不變。
 
 選填的 `job.notification` 會發出一次完成或待人工復原的狀態通知，與業務推送分開：
 

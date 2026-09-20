@@ -89,6 +89,12 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
             }
         }
         if run.cleanup_pending {
+            // Anchor the bounded retry window at the first cleanup tick of an
+            // opt-in Run. Non-opt-in Runs keep `cleanup_started_at = None` so
+            // their observable behaviour is byte-identical to before.
+            if run.config.auto_cleanup && next.cleanup_started_at.is_none() {
+                next.cleanup_started_at = Some(now);
+            }
             let stopped = match &run.attempt {
                 Some(attempt) => runtime.stop(run, attempt),
                 None => Ok(true),
@@ -97,8 +103,19 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
                 Ok(true) => next.cleanup_pending = false,
                 Ok(false) => {}
                 Err(error) => {
-                    next.recovery_required |= error.to_string().contains("recovery_required");
-                    next.error = Some(format!("cleanup pending: {error}"));
+                    let recoverable = error.to_string().contains("recovery_required");
+                    let window_end = next
+                        .cleanup_started_at
+                        .unwrap_or(now)
+                        .saturating_add(run.config.cleanup_retry_secs as i64);
+                    if recoverable && run.config.auto_cleanup && now < window_end {
+                        // The worker may still be shutting down: re-attempt
+                        // containment proof on the next tick. Do NOT claim
+                        // recovery while the bounded window is still open.
+                    } else {
+                        next.recovery_required |= recoverable;
+                        next.error = Some(format!("cleanup pending: {error}"));
+                    }
                 }
             }
         }

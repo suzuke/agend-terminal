@@ -355,7 +355,8 @@ pub(crate) fn def_schedule() -> Value {
                     "chat_id": {"type": "integer", "description": "Must match the configured fleet Telegram group; never derived from the creator or worker."},
                     "topic_id": {"type": "integer", "minimum": 1, "description": "Required: an existing topic id."}
                 }, "required": ["channel", "chat_id", "topic_id"]},
-                "auto_cleanup": {"type": "boolean", "description": "Opt-in: when true, a Succeeded Run whose worker this daemon spawned and can prove fully contained (child reaped, process group gone, no external residue) is cleaned up automatically. Default false keeps today's manual recovery."}
+                "auto_cleanup": {"type": "boolean", "description": "Opt-in: when true, the worker task instructs the worker to exit after finishing, and a Succeeded Run whose worker this daemon spawned and can prove fully contained (child reaped, process group gone, no external residue) is cleaned up automatically. Default false keeps today's manual recovery."},
+                "cleanup_retry_secs": {"type": "integer", "minimum": 0, "maximum": 600, "default": 60, "description": "Bounded retry window for auto_cleanup: each daemon tick re-attempts containment proof for up to this long before falling back to recovery_required. Ignored unless auto_cleanup is true. Default 60; 0 = immediate fallback."}
             }, "required": ["backends", "artifact_directory"]},
             "cron": {"type": "string", "description": "5- or 6-field cron expression (recurring). 5-field layout: `min hour day-of-month month day-of-week`; 6-field prepends seconds. Day-of-week uses Quartz convention: 1=Sun, 2=Mon, 3=Tue, 4=Wed, 5=Thu, 6=Fri, 7=Sat (NOT Unix 0-6). Example: every Wed+Sat at 15:00 → `0 15 * * 4,7`."},
             "run_at": {"type": "string", "description": "ISO 8601 one-shot instant."},

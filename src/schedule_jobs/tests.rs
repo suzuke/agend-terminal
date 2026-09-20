@@ -676,6 +676,151 @@ fn cleared_cleanup_makes_later_occurrences_admissible() {
     std::fs::remove_dir_all(h).unwrap();
 }
 
+fn cleanup_schedule(home: &Path) -> crate::schedules::Schedule {
+    serde_json::from_value(serde_json::json!({"id":"cleanup-test","target":"","message":"do work","created_at":"2026-01-01T00:00:00Z","timezone":"UTC","trigger":{"kind":"cron","expr":"* * * * *"},"job":{"backends":["codex"],"artifact_directory":home.join("artifacts"),"retry_delay_secs":1,"auto_cleanup":true}})).unwrap()
+}
+
+/// Runtime whose containment proof flips only when `contained` is set.
+#[derive(Default)]
+struct Delayed {
+    contained: std::sync::atomic::AtomicBool,
+}
+impl Delayed {
+    fn contained() -> Self {
+        let delayed = Self::default();
+        delayed
+            .contained
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        delayed
+    }
+}
+impl JobRuntime for Delayed {
+    fn start(&self, _: &Run, _: &Attempt) -> anyhow::Result<String> {
+        panic!("late worker must not respawn")
+    }
+    fn observe(&self, _: &Attempt) -> anyhow::Result<Observation> {
+        panic!("terminal phase must not observe")
+    }
+    fn stop(&self, _: &Run, _: &Attempt) -> anyhow::Result<bool> {
+        if self.contained.load(std::sync::atomic::Ordering::SeqCst) {
+            Ok(true)
+        } else {
+            anyhow::bail!("recovery_required: worker not yet contained")
+        }
+    }
+    fn dispatch(&self, _: &Run, _: &Attempt) -> anyhow::Result<()> {
+        panic!("terminal phase must not dispatch")
+    }
+}
+
+fn drive_succeeded(h: &Path, s: &crate::schedules::Schedule, clock: i64) -> Run {
+    admit_due(h, s, now()).unwrap();
+    advance_to_running(h, &Fake::default(), clock);
+    let run = read(h).unwrap().runs[0].clone();
+    let a = run.attempt.as_ref().unwrap();
+    complete_as(
+        h,
+        &run.id,
+        u64::from(a.number),
+        &a.name,
+        a.uuid.as_deref().unwrap(),
+        "done",
+    )
+    .unwrap();
+    run
+}
+
+#[test]
+fn cleanup_retry_window_auto_clears_a_late_worker() {
+    let h = home();
+    let s = cleanup_schedule(&h);
+    let clock = now().timestamp();
+    drive_succeeded(&h, &s, clock);
+    let late = Delayed::default();
+    // First cleanup tick: worker still exiting -> retry, no recovery yet.
+    tick(&h, &late, clock + 1).unwrap();
+    let pending = read(&h).unwrap().runs[0].clone();
+    assert!(
+        pending.cleanup_pending,
+        "cleanup must stay pending in-window"
+    );
+    assert!(
+        !pending.recovery_required,
+        "must not claim recovery while the window is open"
+    );
+    assert_eq!(pending.cleanup_started_at, Some(clock + 1));
+    tick(&h, &late, clock + 30).unwrap();
+    let pending = read(&h).unwrap().runs[0].clone();
+    assert!(pending.cleanup_pending && !pending.recovery_required);
+    // Worker exits within the 60s window -> auto-clean + free later occurrences.
+    tick(&h, &Delayed::contained(), clock + 40).unwrap();
+    let done = read(&h).unwrap().runs[0].clone();
+    assert!(!done.cleanup_pending);
+    assert!(!done.recovery_required);
+    assert_eq!(done.phase, Phase::Succeeded);
+    assert!(!done.active());
+    admit_due(&h, &s, now() + chrono::Duration::minutes(2)).unwrap();
+    assert_eq!(read(&h).unwrap().runs.len(), 2);
+    std::fs::remove_dir_all(h).unwrap();
+}
+
+#[test]
+fn cleanup_retry_window_expires_to_recovery() {
+    let h = home();
+    let s = cleanup_schedule(&h);
+    let clock = now().timestamp();
+    drive_succeeded(&h, &s, clock);
+    let late = Delayed::default();
+    tick(&h, &late, clock + 1).unwrap();
+    // Past the default 60s window the Run falls back to manual recovery and
+    // never waits forever.
+    tick(&h, &late, clock + 61).unwrap();
+    let expired = read(&h).unwrap().runs[0].clone();
+    assert!(
+        expired.recovery_required,
+        "expired window must require recovery"
+    );
+    assert!(expired.cleanup_pending);
+    assert!(expired.active());
+    tick(&h, &Delayed::contained(), clock + 99999).unwrap();
+    let still = read(&h).unwrap().runs[0].clone();
+    assert!(
+        still.recovery_required,
+        "an expired Run must not silently auto-clean later"
+    );
+    std::fs::remove_dir_all(h).unwrap();
+}
+
+#[test]
+fn cleanup_retry_is_inert_without_auto_cleanup() {
+    let h = home();
+    let s = schedule(&h);
+    let clock = now().timestamp();
+    drive_succeeded(&h, &s, clock);
+    tick(&h, &Delayed::default(), clock + 1).unwrap();
+    let run = read(&h).unwrap().runs[0].clone();
+    assert!(run.recovery_required, "non-opt-in keeps today's behaviour");
+    assert_eq!(
+        run.cleanup_started_at, None,
+        "non-opt-in Runs must not anchor a retry window"
+    );
+    std::fs::remove_dir_all(h).unwrap();
+}
+
+#[test]
+fn cleanup_retry_secs_is_bounded_at_admission() {
+    let h = home();
+    let schedule_with = |secs: u64| -> crate::schedules::Schedule {
+        serde_json::from_value(serde_json::json!({"id":"bound-test","target":"","message":"x","created_at":"2026-01-01T00:00:00Z","timezone":"UTC","trigger":{"kind":"cron","expr":"* * * * *"},"job":{"backends":["codex"],"artifact_directory":h.join("artifacts"),"cleanup_retry_secs":secs}})).unwrap()
+    };
+    assert!(admit_due(&h, &schedule_with(601), now())
+        .unwrap_err()
+        .to_string()
+        .contains("cleanup_retry_secs"));
+    admit_due(&h, &schedule_with(600), now()).unwrap();
+    std::fs::remove_dir_all(h).unwrap();
+}
+
 fn telegram_home() -> std::path::PathBuf {
     let h = std::env::temp_dir().join(format!("job-delivery-tests-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&h).unwrap();

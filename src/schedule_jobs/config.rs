@@ -23,6 +23,13 @@ pub struct JobConfig {
     /// today's behaviour: every launched worker requires an operator recovery step.
     #[serde(default)]
     pub auto_cleanup: bool,
+    /// Bounded retry window (seconds) for `auto_cleanup`: while a successful,
+    /// contained-but-not-yet-exited worker is still shutting down, each daemon
+    /// tick re-attempts containment proof for up to this long before falling back
+    /// to `recovery_required`. Default 60; range 0..=600 (0 = today's immediate
+    /// fallback). Ignored unless `auto_cleanup` is true.
+    #[serde(default = "default_cleanup_retry")]
+    pub cleanup_retry_secs: u64,
     /// Opt-in: the existing Telegram topic where the worker delivers business
     /// output through `schedule action=deliver`. Reuses the notification endpoint
     /// shape and its explicit-group validation; unlike `notification` the topic is
@@ -87,6 +94,12 @@ fn default_attempts() -> u32 {
 fn default_retry_delay() -> u64 {
     60
 }
+fn default_cleanup_retry() -> u64 {
+    60
+}
+
+/// Upper bound for `cleanup_retry_secs`; the window may never become unbounded.
+pub const MAX_CLEANUP_RETRY_SECS: u64 = 600;
 
 impl JobConfig {
     pub fn validate(&self) -> Result<(), String> {
@@ -116,6 +129,11 @@ impl JobConfig {
         }
         if !(1..=3600).contains(&self.retry_delay_secs) {
             return Err("job.retry_delay_secs must be 1..3600".into());
+        }
+        if self.cleanup_retry_secs > MAX_CLEANUP_RETRY_SECS {
+            return Err(format!(
+                "job.cleanup_retry_secs must be 0..={MAX_CLEANUP_RETRY_SECS}"
+            ));
         }
         if let Some(notification) = &self.notification {
             notification.validate()?;

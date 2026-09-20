@@ -451,20 +451,7 @@ impl JobRuntime for ManagedRuntime {
             self.identity(attempt)?.is_some(),
             "cannot dispatch without reserved worker identity"
         );
-        let prompt = format!(
-            "Execute scheduled job {} (run {}, attempt {}).\n{}\n\nPersistent artifacts and checkpoints: {}\nOutput context: {}\nTask: {}\nResume existing checkpoints and record delivery per destination before retrying. Save results outside the disposable instance workspace.{}\nWhen ALL requested work is complete, call schedule with action=complete, run_id={}, attempt_id={}, result=<nonempty result summary>. Do not report completion merely because work was queued.",
-            run.schedule_id, run.id, attempt.number, run.message, run.config.artifact_directory.display(),
-            run.config.output_context, run.task_id.as_deref().unwrap_or("pending"),
-            if run.config.worker_topic.is_some() {
-                format!(
-                    "\nBusiness delivery endpoint is configured. Deliver the final output with schedule action=deliver, run_id={}, attempt_id={}, message=<full content> or message_from_file=<absolute path>; this channel has no status-notice length cap and MUST succeed before you complete. If this Run genuinely has no deliverable content, skip deliver and say so in the result.",
-                    run.id, attempt.number
-                )
-            } else {
-                String::new()
-            },
-            run.id, attempt.number,
-        );
+        let prompt = worker_task_prompt(run, attempt);
         let mut message = crate::inbox::InboxMessage::new_system(OWNER, "task", prompt);
         if let Some(task) = &run.task_id {
             message = message.with_correlation_id(task);
@@ -477,6 +464,39 @@ impl JobRuntime for ManagedRuntime {
         )?;
         Ok(())
     }
+}
+
+/// The task message enqueued to a job worker (job path only). The self-close
+/// clause is emitted only under the `auto_cleanup` opt-in, so the default job
+/// worker task text is unchanged.
+fn worker_task_prompt(run: &Run, attempt: &Attempt) -> String {
+    let delivery = if run.config.worker_topic.is_some() {
+        format!(
+            "\nBusiness delivery endpoint is configured. Deliver the final output with schedule action=deliver, run_id={}, attempt_id={}, message=<full content> or message_from_file=<absolute path>; this channel has no status-notice length cap and MUST succeed before you complete. If this Run genuinely has no deliverable content, skip deliver and say so in the result.",
+            run.id, attempt.number
+        )
+    } else {
+        String::new()
+    };
+    let self_close = if run.config.auto_cleanup {
+        "\nWhen the work is done and any configured delivery has succeeded, terminate your own session so the worker process exits on its own (exit your CLI, e.g. /exit or Ctrl-D). The daemon can only auto-clean a finished Run after the worker has exited; a worker that stays alive past the cleanup retry window requires manual recovery."
+    } else {
+        ""
+    };
+    format!(
+        "Execute scheduled job {} (run {}, attempt {}).\n{}\n\nPersistent artifacts and checkpoints: {}\nOutput context: {}\nTask: {}\nResume existing checkpoints and record delivery per destination before retrying. Save results outside the disposable instance workspace.{}{}\nWhen ALL requested work is complete, call schedule with action=complete, run_id={}, attempt_id={}, result=<nonempty result summary>. Do not report completion merely because work was queued.",
+        run.schedule_id,
+        run.id,
+        attempt.number,
+        run.message,
+        run.config.artifact_directory.display(),
+        run.config.output_context,
+        run.task_id.as_deref().unwrap_or("pending"),
+        delivery,
+        self_close,
+        run.id,
+        attempt.number,
+    )
 }
 
 #[cfg(test)]
@@ -626,6 +646,7 @@ mod tests {
                 output_context: String::new(),
                 notification: None,
                 auto_cleanup: false,
+                cleanup_retry_secs: 60,
                 worker_topic: None,
             },
             phase: super::super::Phase::Starting,
@@ -638,6 +659,7 @@ mod tests {
             next_attempt_at: 1,
             deadline: 100,
             cleanup_pending: false,
+            cleanup_started_at: None,
             task_settled: false,
             recovery_required: false,
             recovery_resolution: None,
@@ -1037,6 +1059,28 @@ mod tests {
             .expect("registered worker fixture cleanup must succeed");
         assert!(child.lock().try_wait().unwrap().is_some());
         assert!(crate::fleet::resolve_uuid(home.path(), &attempt.name).is_none());
+    }
+
+    #[test]
+    fn job_worker_prompt_requires_self_close_only_under_auto_cleanup() {
+        let home = TempHome::new();
+        let (_, mut run, attempt) = reserved_fixture(home.path());
+        run.config.auto_cleanup = false;
+        let off = worker_task_prompt(&run, &attempt);
+        assert!(
+            !off.contains("terminate your own session"),
+            "non-opt-in prompt must not demand self-close: {off}"
+        );
+        run.config.auto_cleanup = true;
+        let on = worker_task_prompt(&run, &attempt);
+        assert!(
+            on.contains("terminate your own session"),
+            "opt-in prompt must demand self-close: {on}"
+        );
+        assert!(
+            on.contains("/exit"),
+            "self-close hint must name an exit: {on}"
+        );
     }
 
     /// Spawn a live `sh` worker through the real runtime and return its id.
