@@ -687,6 +687,94 @@ mod tests {
     }
 
     #[test]
+    fn partial_live_binding_evidence_reconciles_from_recorded_archive_3696() {
+        for (case, remove_binding) in [("binding", true), ("signature", false)] {
+            let home = temp_home(&format!("partial-live-{case}"));
+            let instance = format!("recovery-live-partial-{case}-{}", std::process::id());
+            let branch = format!("review/live-partial-{case}");
+            let source_repo = home.join("source-repo");
+            std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
+            let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+                .join(&instance)
+                .join("review-live-partial");
+            std::fs::create_dir_all(&worktree).expect("create worktree fixture");
+            crate::binding::bind_full(
+                &home,
+                &instance,
+                "",
+                &branch,
+                &worktree,
+                &source_repo,
+                false,
+            )
+            .expect("bind recovery fixture");
+            let binding_body = std::fs::read(crate::paths::binding_path(&home, &instance))
+                .expect("read binding fixture");
+            let binding_signature = std::fs::read(
+                crate::paths::runtime_dir(&home)
+                    .join(&instance)
+                    .join("binding.json.sig"),
+            )
+            .expect("read binding signature fixture");
+            crate::agent::deletion_recovery::begin_from_binding(&home, &instance)
+                .expect("persist deleting tombstone")
+                .expect("signed binding must enter recovery lane");
+
+            let archive = home
+                .join(".trash")
+                .join("worktrees")
+                .join(format!("{instance}-archive"));
+            std::fs::create_dir_all(&archive).expect("create complete archive fixture");
+            std::fs::write(archive.join(".agend-recovery-binding.json"), &binding_body)
+                .expect("write archived binding evidence");
+            std::fs::write(
+                archive.join(".agend-recovery-binding.json.sig"),
+                &binding_signature,
+            )
+            .expect("write archived signature evidence");
+            crate::agent::deletion_recovery::mark_recovery_required(
+                &home,
+                &instance,
+                Some(&archive),
+            )
+            .expect("persist archive path before simulated cleanup interruption");
+            std::fs::remove_dir_all(&worktree).expect("simulate archived worktree");
+            if remove_binding {
+                std::fs::remove_file(crate::paths::binding_path(&home, &instance))
+                    .expect("simulate binding cleanup before signature cleanup");
+            } else {
+                std::fs::remove_file(
+                    crate::paths::runtime_dir(&home)
+                        .join(&instance)
+                        .join("binding.json.sig"),
+                )
+                .expect("simulate signature cleanup before binding cleanup");
+            }
+
+            let report = recover_markerless_bound_worktree(
+                &home,
+                "operator",
+                "reconcile partial live recovery evidence after restart",
+                &instance,
+                &branch,
+                &worktree,
+                &source_repo,
+            )
+            .expect("complete archive evidence must reconcile partial live cleanup");
+            assert_eq!(report.archive, archive);
+            assert!(crate::binding::read(&home, &instance).is_none());
+            assert_eq!(
+                crate::agent::deletion_recovery::read(&home, &instance)
+                    .expect("read recovered receipt")
+                    .expect("recovery receipt must remain durable")
+                    .state,
+                crate::agent::deletion_recovery::State::Recovered
+            );
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    #[test]
     fn marker_present_target_is_left_for_normal_release() {
         let home = temp_home("managed");
         let instance = format!("recovery-managed-{}", std::process::id());

@@ -1408,6 +1408,73 @@ fn auto_release_exact_fingerprint_cannot_release_new_generation_s1() {
 }
 
 #[test]
+fn stale_auto_release_preserves_current_generation_recovery_journal_3696() {
+    let home = tmp_home("stale-auto-current-recovery");
+    let repo = tmp_repo("stale-auto-current-recovery-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-stale-current-recovery",
+        "feat/stale-generation-a",
+    );
+    let expected_a =
+        match crate::binding::snapshot_guarded_binding(&home, "agent-stale-current-recovery")
+            .expect("snapshot generation A")
+        {
+            crate::binding::GuardedBinding::Known { fingerprint, .. } => fingerprint,
+            other => panic!("expected Known generation A, got {other:?}"),
+        };
+    let binding_path = crate::paths::binding_path(&home, "agent-stale-current-recovery");
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-stale-current-recovery")
+        .join("binding.json.sig");
+    std::fs::remove_file(&binding_path).expect("remove generation A binding");
+    std::fs::remove_file(&signature_path).expect("remove generation A signature");
+    crate::binding::bind_full(
+        &home,
+        "agent-stale-current-recovery",
+        "T-generation-b",
+        "feat/stale-generation-b",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("install generation B");
+    prepare_release_journal(&home, "agent-stale-current-recovery")
+        .expect("generation B journal should be durable");
+    std::fs::remove_dir_all(&lease.path).expect("simulate generation B removal");
+    mark_release_recovery_required(&home, "agent-stale-current-recovery")
+        .expect("mark generation B recovery required");
+    let tombstone_path =
+        crate::agent::deletion_recovery::path(&home, "agent-stale-current-recovery");
+    let tombstone_before = std::fs::read(&tombstone_path).expect("read generation B tombstone");
+
+    let outcome = release_full_exact(&home, "agent-stale-current-recovery", &expected_a, false);
+
+    assert!(
+        outcome.stale_fingerprint && !outcome.released,
+        "stale generation A must not release generation B: {outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read(&tombstone_path).expect("generation B tombstone must remain"),
+        tombstone_before,
+        "stale generation A must not clear generation B recovery authority"
+    );
+    assert_eq!(
+        crate::binding::read(&home, "agent-stale-current-recovery")
+            .expect("generation B binding must remain")["branch"],
+        "feat/stale-generation-b"
+    );
+    assert!(
+        !lease.path.exists(),
+        "generation B residue remains absent for recovery"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
 fn dirty_release_begins_notice_emit_after_all_transaction_flocks_drop_s1() {
     let home = tmp_home("s1-notice-unlocked");
     let repo = tmp_repo("s1-notice-unlocked-repo");
