@@ -5017,6 +5017,107 @@ fn normal_release_interruption_retains_durable_recovery_journal_3696() {
         .expect("normal release must persist a recovery journal before removal");
     assert_eq!(journal.state, crate::agent::deletion_recovery::State::RecoveryRequired);
 
+    let report = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "archive interrupted normal release residue",
+        "agent-release-journal",
+        "feat/release-journal",
+        &lease.path,
+        &repo,
+    )
+    .expect("restart recovery must archive the exact release residue");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(report.archive.join(".agend-recovery-manifest.json"))
+            .expect("read release recovery manifest"),
+    )
+    .expect("parse release recovery manifest");
+    assert_eq!(manifest["instance"], "agent-release-journal");
+    assert_eq!(manifest["branch"], "feat/release-journal");
+    assert!(
+        report
+            .archive
+            .join(".agend-recovery-binding.json")
+            .is_file()
+    );
+    assert!(
+        report
+            .archive
+            .join(".agend-recovery-binding.json.sig")
+            .is_file()
+    );
+    assert!(crate::binding::read(&home, "agent-release-journal").is_none());
+    assert_eq!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal")
+            .expect("read completed recovery journal")
+            .expect("recovery receipt remains durable")
+            .state,
+        crate::agent::deletion_recovery::State::Recovered
+    );
+    let retry = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "idempotent retry after normal release recovery",
+        "agent-release-journal",
+        "feat/release-journal",
+        &lease.path,
+        &repo,
+    )
+    .expect("identical recovery retry must succeed");
+    assert_eq!(retry.archive, report.archive);
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn exact_bound_release_journals_before_remove_3696() {
+    let home = tmp_home("exact-release-journal");
+    let repo = tmp_repo("exact-release-journal-repo");
+    let lease = lease_bound(&home, &repo, "agent-exact-journal", "feat/exact-journal");
+    let expected = match crate::binding::snapshot_guarded_binding(&home, "agent-exact-journal")
+        .expect("snapshot exact binding")
+    {
+        crate::binding::GuardedBinding::Known { fingerprint, .. } => fingerprint,
+        other => panic!("expected known binding, got {other:?}"),
+    };
+
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _hook = release_test_seam::install(|phase| {
+            if phase == ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear {
+                panic!("simulate exact release interruption");
+            }
+        });
+        release_bound_target_exact(&home, "agent-exact-journal", &expected, &lease.path, &repo);
+    }));
+
+    assert!(interrupted.is_err());
+    assert!(!lease.path.exists());
+    assert_eq!(
+        crate::agent::deletion_recovery::read(&home, "agent-exact-journal")
+            .expect("read exact release journal")
+            .expect("exact bound release must journal signed binding")
+            .state,
+        crate::agent::deletion_recovery::State::RecoveryRequired
+    );
+    let report = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "recover exact release interruption",
+        "agent-exact-journal",
+        "feat/exact-journal",
+        &lease.path,
+        &repo,
+    )
+    .expect("exact release residue must be recoverable");
+    assert!(
+        report
+            .archive
+            .join(".agend-recovery-manifest.json")
+            .is_file()
+    );
+    assert!(crate::binding::read(&home, "agent-exact-journal").is_none());
+
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }

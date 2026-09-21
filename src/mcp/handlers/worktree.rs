@@ -64,7 +64,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             return json!({
                 "error": "repository_path must not contain '..' (path traversal rejected)",
                 "code": "path_traversal"
-            });
+            })
         }
     }
 
@@ -232,10 +232,24 @@ pub(crate) fn handle_release_worktree(home: &Path, args: &Value, sender: &Option
                 "released": false,
                 "error": format!("release refused: bind/rebase in flight; {error}"),
                 "code": "lifecycle_conflict"
-            })
+            });
         }
     };
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    // #3696: clean_empty_init_commits mutates the bound worktree before the
+    // lower release transaction starts, so publish the signed recovery fence
+    // at the real MCP entry point first.  An absent binding remains the normal
+    // idempotent no-op and is handled by release_full below.
+    if !dry_run {
+        if let Err(error) = crate::worktree_pool::prepare_release_journal(home, agent) {
+            return json!({
+                "released": false,
+                "error": error,
+                "code": "release_incomplete",
+                "stage": "release_journal"
+            });
+        }
+    }
     // #789: clean empty init commits before removal (best-effort).
     if !dry_run {
         if let Some(wt) = crate::binding::read(home, agent)

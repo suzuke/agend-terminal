@@ -103,8 +103,21 @@ pub(crate) fn recover_markerless_bound_worktree(
             .archive
             .as_deref()
             .is_some_and(|archive| Path::new(archive).is_dir());
-        if tombstone.archive.is_some() && (recorded_archive_exists || !worktree.exists()) {
+        if tombstone.archive.is_some() && recorded_archive_exists {
             return archive::recover_recorded_archive(
+                home,
+                actor,
+                audit_reason,
+                instance,
+                branch,
+                worktree,
+                source_repo,
+                tombstone,
+                &permit,
+            );
+        }
+        if !worktree.exists() {
+            return archive::recover_absent_worktree(
                 home,
                 actor,
                 audit_reason,

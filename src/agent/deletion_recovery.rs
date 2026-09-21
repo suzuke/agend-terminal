@@ -127,6 +127,26 @@ pub(crate) fn begin_from_binding(home: &Path, instance: &str) -> Result<Option<T
         binding_signature_sha256: crate::daemon::utils::sha256_hex(&signature),
         archive: None,
     };
+    // A release can be retried after a daemon restart, and a delete handler can
+    // re-enter the same boundary while its lifecycle fence is still pending.
+    // Preserve the first exact signed intent instead of replacing it with a
+    // fresh timestamp or silently accepting a different target identity.
+    if let Some(existing) = read(home, instance)? {
+        if existing.state != State::Recovered {
+            if existing.instance == tombstone.instance
+                && existing.branch == tombstone.branch
+                && existing.worktree == tombstone.worktree
+                && existing.source_repo == tombstone.source_repo
+                && existing.binding_sha256 == tombstone.binding_sha256
+                && existing.binding_signature_sha256 == tombstone.binding_signature_sha256
+            {
+                return Ok(Some(existing));
+            }
+            return Err(
+                "recovery_required: existing tombstone identity does not match binding".to_string(),
+            );
+        }
+    }
     write(home, &tombstone)?;
     Ok(Some(tombstone))
 }

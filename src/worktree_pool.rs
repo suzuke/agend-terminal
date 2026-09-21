@@ -727,6 +727,37 @@ fn clear_binding_state(
     crate::binding::unbind_with_permit(home, agent, permit)
 }
 
+/// Publish the exact signed binding fence before any normal release mutation.
+/// The delete lifecycle already owns the same fence; its provenance skips this
+/// helper and keeps ownership until the residual-store audit completes.
+pub(crate) fn prepare_release_journal(home: &Path, agent: &str) -> Result<(), String> {
+    let Some(binding) = crate::binding::read(home, agent) else {
+        return Ok(());
+    };
+    // Pre-signature legacy bindings have no authenticated source identity and
+    // remain on the existing marker/authority release path.  They cannot enter
+    // this journal without inventing signed evidence; the normal release gates
+    // still fail closed when the target itself is unsafe.
+    if binding["source_repo"].as_str().is_none_or(str::is_empty) {
+        return Ok(());
+    }
+    match crate::agent::deletion_recovery::begin_from_binding(home, agent)? {
+        Some(_) => Ok(()),
+        None => Err(
+            "release refused: signed binding evidence is required before destructive cleanup"
+                .to_string(),
+        ),
+    }
+}
+
+fn clear_release_recovery_journal(home: &Path, agent: &str) -> Result<(), String> {
+    crate::agent::deletion_recovery::clear(home, agent)
+}
+
+fn mark_release_recovery_required(home: &Path, agent: &str) -> Result<(), String> {
+    crate::agent::deletion_recovery::mark_recovery_required(home, agent, None)
+}
+
 fn record_binding_removal(out: &mut ReleaseOutcome, removal: crate::binding::BindingRemoval) {
     match removal {
         crate::binding::BindingRemoval::Removed => out.binding_removed = true,
@@ -928,19 +959,59 @@ fn release_known_locked(
             #[cfg(test)]
             release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
             match remove_worktree(agent, wt_path, &source_repo) {
-        WorktreeRemoval::Removed => {
-            managed_verified = true;
-            out.worktree_removed = true;
+                WorktreeRemoval::Removed => {
+                    managed_verified = true;
+                    out.worktree_removed = true;
                     // Success path: a prior refused release may have left a
                     // per-worktree unpreservable-nested-dirt notice marker; clear
                     // it (+ its lock) so a future re-lease of this path re-notifies
                     // from a clean slate. Best-effort.
                     clear_refusal_marker = Some(wt_path.to_path_buf());
+                    if let Err(error) = mark_release_recovery_required(home, agent) {
+                        mark_release_incomplete(
+                            &mut out,
+                            "release_journal",
+                            wt_path,
+                            format!(
+                                "release removed the worktree but could not persist recovery state: {error}"
+                            ),
+                        );
+                        return LockedRelease {
+                            out,
+                            notices,
+                            clear_refusal_marker,
+                            finish_full_release: false,
+                            managed_verified,
+                            worktree_absent,
+                            was_dirty,
+                        };
+                    }
                     #[cfg(test)]
                     release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
                 }
                 WorktreeRemoval::AlreadyAbsent => {
                     worktree_absent = true;
+                    if let Err(error) = mark_release_recovery_required(home, agent) {
+                        mark_release_incomplete(
+                            &mut out,
+                            "release_journal",
+                            wt_path,
+                            format!(
+                                "release found the worktree absent but could not persist recovery state: {error}"
+                            ),
+                        );
+                        return LockedRelease {
+                            out,
+                            notices,
+                            clear_refusal_marker,
+                            finish_full_release: false,
+                            managed_verified,
+                            worktree_absent,
+                            was_dirty,
+                        };
+                    }
+                    #[cfg(test)]
+                    release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
                 }
                 WorktreeRemoval::Unmanaged(err) => {
                     mark_release_incomplete(&mut out, "worktree_remove", wt_path, err);
@@ -1224,6 +1295,17 @@ fn release_full_guarded(
             };
         }
     }
+    if !dry_run && !matches!(provenance, ReleaseProvenance::Delete) {
+        if let Err(error) = prepare_release_journal(home, agent) {
+            return ReleaseOutcome {
+                error: Some(error),
+                code: Some("release_incomplete"),
+                stage: Some("release_journal"),
+                path: (!wt.is_empty()).then(|| wt.to_string()),
+                ..ReleaseOutcome::default()
+            };
+        }
+    }
     let mut locked = release_known_locked(home, agent, &current, dry_run, permit);
     // Explicit drops document the lock boundary: no notice, marker cleanup,
     // branch cleanup, or release event runs with a flock held.
@@ -1234,6 +1316,17 @@ fn release_full_guarded(
     // S1 invariant holds — notice dispatch still begins with NO flock held.
     drop(_path_lock);
     drop(_branch_lock);
+
+    if !dry_run && !matches!(provenance, ReleaseProvenance::Delete) && locked.out.released {
+        if let Err(error) = clear_release_recovery_journal(home, agent) {
+            locked.out.error = Some(format!(
+                "release completed but recovery journal could not be cleared: {error}"
+            ));
+            locked.out.code = Some("release_incomplete");
+            locked.out.stage = Some("release_journal");
+            locked.out.released = false;
+        }
+    }
 
     for notice in locked.notices.drain(..) {
         notice.emit(home);
@@ -1436,6 +1529,16 @@ fn release_bound_target_exact_impl(
         }
     }
 
+    if let Err(error) = prepare_release_journal(home, agent) {
+        return ReleaseOutcome {
+            error: Some(error),
+            code: Some("release_incomplete"),
+            stage: Some("release_journal"),
+            path: Some(target.display().to_string()),
+            ..ReleaseOutcome::default()
+        };
+    }
+
     if require_force_identity
         && matches!(
             force_target_state,
@@ -1475,6 +1578,16 @@ fn release_bound_target_exact_impl(
         let removal = clear_binding_state(home, agent, permit);
         record_binding_removal(&mut out, removal);
         out.released = out.error.is_none() && out.binding_removed;
+        if out.released {
+            if let Err(error) = clear_release_recovery_journal(home, agent) {
+                out.released = false;
+                out.error = Some(format!(
+                    "release completed but recovery journal could not be cleared: {error}"
+                ));
+                out.code = Some("release_incomplete");
+                out.stage = Some("release_journal");
+            }
+        }
         drop(_binding_lock);
         drop(_agent_lock);
         drop(branch_lock);
@@ -1542,18 +1655,66 @@ fn release_bound_target_exact_impl(
         WorktreeRemoval::Removed => {
             out.worktree_removed = true;
             clear_marker = true;
+            if let Err(error) = mark_release_recovery_required(home, agent) {
+                mark_release_incomplete(
+                    &mut out,
+                    "release_journal",
+                    target,
+                    format!(
+                        "release removed the worktree but could not persist recovery state: {error}"
+                    ),
+                );
+                drop(_binding_lock);
+                drop(_agent_lock);
+                drop(branch_lock);
+                return out;
+            }
             #[cfg(test)]
             release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
             let removal = clear_binding_state(home, agent, permit);
             record_binding_removal(&mut out, removal);
             out.released = out.error.is_none() && out.binding_removed;
+            if out.released {
+                if let Err(error) = clear_release_recovery_journal(home, agent) {
+                    out.released = false;
+                    out.error = Some(format!(
+                        "release completed but recovery journal could not be cleared: {error}"
+                    ));
+                    out.code = Some("release_incomplete");
+                    out.stage = Some("release_journal");
+                }
+            }
         }
         WorktreeRemoval::AlreadyAbsent => {
+            if let Err(error) = mark_release_recovery_required(home, agent) {
+                mark_release_incomplete(
+                    &mut out,
+                    "release_journal",
+                    target,
+                    format!(
+                        "release found the worktree absent but could not persist recovery state: {error}"
+                    ),
+                );
+                drop(_binding_lock);
+                drop(_agent_lock);
+                drop(branch_lock);
+                return out;
+            }
             #[cfg(test)]
             release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
             let removal = clear_binding_state(home, agent, permit);
             record_binding_removal(&mut out, removal);
             out.released = out.error.is_none() && out.binding_removed;
+            if out.released {
+                if let Err(error) = clear_release_recovery_journal(home, agent) {
+                    out.released = false;
+                    out.error = Some(format!(
+                        "release completed but recovery journal could not be cleared: {error}"
+                    ));
+                    out.code = Some("release_incomplete");
+                    out.stage = Some("release_journal");
+                }
+            }
         }
         WorktreeRemoval::Unmanaged(error) => {
             mark_release_incomplete(&mut out, "worktree_remove", target, error)

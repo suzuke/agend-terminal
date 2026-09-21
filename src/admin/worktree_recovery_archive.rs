@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_archive_metadata(
@@ -72,6 +73,139 @@ pub(super) fn write_archive_metadata(
         .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Finish recovery when the release already removed the physical worktree but
+/// crashed before clearing its signed binding. The archive is a durable
+/// package for the exact binding residue and manifest; there is deliberately
+/// no path recreation or Git metadata deletion in this arm.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn recover_absent_worktree(
+    home: &Path,
+    actor: &str,
+    audit_reason: &str,
+    instance: &str,
+    branch: &str,
+    worktree: &Path,
+    source_repo: &Path,
+    tombstone: &crate::agent::deletion_recovery::Tombstone,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> Result<super::RecoveryReport, String> {
+    if !matches!(
+        tombstone.state,
+        crate::agent::deletion_recovery::State::Deleting
+            | crate::agent::deletion_recovery::State::RecoveryRequired
+    ) {
+        return Err("recovery refused: tombstone is not pending recovery".to_string());
+    }
+    if tombstone.instance != instance
+        || tombstone.branch != branch
+        || Path::new(&tombstone.worktree) != worktree
+        || Path::new(&tombstone.source_repo) != source_repo
+    {
+        return Err(
+            "recovery refused: supplied identity does not match the release tombstone".to_string(),
+        );
+    }
+    let root = home.join(".trash").join("worktrees");
+    std::fs::create_dir_all(&root).map_err(|e| format!("create recovery archive root: {e}"))?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("recovery archive root is unavailable: {e}"))?;
+    let archive = match tombstone.archive.as_deref() {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            root.join(format!(
+                "{instance}-release-recovery-{}-{}",
+                stamp.as_secs(),
+                stamp.subsec_nanos()
+            ))
+        }
+    };
+    if archive.exists() {
+        let canonical = archive
+            .canonicalize()
+            .map_err(|e| format!("recorded recovery archive is unavailable: {e}"))?;
+        if !canonical.starts_with(&root) || canonical == root {
+            return Err("recovery refused: archive is outside the recovery root".to_string());
+        }
+    } else if archive.parent() != Some(root.as_path()) {
+        return Err("recovery refused: archive parent is outside the recovery root".to_string());
+    }
+    std::fs::create_dir_all(&archive)
+        .map_err(|e| format!("create recovery archive {}: {e}", archive.display()))?;
+
+    let binding_path = crate::paths::binding_path(home, instance);
+    let signature_path = crate::paths::runtime_dir(home)
+        .join(instance)
+        .join("binding.json.sig");
+    let binding_body = std::fs::read(&binding_path)
+        .map_err(|e| format!("read binding metadata {}: {e}", binding_path.display()))?;
+    let binding_signature = std::fs::read(&signature_path)
+        .map_err(|e| format!("read binding signature {}: {e}", signature_path.display()))?;
+    if crate::daemon::utils::sha256_hex(&binding_body) != tombstone.binding_sha256
+        || crate::daemon::utils::sha256_hex(&binding_signature)
+            != tombstone.binding_signature_sha256
+    {
+        return Err("recovery refused: live binding evidence does not match tombstone".to_string());
+    }
+    if !crate::binding::signature_valid(home, instance) {
+        return Err("recovery refused: binding signature for recovery is not valid".to_string());
+    }
+    let binding: serde_json::Value = serde_json::from_slice(&binding_body)
+        .map_err(|e| format!("recovery refused: binding is invalid JSON: {e}"))?;
+    if binding["branch"].as_str() != Some(branch)
+        || binding["worktree"].as_str() != Some(worktree.to_string_lossy().as_ref())
+        || binding["source_repo"].as_str() != Some(source_repo.to_string_lossy().as_ref())
+    {
+        return Err("recovery refused: binding identity does not match tombstone".to_string());
+    }
+    let task_id = binding["task_id"].as_str().unwrap_or_default();
+    if !task_id.is_empty() {
+        let routed = crate::tasks::load_routed(home, task_id)
+            .map_err(|e| format!("recovery refused: task '{task_id}' is unreadable: {e}"))?;
+        if !routed.task.status.is_terminal() {
+            return Err(format!(
+                "recovery refused: task '{task_id}' is still active"
+            ));
+        }
+    }
+    crate::agent::deletion_recovery::mark_recovery_required(home, instance, Some(&archive))?;
+    write_archive_metadata(
+        &archive,
+        actor,
+        audit_reason,
+        instance,
+        branch,
+        source_repo,
+        worktree,
+        &archive,
+        &binding_body,
+        &binding_signature,
+    )?;
+    match crate::binding::unbind_with_permit(home, instance, permit) {
+        crate::binding::BindingRemoval::Removed | crate::binding::BindingRemoval::Absent => {
+            let _ = std::fs::remove_dir_all(crate::paths::runtime_dir(home).join(instance));
+            crate::agent::deletion_recovery::mark_recovered(home, instance, &archive)?;
+            crate::event_log::log(
+                home,
+                "markerless_worktree_recovered",
+                instance,
+                &format!(
+                    "actor={actor}; branch={branch}; archive={}; reason={audit_reason}",
+                    archive.display()
+                ),
+            );
+            Ok(super::RecoveryReport { archive })
+        }
+        crate::binding::BindingRemoval::Failed(error) => Err(format!(
+            "binding removal failed; archive remains at {}: {error}",
+            archive.display()
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
