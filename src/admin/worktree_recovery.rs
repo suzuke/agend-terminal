@@ -616,6 +616,12 @@ mod tests {
         assert!(error.contains("managed marker"));
         assert!(worktree.exists());
         assert!(crate::binding::read(&home, &instance).is_some());
+        assert!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery state")
+                .is_none(),
+            "a rejected preflight must not leave a blocking tombstone"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -646,6 +652,12 @@ mod tests {
         assert!(error.contains("does not match binding"));
         assert!(worktree.exists());
         assert!(crate::binding::read(&home, &instance).is_some());
+        assert!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery state")
+                .is_none(),
+            "a rejected preflight must not leave a blocking tombstone"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
