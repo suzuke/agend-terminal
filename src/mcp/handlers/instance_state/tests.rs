@@ -269,16 +269,8 @@ fn markerless_delete_preserves_binding_for_operator_recovery_3696() {
         format!("instances:\n  {instance}:\n    backend: claude\n"),
     )
     .unwrap();
-    crate::binding::bind_full(
-        &home,
-        instance,
-        "",
-        branch,
-        &worktree,
-        &source_repo,
-        false,
-    )
-    .expect("bind markerless delete fixture");
+    crate::binding::bind_full(&home, instance, "", branch, &worktree, &source_repo, false)
+        .expect("bind markerless delete fixture");
     let binding_path = crate::paths::binding_path(&home, instance);
     let signature_path = crate::paths::runtime_dir(&home)
         .join(instance)
@@ -289,12 +281,15 @@ fn markerless_delete_preserves_binding_for_operator_recovery_3696() {
     let result = handle_delete_instance(&home, &serde_json::json!({"instance": instance}), &None);
 
     assert_eq!(result["code"], "recovery_required", "{result}");
-    assert!(result["error"].as_str().is_some_and(|error| {
-        error.contains("markerless") || error.contains("recovery")
-    }));
+    assert!(result["error"]
+        .as_str()
+        .is_some_and(|error| { error.contains("markerless") || error.contains("recovery") }));
     assert_eq!(std::fs::read(&binding_path).unwrap(), binding_before);
     assert_eq!(std::fs::read(&signature_path).unwrap(), signature_before);
-    assert!(worktree.exists(), "the operator recovery target must remain");
+    assert!(
+        worktree.exists(),
+        "the operator recovery target must remain"
+    );
     assert!(
         crate::agent::deleting::is_deleting(&home, instance),
         "a recovery-required tombstone must fence same-name reuse"
