@@ -82,6 +82,7 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
         return Ok(());
     }
     if matches!(run.phase, Phase::Succeeded | Phase::Failed) {
+        next.dispatch_intent = None;
         if !run.task_settled {
             match settle_task(home, run) {
                 Ok(()) => next.task_settled = true,
@@ -129,6 +130,7 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
     }
     if now >= run.deadline && run.phase != Phase::Stopping {
         next.error = Some("execution deadline exceeded".into());
+        next.dispatch_intent = None;
         next.phase = if run.attempt.is_some() {
             Phase::Stopping
         } else {
@@ -186,6 +188,7 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
             match runtime.observe(attempt)? {
                 Observation::Starting => return Ok(()),
                 Observation::UsageLimited | Observation::Exited | Observation::Missing => {
+                    next.dispatch_intent = None;
                     next.phase = Phase::Stopping;
                     next.error = Some("worker unavailable before dispatch".into());
                 }
@@ -225,6 +228,7 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
                 Observation::Starting | Observation::Running => None,
             };
             if let Some(reason) = reason {
+                next.dispatch_intent = None;
                 next.phase = Phase::Stopping;
                 next.error = Some(reason.into());
                 replace(home, run, next)?;
@@ -238,6 +242,7 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
             if !runtime.stop(run, attempt)? {
                 return Ok(());
             }
+            next.dispatch_intent = None;
             next.previous_attempts.push(attempt.clone());
             next.attempt = None;
             if now >= run.deadline || attempt.number >= run.config.max_attempts {
