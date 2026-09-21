@@ -4985,13 +4985,19 @@ fn release_remove_failure_retains_binding_with_structured_stage() {
 fn normal_release_interruption_retains_durable_recovery_journal_3696() {
     let home = tmp_home("release-journal-red");
     let repo = tmp_repo("release-journal-red-repo");
-    let lease = lease_bound(&home, &repo, "agent-release-journal", "feat/release-journal");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal",
+        "feat/release-journal",
+    );
     let binding_path = crate::paths::binding_path(&home, "agent-release-journal");
     let signature_path = crate::paths::runtime_dir(&home)
         .join("agent-release-journal")
         .join("binding.json.sig");
     let binding_before = std::fs::read(&binding_path).expect("read binding before release");
-    let signature_before = std::fs::read(&signature_path).expect("read binding signature before release");
+    let signature_before =
+        std::fs::read(&signature_path).expect("read binding signature before release");
 
     let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _hook = release_test_seam::install(|phase| {
@@ -5002,8 +5008,14 @@ fn normal_release_interruption_retains_durable_recovery_journal_3696() {
         release_full(&home, "agent-release-journal", false);
     }));
 
-    assert!(interrupted.is_err(), "the seam must simulate an interruption");
-    assert!(!lease.path.exists(), "physical remove must have happened first");
+    assert!(
+        interrupted.is_err(),
+        "the seam must simulate an interruption"
+    );
+    assert!(
+        !lease.path.exists(),
+        "physical remove must have happened first"
+    );
     assert_eq!(
         std::fs::read(&binding_path).expect("binding remains after interruption"),
         binding_before
@@ -5015,7 +5027,10 @@ fn normal_release_interruption_retains_durable_recovery_journal_3696() {
     let journal = crate::agent::deletion_recovery::read(&home, "agent-release-journal")
         .expect("read release recovery journal")
         .expect("normal release must persist a recovery journal before removal");
-    assert_eq!(journal.state, crate::agent::deletion_recovery::State::RecoveryRequired);
+    assert_eq!(
+        journal.state,
+        crate::agent::deletion_recovery::State::RecoveryRequired
+    );
 
     let report = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
         &home,
@@ -5034,18 +5049,14 @@ fn normal_release_interruption_retains_durable_recovery_journal_3696() {
     .expect("parse release recovery manifest");
     assert_eq!(manifest["instance"], "agent-release-journal");
     assert_eq!(manifest["branch"], "feat/release-journal");
-    assert!(
-        report
-            .archive
-            .join(".agend-recovery-binding.json")
-            .is_file()
-    );
-    assert!(
-        report
-            .archive
-            .join(".agend-recovery-binding.json.sig")
-            .is_file()
-    );
+    assert!(report
+        .archive
+        .join(".agend-recovery-binding.json")
+        .is_file());
+    assert!(report
+        .archive
+        .join(".agend-recovery-binding.json.sig")
+        .is_file());
     assert!(crate::binding::read(&home, "agent-release-journal").is_none());
     assert_eq!(
         crate::agent::deletion_recovery::read(&home, "agent-release-journal")
@@ -5110,12 +5121,10 @@ fn exact_bound_release_journals_before_remove_3696() {
         &repo,
     )
     .expect("exact release residue must be recoverable");
-    assert!(
-        report
-            .archive
-            .join(".agend-recovery-manifest.json")
-            .is_file()
-    );
+    assert!(report
+        .archive
+        .join(".agend-recovery-manifest.json")
+        .is_file());
     assert!(crate::binding::read(&home, "agent-exact-journal").is_none());
 
     std::fs::remove_dir_all(&home).ok();

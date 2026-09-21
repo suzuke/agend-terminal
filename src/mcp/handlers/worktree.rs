@@ -64,7 +64,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             return json!({
                 "error": "repository_path must not contain '..' (path traversal rejected)",
                 "code": "path_traversal"
-            })
+            });
         }
     }
 
