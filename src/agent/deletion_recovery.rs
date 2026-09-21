@@ -10,6 +10,27 @@ use std::path::{Path, PathBuf};
 
 const SCHEMA_VERSION: u32 = 1;
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_CLEAR_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ClearFailureGuard;
+
+#[cfg(test)]
+impl Drop for ClearFailureGuard {
+    fn drop(&mut self) {
+        FORCE_CLEAR_FAILURE.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn force_clear_failure() -> ClearFailureGuard {
+    FORCE_CLEAR_FAILURE.with(|flag| flag.set(true));
+    ClearFailureGuard
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum State {
@@ -172,6 +193,10 @@ pub(crate) fn mark_recovered(home: &Path, instance: &str, archive: &Path) -> Res
 }
 
 pub(crate) fn clear(home: &Path, instance: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if FORCE_CLEAR_FAILURE.with(std::cell::Cell::get) {
+        return Err("forced deletion tombstone clear failure".to_string());
+    }
     let path = path(home, instance);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),

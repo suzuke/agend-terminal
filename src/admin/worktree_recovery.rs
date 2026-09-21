@@ -678,6 +678,43 @@ mod tests {
     }
 
     #[test]
+    fn absent_recovery_rejects_target_outside_managed_root() {
+        let home = temp_home("absent-outside-root");
+        let instance = format!("recovery-outside-root-{}", std::process::id());
+        let branch = "review/outside-root";
+        let source_repo = home.join("source-repo");
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
+        let worktree = home
+            .join("outside-worktrees")
+            .join(&instance)
+            .join("review-outside-root");
+        std::fs::create_dir_all(&worktree).expect("create outside worktree fixture");
+        crate::binding::bind_full(&home, &instance, "", branch, &worktree, &source_repo, false)
+            .expect("bind outside-root recovery fixture");
+        crate::agent::deletion_recovery::begin_from_binding(&home, &instance)
+            .expect("persist outside-root tombstone")
+            .expect("signed binding must enter recovery lane");
+        std::fs::remove_dir_all(&worktree).expect("simulate removed outside worktree");
+
+        let error = recover_markerless_bound_worktree(
+            &home,
+            "operator",
+            "reject outside managed root",
+            &instance,
+            branch,
+            &worktree,
+            &source_repo,
+        )
+        .expect_err("absent recovery must prove the managed target root");
+        assert!(error.contains("daemon worktree root"), "{error}");
+        assert!(crate::binding::read(&home, &instance).is_some());
+        assert!(crate::agent::deletion_recovery::read(&home, &instance)
+            .expect("read retained tombstone")
+            .is_some());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn concurrent_recovery_archives_once_and_clears_once() {
         let home = temp_home("race");
         let instance = format!("recovery-race-{}", std::process::id());

@@ -5132,6 +5132,104 @@ fn exact_bound_release_journals_before_remove_3696() {
 }
 
 #[test]
+fn stale_normal_release_clears_only_the_superseded_generation_journal_3696() {
+    let home = tmp_home("release-journal-stale-generation");
+    let repo = tmp_repo("release-journal-stale-generation-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal-stale",
+        "feat/release-journal-a",
+    );
+    prepare_release_journal(&home, "agent-release-journal-stale")
+        .expect("generation A journal should be durable");
+
+    let binding_path = crate::paths::binding_path(&home, "agent-release-journal-stale");
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-release-journal-stale")
+        .join("binding.json.sig");
+    let _hook = release_test_seam::install({
+        let home = home.clone();
+        let binding_path = binding_path.clone();
+        let signature_path = signature_path.clone();
+        let worktree = lease.path.clone();
+        let repo = repo.clone();
+        move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                std::fs::remove_file(&binding_path).expect("remove generation A binding");
+                std::fs::remove_file(&signature_path).expect("remove generation A signature");
+                crate::binding::bind_full(
+                    &home,
+                    "agent-release-journal-stale",
+                    "",
+                    "feat/release-journal-b",
+                    &worktree,
+                    &repo,
+                    false,
+                )
+                .expect("install replacement generation B");
+            }
+        }
+    });
+    let outcome = release_full(&home, "agent-release-journal-stale", false);
+
+    assert!(
+        outcome.stale_fingerprint,
+        "replacement generation must win CAS"
+    );
+    assert!(crate::binding::read(&home, "agent-release-journal-stale").is_some());
+    assert!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal-stale")
+            .expect("read generation journal")
+            .is_none(),
+        "stale generation A journal must not fence replacement generation B"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn release_journal_clear_failure_is_settled_by_restart_retry_3696() {
+    let home = tmp_home("release-journal-clear-failure");
+    let repo = tmp_repo("release-journal-clear-failure-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal-clear",
+        "feat/release-journal-clear",
+    );
+    let outcome = {
+        let _failure = crate::agent::deletion_recovery::force_clear_failure();
+        release_full(&home, "agent-release-journal-clear", false)
+    };
+
+    assert!(!outcome.released, "unlink failure must not report success");
+    assert!(!lease.path.exists(), "physical teardown already completed");
+    assert!(crate::binding::read(&home, "agent-release-journal-clear").is_none());
+    assert_eq!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal-clear")
+            .expect("read retained recovery journal")
+            .expect("journal remains after clear failure")
+            .state,
+        crate::agent::deletion_recovery::State::RecoveryRequired
+    );
+
+    let retry = release_full(&home, "agent-release-journal-clear", false);
+    assert!(
+        retry.released,
+        "restart retry must settle completed release: {retry:?}"
+    );
+    assert!(retry.already_released);
+    assert!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal-clear")
+            .expect("read settled journal")
+            .is_none()
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
 fn release_full_clean_worktree_creates_no_recovery_ref() {
     let home = tmp_home("release-clean-noref");
     let repo = tmp_repo("release-clean-noref-repo");
