@@ -1062,8 +1062,10 @@ fn release_full_guarded(
         Ok(GuardedBinding::Opaque(reason)) => return opaque_release(reason),
         Ok(GuardedBinding::Known { value, fingerprint }) => (value, fingerprint),
     };
-    if expected.is_some_and(|expected| expected != &fingerprint) {
-        return stale_release_after_snapshot(home, agent, &snapshot, &fingerprint);
+    if let Some(expected) = expected {
+        if expected != &fingerprint {
+            return stale_release_after_snapshot(home, agent, expected);
+        }
     }
     #[cfg(test)]
     release_test_seam::hit(ReleaseTestPhase::AfterBindingSnapshot);
@@ -1112,7 +1114,7 @@ fn release_full_guarded(
             fingerprint: live,
         } if live == fingerprint => value,
         GuardedBinding::Known { .. } => {
-            return stale_release_after_snapshot(home, agent, &snapshot, &fingerprint)
+            return stale_release_after_snapshot(home, agent, &fingerprint)
         }
     };
     let wt_path = current["worktree"].as_str().unwrap_or("");

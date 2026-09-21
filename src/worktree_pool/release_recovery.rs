@@ -16,11 +16,10 @@ fn stale_release() -> ReleaseOutcome {
 pub(crate) fn stale_release_after_snapshot(
     home: &Path,
     agent: &str,
-    snapshot: &serde_json::Value,
-    fingerprint: &crate::binding::BindingFingerprint,
+    caller_generation: &crate::binding::BindingFingerprint,
 ) -> ReleaseOutcome {
     let mut outcome = stale_release();
-    if let Err(error) = clear_if_matches_snapshot(home, agent, snapshot, fingerprint) {
+    if let Err(error) = clear_if_matches_generation(home, agent, caller_generation) {
         outcome.error = Some(format!(
             "{}; superseded recovery journal could not be cleared: {error}",
             outcome.error.as_deref().unwrap_or("release refused")
@@ -29,23 +28,18 @@ pub(crate) fn stale_release_after_snapshot(
     outcome
 }
 
-/// Clear a preflight journal only when the stale snapshot proves it owns that
-/// exact signed generation. A replacement binding must never inherit a
-/// predecessor's recovery fence.
-pub(crate) fn clear_if_matches_snapshot(
+/// Clear a preflight journal only when its exact signed generation belongs to
+/// the stale caller. A replacement binding must never inherit a predecessor's
+/// recovery fence, and a stale caller must never clear the replacement's.
+pub(crate) fn clear_if_matches_generation(
     home: &Path,
     agent: &str,
-    binding: &serde_json::Value,
-    fingerprint: &crate::binding::BindingFingerprint,
+    caller_generation: &crate::binding::BindingFingerprint,
 ) -> Result<(), String> {
     let Some(tombstone) = crate::agent::deletion_recovery::read(home, agent)? else {
         return Ok(());
     };
-    if tombstone.binding_sha256 != fingerprint.digest
-        || tombstone.branch != binding["branch"].as_str().unwrap_or_default()
-        || tombstone.worktree != binding["worktree"].as_str().unwrap_or_default()
-        || tombstone.source_repo != binding["source_repo"].as_str().unwrap_or_default()
-    {
+    if tombstone.binding_sha256 != caller_generation.digest {
         return Ok(());
     }
     crate::agent::deletion_recovery::clear(home, agent)

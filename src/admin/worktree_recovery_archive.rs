@@ -299,30 +299,43 @@ pub(super) fn recover_recorded_archive(
         .join("binding.json.sig");
     let binding_exists = binding_path.is_file();
     let signature_exists = signature_path.is_file();
-    if binding_exists != signature_exists {
-        return Err("recovery refused: binding evidence is only partially present".to_string());
-    }
-    let live_binding = if binding_exists {
-        let body = std::fs::read(&binding_path)
-            .map_err(|e| format!("read binding metadata {}: {e}", binding_path.display()))?;
-        let signature = std::fs::read(&signature_path)
-            .map_err(|e| format!("read binding signature {}: {e}", signature_path.display()))?;
-        if crate::daemon::utils::sha256_hex(&body) != tombstone.binding_sha256
-            || crate::daemon::utils::sha256_hex(&signature) != tombstone.binding_signature_sha256
-        {
+    let live_binding_body = if binding_exists {
+        Some(
+            std::fs::read(&binding_path)
+                .map_err(|e| format!("read binding metadata {}: {e}", binding_path.display()))?,
+        )
+    } else {
+        None
+    };
+    let live_signature = if signature_exists {
+        Some(
+            std::fs::read(&signature_path)
+                .map_err(|e| format!("read binding signature {}: {e}", signature_path.display()))?,
+        )
+    } else {
+        None
+    };
+    if let Some(body) = live_binding_body.as_ref() {
+        if crate::daemon::utils::sha256_hex(body) != tombstone.binding_sha256 {
             return Err(
                 "recovery refused: live binding evidence does not match tombstone".to_string(),
             );
         }
+    }
+    if let Some(signature) = live_signature.as_ref() {
+        if crate::daemon::utils::sha256_hex(signature) != tombstone.binding_signature_sha256 {
+            return Err(
+                "recovery refused: live signature evidence does not match tombstone".to_string(),
+            );
+        }
+    }
+    if let (Some(_), Some(_)) = (&live_binding_body, &live_signature) {
         if !crate::binding::signature_valid(home, instance) {
             return Err(
                 "recovery refused: binding signature for recovery is not valid".to_string(),
             );
         }
-        Some((body, signature))
-    } else {
-        None
-    };
+    }
     let archived_binding = match std::fs::read(archive.join(".agend-recovery-binding.json")) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -339,7 +352,7 @@ pub(super) fn recover_recorded_archive(
                 "recovery refused: archived binding evidence does not match tombstone".to_string(),
             );
         }
-        if let Some((live_body, _)) = live_binding.as_ref() {
+        if let Some(live_body) = live_binding_body.as_ref() {
             if live_body != binding {
                 return Err(
                     "recovery refused: live binding evidence does not match archive".to_string(),
@@ -354,7 +367,7 @@ pub(super) fn recover_recorded_archive(
                     .to_string(),
             );
         }
-        if let Some((_, live_signature)) = live_binding.as_ref() {
+        if let Some(live_signature) = live_signature.as_ref() {
             if live_signature != signature {
                 return Err(
                     "recovery refused: live signature evidence does not match archive".to_string(),
@@ -362,14 +375,12 @@ pub(super) fn recover_recorded_archive(
             }
         }
     }
-    let evidence_binding = live_binding
-        .as_ref()
-        .map(|(body, _)| body.as_slice())
+    let evidence_binding = live_binding_body
+        .as_deref()
         .or(archived_binding.as_deref())
         .ok_or_else(|| "recovery refused: archive has no signed binding evidence".to_string())?;
-    let evidence_signature = live_binding
-        .as_ref()
-        .map(|(_, signature)| signature.as_slice())
+    let evidence_signature = live_signature
+        .as_deref()
         .or(archived_signature.as_deref())
         .ok_or_else(|| "recovery refused: archive has no signed signature evidence".to_string())?;
     let binding: serde_json::Value = serde_json::from_slice(evidence_binding)
@@ -409,15 +420,13 @@ pub(super) fn recover_recorded_archive(
         evidence_binding,
         evidence_signature,
     )?;
-    if binding_exists {
-        match crate::binding::unbind_with_permit(home, instance, permit) {
-            crate::binding::BindingRemoval::Removed | crate::binding::BindingRemoval::Absent => {}
-            crate::binding::BindingRemoval::Failed(error) => {
-                return Err(format!(
-                    "binding removal failed; archive remains at {}: {error}",
-                    archive.display()
-                ));
-            }
+    match crate::binding::unbind_with_permit(home, instance, permit) {
+        crate::binding::BindingRemoval::Removed | crate::binding::BindingRemoval::Absent => {}
+        crate::binding::BindingRemoval::Failed(error) => {
+            return Err(format!(
+                "binding removal failed; archive remains at {}: {error}",
+                archive.display()
+            ));
         }
     }
     super::remove_empty_dir_tree(
