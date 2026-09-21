@@ -5947,6 +5947,140 @@ fn manual_sweep_rejects_foreign_confirm_id_before_emit_3584() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+fn backdate_task_event_for_sweep(home: &std::path::Path, task_id: &str, days: i64) {
+    let path = home.join("task_events.jsonl");
+    let past = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let mut changed = false;
+    let rewritten = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let event_task_id = value["event"]
+                .as_object()
+                .and_then(|event| event.values().next())
+                .and_then(|payload| payload["task_id"].as_str());
+            if event_task_id == Some(task_id) {
+                value["timestamp"] = serde_json::json!(past);
+                changed = true;
+                serde_json::to_string(&value).unwrap()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(changed, "task event fixture must contain {task_id}");
+    std::fs::write(path, format!("{}\n", rewritten)).unwrap();
+}
+
+#[test]
+fn manual_sweep_rejects_repository_claim_change_before_emit_3584() {
+    let home = tmp_home("3584-scope-toctou");
+    let repo_a = home.join("repo-a");
+    let repo_b = home.join("repo-b");
+    init_git_repo_with_origin(&repo_a, "https://github.com/test/repo.git");
+    init_git_repo_with_origin(&repo_b, "https://github.com/other/repo.git");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  alive:\n    backend: claude\nteams:\n  sweep:\n    members: [alive]\n    source_repo: {}\n    project_id: default\n",
+            repo_a.display()
+        ),
+    )
+    .unwrap();
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+    let task_id = create_open_task(&home, "stale unreferenced task");
+    backdate_task_event_for_sweep(&home, &task_id, 30);
+
+    let repo_b = repo_b.clone();
+    let home_for_hook = home.clone();
+    super::set_before_manual_sweep_repository_scope_hook_for_test(move || {
+        let response = crate::teams::update(
+            &home_for_hook,
+            &serde_json::json!({
+                "name": "sweep",
+                "repository_path": repo_b,
+            }),
+        );
+        assert!(
+            response["error"].is_null(),
+            "claim mutation failed: {response}"
+        );
+    });
+
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo",
+            "apply": true,
+            "confirm_ids": [task_id],
+            "audit_reason": "scope authority TOCTOU regression"
+        }),
+    );
+    assert_eq!(
+        response["code"], "repository_scope_changed",
+        "response: {response}"
+    );
+    let task = list_all_at(&home, &crate::task_events::board_root(&home, "default"))
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .unwrap();
+    assert_eq!(
+        task.status,
+        crate::task_events::TaskStatus::Open,
+        "mapping change must prevent a stale-scope cancellation"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn manual_sweep_stable_repository_claim_can_apply_3584() {
+    let home = tmp_home("3584-scope-stable-apply");
+    let repo = home.join("repo");
+    init_git_repo_with_origin(&repo, "https://github.com/test/repo.git");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  alive:\n    backend: claude\nteams:\n  sweep:\n    members: [alive]\n    source_repo: {}\n    project_id: default\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+    let task_id = create_open_task(&home, "stable stale unreferenced task");
+    backdate_task_event_for_sweep(&home, &task_id, 30);
+
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo",
+            "apply": true,
+            "confirm_ids": [task_id],
+            "audit_reason": "stable scope apply regression"
+        }),
+    );
+    assert_eq!(response["applied"], 1, "response: {response}");
+    let task = list_all_at(&home, &crate::task_events::board_root(&home, "default"))
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .unwrap();
+    assert_eq!(task.status, crate::task_events::TaskStatus::Cancelled);
+    std::fs::remove_dir_all(&home).ok();
+}
+
 fn init_git_repo_with_origin(path: &std::path::Path, origin: &str) {
     std::fs::create_dir_all(path).unwrap();
     let run = |args: &[&str]| {
