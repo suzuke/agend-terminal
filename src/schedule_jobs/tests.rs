@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 pub(super) struct TempHome(std::path::PathBuf);
 impl TempHome {
     pub(super) fn new() -> Self {
@@ -174,6 +174,75 @@ fn advance_to_running(h: &Path, rt: &Fake, clock: i64) {
     tick(h, rt, clock).unwrap();
     assert_eq!(read(h).unwrap().runs[0].phase, Phase::Running);
 }
+
+#[cfg(unix)]
+#[test]
+fn issue3698_real_managed_dispatch_is_not_called_under_driver_flock() {
+    let h = home();
+    let s = schedule(&h);
+    admit_due(&h, &s, now()).unwrap();
+    let old = read(&h).unwrap().runs[0].clone();
+    let mut queued = old.clone();
+    // The validated production config does not expose a shell backend; use it
+    // only after admission so this test owns a deterministic live worker.
+    queued.config.backends = vec!["sh".into()];
+    replace(&h, &old, queued).unwrap();
+    let queued = read(&h).unwrap().runs[0].clone();
+    let task_id = queued.task_id.clone().unwrap();
+    crate::tasks::create_schedule_task(
+        &h,
+        &task_id,
+        &serde_json::json!({
+            "title": "issue3698",
+            "description": "production dispatch lock regression",
+            "tags": ["schedule-job", queued.id],
+            "project": "default",
+            "bind": false
+        }),
+    );
+
+    let registry: crate::agent::AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs: crate::api::ConfigRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let externals: crate::agent::ExternalRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let runtime = crate::schedule_jobs::runtime::ManagedRuntime::new(
+        &h,
+        &registry,
+        &configs,
+        &externals,
+    );
+
+    tick(&h, &runtime, now().timestamp()).unwrap();
+    tick(&h, &runtime, now().timestamp()).unwrap();
+    assert_eq!(read(&h).unwrap().runs[0].phase, Phase::Dispatching);
+    tick(&h, &runtime, now().timestamp()).unwrap();
+
+    let observed = read(&h).unwrap().runs[0].clone();
+    let attempt = observed.attempt.as_ref().unwrap();
+    let uuid = attempt.uuid.as_deref().unwrap();
+    crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_expected_identity(
+        &h,
+        &attempt.name,
+        Some(&crate::agent_ops::DeleteContext {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+        }),
+        Some(("system:schedule_job", Some(uuid))),
+    )
+    .unwrap();
+
+    assert_eq!(
+        observed.phase,
+        Phase::Running,
+        "managed dispatch must complete after the driver flock is released: {observed:?}"
+    );
+    assert_eq!(crate::inbox::drain(&h, &attempt.name).len(), 1);
+}
+
 #[test]
 fn full_task_flow_fallback_and_completion_cleanup_are_restart_idempotent() {
     let h = home();
