@@ -1,5 +1,7 @@
 use super::*;
-use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::sync::Arc;
+use std::sync::Mutex;
 pub(super) struct TempHome(std::path::PathBuf);
 impl TempHome {
     pub(super) fn new() -> Self {
