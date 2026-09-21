@@ -22,6 +22,18 @@ pub(crate) use branch_cleanup::{
 mod build_cache;
 use build_cache::clean_ignored_build_cache;
 
+mod release_recovery;
+pub(crate) use release_recovery::prepare_release_journal;
+use release_recovery::{
+    clear_binding_state, clear_release_recovery_journal, mark_release_recovery_required,
+    record_binding_removal,
+};
+
+mod target_identity;
+#[allow(unused_imports)]
+pub use target_identity::{is_pinned, pin, reconcile_orphan_leases, unpin};
+use target_identity::{marker_branch, marker_source_repo, target_source_repo_matches};
+
 pub(crate) struct NestedDirtDiscard<'a> {
     pub expected_digest: &'a str,
     pub audit_reason: &'a str,
@@ -718,64 +730,6 @@ pub(crate) use workspace::{
     release_one_stale_holder, workspace_as_worktree_from_env, workspace_worktree_test_seam,
     worktree_common_dir_matches,
 };
-
-fn clear_binding_state(
-    home: &Path,
-    agent: &str,
-    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
-) -> crate::binding::BindingRemoval {
-    crate::binding::unbind_with_permit(home, agent, permit)
-}
-
-/// Publish the exact signed binding fence before any normal release mutation.
-/// The delete lifecycle already owns the same fence; its provenance skips this
-/// helper and keeps ownership until the residual-store audit completes.
-pub(crate) fn prepare_release_journal(home: &Path, agent: &str) -> Result<(), String> {
-    let Some(binding) = crate::binding::read(home, agent) else {
-        return Ok(());
-    };
-    // Pre-signature legacy bindings have no authenticated source identity and
-    // remain on the existing marker/authority release path.  They cannot enter
-    // this journal without inventing signed evidence; the normal release gates
-    // still fail closed when the target itself is unsafe.
-    if binding["source_repo"].as_str().is_none_or(str::is_empty) {
-        return Ok(());
-    }
-    match crate::agent::deletion_recovery::begin_from_binding(home, agent)? {
-        Some(_) => Ok(()),
-        None => Err(
-            "release refused: signed binding evidence is required before destructive cleanup"
-                .to_string(),
-        ),
-    }
-}
-
-fn clear_release_recovery_journal(home: &Path, agent: &str) -> Result<(), String> {
-    crate::agent::deletion_recovery::clear(home, agent)
-}
-
-fn mark_release_recovery_required(home: &Path, agent: &str) -> Result<(), String> {
-    crate::agent::deletion_recovery::mark_recovery_required(home, agent, None)
-}
-
-fn record_binding_removal(out: &mut ReleaseOutcome, removal: crate::binding::BindingRemoval) {
-    match removal {
-        crate::binding::BindingRemoval::Removed => out.binding_removed = true,
-        crate::binding::BindingRemoval::Absent => {
-            if out.error.is_none() {
-                out.error = Some("binding disappeared before removal".to_string());
-            }
-        }
-        crate::binding::BindingRemoval::Failed(error) => {
-            if let Some(existing) = &mut out.error {
-                existing.push_str("; binding removal failed: ");
-                existing.push_str(&error);
-            } else {
-                out.error = Some(format!("binding removal failed: {error}"));
-            }
-        }
-    }
-}
 
 fn task_active_for_branch(home: &Path, task_id: &str, branch: &str) -> Option<bool> {
     if task_id.is_empty() {
@@ -2499,86 +2453,6 @@ fn release_absent_target_impl(
         notice.emit(home);
     }
     out
-}
-
-fn marker_branch(worktree: &Path) -> Option<String> {
-    std::fs::read_to_string(worktree.join(MANAGED_MARKER))
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("branch="))
-        .map(|s| s.trim().to_string())
-}
-
-fn marker_source_repo(worktree: &Path) -> Option<PathBuf> {
-    std::fs::read_to_string(worktree.join(MANAGED_MARKER))
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("source_repo="))
-        .map(|s| PathBuf::from(s.trim()))
-}
-
-fn git_pointer_source_repo(worktree: &Path) -> Option<PathBuf> {
-    let content = std::fs::read_to_string(worktree.join(".git")).ok()?;
-    let gitdir = content
-        .lines()
-        .find_map(|line| line.strip_prefix("gitdir:").map(str::trim))?;
-    let gitdir = PathBuf::from(gitdir);
-    let gitdir = if gitdir.is_absolute() {
-        gitdir
-    } else {
-        worktree.join(gitdir)
-    };
-    let canonical = gitdir.canonicalize().ok()?;
-    let worktrees = canonical.parent()?;
-    if worktrees.file_name().and_then(|n| n.to_str()) != Some("worktrees") {
-        return None;
-    }
-    Some(worktrees.parent()?.parent()?.to_path_buf())
-}
-
-fn target_source_repo_matches(worktree: &Path, source_repo: &Path) -> bool {
-    let source = source_repo.canonicalize().ok();
-    let Some(source) = source else { return false };
-    let marker = marker_source_repo(worktree).and_then(|p| p.canonicalize().ok());
-    let pointer = git_pointer_source_repo(worktree).and_then(|p| p.canonicalize().ok());
-    match (marker, pointer) {
-        (Some(marker), Some(pointer)) => marker == source && pointer == source,
-        (Some(marker), None) => marker == source,
-        (None, Some(pointer)) => pointer == source,
-        (None, None) => false,
-    }
-}
-
-/// Pin a worktree (operator override — prevents GC in Phase 4).
-pub fn pin(worktree_path: &Path) {
-    let pin_file = worktree_path.join(".agend-pinned");
-    let _ = std::fs::write(&pin_file, chrono::Utc::now().to_rfc3339());
-}
-
-/// Unpin a worktree (allow GC again).
-pub fn unpin(worktree_path: &Path) {
-    let pin_file = worktree_path.join(".agend-pinned");
-    let _ = std::fs::remove_file(pin_file);
-}
-
-/// Check if a worktree is pinned.
-pub fn is_pinned(worktree_path: &Path) -> bool {
-    worktree_path.join(".agend-pinned").exists()
-}
-
-/// Reconcile orphan leases at daemon startup (log only, no delete in Phase 3).
-pub fn reconcile_orphan_leases(home: &Path) {
-    for (agent_name, v) in crate::binding::binding_scan_all(home) {
-        if let Some(wt_path) = v["worktree"].as_str() {
-            if !Path::new(wt_path).exists() {
-                tracing::warn!(
-                    agent = agent_name.as_str(),
-                    worktree = wt_path,
-                    "orphan lease: worktree path missing"
-                );
-            }
-        }
-    }
 }
 
 // ── Phase 4: GC scan + dry-run + cutover ────────────────────────────────
