@@ -277,32 +277,9 @@ pub(super) fn scan_categories_with_authority(
         let age = chrono::DateTime::parse_from_rfc3339(&t.updated_at)
             .ok()
             .map(|dt| now.signed_duration_since(dt.with_timezone(&Utc)));
-        // (1) validation_leftovers — title prefix match + 1d stale.
-        let title_lc = t.title.to_lowercase();
-        let is_validation = title_lc.starts_with("val-")
-            || title_lc.starts_with("canary-")
-            || title_lc.starts_with("test/")
-            || title_lc.starts_with("test_")
-            || t.branch
-                .as_deref()
-                .map(|b| b.starts_with("test/"))
-                .unwrap_or(false);
-        if is_validation {
-            if let Some(a) = age {
-                if a > Duration::days(1) {
-                    cats.validation_leftovers.push(candidate(
-                        t,
-                        format!("validation/canary title prefix, {}d stale", a.num_days()),
-                        None,
-                        vec![],
-                    ));
-                    continue;
-                }
-            }
-        }
         // InReview and other active-work states are always report-only.  This
-        // check must precede owner admission so a strict ghost cannot turn a
-        // review residue into an apply-capable team_disbanded candidate.
+        // check must precede validation and owner admission so an active task
+        // cannot enter an apply-capable category through a title/branch prefix.
         let search_text = format!("{}\n{}", t.title, t.description);
         if matches!(
             t.status,
@@ -339,6 +316,31 @@ pub(super) fn scan_categories_with_authority(
                 ref_labels,
             ));
             continue;
+        }
+        // (1) validation_leftovers — title prefix match + 1d stale.  Terminal
+        // tasks already returned above; only non-active validation residue is
+        // eligible for this apply-capable category.
+        let title_lc = t.title.to_lowercase();
+        let is_validation = title_lc.starts_with("val-")
+            || title_lc.starts_with("canary-")
+            || title_lc.starts_with("test/")
+            || title_lc.starts_with("test_")
+            || t.branch
+                .as_deref()
+                .map(|b| b.starts_with("test/"))
+                .unwrap_or(false);
+        if is_validation {
+            if let Some(a) = age {
+                if a > Duration::days(1) {
+                    cats.validation_leftovers.push(candidate(
+                        t,
+                        format!("validation/canary title prefix, {}d stale", a.num_days()),
+                        None,
+                        vec![],
+                    ));
+                    continue;
+                }
+            }
         }
         // No owner-bearing task may reach an apply-capable category while the
         // live or fleet authority is unavailable.  Unassigned tasks still
