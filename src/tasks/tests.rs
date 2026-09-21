@@ -5316,6 +5316,173 @@ fn test_sweep_scan_identifies_team_disbanded_category() {
 }
 
 #[test]
+fn test_sweep_public_handler_fails_closed_when_live_authority_unavailable() {
+    let home = tmp_home("sweep_owner_authority_unavailable");
+    write_fleet_yaml(&home, &["alive"]);
+    let created = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "old ghost work",
+            "assignee": "ghost"
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+    let response = handle(&home, "alive", &serde_json::json!({"action": "sweep"}));
+    assert_eq!(response["dry_run"], true, "sweep should still report non-owner categories");
+    assert_eq!(response["owner_authority"]["available"], false, "authority outage must be explicit");
+    assert!(
+        !response["candidate_ids"]
+            .as_array()
+            .expect("candidate ids")
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(&id)),
+        "unavailable authority must never admit owner-derived candidates: {response}"
+    );
+    assert!(
+        response["categories"]["team_disbanded"]
+            .as_array()
+            .expect("team_disbanded")
+            .is_empty(),
+        "unavailable authority must not populate team_disbanded: {response}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_runtime_entry_configured_offline_is_report_only() {
+    let home = tmp_home("sweep_configured_offline");
+    write_fleet_yaml(&home, &["alive", "ghost"]);
+    let created = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "configured but offline work",
+            "assignee": "ghost"
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let response = handle_with_live_instances(
+        &home,
+        "alive",
+        &serde_json::json!({"action": "sweep"}),
+        &live,
+    );
+    assert_eq!(response["dry_run"], true, "sweep should return a dry-run plan");
+    assert!(
+        response["categories"]["team_disbanded"]
+            .as_array()
+            .expect("team_disbanded")
+            .is_empty(),
+        "configured-but-offline owner must not be apply-capable: {response}"
+    );
+    assert!(
+        response["categories"]["owner_report_only"]
+            .as_array()
+            .expect("owner_report_only")
+            .iter()
+            .any(|candidate| candidate["id"].as_str() == Some(&id)),
+        "configured-but-offline owner must remain visible as report-only: {response}"
+    );
+    assert!(
+        !response["candidate_ids"]
+            .as_array()
+            .expect("candidate ids")
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(&id)),
+        "report-only owner must not enter apply ids: {response}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_strict_ghost_with_open_or_unknown_ref_is_report_only() {
+    for (suffix, title) in [("open", "ghost work PR #100"), ("unknown", "ghost work PR #404")] {
+        let home = tmp_home(&format!("sweep_strict_live_ref_{suffix}"));
+        write_fleet_yaml(&home, &["alive"]);
+        let created = handle(
+            &home,
+            "alive",
+            &serde_json::json!({"action": "create", "title": title, "assignee": "ghost"}),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+        let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+        let authority = sweep::OwnerAuthority::available(live, ["alive".to_string()].into_iter().collect());
+        let now = chrono::Utc::now() + chrono::Duration::days(60);
+        let categories = sweep::scan_categories_with_authority(
+            &home,
+            &authority,
+            &stub_pr_lookup,
+            &stub_issue_lookup,
+            Some("test/repo"),
+            now,
+        )
+        .expect("scan categories");
+        assert!(
+            !categories.all_ids().contains(&id),
+            "strict owner with {suffix} live ref must not be apply-capable: {categories:?}"
+        );
+        assert!(
+            categories.owner_report_only.iter().any(|candidate| candidate.id == id),
+            "strict owner with {suffix} live ref must remain report-only: {categories:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+#[test]
+fn test_sweep_strict_ghost_in_review_is_report_only() {
+    let home = tmp_home("sweep_strict_in_review");
+    write_fleet_yaml(&home, &["alive"]);
+    let created = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "ghost review work",
+            "assignee": "ghost"
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+    let claimed = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    assert!(claimed.get("error").is_none(), "setup claim failed: {claimed}");
+    let updated = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_review"}),
+    );
+    assert!(updated.get("error").is_none(), "setup review transition failed: {updated}");
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let authority = sweep::OwnerAuthority::available(live, ["alive".to_string()].into_iter().collect());
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let categories = sweep::scan_categories_with_authority(
+        &home,
+        &authority,
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        None,
+        now,
+    )
+    .expect("scan categories");
+    assert!(
+        categories.all_ids().is_empty(),
+        "InReview strict ghost must not be apply-capable: {categories:?}"
+    );
+    assert!(
+        categories.owner_report_only.iter().any(|candidate| candidate.id == id),
+        "InReview strict ghost must be report-only: {categories:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_sweep_nondefault_route_residue_is_reported() {
     let home = tmp_home("sweep_replacement_nondefault_route");
     cross_board_fleet(&home);
