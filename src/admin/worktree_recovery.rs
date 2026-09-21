@@ -103,6 +103,12 @@ pub(crate) fn recover_markerless_bound_worktree(
     // archive mutation so a crash is recoverable through the same lane.
     if durable_tombstone.is_none() {
         durable_tombstone = crate::agent::deletion_recovery::begin_from_binding(home, instance)?;
+        if durable_tombstone.is_none() {
+            return Err(
+                "recovery refused: signed binding evidence is required for operator recovery"
+                    .to_string(),
+            );
+        }
     }
 
     if let Some(tombstone) = durable_tombstone.as_ref() {
