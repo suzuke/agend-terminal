@@ -1468,20 +1468,9 @@ fn handle_sweep(home: &Path, args: &Value) -> Value {
     // `Closes t-XXX-N` PR markers). This action is operator-
     // triggered, scans for 4 stale categories, returns a
     // dry-run plan, then applies on a confirm round-trip.
-    let live_instances: std::collections::HashSet<String> = crate::api::call(
-        home,
-        &serde_json::json!({"method": crate::api::method::LIST}),
-    )
-    .ok()
-    .and_then(|r| {
-        r["result"]["agents"].as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|a| a["name"].as_str().map(String::from))
-                .collect()
-        })
-    })
-    .unwrap_or_default();
-    handle_sweep_with_live_instances(home, args, &live_instances)
+    let live_instances = crate::runtime::list_live_agents(home);
+    let authority = owner_authority_from_live(home, live_instances);
+    handle_sweep_with_owner_authority(home, args, &authority)
 }
 
 fn handle_sweep_with_live_instances(
@@ -1491,6 +1480,36 @@ fn handle_sweep_with_live_instances(
 ) -> Value {
     // #2454: the MCP adapter supplies this set from the in-process runtime;
     // the public `handle` wrapper above retains its API-derived behavior.
+    let authority = owner_authority_from_live(home, Some(live_instances.clone()));
+    handle_sweep_with_owner_authority(home, args, &authority)
+}
+
+fn owner_authority_from_live(
+    home: &Path,
+    live_instances: Option<std::collections::HashSet<String>>,
+) -> super::sweep::OwnerAuthority {
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home));
+    let fleet_instances = fleet
+        .as_ref()
+        .map(|config| config.instances.keys().cloned().collect())
+        .unwrap_or_default();
+    let fleet_available = fleet.is_ok();
+    match live_instances {
+        Some(live_instances) => super::sweep::OwnerAuthority {
+            live_instances,
+            fleet_instances,
+            live_available: true,
+            fleet_available,
+        },
+        None => super::sweep::OwnerAuthority::unavailable(fleet_instances, fleet_available),
+    }
+}
+
+fn handle_sweep_with_owner_authority(
+    home: &Path,
+    args: &Value,
+    authority: &super::sweep::OwnerAuthority,
+) -> Value {
     let apply = args["apply"].as_bool().unwrap_or(false);
     let confirm_ids: std::collections::HashSet<String> = args["confirm_ids"]
         .as_array()
@@ -1510,9 +1529,9 @@ fn handle_sweep_with_live_instances(
     let now = chrono::Utc::now();
     let pr_lookup: super::sweep::PrLookup = &super::sweep::gh_pr_lookup;
     let issue_lookup: super::sweep::IssueLookup = &super::sweep::gh_issue_lookup;
-    let categories = match super::sweep::scan_categories(
+    let categories = match super::sweep::scan_categories_with_authority(
         home,
-        live_instances,
+        authority,
         pr_lookup,
         issue_lookup,
         repo_owned.as_deref(),
@@ -1532,6 +1551,7 @@ fn handle_sweep_with_live_instances(
             "categories": categories.as_json(),
             "candidate_ids": categories.all_ids(),
             "total_candidates": categories.total(),
+            "owner_authority": authority.as_json(),
             "to_apply_hint": "task action=sweep apply=true confirm_ids=<subset> audit_reason=<...>",
         });
     }

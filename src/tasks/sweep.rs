@@ -2,6 +2,62 @@ use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Snapshot of the two authorities needed before a task owner can become an
+/// apply-capable sweep candidate.  `Some(empty)` is a healthy empty registry;
+/// `live_available = false` is an authority outage and must never be treated
+/// as an empty live set.
+#[derive(Debug, Clone)]
+pub(super) struct OwnerAuthority {
+    pub live_instances: HashSet<String>,
+    pub fleet_instances: HashSet<String>,
+    pub live_available: bool,
+    pub fleet_available: bool,
+}
+
+impl OwnerAuthority {
+    #[allow(dead_code)]
+    pub(super) fn available(
+        live_instances: HashSet<String>,
+        fleet_instances: HashSet<String>,
+    ) -> Self {
+        Self {
+            live_instances,
+            fleet_instances,
+            live_available: true,
+            fleet_available: true,
+        }
+    }
+
+    pub(super) fn unavailable(fleet_instances: HashSet<String>, fleet_available: bool) -> Self {
+        Self {
+            live_instances: HashSet::new(),
+            fleet_instances,
+            live_available: false,
+            fleet_available,
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.live_available && self.fleet_available
+    }
+
+    pub(super) fn as_json(&self) -> serde_json::Value {
+        let diagnostic = if self.is_available() {
+            "owner_authority_available"
+        } else {
+            "owner_authority_unavailable"
+        };
+        serde_json::json!({
+            "code": diagnostic,
+            "available": self.is_available(),
+            "live_available": self.live_available,
+            "fleet_available": self.fleet_available,
+            "live_count": self.live_instances.len(),
+            "fleet_count": self.fleet_instances.len(),
+        })
+    }
+}
+
 /// State of a PR referenced by a task title/description.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum PrState {
@@ -111,6 +167,10 @@ pub(super) struct Categories {
     pub shipped: Vec<Candidate>,
     pub superseded: Vec<Candidate>,
     pub team_disbanded: Vec<Candidate>,
+    /// Owner-related findings that are visible to the operator but are never
+    /// admitted to `all_ids()` (configured-offline owners and strict ghosts
+    /// whose refs/status still prove live work).
+    pub owner_report_only: Vec<Candidate>,
     pub validation_leftovers: Vec<Candidate>,
     /// #2061: open/backlog tasks whose referenced issue/PR are ALL terminal,
     /// or which carry no ref and are >14d stale.
@@ -146,6 +206,7 @@ impl Categories {
             "shipped": self.shipped,
             "superseded": self.superseded,
             "team_disbanded": self.team_disbanded,
+            "owner_report_only": self.owner_report_only,
             "validation_leftovers": self.validation_leftovers,
             "stale_open": self.stale_open,
             "stale_nonterminal": self.stale_nonterminal,
@@ -162,9 +223,35 @@ impl Categories {
 ///
 /// `now` is parameterized so tests can fast-forward age thresholds
 /// without forging event-log timestamps.
+#[allow(dead_code)]
 pub(super) fn scan_categories(
     home: &Path,
     live_instances: &HashSet<String>,
+    pr_lookup: PrLookup,
+    issue_lookup: IssueLookup,
+    repo: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Categories, super::TaskRouteError> {
+    // Compatibility seam for deterministic unit fixtures.  Production
+    // handlers use `scan_categories_with_authority` so an unavailable live
+    // registry cannot be collapsed into an empty set.
+    let fleet_instances = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .map(|config| config.instances.keys().cloned().collect())
+        .unwrap_or_default();
+    scan_categories_with_authority(
+        home,
+        &OwnerAuthority::available(live_instances.clone(), fleet_instances),
+        pr_lookup,
+        issue_lookup,
+        repo,
+        now,
+    )
+}
+
+pub(super) fn scan_categories_with_authority(
+    home: &Path,
+    authority: &OwnerAuthority,
     pr_lookup: PrLookup,
     issue_lookup: IssueLookup,
     repo: Option<&str>,
@@ -213,18 +300,9 @@ pub(super) fn scan_categories(
                 }
             }
         }
-        // (2) team_disbanded — owner not in live fleet + 30d stale.
-        if let (Some(owner), Some(a)) = (t.assignee.as_ref(), age) {
-            if !live_instances.contains(owner) && a > Duration::days(30) {
-                cats.team_disbanded.push(candidate(
-                    t,
-                    format!("owner '{owner}' not in live fleet, {}d stale", a.num_days()),
-                    None,
-                    vec![],
-                ));
-                continue;
-            }
-        }
+        // InReview and other active-work states are always report-only.  This
+        // check must precede owner admission so a strict ghost cannot turn a
+        // review residue into an apply-capable team_disbanded candidate.
         let search_text = format!("{}\n{}", t.title, t.description);
         if matches!(
             t.status,
@@ -237,12 +315,23 @@ pub(super) fn scan_categories(
                 continue;
             };
             let refs = extract_refs(&search_text);
-            let ref_labels = refs
+            let ref_labels: Vec<String> = refs
                 .pr_nums
                 .iter()
                 .map(|n| format!("PR #{n}"))
                 .chain(refs.issue_nums.iter().map(|n| format!("issue #{n}")))
                 .collect();
+            if t.status == crate::task_events::TaskStatus::InReview
+                && authority.is_available()
+                && t.assignee.is_some()
+            {
+                cats.owner_report_only.push(candidate(
+                    t,
+                    "InReview owner is report-only; no cancellation admission".to_string(),
+                    refs.pr_nums.first().copied(),
+                    ref_labels.clone(),
+                ));
+            }
             cats.stale_nonterminal.push(candidate(
                 t,
                 format!("{} task {}d stale", t.status, a.num_days()),
@@ -250,6 +339,96 @@ pub(super) fn scan_categories(
                 ref_labels,
             ));
             continue;
+        }
+        // No owner-bearing task may reach an apply-capable category while the
+        // live or fleet authority is unavailable.  Unassigned tasks still
+        // flow through the independent non-owner categories below.
+        if t.assignee.is_some() && !authority.is_available() {
+            continue;
+        }
+        // A configured-but-offline owner is a soft ghost.  Keep it visible for
+        // operator diagnosis, but never let shipped/superseded/stale-open
+        // admission cancel it during the same sweep.
+        if let Some(owner) = t.assignee.as_ref() {
+            if super::orphan::classify_owner(
+                owner,
+                &authority.live_instances,
+                &authority.fleet_instances,
+            ) == super::orphan::OwnerClassification::Soft
+            {
+                cats.owner_report_only.push(candidate(
+                    t,
+                    format!("owner '{owner}' is configured but offline; report-only"),
+                    None,
+                    vec![],
+                ));
+                continue;
+            }
+        }
+        // (2) team_disbanded — only a fully available authority may admit a
+        // strict owner, and refs must prove there is no live work first.
+        if let (Some(owner), Some(a)) = (t.assignee.as_ref(), age) {
+            if a > Duration::days(30) {
+                match super::orphan::classify_owner(
+                    owner,
+                    &authority.live_instances,
+                    &authority.fleet_instances,
+                ) {
+                    super::orphan::OwnerClassification::Live => {}
+                    // Soft owners are handled by the report-only guard above;
+                    // keep this arm exhaustive if that guard changes later.
+                    super::orphan::OwnerClassification::Soft => continue,
+                    super::orphan::OwnerClassification::Strict => {
+                        let refs = extract_refs(&search_text);
+                        let ref_labels = refs
+                            .pr_nums
+                            .iter()
+                            .map(|n| format!("PR #{n}"))
+                            .chain(refs.issue_nums.iter().map(|n| format!("issue #{n}")))
+                            .collect::<Vec<_>>();
+                        let refs_terminal = if refs.is_empty() {
+                            !refs.saw_token
+                        } else if let Some(repo) = repo {
+                            refs.pr_nums.iter().all(|&n| {
+                                matches!(
+                                    pr_cache.entry(n).or_insert_with(|| {
+                                        pr_lookup(repo, n).unwrap_or(PrState::Unknown)
+                                    }),
+                                    PrState::Merged { .. } | PrState::Closed
+                                )
+                            }) && refs.issue_nums.iter().all(|&n| {
+                                *issue_cache.entry(n).or_insert_with(|| {
+                                    issue_lookup(repo, n).unwrap_or(IssueState::Unknown)
+                                }) == IssueState::Closed
+                            })
+                        } else {
+                            false
+                        };
+                        if refs_terminal {
+                            cats.team_disbanded.push(candidate(
+                                t,
+                                format!(
+                                    "owner '{owner}' not in live fleet, {}d stale",
+                                    a.num_days()
+                                ),
+                                refs.pr_nums.first().copied(),
+                                ref_labels,
+                            ));
+                        } else {
+                            cats.owner_report_only.push(candidate(
+                                t,
+                                format!(
+                                    "owner '{owner}' has unresolved/live work refs, {}d stale; report-only",
+                                    a.num_days()
+                                ),
+                                refs.pr_nums.first().copied(),
+                                ref_labels,
+                            ));
+                        }
+                        continue;
+                    }
+                }
+            }
         }
         // (3) shipped / (4) superseded — first PR ref + query. Unchanged
         // predicates; only a `continue` is added after each push so an
