@@ -5509,6 +5509,82 @@ fn test_sweep_strict_ghost_in_review_is_report_only() {
 }
 
 #[test]
+fn test_sweep_in_review_validation_residue_is_report_only() {
+    let home = tmp_home("sweep_in_review_validation");
+    write_fleet_yaml(&home, &["alive"]);
+    let open = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "test/open validation residue"
+        }),
+    );
+    let open_id = open["id"].as_str().expect("open id").to_string();
+    let review = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "test/review validation residue",
+            "assignee": "alive"
+        }),
+    );
+    let review_id = review["id"].as_str().expect("review id").to_string();
+    let claimed = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action": "claim", "id": review_id}),
+    );
+    assert!(
+        claimed.get("error").is_none(),
+        "setup claim failed: {claimed}"
+    );
+    let updated = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action": "update", "id": review_id, "status": "in_review"}),
+    );
+    assert!(
+        updated.get("error").is_none(),
+        "setup review transition failed: {updated}"
+    );
+
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let categories =
+        sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+            .expect("scan categories");
+
+    assert!(
+        categories
+            .validation_leftovers
+            .iter()
+            .any(|candidate| candidate.id == open_id),
+        "open validation residue should remain an apply-capable validation leftover: {categories:?}"
+    );
+    assert!(
+        !categories
+            .validation_leftovers
+            .iter()
+            .any(|candidate| candidate.id == review_id),
+        "InReview validation residue must not enter validation_leftovers: {categories:?}"
+    );
+    assert!(
+        categories
+            .stale_nonterminal
+            .iter()
+            .any(|candidate| candidate.id == review_id),
+        "InReview validation residue should remain report-only stale residue: {categories:?}"
+    );
+    assert!(
+        !categories.all_ids().contains(&review_id),
+        "InReview validation residue must stay out of apply ids: {categories:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_sweep_nondefault_route_residue_is_reported() {
     let home = tmp_home("sweep_replacement_nondefault_route");
     cross_board_fleet(&home);
