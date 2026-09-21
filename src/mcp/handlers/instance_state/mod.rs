@@ -30,6 +30,32 @@ pub(crate) mod spawn;
 /// 64 is already far beyond any real team size; reject above it at the MCP
 /// boundary, before the allocation and the CREATE_TEAM RPC.
 const MAX_TEAM_COUNT: usize = 64;
+
+fn record_creator_force_delete(
+    home: &Path,
+    caller: &str,
+    name: &str,
+    reason: &str,
+    has_binding: bool,
+    has_active_task: bool,
+) -> Result<(), String> {
+    let event = serde_json::json!({
+        "kind": "creator_force_delete",
+        "agent": caller,
+        "target": name,
+        "force_reason": reason,
+        "has_binding": has_binding,
+        "has_active_task": has_active_task,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    agentic_audit_append::append_audit_line_bounded(
+        home,
+        &event,
+        agentic_audit_append::DEFAULT_BOUNDED_BUDGET,
+    )
+    .map_err(|e| e.to_string())
+}
+
 pub(super) fn handle_create_instance(
     home: &Path,
     args: &Value,

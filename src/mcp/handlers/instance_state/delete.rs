@@ -79,30 +79,16 @@ pub(crate) fn handle_delete_instance_with_runtime(
                         );
                         // Durable audit trail — a permission override deleting
                         // in-flight work needs more than a process log line.
-                        // Mirrors ci/merge.rs's merge_force_bypass: fail-closed
-                        // if the write itself fails (an unrecordable override
-                        // must not proceed).
-                        let event = serde_json::json!({
-                            "kind": "creator_force_delete",
-                            "agent": caller,
-                            "target": name,
-                            "force_reason": reason,
-                            "has_binding": has_binding,
-                            "has_active_task": has_active_task,
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                        });
-                        // #3416: goes through the one serialized appender. Destructive
-                        // fail-closed gate — bounded retry, then refuse; never an
-                        // unlocked fallback. `Err` means no TRUSTWORTHY record exists,
-                        // so the force-delete must not proceed. It does not always mean
-                        // nothing was written: a `Write` failure can leave a partial
-                        // line, which is why the refusal reports the error's own wording.
-                        let audit_written = agentic_audit_append::append_audit_line_bounded(
+                        // The helper remains in the parent module so the audit
+                        // sink invariant can inspect this production region.
+                        if let Err(e) = super::record_creator_force_delete(
                             home,
-                            &event,
-                            agentic_audit_append::DEFAULT_BOUNDED_BUDGET,
-                        );
-                        if let Err(e) = audit_written {
+                            caller,
+                            name,
+                            reason,
+                            has_binding,
+                            has_active_task,
+                        ) {
                             return serde_json::json!({
                                 "error": format!("creator force-delete refused: {e}"),
                                 "code": "creator_force_delete_audit_failed"
