@@ -98,19 +98,6 @@ pub(crate) fn recover_markerless_bound_worktree(
         ));
     }
 
-    // Public CLI recovery can start without the delete handler having written
-    // a tombstone.  Establish the same signed durable journal before any
-    // archive mutation so a crash is recoverable through the same lane.
-    if durable_tombstone.is_none() {
-        durable_tombstone = crate::agent::deletion_recovery::begin_from_binding(home, instance)?;
-        if durable_tombstone.is_none() {
-            return Err(
-                "recovery refused: signed binding evidence is required for operator recovery"
-                    .to_string(),
-            );
-        }
-    }
-
     if let Some(tombstone) = durable_tombstone.as_ref() {
         let recorded_archive_exists = tombstone
             .archive
@@ -226,6 +213,22 @@ pub(crate) fn recover_markerless_bound_worktree(
         {
             return Err(
                 "recovery refused: binding evidence does not match the delete tombstone"
+                    .to_string(),
+            );
+        }
+    }
+
+    // Public CLI recovery can start without the delete handler having written
+    // a tombstone.  All rejection-only preflight checks above intentionally
+    // run before this journal write, so a bad operator request cannot leave a
+    // blocking Deleting tombstone behind.  Once the signed binding evidence
+    // has passed those checks, establish the same durable journal used by the
+    // delete handler before any archive mutation so a crash is recoverable.
+    if durable_tombstone.is_none() {
+        durable_tombstone = crate::agent::deletion_recovery::begin_from_binding(home, instance)?;
+        if durable_tombstone.is_none() {
+            return Err(
+                "recovery refused: signed binding evidence is required for operator recovery"
                     .to_string(),
             );
         }
