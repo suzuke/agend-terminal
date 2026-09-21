@@ -5956,10 +5956,7 @@ fn backdate_task_event_for_sweep(home: &std::path::Path, task_id: &str, days: i6
         .lines()
         .map(|line| {
             let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
-            let event_task_id = value["event"]
-                .as_object()
-                .and_then(|event| event.values().next())
-                .and_then(|payload| payload["task_id"].as_str());
+            let event_task_id = value["event"]["task_id"].as_str();
             if event_task_id == Some(task_id) {
                 value["timestamp"] = serde_json::json!(past);
                 changed = true;
@@ -5972,6 +5969,7 @@ fn backdate_task_event_for_sweep(home: &std::path::Path, task_id: &str, days: i6
         .join("\n");
     assert!(changed, "task event fixture must contain {task_id}");
     std::fs::write(path, format!("{}\n", rewritten)).unwrap();
+    crate::task_events::catalog::rebuild_for_test(home);
 }
 
 #[test]
@@ -5994,8 +5992,29 @@ fn manual_sweep_rejects_repository_claim_change_before_emit_3584() {
         &serde_json::json!({"repository": "test/repo"}),
     );
     write_manual_sweep_provenance(&home, "default", "test/repo");
-    let task_id = create_open_task(&home, "stale unreferenced task");
+    let task_id = handle(
+        &home,
+        "operator",
+        &serde_json::json!({"action": "create", "title": "stale unreferenced task"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     backdate_task_event_for_sweep(&home, &task_id, 30);
+    let dry = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo"
+        }),
+    );
+    assert!(
+        dry["candidate_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&task_id))),
+        "stale fixture must be a candidate: {dry}"
+    );
 
     let repo_b = repo_b.clone();
     let home_for_hook = home.clone();
@@ -6058,8 +6077,32 @@ fn manual_sweep_stable_repository_claim_can_apply_3584() {
         &serde_json::json!({"repository": "test/repo"}),
     );
     write_manual_sweep_provenance(&home, "default", "test/repo");
-    let task_id = create_open_task(&home, "stable stale unreferenced task");
+    let task_id = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "create",
+            "title": "stable stale unreferenced task"
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     backdate_task_event_for_sweep(&home, &task_id, 30);
+    let dry = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo"
+        }),
+    );
+    assert!(
+        dry["candidate_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&task_id))),
+        "stable stale fixture must be a candidate: {dry}"
+    );
 
     let response = handle(
         &home,

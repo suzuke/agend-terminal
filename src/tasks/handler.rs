@@ -1638,6 +1638,57 @@ fn handle_sweep_with_owner_authority(
             "hint": "re-run dry-run; candidates may have changed since last scan",
         });
     }
+    // Repository/team provenance is mutable independently of the task boards.
+    // Re-check it under the same fleet lock used by team updates, and retain
+    // that lock through append so a claim cannot change after authorization.
+    #[cfg(test)]
+    super::fire_before_manual_sweep_repository_scope_hook_for_test();
+    let _fleet_authority_lock = if repository_scope.is_some() {
+        match crate::fleet::persist::acquire_fleet_lock(home) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                return serde_json::json!({
+                    "error": format!("could not lock repository authority: {error}"),
+                    "code": "repository_scope_lock_unavailable",
+                })
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(expected_scope) = repository_scope.as_ref() {
+        let fresh_scope = crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(
+            home,
+            &expected_scope.repository,
+        );
+        if !fresh_scope.diagnostics.is_empty() || fresh_scope.projects != expected_scope.projects {
+            return serde_json::json!({
+                "error": "repository scope changed after candidate confirmation",
+                "code": "repository_scope_changed",
+                "repository_scope": fresh_scope.as_json(),
+                "expected_repository_scope": expected_scope.as_json(),
+            });
+        }
+        let fresh_projects: std::collections::BTreeSet<String> =
+            fresh_scope.projects.iter().cloned().collect();
+        let foreign: Vec<String> = confirm_ids
+            .iter()
+            .filter(|id| {
+                crate::tasks::load_routed(home, id)
+                    .ok()
+                    .is_some_and(|routed| !fresh_projects.contains(routed.board().project()))
+            })
+            .cloned()
+            .collect();
+        if !foreign.is_empty() {
+            return serde_json::json!({
+                "error": "confirm_ids are outside the fresh repository scope",
+                "code": "repository_scope_confirm_id_out_of_scope",
+                "foreign_confirm_ids": foreign,
+                "repository_scope": fresh_scope.as_json(),
+            });
+        }
+    }
     let applied = super::sweep::emit_cancelled_batch(home, &categories, &confirm_ids, audit_reason);
     match applied {
         Ok(count) => serde_json::json!({

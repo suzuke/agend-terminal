@@ -646,6 +646,29 @@ pub(super) fn fire_before_mutation_commit_hook_for_test() {
     }
 }
 
+// #3584: test-only seam for the manual sweep repository-authority TOCTOU.
+// Fires after candidate/confirm validation and before the apply path acquires
+// the fleet authority lock, so a regression test can mutate a team claim and
+// prove the fresh locked scope rejects the stale candidate.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MANUAL_SWEEP_REPOSITORY_SCOPE_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_manual_sweep_repository_scope_hook_for_test(f: impl FnOnce() + 'static) {
+    BEFORE_MANUAL_SWEEP_REPOSITORY_SCOPE_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+
+#[cfg(test)]
+pub(super) fn fire_before_manual_sweep_repository_scope_hook_for_test() {
+    let hook = BEFORE_MANUAL_SWEEP_REPOSITORY_SCOPE_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 impl<'a> DepResolver<'a> {
     fn new(home: &'a Path, local_board: &'a Path, snapshot: &[Task]) -> Self {
         let local = snapshot.iter().map(|t| (t.id.clone(), t.status)).collect();

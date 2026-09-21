@@ -60,6 +60,14 @@ fn acquire_lock(home: &Path) -> Result<crate::store::FileFlockGuard> {
     crate::store::acquire_file_lock(&lock_path).context("failed to acquire fleet lock")
 }
 
+/// Hold the same authority lock used by every fleet.yaml mutation while a
+/// caller revalidates a fleet-derived decision and commits its dependent
+/// mutation.  This is intentionally crate-visible: consumers must share the
+/// writer's lock rather than inventing a second authority domain.
+pub(crate) fn acquire_fleet_lock(home: &Path) -> Result<crate::store::FileFlockGuard> {
+    acquire_lock(home)
+}
+
 pub(crate) fn mutate_fleet_yaml(
     home: &Path,
     default_content: &str,
