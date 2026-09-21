@@ -26,6 +26,14 @@ pub(crate) struct Attempt {
     pub started_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DispatchIntent {
+    pub run_id: String,
+    pub attempt_number: u32,
+    pub revision: u64,
+    pub intent_id: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Phase {
@@ -78,6 +86,11 @@ pub(crate) struct Run {
     pub config: JobConfig,
     pub phase: Phase,
     pub revision: u64,
+    /// Durable two-phase dispatch claim. The worker message may be sent after
+    /// this claim and before its result is committed; the idempotency key in
+    /// `ManagedRuntime::dispatch` makes that retry safe.
+    #[serde(default)]
+    pub dispatch_intent: Option<DispatchIntent>,
     pub attempt: Option<Attempt>,
     pub previous_attempts: Vec<Attempt>,
     pub task_id: Option<String>,
@@ -230,6 +243,7 @@ pub(crate) fn admit_due(
             config: config.clone(),
             phase: Phase::Queued,
             revision: 0,
+            dispatch_intent: None,
             attempt: None,
             previous_attempts: vec![],
             task_id: Some(format!("t-{}-{}-0", now.timestamp_micros(), uuid.as_u128())),
@@ -326,6 +340,7 @@ fn complete_as(
         );
         run.result = Some(result.into());
         run.phase = Phase::Succeeded;
+        run.dispatch_intent = None;
         run.cleanup_pending = true;
         run.revision += 1;
         Ok(())

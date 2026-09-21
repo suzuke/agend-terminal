@@ -1,4 +1,4 @@
-use super::{read, replace, Attempt, Phase, Run};
+use super::{read, replace, Attempt, DispatchIntent, Phase, Run};
 use super::{JobRuntime, Observation};
 use std::path::Path;
 
@@ -7,11 +7,6 @@ use std::path::Path;
 /// fleet, task or transport calls); no runtime service calls back under state.
 pub(crate) fn tick(home: &Path, runtime: &impl JobRuntime, now: i64) -> anyhow::Result<()> {
     std::fs::create_dir_all(home)?;
-    let Some(_driver) =
-        crate::store::try_acquire_file_lock(&home.join("schedule-jobs-driver.lock"))?
-    else {
-        return Ok(());
-    };
     for run in read(home)?.runs {
         if let Err(error) = step(home, runtime, &run, now) {
             tracing::error!(run_id = %run.id, %error, "job reconciliation failed; durable state retained");
@@ -76,12 +71,18 @@ fn settle_task(home: &Path, run: &Run) -> anyhow::Result<()> {
     task_ok(crate::tasks::handle(home, "system:schedule_job", &args))
 }
 fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::Result<()> {
+    let Some(driver) =
+        crate::store::try_acquire_file_lock(&home.join("schedule-jobs-driver.lock"))?
+    else {
+        return Ok(());
+    };
     let mut next = run.clone();
     if run.recovery_required {
         reconcile_notification(home, run, |r| super::notification::send(home, r))?;
         return Ok(());
     }
     if matches!(run.phase, Phase::Succeeded | Phase::Failed) {
+        next.dispatch_intent = None;
         if !run.task_settled {
             match settle_task(home, run) {
                 Ok(()) => next.task_settled = true,
@@ -129,6 +130,7 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
     }
     if now >= run.deadline && run.phase != Phase::Stopping {
         next.error = Some("execution deadline exceeded".into());
+        next.dispatch_intent = None;
         next.phase = if run.attempt.is_some() {
             Phase::Stopping
         } else {
@@ -186,18 +188,29 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
             match runtime.observe(attempt)? {
                 Observation::Starting => return Ok(()),
                 Observation::UsageLimited | Observation::Exited | Observation::Missing => {
+                    next.dispatch_intent = None;
                     next.phase = Phase::Stopping;
                     next.error = Some("worker unavailable before dispatch".into());
                 }
                 Observation::Running => {
                     prepare_task(home, run, attempt)?;
-                    match runtime.dispatch(run, attempt) {
-                        Ok(()) => next.phase = Phase::Running,
-                        Err(e) => {
-                            next.phase = Phase::Stopping;
-                            next.error = Some(format!("dispatch failed: {e}"));
-                        }
-                    }
+                    let (claimed, intent) = claim_dispatch(home, run, attempt)?;
+                    let Some((claimed, intent)) = claimed.zip(intent) else {
+                        return Ok(());
+                    };
+                    // The production dispatch reaches loopback self-IPC through
+                    // enqueue_once_with_idle_hint. The driver claim is durable,
+                    // so every flock is dropped before that call.
+                    drop(driver);
+                    let outcome = runtime.dispatch(&claimed, attempt);
+                    let Some(_driver) = crate::store::try_acquire_file_lock(
+                        &home.join("schedule-jobs-driver.lock"),
+                    )?
+                    else {
+                        return Ok(());
+                    };
+                    commit_dispatch(home, &claimed, &intent, outcome)?;
+                    return Ok(());
                 }
             }
             replace(home, run, next)?;
@@ -215,6 +228,7 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
                 Observation::Starting | Observation::Running => None,
             };
             if let Some(reason) = reason {
+                next.dispatch_intent = None;
                 next.phase = Phase::Stopping;
                 next.error = Some(reason.into());
                 replace(home, run, next)?;
@@ -228,6 +242,7 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
             if !runtime.stop(run, attempt)? {
                 return Ok(());
             }
+            next.dispatch_intent = None;
             next.previous_attempts.push(attempt.clone());
             next.attempt = None;
             if now >= run.deadline || attempt.number >= run.config.max_attempts {
@@ -240,6 +255,70 @@ fn step(home: &Path, runtime: &impl JobRuntime, run: &Run, now: i64) -> anyhow::
         }
         Phase::Succeeded | Phase::Failed => unreachable!(),
     }
+    Ok(())
+}
+
+/// Persist the dispatch claim while the driver flock is held. An existing
+/// matching intent is reused after a crash or an enqueue-before-commit retry.
+pub(super) fn claim_dispatch(
+    home: &Path,
+    run: &Run,
+    attempt: &Attempt,
+) -> anyhow::Result<(Option<Run>, Option<DispatchIntent>)> {
+    if let Some(intent) = &run.dispatch_intent {
+        anyhow::ensure!(
+            intent.run_id == run.id
+                && intent.attempt_number == attempt.number
+                && intent.revision == run.revision,
+            "dispatch intent does not match active run revision"
+        );
+        return Ok((Some(run.clone()), Some(intent.clone())));
+    }
+    let intent = DispatchIntent {
+        run_id: run.id.clone(),
+        attempt_number: attempt.number,
+        revision: run.revision + 1,
+        intent_id: uuid::Uuid::new_v4().simple().to_string(),
+    };
+    let mut claimed = run.clone();
+    claimed.dispatch_intent = Some(intent.clone());
+    if !replace(home, run, claimed.clone())? {
+        return Ok((None, None));
+    }
+    Ok((Some(claimed), Some(intent)))
+}
+
+/// Commit a dispatch result only if the exact durable intent is still current.
+/// A completion receipt, retry, or another tick may have advanced the revision
+/// while the self-IPC call was outside the driver flock.
+pub(super) fn commit_dispatch(
+    home: &Path,
+    claimed: &Run,
+    intent: &DispatchIntent,
+    outcome: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let Some(current) = read(home)?.runs.into_iter().find(|r| r.id == claimed.id) else {
+        return Ok(());
+    };
+    if current.revision != intent.revision
+        || current.dispatch_intent.as_ref() != Some(intent)
+        || current.attempt != claimed.attempt
+    {
+        return Ok(());
+    }
+    let mut next = current.clone();
+    next.dispatch_intent = None;
+    match outcome {
+        Ok(()) => {
+            next.phase = Phase::Running;
+            next.error = None;
+        }
+        Err(error) => {
+            next.phase = Phase::Stopping;
+            next.error = Some(format!("dispatch failed: {error}"));
+        }
+    }
+    replace(home, &current, next)?;
     Ok(())
 }
 
