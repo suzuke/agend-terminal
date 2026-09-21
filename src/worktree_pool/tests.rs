@@ -5148,16 +5148,28 @@ fn stale_normal_release_clears_only_the_superseded_generation_journal_3696() {
     let signature_path = crate::paths::runtime_dir(&home)
         .join("agent-release-journal-stale")
         .join("binding.json.sig");
+    let settled_archive = home
+        .join(".trash")
+        .join("worktrees")
+        .join("superseded-generation");
     let _hook = release_test_seam::install({
         let home = home.clone();
         let binding_path = binding_path.clone();
         let signature_path = signature_path.clone();
         let worktree = lease.path.clone();
         let repo = repo.clone();
+        let settled_archive = settled_archive.clone();
         move |phase| {
             if phase == ReleaseTestPhase::AfterBindingSnapshot {
                 std::fs::remove_file(&binding_path).expect("remove generation A binding");
                 std::fs::remove_file(&signature_path).expect("remove generation A signature");
+                std::fs::create_dir_all(&settled_archive).expect("create settled archive");
+                crate::agent::deletion_recovery::mark_recovered(
+                    &home,
+                    "agent-release-journal-stale",
+                    &settled_archive,
+                )
+                .expect("settle generation A recovery before replacement bind");
                 crate::binding::bind_full(
                     &home,
                     "agent-release-journal-stale",

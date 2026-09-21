@@ -305,6 +305,15 @@ pub(crate) fn bind_full_with_provenance(
     // S1: stable A lives outside runtime; legacy B stays for compatibility. A→B.
     let _agent_lock = acquire_agent_mutation_lock(home, agent)?;
     let _binding_lock = acquire_binding_file_lock(home, agent)?;
+    // #3696: a pending recovery tombstone is an authoritative lifecycle fence.
+    // Do not let a replacement generation overwrite the binding while the
+    // prior generation still needs operator recovery, even if its worktree
+    // directory has already disappeared.
+    if crate::agent::deletion_recovery::is_blocking(home, agent) {
+        return Err(format!(
+            "binding refused: agent '{agent}' has a pending recovery tombstone"
+        ));
+    }
     // #2158 PR2: read the CURRENT on-disk binding UNDER the lock (the in-memory
     // index can be stale) — drives guard-b + the binding-CHANGE audit.
     let existing: Option<serde_json::Value> = std::fs::read_to_string(&path)

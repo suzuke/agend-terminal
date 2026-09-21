@@ -333,40 +333,45 @@ pub(super) fn recover_recorded_archive(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(format!("read archived binding signature evidence: {error}")),
     };
-    if archived_binding.is_some() != archived_signature.is_some() {
-        return Err(
-            "recovery refused: archived binding evidence is only partially present".to_string(),
-        );
-    }
     if let Some(binding) = archived_binding.as_ref() {
-        let signature = archived_signature
-            .as_ref()
-            .expect("archived binding/signature presence checked above");
-        if crate::daemon::utils::sha256_hex(binding) != tombstone.binding_sha256
-            || crate::daemon::utils::sha256_hex(signature) != tombstone.binding_signature_sha256
-        {
+        if crate::daemon::utils::sha256_hex(binding) != tombstone.binding_sha256 {
             return Err(
                 "recovery refused: archived binding evidence does not match tombstone".to_string(),
             );
         }
-        if let Some((live_body, live_signature)) = live_binding.as_ref() {
-            if live_body != binding || live_signature != signature {
+        if let Some((live_body, _)) = live_binding.as_ref() {
+            if live_body != binding {
                 return Err(
                     "recovery refused: live binding evidence does not match archive".to_string(),
                 );
             }
         }
     }
-    let (evidence_binding, evidence_signature) = live_binding
+    if let Some(signature) = archived_signature.as_ref() {
+        if crate::daemon::utils::sha256_hex(signature) != tombstone.binding_signature_sha256 {
+            return Err(
+                "recovery refused: archived signature evidence does not match tombstone"
+                    .to_string(),
+            );
+        }
+        if let Some((_, live_signature)) = live_binding.as_ref() {
+            if live_signature != signature {
+                return Err(
+                    "recovery refused: live signature evidence does not match archive".to_string(),
+                );
+            }
+        }
+    }
+    let evidence_binding = live_binding
         .as_ref()
-        .map(|(body, signature)| (body.as_slice(), signature.as_slice()))
-        .or_else(|| {
-            archived_binding
-                .as_ref()
-                .zip(archived_signature.as_ref())
-                .map(|(body, signature)| (body.as_slice(), signature.as_slice()))
-        })
+        .map(|(body, _)| body.as_slice())
+        .or(archived_binding.as_deref())
         .ok_or_else(|| "recovery refused: archive has no signed binding evidence".to_string())?;
+    let evidence_signature = live_binding
+        .as_ref()
+        .map(|(_, signature)| signature.as_slice())
+        .or(archived_signature.as_deref())
+        .ok_or_else(|| "recovery refused: archive has no signed signature evidence".to_string())?;
     let binding: serde_json::Value = serde_json::from_slice(evidence_binding)
         .map_err(|e| format!("recovery refused: archived binding is invalid JSON: {e}"))?;
     if binding["branch"].as_str() != Some(tombstone.branch.as_str())

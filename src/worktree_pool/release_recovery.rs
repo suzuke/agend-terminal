@@ -79,8 +79,15 @@ pub(crate) fn prepare_release_journal(home: &Path, agent: &str) -> Result<(), St
     let signature_path = crate::paths::runtime_dir(home)
         .join(agent)
         .join("binding.json.sig");
-    if !signature_path.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(&signature_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "release refused: inspect binding signature sidecar {}: {error}",
+                signature_path.display()
+            ));
+        }
     }
     match crate::agent::deletion_recovery::begin_from_binding(home, agent)? {
         Some(_) => Ok(()),
