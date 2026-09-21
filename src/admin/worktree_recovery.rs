@@ -367,6 +367,53 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_deleting_tombstone_is_recoverable_after_restart() {
+        let home = temp_home("interrupted-delete");
+        let instance = format!("recovery-interrupted-{}", std::process::id());
+        let branch = "review/interrupted";
+        let source_repo = home.join("source-repo");
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
+        let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+            .join(&instance)
+            .join("review-interrupted");
+        std::fs::create_dir_all(&worktree).expect("create worktree fixture");
+        std::fs::write(worktree.join("leftover.txt"), b"survive restart")
+            .expect("write residual worktree fixture");
+        crate::binding::bind_full(&home, &instance, "", branch, &worktree, &source_repo, false)
+            .expect("bind recovery fixture");
+
+        crate::agent::deletion_recovery::begin_from_binding(&home, &instance)
+            .expect("persist interrupted deleting tombstone")
+            .expect("signed binding must enter recovery lane");
+
+        let report = recover_markerless_bound_worktree(
+            &home,
+            "operator",
+            "recover interrupted delete after restart",
+            &instance,
+            branch,
+            &worktree,
+            &source_repo,
+        )
+        .expect("operator recovery must accept an interrupted deleting tombstone");
+
+        assert!(!worktree.exists());
+        assert_eq!(
+            std::fs::read(report.archive.join("leftover.txt")).expect("read archived fixture"),
+            b"survive restart"
+        );
+        assert!(crate::binding::read(&home, &instance).is_none());
+        assert_eq!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery receipt")
+                .expect("receipt must persist")
+                .state,
+            crate::agent::deletion_recovery::State::Recovered
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn marker_present_target_is_left_for_normal_release() {
         let home = temp_home("managed");
         let instance = format!("recovery-managed-{}", std::process::id());
