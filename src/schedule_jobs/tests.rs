@@ -207,21 +207,23 @@ fn issue3698_real_managed_dispatch_is_not_called_under_driver_flock() {
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     let externals: crate::agent::ExternalRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-    let runtime = crate::schedule_jobs::runtime::ManagedRuntime::new(
-        &h,
-        &registry,
-        &configs,
-        &externals,
-    );
+    let runtime =
+        crate::schedule_jobs::runtime::ManagedRuntime::new(&h, &registry, &configs, &externals);
 
     tick(&h, &runtime, now().timestamp()).unwrap();
     tick(&h, &runtime, now().timestamp()).unwrap();
     assert_eq!(read(&h).unwrap().runs[0].phase, Phase::Dispatching);
-    tick(&h, &runtime, now().timestamp()).unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| tick(&h, &runtime, now().timestamp()).unwrap());
+        }
+    });
 
     let observed = read(&h).unwrap().runs[0].clone();
     let attempt = observed.attempt.as_ref().unwrap();
     let uuid = attempt.uuid.as_deref().unwrap();
+    runtime.dispatch(&observed, attempt).unwrap();
+    let inbox_count = crate::inbox::drain(&h, &attempt.name).len();
     crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_expected_identity(
         &h,
         &attempt.name,
@@ -240,7 +242,43 @@ fn issue3698_real_managed_dispatch_is_not_called_under_driver_flock() {
         Phase::Running,
         "managed dispatch must complete after the driver flock is released: {observed:?}"
     );
-    assert_eq!(crate::inbox::drain(&h, &attempt.name).len(), 1);
+    assert_eq!(inbox_count, 1);
+}
+
+#[test]
+fn issue3698_durable_intent_retry_fences_stale_completion() {
+    let h = home();
+    admit_due(&h, &schedule(&h), now()).unwrap();
+    let runtime = Fake::default();
+    tick(&h, &runtime, now().timestamp()).unwrap();
+    tick(&h, &runtime, now().timestamp()).unwrap();
+    let dispatching = read(&h).unwrap().runs[0].clone();
+    let attempt = dispatching.attempt.as_ref().unwrap().clone();
+
+    let (claimed, intent) = super::controller::claim_dispatch(&h, &dispatching, &attempt).unwrap();
+    let claimed = claimed.unwrap();
+    let intent = intent.unwrap();
+    assert_eq!(
+        read(&h).unwrap().runs[0].dispatch_intent,
+        Some(intent.clone())
+    );
+
+    // A retry after a crash must reuse the exact persisted intent, not mint a
+    // second revision or idempotency identity.
+    let retried = read(&h).unwrap().runs[0].clone();
+    let (retry_claim, retry_intent) =
+        super::controller::claim_dispatch(&h, &retried, &attempt).unwrap();
+    assert_eq!(retry_claim.unwrap().dispatch_intent, Some(intent.clone()));
+    assert_eq!(retry_intent, Some(intent.clone()));
+
+    // A newer completion wins while the dispatch result is in flight; the
+    // stale result must not move the terminal run back to Running.
+    let mut completed = read(&h).unwrap().runs[0].clone();
+    completed.phase = Phase::Succeeded;
+    completed.dispatch_intent = None;
+    replace(&h, &retried, completed).unwrap();
+    super::controller::commit_dispatch(&h, &claimed, &intent, Ok(())).unwrap();
+    assert_eq!(read(&h).unwrap().runs[0].phase, Phase::Succeeded);
 }
 
 #[test]

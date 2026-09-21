@@ -97,6 +97,7 @@ mod tests {
             },
             phase: Phase::Running,
             revision: 0,
+            dispatch_intent: None,
             attempt: None,
             previous_attempts: vec![],
             task_id: None,

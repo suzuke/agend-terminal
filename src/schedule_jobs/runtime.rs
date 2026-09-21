@@ -651,6 +651,7 @@ mod tests {
             },
             phase: super::super::Phase::Starting,
             revision: 0,
+            dispatch_intent: None,
             attempt: Some(attempt.clone()),
             previous_attempts: vec![],
             task_id: None,
