@@ -161,7 +161,17 @@ pub fn parse_task_entry(text: &str) -> Option<&str> {
 /// authoritative, so every active task carrying the merged branch is closed.
 /// The legacy text-token fallback remains Verified-only and single-match.
 pub fn auto_close_merged_tasks(home: &Path, branch: &str) {
-    let tasks = crate::tasks::list_all(home);
+    let tasks = match crate::tasks::list_all_strict(home) {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                branch,
+                "skipping merged-branch auto-close because task-board authority is incomplete"
+            );
+            return;
+        }
+    };
     // #2037 (5): the Verified-only status filter was the zombie-task gap —
     // a dispatch task stays `claimed`/`in_progress` on the board while the
     // reviewer's VERIFIED verdict lives in messages, so "PR merged but task
@@ -232,6 +242,7 @@ pub fn auto_close_merged_tasks(home: &Path, branch: &str) {
                     "branch": branch,
                     "merged_at": chrono::Utc::now().to_rfc3339(),
                 },
+                "expected_branch": branch,
             }),
         );
         if resp.get("error").is_some() {
@@ -444,8 +455,7 @@ teams:
         let hook_task_id = task_id.clone();
         crate::tasks::set_before_mutation_commit_hook_for_test(move || {
             assert!(
-                crate::tasks::link_branch_to_task(&hook_home, &hook_task_id, new_branch)
-                    .unwrap()
+                crate::tasks::link_branch_to_task(&hook_home, &hook_task_id, new_branch).unwrap()
             );
         });
         auto_close_merged_tasks(&home, merged_branch);
@@ -461,6 +471,102 @@ teams:
             TaskStatus::Claimed,
             "old merge must not close work retargeted to a new branch"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn seed_claimed_task(board: &std::path::Path, id: &str, branch: &str) {
+        use crate::task_events::{append_batch_at, InstanceName, TaskEvent, TaskId};
+
+        append_batch_at(
+            board,
+            &InstanceName::from("test:seed"),
+            vec![
+                TaskEvent::Created {
+                    task_id: TaskId(id.into()),
+                    title: "merge settlement guard".into(),
+                    description: "test".into(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: Some(branch.into()),
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
+                },
+                TaskEvent::Claimed {
+                    task_id: TaskId(id.into()),
+                    by: InstanceName::from("dev"),
+                },
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn auto_close_external_merge_fails_closed_on_unreadable_board_3584() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-autoclose-unreadable-board-3584-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let branch = "fix/3584-unreadable-board";
+        seed_claimed_task(&home, "t-3584-unreadable", branch);
+        std::fs::write(home.join("boards"), "not a directory").unwrap();
+
+        auto_close_merged_tasks(&home, branch);
+
+        let task = crate::task_events::replay(&home)
+            .unwrap()
+            .tasks
+            .into_values()
+            .next()
+            .unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Claimed,
+            "incomplete board authority must not close a task"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn auto_close_external_merge_fails_closed_on_ambiguous_board_3584() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-autoclose-ambiguous-board-3584-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let branch = "fix/3584-ambiguous-board";
+        seed_claimed_task(&home, "t-3584-ambiguous", branch);
+        seed_claimed_task(
+            &crate::task_events::board_root(&home, "orgA_projA"),
+            "t-3584-ambiguous",
+            branch,
+        );
+
+        auto_close_merged_tasks(&home, branch);
+
+        for board in [
+            home.clone(),
+            crate::task_events::board_root(&home, "orgA_projA"),
+        ] {
+            let task = crate::task_events::replay(&board)
+                .unwrap()
+                .tasks
+                .into_values()
+                .next()
+                .unwrap();
+            assert_eq!(
+                task.status,
+                TaskStatus::Claimed,
+                "ambiguous task identity must not close either copy"
+            );
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 

@@ -568,6 +568,11 @@ fn handle_done(
         None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
     let result_text = args["result"].as_str().map(String::from);
+    let expected_branch = args
+        .get("expected_branch")
+        .and_then(Value::as_str)
+        .filter(|branch| !branch.is_empty())
+        .map(String::from);
     let caller = instance_name.to_string();
     // #2760: resolve the task's authoritative board ONCE via the strict route
     // (fail-closed); reuse it for the ACL gate, pre-checks, and the checked append.
@@ -664,6 +669,7 @@ fn handle_done(
     // so the post-lock read-back reads the right board.
     #[cfg(test)]
     super::fire_before_mutation_commit_hook_for_test();
+    let expected_branch_for_commit = expected_branch.clone();
     let append_result = routed.with_revalidated_board(home, |board| {
         crate::task_events::append_checked_at(board, &emitter, event, |state| {
             let tv = state
@@ -672,6 +678,14 @@ fn handle_done(
                 .map(record_to_task)
                 .find(|t| t.id == done_id)
                 .ok_or_else(|| format!("task '{done_id}' not found"))?;
+            if let Some(expected_branch) = expected_branch_for_commit.as_deref() {
+                if tv.branch.as_deref() != Some(expected_branch) {
+                    return Err(format!(
+                        "branch precondition failed for task {done_id}: expected '{expected_branch}', found '{}'",
+                        tv.branch.as_deref().unwrap_or("<none>")
+                    ));
+                }
+            }
             if !tv
                 .status
                 .can_transition_to(crate::task_events::TaskStatus::Done)
@@ -758,7 +772,14 @@ fn handle_done(
                     "status": "done",
                 })
             }
-            Ok(Err(reason)) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
+            Ok(Err(reason)) => {
+                let code = if reason.starts_with("illegal transition") {
+                    "illegal_transition"
+                } else {
+                    "precondition_failed"
+                };
+                serde_json::json!({"error": reason, "code": code})
+            }
             Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
         },
     }
