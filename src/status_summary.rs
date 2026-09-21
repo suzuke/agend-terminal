@@ -344,6 +344,126 @@ mod tests {
         assert!(!contains_as_token("test", ""));
     }
 
+    /// #3584 RED: external merge auto-close must discover structured tasks on
+    /// the authoritative project board, not only the default board.
+    #[test]
+    fn auto_close_external_merge_discovers_project_board_task_3584_red() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-autoclose-project-board-3584-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            r#"
+instances:
+  devA:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+"#,
+        )
+        .unwrap();
+
+        let task_id = crate::tasks::handle(
+            &home,
+            "devA",
+            &serde_json::json!({
+                "action": "create",
+                "title": "project-board merge settlement",
+                "assignee": "devA",
+            }),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            crate::tasks::handle(
+                &home,
+                "devA",
+                &serde_json::json!({"action": "claim", "id": &task_id}),
+            )["event"],
+            "claimed"
+        );
+        let branch = "fix/3584-project-board-merge";
+        assert!(crate::tasks::link_branch_to_task(&home, &task_id, branch).unwrap());
+
+        auto_close_merged_tasks(&home, branch);
+
+        let task = crate::tasks::list_all_strict(&home)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Done,
+            "external merge must settle the structured project-board task"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3584 RED: a branch relink between candidate discovery and the routed
+    /// done commit must not let an old merge close the new branch's work.
+    #[test]
+    fn auto_close_external_merge_rejects_branch_retarget_3584_red() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-autoclose-branch-retarget-3584-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let task_id = crate::tasks::handle(
+            &home,
+            "dev",
+            &serde_json::json!({
+                "action": "create",
+                "title": "branch retarget merge settlement",
+                "assignee": "dev",
+            }),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            crate::tasks::handle(
+                &home,
+                "dev",
+                &serde_json::json!({"action": "claim", "id": &task_id}),
+            )["event"],
+            "claimed"
+        );
+        let merged_branch = "fix/3584-old-merge";
+        let new_branch = "fix/3584-new-work";
+        assert!(crate::tasks::link_branch_to_task(&home, &task_id, merged_branch).unwrap());
+
+        let hook_home = home.clone();
+        let hook_task_id = task_id.clone();
+        crate::tasks::set_before_mutation_commit_hook_for_test(move || {
+            assert!(
+                crate::tasks::link_branch_to_task(&hook_home, &hook_task_id, new_branch)
+                    .unwrap()
+            );
+        });
+        auto_close_merged_tasks(&home, merged_branch);
+
+        let task = crate::tasks::list_all_strict(&home)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        assert_eq!(task.branch.as_deref(), Some(new_branch));
+        assert_eq!(
+            task.status,
+            TaskStatus::Claimed,
+            "old merge must not close work retargeted to a new branch"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn auto_close_skips_unverified_task() {
         // F1 invariant: only verified → done, never skip review
