@@ -1524,17 +1524,54 @@ fn handle_sweep_with_owner_authority(
     // None (shipped/superseded categories skipped without repo).
     let repo_owned: Option<String> = args["repository"]
         .as_str()
+        .filter(|repo| !repo.trim().is_empty())
         .map(String::from)
         .or_else(|| crate::daemon::task_sweep::load_sweep_config_for_doctor(home).repo);
+    let repository_scope = repo_owned.as_deref().map(|repository| {
+        crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(home, repository)
+    });
+    if let Some(scope) = repository_scope
+        .as_ref()
+        .filter(|scope| !scope.diagnostics.is_empty())
+    {
+        let diagnostics =
+            serde_json::to_value(&scope.diagnostics).unwrap_or_else(|_| serde_json::json!([]));
+        if !apply {
+            return serde_json::json!({
+                "dry_run": true,
+                "categories": super::sweep::Categories::default().as_json(),
+                "candidate_ids": [],
+                "total_candidates": 0,
+                "diagnostics": diagnostics,
+                "repository_scope": scope.as_json(),
+                "owner_authority": authority.as_json(),
+                "to_apply_hint": "resolve repository scope before applying",
+            });
+        }
+        return serde_json::json!({
+            "error": "repository scope is not apply-capable",
+            "code": "repository_scope_unavailable",
+            "diagnostics": diagnostics,
+            "repository_scope": scope.as_json(),
+        });
+    }
+    let scope_projects = repository_scope.as_ref().map(|scope| {
+        scope
+            .projects
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+    });
     let now = chrono::Utc::now();
     let pr_lookup: super::sweep::PrLookup = &super::sweep::gh_pr_lookup;
     let issue_lookup: super::sweep::IssueLookup = &super::sweep::gh_issue_lookup;
-    let categories = match super::sweep::scan_categories_with_authority(
+    let categories = match super::sweep::scan_categories_with_authority_scoped(
         home,
         authority,
         pr_lookup,
         issue_lookup,
         repo_owned.as_deref(),
+        scope_projects.as_ref(),
         now,
     ) {
         Ok(categories) => categories,
@@ -1551,6 +1588,8 @@ fn handle_sweep_with_owner_authority(
             "categories": categories.as_json(),
             "candidate_ids": categories.all_ids(),
             "total_candidates": categories.total(),
+            "diagnostics": categories.diagnostics,
+            "repository_scope": repository_scope.as_ref().map(|scope| scope.as_json()),
             "owner_authority": authority.as_json(),
             "to_apply_hint": "task action=sweep apply=true confirm_ids=<subset> audit_reason=<...>",
         });
@@ -1566,13 +1605,36 @@ fn handle_sweep_with_owner_authority(
             "error": "apply=true requires non-empty 'audit_reason' for the cross-board event log entry"
         });
     }
+    if !categories.diagnostics.is_empty() {
+        return serde_json::json!({
+            "error": "repository provider unavailable; no candidates are apply-capable",
+            "code": "provider_unavailable",
+            "diagnostics": categories.diagnostics,
+            "repository_scope": repository_scope.as_ref().map(|scope| scope.as_json()),
+        });
+    }
     let candidate_set: std::collections::HashSet<String> =
         categories.all_ids().into_iter().collect();
     let unknown: Vec<String> = confirm_ids.difference(&candidate_set).cloned().collect();
     if !unknown.is_empty() {
+        let foreign: Vec<String> = if let Some(scope) = scope_projects.as_ref() {
+            unknown
+                .iter()
+                .filter(|id| {
+                    crate::tasks::load_routed(home, id)
+                        .ok()
+                        .is_some_and(|routed| !scope.contains(routed.board().project()))
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         return serde_json::json!({
             "error": "confirm_ids contained entries not in current sweep candidates",
             "unknown": unknown,
+            "foreign_confirm_ids": foreign,
+            "code": if foreign.is_empty() { "confirm_ids_unknown" } else { "repository_scope_confirm_id_out_of_scope" },
             "hint": "re-run dry-run; candidates may have changed since last scan",
         });
     }

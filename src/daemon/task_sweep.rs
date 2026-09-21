@@ -180,6 +180,38 @@ struct SweepPlan {
     default_repo: Option<String>,
 }
 
+/// Read-only repository scope used by the operator-triggered task sweep.
+///
+/// The daemon tick already has a board/repository plan.  Manual sweep is a
+/// separate path, so it needs the same provenance decision without invoking
+/// the tick (which persists provenance and health snapshots).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ManualSweepScopeDiagnostic {
+    pub code: String,
+    pub project_id: Option<String>,
+    pub repository: Option<String>,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ManualSweepRepositoryScope {
+    pub repository: String,
+    pub projects: Vec<String>,
+    pub diagnostics: Vec<ManualSweepScopeDiagnostic>,
+}
+
+impl ManualSweepRepositoryScope {
+    pub(crate) fn as_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| {
+            serde_json::json!({
+                "repository": self.repository,
+                "projects": self.projects,
+                "diagnostics": self.diagnostics,
+            })
+        })
+    }
+}
+
 fn config_path(home: &Path) -> PathBuf {
     home.join("task_sweep.json")
 }
@@ -326,6 +358,180 @@ fn active_team_claims(home: &Path, cfg: &SweepConfig) -> anyhow::Result<BTreeMap
         }
     }
     Ok(resolved)
+}
+
+/// Resolve an operator-supplied repository to boards without mutating the
+/// daemon's provenance or health stores.  Manual sweep must not use the
+/// daemon tick's `resolve_sweep_plan`, because that routine intentionally
+/// persists its reconciliation state.
+pub(crate) fn resolve_manual_sweep_repository_scope(
+    home: &Path,
+    repository: &str,
+) -> ManualSweepRepositoryScope {
+    let repository = match canonical_repo(repository) {
+        Some(repository) => repository,
+        None => {
+            return ManualSweepRepositoryScope {
+                repository: repository.trim().to_string(),
+                projects: Vec::new(),
+                diagnostics: vec![ManualSweepScopeDiagnostic {
+                    code: "INVALID_REPOSITORY".to_string(),
+                    project_id: None,
+                    repository: Some(repository.trim().to_string()),
+                    evidence: "repository must be a canonical owner/repo slug".to_string(),
+                }],
+            }
+        }
+    };
+
+    let cfg = load_config(home);
+    let mut claims = match active_team_claims(home, &cfg) {
+        Ok(claims) => claims,
+        Err(error) => {
+            return ManualSweepRepositoryScope {
+                repository: repository.clone(),
+                projects: Vec::new(),
+                diagnostics: vec![ManualSweepScopeDiagnostic {
+                    code: "AMBIGUOUS_REPOSITORY_MAPPING".to_string(),
+                    project_id: None,
+                    repository: Some(repository),
+                    evidence: error.to_string(),
+                }],
+            }
+        }
+    };
+
+    // Preserve the single-project compatibility rule: when teams do not claim
+    // DEFAULT, the operator's repository is the temporary default-board claim
+    // for this read-only manual sweep.  An explicit team claim always wins.
+    if !claims.contains_key(crate::task_events::DEFAULT_PROJECT) {
+        let mut fallback_cfg = cfg.clone();
+        fallback_cfg.repo = Some(repository.clone());
+        claims = match active_team_claims(home, &fallback_cfg) {
+            Ok(claims) => claims,
+            Err(error) => {
+                return ManualSweepRepositoryScope {
+                    repository: repository.clone(),
+                    projects: Vec::new(),
+                    diagnostics: vec![ManualSweepScopeDiagnostic {
+                        code: "AMBIGUOUS_REPOSITORY_MAPPING".to_string(),
+                        project_id: None,
+                        repository: Some(repository),
+                        evidence: error.to_string(),
+                    }],
+                }
+            }
+        };
+    }
+
+    let boards = match crate::tasks::list_all_boards_checked(home) {
+        Ok(boards) => boards,
+        Err(error) => {
+            return ManualSweepRepositoryScope {
+                repository: repository.clone(),
+                projects: Vec::new(),
+                diagnostics: vec![ManualSweepScopeDiagnostic {
+                    code: "BOARD_ENUMERATION_UNAVAILABLE".to_string(),
+                    project_id: None,
+                    repository: Some(repository),
+                    evidence: error.to_string(),
+                }],
+            }
+        }
+    };
+
+    let target_project = canonical_project_id(&repository);
+    let materialized_unclaimed = boards.iter().any(|(project, tasks)| {
+        canonical_project_id(project) == target_project
+            && !tasks.is_empty()
+            && !claims.contains_key(&target_project)
+    });
+    if target_project != crate::task_events::DEFAULT_PROJECT && materialized_unclaimed {
+        return ManualSweepRepositoryScope {
+            repository,
+            projects: Vec::new(),
+            diagnostics: vec![ManualSweepScopeDiagnostic {
+                code: "MANUAL_UNMAPPED".to_string(),
+                project_id: Some(target_project),
+                repository: None,
+                evidence: "explicit project board has no deterministic team/repo mapping"
+                    .to_string(),
+            }],
+        };
+    }
+
+    let api_base = canonical_api_base(
+        cfg.api_base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_GITHUB_API_BASE),
+    );
+    let provenance = load_provenance(home);
+    let target_projects: Vec<String> = claims
+        .iter()
+        .filter(|(_, claimed_repo)| *claimed_repo == &repository)
+        .map(|(project, _)| project.clone())
+        .collect();
+    let mut projects = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    for project_id in target_projects {
+        let (total_tasks, _) = board_counts(home, &project_id);
+        let key = provenance_key(&project_id, &repository, &api_base);
+        let acknowledged = cfg
+            .provenance_acknowledgements
+            .iter()
+            .any(|ack| ack == &key);
+        let has_active_exact = provenance.entries.iter().any(|entry| {
+            entry.retired_at.is_none()
+                && provenance_key(&entry.project_id, &entry.repo, &entry.api_base) == key
+        });
+        if total_tasks > 0 && !acknowledged && !has_active_exact {
+            diagnostics.push(ManualSweepScopeDiagnostic {
+                code: "BASELINE_UNVERIFIED".to_string(),
+                project_id: Some(project_id),
+                repository: Some(repository.clone()),
+                evidence: format!(
+                    "board has {total_tasks} task(s) but no acknowledged provenance key {key}"
+                ),
+            });
+        } else {
+            projects.push(project_id);
+        }
+    }
+
+    // A named board whose slug matches the requested repository but has no
+    // deterministic claim is operator-owned, not a repository mapping.
+    if projects.is_empty() && diagnostics.is_empty() {
+        let materialized = boards.iter().any(|(project, tasks)| {
+            canonical_project_id(project) == target_project && !tasks.is_empty()
+        });
+        if materialized && !claims.contains_key(&target_project) {
+            diagnostics.push(ManualSweepScopeDiagnostic {
+                code: "MANUAL_UNMAPPED".to_string(),
+                project_id: Some(target_project),
+                repository: None,
+                evidence: "explicit project board has no deterministic team/repo mapping"
+                    .to_string(),
+            });
+        }
+    }
+
+    if projects.is_empty() && diagnostics.is_empty() {
+        diagnostics.push(ManualSweepScopeDiagnostic {
+            code: "MANUAL_UNMAPPED".to_string(),
+            project_id: None,
+            repository: Some(repository.clone()),
+            evidence: "repository has no deterministic project-board mapping".to_string(),
+        });
+    }
+
+    projects.sort();
+    projects.dedup();
+    ManualSweepRepositoryScope {
+        repository,
+        projects,
+        diagnostics,
+    }
 }
 
 fn current_board_projects(home: &Path) -> HashSet<String> {

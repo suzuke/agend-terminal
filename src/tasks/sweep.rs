@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 /// Snapshot of the two authorities needed before a task owner can become an
@@ -179,10 +179,17 @@ pub(super) struct Categories {
     /// are intentionally excluded from `all_ids()` and therefore cannot enter
     /// the cancellation apply path.
     pub stale_nonterminal: Vec<Candidate>,
+    /// Provider failures are explicit blocking diagnostics.  They are kept
+    /// separate from candidate categories so a failed lookup cannot become an
+    /// apply-capable ID through a partial scan.
+    pub diagnostics: Vec<serde_json::Value>,
 }
 
 impl Categories {
     pub fn all_ids(&self) -> Vec<String> {
+        if !self.diagnostics.is_empty() {
+            return Vec::new();
+        }
         let mut v: Vec<String> = self
             .shipped
             .iter()
@@ -210,6 +217,7 @@ impl Categories {
             "validation_leftovers": self.validation_leftovers,
             "stale_open": self.stale_open,
             "stale_nonterminal": self.stale_nonterminal,
+            "diagnostics": self.diagnostics,
         })
     }
 }
@@ -257,8 +265,21 @@ pub(super) fn scan_categories_with_authority(
     repo: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Categories, super::TaskRouteError> {
+    scan_categories_with_authority_scoped(home, authority, pr_lookup, issue_lookup, repo, None, now)
+}
+
+pub(super) fn scan_categories_with_authority_scoped(
+    home: &Path,
+    authority: &OwnerAuthority,
+    pr_lookup: PrLookup,
+    issue_lookup: IssueLookup,
+    repo: Option<&str>,
+    scope: Option<&BTreeSet<String>>,
+    now: DateTime<Utc>,
+) -> Result<Categories, super::TaskRouteError> {
     let tasks = crate::tasks::board_router::list_all_boards_checked(home)?
         .into_iter()
+        .filter(|(project, _)| scope.is_none_or(|scope| scope.contains(project)))
         .flat_map(|(project, tasks)| {
             tasks.into_iter().map(move |mut task| {
                 task.metadata
@@ -270,6 +291,7 @@ pub(super) fn scan_categories_with_authority(
     let mut cats = Categories::default();
     let mut pr_cache: HashMap<u32, PrState> = HashMap::new();
     let mut issue_cache: HashMap<u32, IssueState> = HashMap::new();
+    let mut provider_errors = BTreeSet::new();
     for t in &tasks {
         if t.status.is_terminal() || t.status == crate::task_events::TaskStatus::Verified {
             continue;
@@ -394,13 +416,27 @@ pub(super) fn scan_categories_with_authority(
                             refs.pr_nums.iter().all(|&n| {
                                 matches!(
                                     pr_cache.entry(n).or_insert_with(|| {
-                                        pr_lookup(repo, n).unwrap_or(PrState::Unknown)
+                                        match pr_lookup(repo, n) {
+                                            Ok(state) => state,
+                                            Err(error) => {
+                                                provider_errors
+                                                    .insert(format!("{repo}: PR #{n}: {error}"));
+                                                PrState::Unknown
+                                            }
+                                        }
                                     }),
                                     PrState::Merged { .. } | PrState::Closed
                                 )
                             }) && refs.issue_nums.iter().all(|&n| {
                                 *issue_cache.entry(n).or_insert_with(|| {
-                                    issue_lookup(repo, n).unwrap_or(IssueState::Unknown)
+                                    match issue_lookup(repo, n) {
+                                        Ok(state) => state,
+                                        Err(error) => {
+                                            provider_errors
+                                                .insert(format!("{repo}: issue #{n}: {error}"));
+                                            IssueState::Unknown
+                                        }
+                                    }
                                 }) == IssueState::Closed
                             })
                         } else {
@@ -440,7 +476,13 @@ pub(super) fn scan_categories_with_authority(
             if let Some(pr_num) = extract_pr_number(&search_text) {
                 let state = pr_cache
                     .entry(pr_num)
-                    .or_insert_with(|| pr_lookup(repo, pr_num).unwrap_or(PrState::Unknown))
+                    .or_insert_with(|| match pr_lookup(repo, pr_num) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            provider_errors.insert(format!("{repo}: PR #{pr_num}: {error}"));
+                            PrState::Unknown
+                        }
+                    })
                     .clone();
                 match state {
                     PrState::Merged { merged_at } => {
@@ -516,13 +558,25 @@ pub(super) fn scan_categories_with_authority(
             matches!(
                 pr_cache
                     .entry(n)
-                    .or_insert_with(|| pr_lookup(repo, n).unwrap_or(PrState::Unknown)),
+                    .or_insert_with(|| match pr_lookup(repo, n) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            provider_errors.insert(format!("{repo}: PR #{n}: {error}"));
+                            PrState::Unknown
+                        }
+                    }),
                 PrState::Merged { .. } | PrState::Closed
             )
         }) && refs.issue_nums.iter().all(|&n| {
             *issue_cache
                 .entry(n)
-                .or_insert_with(|| issue_lookup(repo, n).unwrap_or(IssueState::Unknown))
+                .or_insert_with(|| match issue_lookup(repo, n) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        provider_errors.insert(format!("{repo}: issue #{n}: {error}"));
+                        IssueState::Unknown
+                    }
+                })
                 == IssueState::Closed
         });
         if all_terminal {
@@ -543,6 +597,16 @@ pub(super) fn scan_categories_with_authority(
             ));
         }
     }
+    cats.diagnostics = provider_errors
+        .into_iter()
+        .map(|evidence| {
+            serde_json::json!({
+                "code": "PROVIDER_UNAVAILABLE",
+                "repository": repo,
+                "evidence": evidence,
+            })
+        })
+        .collect();
     Ok(cats)
 }
 
