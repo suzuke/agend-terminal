@@ -25,9 +25,17 @@ use std::path::Path;
 /// matched), or an `Err` carrying the underlying replay / append
 /// failure detail for the caller to surface into its audit chain.
 pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, String> {
+    orphan_tasks_for_owner_at(
+        home,
+        &crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT),
+        owner_name,
+    )
+}
+
+fn orphan_tasks_for_owner_at(home: &Path, board: &Path, owner_name: &str) -> Result<usize, String> {
     use crate::task_events::{InstanceName, TaskEvent, TaskStatus};
 
-    let state = crate::task_events::projected_state(home).map_err(|e| e.to_string())?;
+    let state = crate::task_events::projected_state_at(board).map_err(|e| e.to_string())?;
     let affected: Vec<crate::task_events::TaskId> = state
         .tasks
         .values()
@@ -57,7 +65,7 @@ pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, St
             routed_to: None,
         })
         .collect();
-    crate::task_events::append_batch(home, &emitter, events).map_err(|e| e.to_string())?;
+    crate::task_events::append_batch_at(board, &emitter, events).map_err(|e| e.to_string())?;
     // #1916: an orphaned task has NO owner → clear its dispatch-idle sidecar so the
     // watchdog stops nudging the (now-removed) former owner. Same helper as the
     // reassign path, with owner=None. Best-effort, post-append (the orphan is
@@ -448,75 +456,100 @@ pub fn reconcile_orphan_owners_with_live(home: &Path, live: &std::collections::H
             .ok()
             .map(|c| c.instances.keys().cloned().collect())
             .unwrap_or_default();
-    let state = match crate::task_events::projected_state(home) {
-        Ok(s) => s,
-        Err(e) => {
+    let empty_confirm_ids = std::collections::HashSet::new();
+    let boards = match crate::tasks::list_all_boards_checked(home) {
+        Ok(boards) => boards
+            .into_iter()
+            .map(|(project, _)| project)
+            .collect::<Vec<_>>(),
+        Err(error) => {
             tracing::warn!(
-                error = %e,
-                "#829: task_events replay failed — skipping orphan-owner sweep"
+                %error,
+                "#829: task board enumeration failed — skipping orphan-owner sweep"
             );
             return;
         }
     };
 
-    let empty_confirm_ids = std::collections::HashSet::new();
-    let in_review_plan = plan_strict_in_review_ghosts(
-        &state,
-        live,
-        &fleet_instances,
-        false,
-        &empty_confirm_ids,
-        "",
-    );
-    if in_review_plan["total_candidates"]
-        .as_u64()
-        .unwrap_or_default()
-        > 0
-    {
-        tracing::warn!(
-            candidates = in_review_plan["total_candidates"]
-                .as_u64()
-                .unwrap_or_default(),
-            "#829: strict ghost owners on InReview tasks are report-only; no mutation applied"
+    let mut found_candidate = false;
+    for project in boards {
+        let board = crate::task_events::board_root(home, &project);
+        let state = match crate::task_events::projected_state_at(&board) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    %project,
+                    %error,
+                    "#829: task_events board replay failed — skipping board"
+                );
+                continue;
+            }
+        };
+        let in_review_plan = plan_strict_in_review_ghosts(
+            &state,
+            live,
+            &fleet_instances,
+            false,
+            &empty_confirm_ids,
+            "",
         );
-    }
+        if in_review_plan["total_candidates"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0
+        {
+            tracing::warn!(
+                %project,
+                candidates = in_review_plan["total_candidates"]
+                    .as_u64()
+                    .unwrap_or_default(),
+                "#829: strict ghost owners on InReview tasks are report-only; no mutation applied"
+            );
+        }
 
-    let result = scan_orphan_candidates(&state, live, &fleet_instances);
-    if result.strict.is_empty() && result.soft.is_empty() {
-        tracing::debug!("#829: orphan-owner sweep clean — no ghost owners detected");
-        return;
-    }
+        let result = scan_orphan_candidates(&state, live, &fleet_instances);
+        if result.strict.is_empty() && result.soft.is_empty() {
+            continue;
+        }
+        found_candidate = true;
 
-    // Strict bucket → auto-apply via orphan_tasks_for_owner.
-    for (owner, task_ids) in &result.strict {
-        match orphan_tasks_for_owner(home, owner) {
-            Ok(n) => tracing::info!(
-                owner = %owner,
-                tasks = task_ids.len(),
-                orphaned = n,
-                "#829: orphan-owner sweep applied (strict — owner fully gone)"
-            ),
-            Err(e) => tracing::warn!(
-                owner = %owner,
-                error = %e,
-                "#829: orphan-owner sweep failed for strict candidate"
-            ),
+        // Strict bucket → auto-apply via the board-local event log.
+        for (owner, task_ids) in &result.strict {
+            match orphan_tasks_for_owner_at(home, &board, owner) {
+                Ok(n) => tracing::info!(
+                    %project,
+                    owner = %owner,
+                    tasks = task_ids.len(),
+                    orphaned = n,
+                    "#829: orphan-owner sweep applied (strict — owner fully gone)"
+                ),
+                Err(e) => tracing::warn!(
+                    %project,
+                    owner = %owner,
+                    error = %e,
+                    "#829: orphan-owner sweep failed for strict candidate"
+                ),
+            }
+        }
+
+        // Soft bucket → dry-run + warn (no mutation).
+        if !result.soft.is_empty() {
+            let soft_summary: Vec<(String, usize)> = result
+                .soft
+                .iter()
+                .map(|(owner, ids)| (owner.clone(), ids.len()))
+                .collect();
+            tracing::warn!(
+                %project,
+                ?soft_summary,
+                "#829: detected tasks owned by configured-but-not-live agents \
+                 (in fleet.yaml ∧ ∉ live registry); operator may run `task action=sweep` \
+                 to apply orphan cleanup"
+            );
         }
     }
-
-    // Soft bucket → dry-run + warn (no mutation).
-    if !result.soft.is_empty() {
-        let soft_summary: Vec<(String, usize)> = result
-            .soft
-            .iter()
-            .map(|(owner, ids)| (owner.clone(), ids.len()))
-            .collect();
-        tracing::warn!(
-            ?soft_summary,
-            "#829: detected tasks owned by configured-but-not-live agents \
-             (in fleet.yaml ∧ ∉ live registry); operator may run `task action=sweep` \
-             to apply orphan cleanup"
-        );
+    if !found_candidate {
+        tracing::debug!("#829: orphan-owner sweep clean — no ghost owners detected");
     }
 }
 

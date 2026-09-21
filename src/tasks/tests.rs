@@ -539,6 +539,57 @@ fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3584 regression: boot ghost-owner recovery covers every authoritative
+/// board, not only the default board. The pre-fix entrypoint read and wrote
+/// through the home-default task-event wrappers, so a strict ghost on an
+/// explicit project board survived despite the aggregate health scan seeing it.
+#[test]
+fn reconcile_orphan_owners_with_live_covers_explicit_board() {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let home = tmp_home("reconcile_explicit_board");
+    let board = crate::task_events::board_root(&home, "owner/repo");
+    let emitter = InstanceName::from("test:seed");
+    let tid = TaskId("t-ghost-explicit-board".into());
+    crate::task_events::append_batch_at(
+        &board,
+        &emitter,
+        vec![TaskEvent::Created {
+            task_id: tid.clone(),
+            title: "ghost-owned explicit-board task".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: Some(InstanceName::from("gone-explicit-owner")),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: vec![],
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+        }],
+    )
+    .expect("seed explicit-board task");
+
+    reconcile_orphan_owners_with_live(&home, &std::collections::HashSet::new());
+
+    let post = crate::task_events::projected_state_at(&board).expect("explicit board replay");
+    assert!(
+        post.tasks
+            .get(&tid)
+            .and_then(|record| record.owner.as_ref())
+            .is_none(),
+        "strict ghost owner on explicit board must be cleared (got {:?})",
+        post.tasks
+            .get(&tid)
+            .and_then(|record| record.owner.as_ref())
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn reconcile_mixed_owner_does_not_orphan_in_review_task() {
     use crate::task_events::{InstanceName, TaskEvent, TaskId};
