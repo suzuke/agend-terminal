@@ -398,6 +398,13 @@ mod tests {
             .join(".agend-recovery-binding.json.sig")
             .is_file());
         assert!(crate::binding::read(&home, &instance).is_none());
+        assert_eq!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery receipt")
+                .expect("CLI recovery must journal signed binding")
+                .state,
+            crate::agent::deletion_recovery::State::Recovered
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -509,6 +516,74 @@ mod tests {
             std::fs::read(report.archive.join("leftover.txt")).expect("read archived payload"),
             b"archived before receipt"
         );
+        assert_eq!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery receipt")
+                .expect("receipt must persist")
+                .state,
+            crate::agent::deletion_recovery::State::Recovered
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn archive_metadata_gap_is_recoverable_after_restart() {
+        let home = temp_home("metadata-gap");
+        let instance = format!("recovery-metadata-gap-{}", std::process::id());
+        let branch = "review/metadata-gap";
+        let source_repo = home.join("source-repo");
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
+        let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+            .join(&instance)
+            .join("review-metadata-gap");
+        std::fs::create_dir_all(&worktree).expect("create worktree fixture");
+        crate::binding::bind_full(&home, &instance, "", branch, &worktree, &source_repo, false)
+            .expect("bind recovery fixture");
+        crate::agent::deletion_recovery::begin_from_binding(&home, &instance)
+            .expect("persist deleting tombstone")
+            .expect("signed binding must enter recovery lane");
+
+        let archive = home
+            .join(".trash")
+            .join("worktrees")
+            .join(format!("{instance}-metadata-gap"));
+        std::fs::create_dir_all(&archive).expect("create partial archive fixture");
+        std::fs::write(
+            archive.join("leftover.txt"),
+            b"archive survived metadata crash",
+        )
+        .expect("write archived payload fixture");
+        crate::agent::deletion_recovery::mark_recovery_required(&home, &instance, Some(&archive))
+            .expect("persist archive path before simulated crash");
+        std::fs::remove_dir_all(&worktree).expect("simulate rename before metadata writes");
+
+        let report = recover_markerless_bound_worktree(
+            &home,
+            "operator",
+            "complete metadata after restart",
+            &instance,
+            branch,
+            &worktree,
+            &source_repo,
+        )
+        .expect("recovery must complete metadata after rename crash");
+
+        assert_eq!(
+            std::fs::read(report.archive.join("leftover.txt")).expect("read archived payload"),
+            b"archive survived metadata crash"
+        );
+        assert!(report
+            .archive
+            .join(".agend-recovery-binding.json")
+            .is_file());
+        assert!(report
+            .archive
+            .join(".agend-recovery-binding.json.sig")
+            .is_file());
+        assert!(report
+            .archive
+            .join(".agend-recovery-manifest.json")
+            .is_file());
         assert_eq!(
             crate::agent::deletion_recovery::read(&home, &instance)
                 .expect("read recovery receipt")
