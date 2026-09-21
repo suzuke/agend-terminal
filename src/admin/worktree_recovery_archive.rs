@@ -198,6 +198,31 @@ pub(super) fn recover_recorded_archive(
                 .map(|(body, signature)| (body.as_slice(), signature.as_slice()))
         })
         .ok_or_else(|| "recovery refused: archive has no signed binding evidence".to_string())?;
+    let binding: serde_json::Value = serde_json::from_slice(evidence_binding)
+        .map_err(|e| format!("recovery refused: archived binding is invalid JSON: {e}"))?;
+    if binding["branch"].as_str() != Some(tombstone.branch.as_str())
+        || binding["worktree"].as_str() != Some(tombstone.worktree.as_str())
+        || binding["source_repo"].as_str() != Some(tombstone.source_repo.as_str())
+    {
+        return Err(
+            "recovery refused: archived binding identity does not match tombstone".to_string(),
+        );
+    }
+    let task_id = binding["task_id"].as_str().unwrap_or_default();
+    if !task_id.is_empty() {
+        let routed = crate::tasks::load_routed(home, task_id)
+            .map_err(|e| format!("recovery refused: task '{task_id}' is unreadable: {e}"))?;
+        if !routed.task.status.is_terminal() {
+            return Err(format!(
+                "recovery refused: task '{task_id}' is still active"
+            ));
+        }
+    }
+    if !binding_exists && crate::worktree_pool::is_agent_alive(home, instance) {
+        return Err(format!(
+            "recovery refused: instance '{instance}' still shows liveness"
+        ));
+    }
     write_archive_metadata(
         &archive,
         actor,
