@@ -32,6 +32,7 @@ pub(crate) struct NestedDirtDiscard<'a> {
 pub(crate) enum ReleaseTestPhase {
     AfterBindingSnapshot,
     BeforeWorktreeRemove,
+    AfterWorktreeRemoveBeforeBindingClear,
     BeforeNoticeEmit,
     CheckoutBoundBeforeCommit,
 }
@@ -927,14 +928,16 @@ fn release_known_locked(
             #[cfg(test)]
             release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
             match remove_worktree(agent, wt_path, &source_repo) {
-                WorktreeRemoval::Removed => {
-                    managed_verified = true;
-                    out.worktree_removed = true;
+        WorktreeRemoval::Removed => {
+            managed_verified = true;
+            out.worktree_removed = true;
                     // Success path: a prior refused release may have left a
                     // per-worktree unpreservable-nested-dirt notice marker; clear
                     // it (+ its lock) so a future re-lease of this path re-notifies
                     // from a clean slate. Best-effort.
                     clear_refusal_marker = Some(wt_path.to_path_buf());
+                    #[cfg(test)]
+                    release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
                 }
                 WorktreeRemoval::AlreadyAbsent => {
                     worktree_absent = true;
@@ -1539,11 +1542,15 @@ fn release_bound_target_exact_impl(
         WorktreeRemoval::Removed => {
             out.worktree_removed = true;
             clear_marker = true;
+            #[cfg(test)]
+            release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
             let removal = clear_binding_state(home, agent, permit);
             record_binding_removal(&mut out, removal);
             out.released = out.error.is_none() && out.binding_removed;
         }
         WorktreeRemoval::AlreadyAbsent => {
+            #[cfg(test)]
+            release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
             let removal = clear_binding_state(home, agent, permit);
             record_binding_removal(&mut out, removal);
             out.released = out.error.is_none() && out.binding_removed;
@@ -2301,6 +2308,8 @@ fn release_absent_target_impl(
             out.released = true;
             out.already_released = true;
             out.worktree_removed = true;
+            #[cfg(test)]
+            release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
         }
         WorktreeRemoval::AlreadyAbsent => {
             if let Some(detail) = &discard_audit_detail {
@@ -2308,6 +2317,8 @@ fn release_absent_target_impl(
             }
             out.released = true;
             out.already_released = true;
+            #[cfg(test)]
+            release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
         }
         WorktreeRemoval::Unmanaged(error) | WorktreeRemoval::Failed(error) => {
             if let Some(detail) = &discard_audit_detail {

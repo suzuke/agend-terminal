@@ -4977,6 +4977,50 @@ fn release_remove_failure_retains_binding_with_structured_stage() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3696 RED: the real normal release path must journal the exact signed
+/// binding before removing the worktree.  An interruption after physical
+/// removal and before binding clear must leave a durable recovery fence so a
+/// daemon restart can route the residue to operator recovery.
+#[test]
+fn normal_release_interruption_retains_durable_recovery_journal_3696() {
+    let home = tmp_home("release-journal-red");
+    let repo = tmp_repo("release-journal-red-repo");
+    let lease = lease_bound(&home, &repo, "agent-release-journal", "feat/release-journal");
+    let binding_path = crate::paths::binding_path(&home, "agent-release-journal");
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-release-journal")
+        .join("binding.json.sig");
+    let binding_before = std::fs::read(&binding_path).expect("read binding before release");
+    let signature_before = std::fs::read(&signature_path).expect("read binding signature before release");
+
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _hook = release_test_seam::install(|phase| {
+            if phase == ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear {
+                panic!("simulate daemon interruption after physical removal");
+            }
+        });
+        release_full(&home, "agent-release-journal", false);
+    }));
+
+    assert!(interrupted.is_err(), "the seam must simulate an interruption");
+    assert!(!lease.path.exists(), "physical remove must have happened first");
+    assert_eq!(
+        std::fs::read(&binding_path).expect("binding remains after interruption"),
+        binding_before
+    );
+    assert_eq!(
+        std::fs::read(&signature_path).expect("signature remains after interruption"),
+        signature_before
+    );
+    let journal = crate::agent::deletion_recovery::read(&home, "agent-release-journal")
+        .expect("read release recovery journal")
+        .expect("normal release must persist a recovery journal before removal");
+    assert_eq!(journal.state, crate::agent::deletion_recovery::State::RecoveryRequired);
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 #[test]
 fn release_full_clean_worktree_creates_no_recovery_ref() {
     let home = tmp_home("release-clean-noref");
