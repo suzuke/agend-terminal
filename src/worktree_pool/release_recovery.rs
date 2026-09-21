@@ -73,6 +73,15 @@ pub(crate) fn prepare_release_journal(home: &Path, agent: &str) -> Result<(), St
     if binding["source_repo"].as_str().is_none_or(str::is_empty) {
         return Ok(());
     }
+    // Bindings written before the signed-source rollout may still carry a
+    // source_repo field but have no signature sidecar. Preserve their legacy
+    // release path; a present-but-invalid sidecar remains fail-closed below.
+    let signature_path = crate::paths::runtime_dir(home)
+        .join(agent)
+        .join("binding.json.sig");
+    if !signature_path.exists() {
+        return Ok(());
+    }
     match crate::agent::deletion_recovery::begin_from_binding(home, agent)? {
         Some(_) => Ok(()),
         None => Err(
@@ -87,6 +96,11 @@ pub(crate) fn clear_release_recovery_journal(home: &Path, agent: &str) -> Result
 }
 
 pub(crate) fn mark_release_recovery_required(home: &Path, agent: &str) -> Result<(), String> {
+    if crate::agent::deletion_recovery::read(home, agent)?.is_none() {
+        // Unsigned legacy bindings do not enter the durable recovery lane and
+        // retain the pre-#3696 absent-target release behavior.
+        return Ok(());
+    }
     crate::agent::deletion_recovery::mark_recovery_required(home, agent, None)
 }
 
