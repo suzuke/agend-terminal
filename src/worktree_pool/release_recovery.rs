@@ -2,6 +2,55 @@ use std::path::Path;
 
 use super::ReleaseOutcome;
 
+fn stale_release() -> ReleaseOutcome {
+    ReleaseOutcome {
+        stale_fingerprint: true,
+        error: Some(
+            "release refused: binding fingerprint changed before destructive authority was reacquired"
+                .to_string(),
+        ),
+        ..ReleaseOutcome::default()
+    }
+}
+
+pub(crate) fn stale_release_after_snapshot(
+    home: &Path,
+    agent: &str,
+    snapshot: &serde_json::Value,
+    fingerprint: &crate::binding::BindingFingerprint,
+) -> ReleaseOutcome {
+    let mut outcome = stale_release();
+    if let Err(error) = clear_if_matches_snapshot(home, agent, snapshot, fingerprint) {
+        outcome.error = Some(format!(
+            "{}; superseded recovery journal could not be cleared: {error}",
+            outcome.error.as_deref().unwrap_or("release refused")
+        ));
+    }
+    outcome
+}
+
+/// Clear a preflight journal only when the stale snapshot proves it owns that
+/// exact signed generation. A replacement binding must never inherit a
+/// predecessor's recovery fence.
+pub(crate) fn clear_if_matches_snapshot(
+    home: &Path,
+    agent: &str,
+    binding: &serde_json::Value,
+    fingerprint: &crate::binding::BindingFingerprint,
+) -> Result<(), String> {
+    let Some(tombstone) = crate::agent::deletion_recovery::read(home, agent)? else {
+        return Ok(());
+    };
+    if tombstone.binding_sha256 != fingerprint.digest
+        || tombstone.branch != binding["branch"].as_str().unwrap_or_default()
+        || tombstone.worktree != binding["worktree"].as_str().unwrap_or_default()
+        || tombstone.source_repo != binding["source_repo"].as_str().unwrap_or_default()
+    {
+        return Ok(());
+    }
+    crate::agent::deletion_recovery::clear(home, agent)
+}
+
 pub(crate) fn clear_binding_state(
     home: &Path,
     agent: &str,

@@ -26,7 +26,7 @@ mod release_recovery;
 pub(crate) use release_recovery::prepare_release_journal;
 use release_recovery::{
     clear_binding_state, clear_release_recovery_journal, mark_release_recovery_required,
-    record_binding_removal,
+    record_binding_removal, stale_release_after_snapshot,
 };
 
 mod target_identity;
@@ -1063,7 +1063,7 @@ fn release_full_guarded(
         Ok(GuardedBinding::Known { value, fingerprint }) => (value, fingerprint),
     };
     if expected.is_some_and(|expected| expected != &fingerprint) {
-        return stale_release();
+        return stale_release_after_snapshot(home, agent, &snapshot, &fingerprint);
     }
     #[cfg(test)]
     release_test_seam::hit(ReleaseTestPhase::AfterBindingSnapshot);
@@ -1111,7 +1111,9 @@ fn release_full_guarded(
             value,
             fingerprint: live,
         } if live == fingerprint => value,
-        GuardedBinding::Known { .. } => return stale_release(),
+        GuardedBinding::Known { .. } => {
+            return stale_release_after_snapshot(home, agent, &snapshot, &fingerprint)
+        }
     };
     let wt_path = current["worktree"].as_str().unwrap_or("");
     let wt_exists = !wt_path.is_empty() && Path::new(wt_path).exists();

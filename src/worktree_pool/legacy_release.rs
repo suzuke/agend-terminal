@@ -6,6 +6,33 @@ use std::path::{Path, PathBuf};
 /// recovery guidance and never authorize implicit deletion.
 pub(super) fn absent_release_outcome(home: &Path, agent: &str) -> super::ReleaseOutcome {
     let Some(candidate) = find_survivor_candidate(home, agent) else {
+        match crate::agent::deletion_recovery::read(home, agent) {
+            Ok(Some(tombstone))
+                if tombstone.state == crate::agent::deletion_recovery::State::RecoveryRequired =>
+            {
+                if let Err(error) = crate::agent::deletion_recovery::clear(home, agent) {
+                    return super::ReleaseOutcome {
+                        error: Some(format!(
+                            "release recovery receipt could not be settled: {error}"
+                        )),
+                        code: Some("release_incomplete"),
+                        stage: Some("release_journal"),
+                        ..super::ReleaseOutcome::default()
+                    };
+                }
+            }
+            Err(error) => {
+                return super::ReleaseOutcome {
+                    error: Some(format!(
+                        "release recovery receipt could not be read: {error}"
+                    )),
+                    code: Some("release_incomplete"),
+                    stage: Some("release_journal"),
+                    ..super::ReleaseOutcome::default()
+                };
+            }
+            _ => {}
+        }
         return super::idempotent_absent();
     };
     let layout = if candidate.flat { "flat" } else { "nested" };

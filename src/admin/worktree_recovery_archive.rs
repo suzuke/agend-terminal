@@ -1,6 +1,28 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn canonicalize_with_missing_tail(path: &Path) -> Result<PathBuf, String> {
+    let mut missing = Vec::new();
+    let mut existing = path.to_path_buf();
+    while !existing.exists() {
+        let component = existing
+            .file_name()
+            .ok_or_else(|| format!("path has no canonicalizable parent: {}", path.display()))?;
+        missing.push(component.to_os_string());
+        existing = existing
+            .parent()
+            .ok_or_else(|| format!("path has no canonicalizable parent: {}", path.display()))?
+            .to_path_buf();
+    }
+    let mut canonical = existing
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {}: {e}", existing.display()))?;
+    for component in missing.iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_archive_metadata(
     directory: &Path,
@@ -107,6 +129,19 @@ pub(super) fn recover_absent_worktree(
             "recovery refused: supplied identity does not match the release tombstone".to_string(),
         );
     }
+    let managed_root = crate::worktree_pool::daemon_managed_worktree_root(home)
+        .canonicalize()
+        .map_err(|e| format!("managed worktree root is unavailable: {e}"))?;
+    let target = canonicalize_with_missing_tail(worktree)?;
+    if !target.starts_with(&managed_root) || target == managed_root {
+        return Err(format!(
+            "recovery target is outside the daemon worktree root: {}",
+            target.display()
+        ));
+    }
+    source_repo
+        .canonicalize()
+        .map_err(|e| format!("source repository is unavailable: {e}"))?;
     let root = home.join(".trash").join("worktrees");
     std::fs::create_dir_all(&root).map_err(|e| format!("create recovery archive root: {e}"))?;
     let root = root
