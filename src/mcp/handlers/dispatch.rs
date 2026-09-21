@@ -2102,7 +2102,9 @@ mod tests {
         assert_eq!(counts.get("runtime_none_deployment_create_team"), Some(&1));
         assert_eq!(counts.get("runtime_none_deployment_delete"), Some(&1));
         assert_eq!(counts.get("runtime_none_send_bridge"), Some(&1));
-        assert_eq!(counts.get("runtime_none_task_sweep_wrapper"), Some(&1));
+        // Public sweep now obtains LIST through the shared runtime wrapper;
+        // there is no longer a direct transport call in tasks::handle_sweep.
+        assert_eq!(counts.get("runtime_none_task_sweep_wrapper"), None);
         assert_eq!(counts.get("shared_runtime_none_list_wrapper"), Some(&1));
     }
 
