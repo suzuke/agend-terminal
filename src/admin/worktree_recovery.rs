@@ -601,6 +601,92 @@ mod tests {
     }
 
     #[test]
+    fn partial_archive_evidence_repairs_each_written_prefix_3696() {
+        for (case, write_binding) in [("binding", true), ("signature", false)] {
+            let home = temp_home(&format!("partial-archive-{case}"));
+            let instance = format!("recovery-partial-{case}-{}", std::process::id());
+            let branch = format!("review/partial-{case}");
+            let source_repo = home.join("source-repo");
+            std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
+            let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+                .join(&instance)
+                .join("review-partial");
+            std::fs::create_dir_all(&worktree).expect("create worktree fixture");
+            crate::binding::bind_full(
+                &home,
+                &instance,
+                "",
+                &branch,
+                &worktree,
+                &source_repo,
+                false,
+            )
+            .expect("bind recovery fixture");
+            let binding_body = std::fs::read(crate::paths::binding_path(&home, &instance))
+                .expect("read binding fixture");
+            let binding_signature = std::fs::read(
+                crate::paths::runtime_dir(&home)
+                    .join(&instance)
+                    .join("binding.json.sig"),
+            )
+            .expect("read binding signature fixture");
+            crate::agent::deletion_recovery::begin_from_binding(&home, &instance)
+                .expect("persist deleting tombstone")
+                .expect("signed binding must enter recovery lane");
+
+            let archive = home
+                .join(".trash")
+                .join("worktrees")
+                .join(format!("{instance}-archive"));
+            std::fs::create_dir_all(&archive).expect("create partial archive fixture");
+            std::fs::write(archive.join("leftover.txt"), b"partial archive payload")
+                .expect("write archived payload fixture");
+            let partial_path = if write_binding {
+                archive.join(".agend-recovery-binding.json")
+            } else {
+                archive.join(".agend-recovery-binding.json.sig")
+            };
+            let partial_bytes = if write_binding {
+                &binding_body
+            } else {
+                &binding_signature
+            };
+            std::fs::write(partial_path, partial_bytes).expect("write partial archive evidence");
+            crate::agent::deletion_recovery::mark_recovery_required(
+                &home,
+                &instance,
+                Some(&archive),
+            )
+            .expect("persist archive path before simulated crash");
+            std::fs::remove_dir_all(&worktree).expect("simulate archived worktree");
+
+            let report = recover_markerless_bound_worktree(
+                &home,
+                "operator",
+                "repair partial archive evidence after restart",
+                &instance,
+                &branch,
+                &worktree,
+                &source_repo,
+            )
+            .expect("retry must repair a partial archive metadata prefix");
+            assert_eq!(report.archive, archive);
+            assert!(archive.join(".agend-recovery-binding.json").is_file());
+            assert!(archive.join(".agend-recovery-binding.json.sig").is_file());
+            assert!(archive.join(".agend-recovery-manifest.json").is_file());
+            assert!(crate::binding::read(&home, &instance).is_none());
+            assert_eq!(
+                crate::agent::deletion_recovery::read(&home, &instance)
+                    .expect("read recovered receipt")
+                    .expect("recovery receipt must remain durable")
+                    .state,
+                crate::agent::deletion_recovery::State::Recovered
+            );
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    #[test]
     fn marker_present_target_is_left_for_normal_release() {
         let home = temp_home("managed");
         let instance = format!("recovery-managed-{}", std::process::id());

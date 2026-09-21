@@ -149,6 +149,59 @@ fn scan_both_present_different_repo_does_not_match_p3b() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn pending_recovery_tombstone_blocks_cross_branch_rebind_after_worktree_loss_3696() {
+    let home = tmp_home("recovery-tombstone-rebind");
+    let agent = format!("rebind-recovery-{}", std::process::id());
+    let source_repo = home.join("source-repo");
+    let old_worktree = home.join("worktrees").join(&agent).join("old-branch");
+    let new_worktree = home.join("worktrees").join(&agent).join("new-branch");
+    std::fs::create_dir_all(&source_repo).unwrap();
+    std::fs::create_dir_all(&old_worktree).unwrap();
+
+    bind_full(
+        &home,
+        &agent,
+        "",
+        "feat/recovery-old",
+        &old_worktree,
+        &source_repo,
+        false,
+    )
+    .expect("bind original generation");
+    crate::agent::deletion_recovery::begin_from_binding(&home, &agent)
+        .expect("persist recovery tombstone")
+        .expect("signed binding must enter recovery lane");
+    std::fs::remove_dir_all(&old_worktree).unwrap();
+
+    let error = bind_full(
+        &home,
+        &agent,
+        "",
+        "feat/recovery-new",
+        &new_worktree,
+        &source_repo,
+        false,
+    )
+    .expect_err("pending recovery must block replacement generation bind");
+    assert!(
+        error.contains("recovery") || error.contains("tombstone"),
+        "error must identify the pending recovery fence: {error}"
+    );
+    assert_eq!(
+        read(&home, &agent)
+            .and_then(|binding| binding["branch"].as_str().map(str::to_owned))
+            .as_deref(),
+        Some("feat/recovery-old"),
+        "blocked rebind must preserve the prior authoritative binding"
+    );
+    assert!(
+        !new_worktree.exists(),
+        "blocked bind must not install a target"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 fn tmp_home(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);

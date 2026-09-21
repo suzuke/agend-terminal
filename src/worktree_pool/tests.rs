@@ -5229,6 +5229,51 @@ fn release_journal_clear_failure_is_settled_by_restart_retry_3696() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+#[cfg(unix)]
+#[test]
+fn dangling_signature_sidecar_is_present_invalid_and_fails_closed_3696() {
+    use std::os::unix::fs::symlink;
+
+    let home = tmp_home("release-journal-dangling-signature");
+    let repo = tmp_repo("release-journal-dangling-signature-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal-dangling",
+        "feat/release-journal-dangling",
+    );
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-release-journal-dangling")
+        .join("binding.json.sig");
+    std::fs::remove_file(&signature_path).expect("remove valid signature sidecar");
+    symlink("missing-signature", &signature_path).expect("create dangling signature sidecar");
+
+    let outcome = release_full(&home, "agent-release-journal-dangling", false);
+
+    assert!(
+        !outcome.released,
+        "dangling signature must not release: {outcome:?}"
+    );
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("signature")),
+        "failure must identify invalid signature evidence: {outcome:?}"
+    );
+    assert!(
+        lease.path.exists(),
+        "fail-closed release must preserve target"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-release-journal-dangling").is_some(),
+        "fail-closed release must preserve binding"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 #[test]
 fn release_full_clean_worktree_creates_no_recovery_ref() {
     let home = tmp_home("release-clean-noref");
