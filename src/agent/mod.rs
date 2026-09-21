@@ -27,6 +27,7 @@ use dismiss::{
 };
 
 pub mod deleting;
+pub(crate) mod deletion_recovery;
 
 /// #3315 B3: platform shim so the write path never names `write_actor` directly.
 mod actor_write;

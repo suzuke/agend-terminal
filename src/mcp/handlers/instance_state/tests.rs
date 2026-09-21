@@ -307,6 +307,36 @@ fn markerless_delete_preserves_binding_for_operator_recovery_3696() {
     assert_eq!(tombstone_body["state"], "recovery_required");
     assert_eq!(tombstone_body["instance"], instance);
     assert_eq!(tombstone_body["branch"], branch);
+    let report = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "archive markerless residual",
+        instance,
+        branch,
+        &worktree,
+        &source_repo,
+    )
+    .expect("tombstone-authorized operator recovery");
+    assert_eq!(
+        std::fs::read(report.archive.join("residual.txt")).unwrap(),
+        b"preserve this payload"
+    );
+    let retry = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "idempotent retry",
+        instance,
+        branch,
+        &worktree,
+        &source_repo,
+    )
+    .expect("recovery retry should return the same archive");
+    assert_eq!(retry.archive, report.archive);
+    assert!(crate::binding::read(&home, instance).is_none());
+    assert!(!crate::worktree_pool::daemon_managed_worktree_root(&home)
+        .join(instance)
+        .exists());
+    assert!(!crate::agent::deleting::is_deleting(&home, instance));
     std::fs::remove_dir_all(&home).ok();
 }
 

@@ -209,6 +209,18 @@ pub(crate) fn full_delete_instance_with_precondition(
     if let Some(check) = precondition {
         check()?;
     }
+    // #3696: a bound delete must publish a durable fence before killing the
+    // child or removing fleet state.  The sidecar is outside runtime/<name>/,
+    // so it survives the residual binding and a daemon restart; its presence
+    // also prevents every spawn/reconcile chokepoint from reusing the name.
+    if let Some(existing) = crate::agent::deletion_recovery::read(home, name)? {
+        if existing.state != crate::agent::deletion_recovery::State::Recovered {
+            return Err(format!(
+                "recovery_required: instance '{name}' already has a pending delete tombstone"
+            ));
+        }
+    }
+    let delete_tombstone = crate::agent::deletion_recovery::begin_from_binding(home, name)?;
     delete_fence.commit_cleanup(name);
     // Fence transport delivery before any teardown side effect. The keyed
     // guard invalidates queued epochs and excludes same-agent I/O for the full
@@ -482,8 +494,14 @@ pub(crate) fn full_delete_instance_with_precondition(
         &lifecycle_permit,
         crate::worktree_pool::ReleaseProvenance::Delete,
     );
+    let release_failed = release.error.is_some();
     if let Some(error) = release.error {
         step_errors.push(format!("worktree release: {error}"));
+        if let Err(tombstone_error) =
+            crate::agent::deletion_recovery::mark_recovery_required(home, name, None)
+        {
+            step_errors.push(format!("delete recovery tombstone: {tombstone_error}"));
+        }
     }
     // release_full removes the leaf worktree `worktrees/<name>/<branch>/`; drop the
     // now-empty agent dir `worktrees/<name>/` too so the audit below reads clean.
@@ -501,17 +519,21 @@ pub(crate) fn full_delete_instance_with_precondition(
     // ran bind_self / repo checkout) without a prior release both leaked the
     // binding (blocking a same-name re-bind) AND tripped the residual audit below
     // → the whole teardown returned Err despite otherwise succeeding.
-    if let crate::binding::BindingRemoval::Failed(error) =
-        crate::binding::unbind_with_permit(home, name, &lifecycle_permit)
-    {
-        step_errors.push(format!("binding removal: {error}"));
+    if !release_failed {
+        if let crate::binding::BindingRemoval::Failed(error) =
+            crate::binding::unbind_with_permit(home, name, &lifecycle_permit)
+        {
+            step_errors.push(format!("binding removal: {error}"));
+        }
     }
     // #1907: `unbind` drops binding.json + its HMAC sidecar but leaves the now-empty
     // `runtime/<name>/` dir + its `.binding.json.lock` flock behind. Remove the whole
     // dir so teardown is fully clean (the residual audit below now checks it). Safe:
     // the agent is dead (api::call(DELETE) waited for exit), so no concurrent bind
     // re-creates it; `runtime/<name>/` holds only this agent's binding artefacts.
-    let _ = std::fs::remove_dir_all(crate::paths::runtime_dir(home).join(name));
+    if !release_failed {
+        let _ = std::fs::remove_dir_all(crate::paths::runtime_dir(home).join(name));
+    }
     // #1935: explicitly remove the per-agent TUI port file `run/<pid>/<name>.port`.
     // The `api::call(DELETE)` stop-path already calls `remove_port` for a live
     // agent, but a boot-spawn that published the port without the agent reaching a
@@ -526,6 +548,9 @@ pub(crate) fn full_delete_instance_with_precondition(
     // exactly the silent-drop class pattern this fix prevents.
     let residual = name_residual_anywhere(home, name, instance_id.as_deref());
     if residual.is_empty() && step_errors.is_empty() {
+        if delete_tombstone.is_some() {
+            crate::agent::deletion_recovery::clear(home, name)?;
+        }
         return Ok(());
     }
     let detail = match (residual.is_empty(), step_errors.is_empty()) {
@@ -543,7 +568,11 @@ pub(crate) fn full_delete_instance_with_precondition(
         step_errors = ?step_errors,
         "full_delete_instance left residual state — silent-drop class pattern blocked"
     );
-    Err(detail)
+    if release_failed {
+        Err(format!("recovery_required: {detail}"))
+    } else {
+        Err(detail)
+    }
 }
 
 /// Sprint 54 P1-B Bug 1: enumerate every fleet store that still holds

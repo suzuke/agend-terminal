@@ -357,12 +357,23 @@ pub(super) fn handle_delete_instance_with_runtime(
     });
     match lifecycle::full_delete_instance_with_runtime(home, name, delete_context.as_ref()) {
         Ok(()) => json!({"name": name}),
-        Err(detail) => json!({
-            "name": name,
-            "error": format!(
-                "delete completed with residual state — fleet may resurrect on next reconcile: {detail}"
-            ),
-        }),
+        Err(detail) => {
+            let recovery_required = detail.starts_with("recovery_required:");
+            let mut result = json!({
+                "name": name,
+                "error": if recovery_required {
+                    format!("delete requires operator recovery: {detail}")
+                } else {
+                    format!(
+                        "delete completed with residual state — fleet may resurrect on next reconcile: {detail}"
+                    )
+                },
+            });
+            if recovery_required {
+                result["code"] = json!("recovery_required");
+            }
+            result
+        }
     }
 }
 

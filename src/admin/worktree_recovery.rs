@@ -4,6 +4,17 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn remove_empty_dir_tree(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                remove_empty_dir_tree(&entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecoveryReport {
     pub archive: PathBuf,
@@ -28,6 +39,40 @@ pub(crate) fn recover_markerless_bound_worktree(
         .map_err(|_| format!("invalid instance name '{instance}'"))?;
     if branch.trim().is_empty() {
         return Err("branch is required".to_string());
+    }
+
+    // #3696: a completed operator archive is a durable idempotency receipt.
+    // It deliberately lives outside runtime/<instance>/, which the first
+    // recovery removes after unbinding.  A retry returns the exact same
+    // archive and never touches a same-name replacement binding.
+    let durable_tombstone = crate::agent::deletion_recovery::read(home, instance)?;
+    if let Some(tombstone) = durable_tombstone.as_ref() {
+        if tombstone.state == crate::agent::deletion_recovery::State::Recovered {
+            if tombstone.instance != instance
+                || tombstone.branch != branch
+                || Path::new(&tombstone.worktree) != worktree
+                || Path::new(&tombstone.source_repo) != source_repo
+            {
+                return Err(
+                    "recovery refused: supplied instance/branch/worktree/source does not match tombstone"
+                        .to_string(),
+                );
+            }
+            let archive = tombstone
+                .archive
+                .as_deref()
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    "recovery refused: recovered tombstone has no archive".to_string()
+                })?;
+            if !archive.is_dir() {
+                return Err(format!(
+                    "recovery refused: recorded archive is unavailable: {}",
+                    archive.display()
+                ));
+            }
+            return Ok(RecoveryReport { archive });
+        }
     }
 
     let root = crate::worktree_pool::daemon_managed_worktree_root(home)
@@ -57,7 +102,10 @@ pub(crate) fn recover_markerless_bound_worktree(
     let _agent_lock = crate::binding::acquire_agent_mutation_lock(home, instance)?;
     let _binding_lock = crate::binding::acquire_binding_file_lock(home, instance)?;
 
-    if crate::worktree_pool::is_agent_alive(home, instance) {
+    let tombstone_recovery = durable_tombstone.as_ref().is_some_and(|tombstone| {
+        tombstone.state == crate::agent::deletion_recovery::State::RecoveryRequired
+    });
+    if !tombstone_recovery && crate::worktree_pool::is_agent_alive(home, instance) {
         return Err(format!(
             "recovery refused: instance '{instance}' still shows liveness"
         ));
@@ -91,6 +139,19 @@ pub(crate) fn recover_markerless_bound_worktree(
                 .to_string(),
         );
     }
+    if let Some(tombstone) = durable_tombstone.as_ref() {
+        if tombstone.instance != instance
+            || tombstone.state != crate::agent::deletion_recovery::State::RecoveryRequired
+            || tombstone.branch != bound_branch
+            || Path::new(&tombstone.worktree) != Path::new(bound_worktree)
+            || Path::new(&tombstone.source_repo) != Path::new(bound_source)
+        {
+            return Err(
+                "recovery refused: supplied identity does not match the delete tombstone"
+                    .to_string(),
+            );
+        }
+    }
     if crate::worktree_pool::is_daemon_managed(&target) {
         return Err(
             "recovery refused: worktree still has its managed marker; use normal release"
@@ -117,6 +178,18 @@ pub(crate) fn recover_markerless_bound_worktree(
         .join("binding.json.sig");
     let binding_signature = std::fs::read(&signature_path)
         .map_err(|e| format!("read binding signature {}: {e}", signature_path.display()))?;
+    if let Some(tombstone) = durable_tombstone.as_ref() {
+        let binding_sha256 = crate::daemon::utils::sha256_hex(&binding_body);
+        let signature_sha256 = crate::daemon::utils::sha256_hex(&binding_signature);
+        if tombstone.binding_sha256 != binding_sha256
+            || tombstone.binding_signature_sha256 != signature_sha256
+        {
+            return Err(
+                "recovery refused: binding evidence does not match the delete tombstone"
+                    .to_string(),
+            );
+        }
+    }
 
     let archive_root = home.join(".trash").join("worktrees");
     std::fs::create_dir_all(&archive_root)
@@ -185,6 +258,20 @@ pub(crate) fn recover_markerless_bound_worktree(
 
     match crate::binding::unbind_with_permit(home, instance, &permit) {
         crate::binding::BindingRemoval::Removed => {
+            remove_empty_dir_tree(
+                &crate::worktree_pool::daemon_managed_worktree_root(home).join(instance),
+            );
+            let _ = std::fs::remove_dir_all(crate::paths::runtime_dir(home).join(instance));
+            if durable_tombstone.is_some() {
+                if let Err(error) =
+                    crate::agent::deletion_recovery::mark_recovered(home, instance, &archive)
+                {
+                    return Err(format!(
+                        "archive created and binding cleared at {}, but recovery receipt failed: {error}",
+                        archive.display()
+                    ));
+                }
+            }
             crate::event_log::log(
                 home,
                 "markerless_worktree_recovered",

@@ -46,6 +46,7 @@ fn key(home: &Path, name: &str) -> (PathBuf, String) {
 /// True iff `name` under `home` is currently mid-delete and must not be spawned.
 pub fn is_deleting(home: &Path, name: &str) -> bool {
     registry().lock().contains_key(&key(home, name))
+        || crate::agent::deletion_recovery::is_blocking(home, name)
 }
 
 /// Mark `name` under `home` as deleting for the lifetime of the returned guard.
