@@ -684,6 +684,8 @@ mod tests {
         let branch = "review/outside-root";
         let source_repo = home.join("source-repo");
         std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
+        std::fs::create_dir_all(crate::worktree_pool::daemon_managed_worktree_root(&home))
+            .expect("create managed worktree root");
         let worktree = home
             .join("outside-worktrees")
             .join(&instance)
