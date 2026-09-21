@@ -48,7 +48,7 @@ pub(crate) fn recover_markerless_bound_worktree(
     // It deliberately lives outside runtime/<instance>/, which the first
     // recovery removes after unbinding.  A retry returns the exact same
     // archive and never touches a same-name replacement binding.
-    let durable_tombstone = crate::agent::deletion_recovery::read(home, instance)?;
+    let mut durable_tombstone = crate::agent::deletion_recovery::read(home, instance)?;
     if let Some(tombstone) = durable_tombstone.as_ref() {
         if tombstone.state == crate::agent::deletion_recovery::State::Recovered {
             if tombstone.instance != instance
@@ -96,6 +96,13 @@ pub(crate) fn recover_markerless_bound_worktree(
         return Err(format!(
             "recovery refused: instance '{instance}' still shows liveness"
         ));
+    }
+
+    // Public CLI recovery can start without the delete handler having written
+    // a tombstone.  Establish the same signed durable journal before any
+    // archive mutation so a crash is recoverable through the same lane.
+    if durable_tombstone.is_none() {
+        durable_tombstone = crate::agent::deletion_recovery::begin_from_binding(home, instance)?;
     }
 
     if let Some(tombstone) = durable_tombstone.as_ref() {
@@ -241,6 +248,22 @@ pub(crate) fn recover_markerless_bound_worktree(
         crate::agent::deletion_recovery::mark_recovery_required(home, instance, Some(&archive))?;
     }
 
+    // Prepare self-describing metadata inside the source before rename.  The
+    // rename then carries the signed evidence and manifest atomically with the
+    // payload, while retries can safely complete any interrupted metadata write.
+    archive::write_archive_metadata(
+        &target,
+        actor,
+        audit_reason,
+        instance,
+        branch,
+        &source,
+        &target,
+        &archive,
+        &binding_body,
+        &binding_signature,
+    )?;
+
     // Rename is the safety boundary: it is atomic on the normal same-filesystem
     // layout. Cross-device copy is deliberately refused so recovery never turns
     // into a partially copied destructive cleanup.
@@ -251,45 +274,6 @@ pub(crate) fn recover_markerless_bound_worktree(
             archive.display()
         )
     })?;
-
-    let metadata_result = (|| {
-        crate::store::atomic_write(&archive.join(".agend-recovery-binding.json"), &binding_body)
-            .map_err(|e| e.to_string())?;
-        crate::store::atomic_write(
-            &archive.join(".agend-recovery-binding.json.sig"),
-            &binding_signature,
-        )
-        .map_err(|e| e.to_string())?;
-        let manifest = serde_json::json!({
-            "schema_version": 1,
-            "actor": actor,
-            "audit_reason": audit_reason,
-            "instance": instance,
-            "branch": branch,
-            "source_repo": source,
-            "original_worktree": target,
-            "archived_worktree": archive,
-            "binding_sha256": crate::daemon::utils::sha256_hex(&binding_body),
-        });
-        crate::store::atomic_write(
-            &archive.join(".agend-recovery-manifest.json"),
-            serde_json::to_string_pretty(&manifest)
-                .map_err(|e| e.to_string())?
-                .as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok::<(), String>(())
-    })();
-    if let Err(error) = metadata_result {
-        let rollback = std::fs::rename(&archive, &target);
-        return Err(match rollback {
-            Ok(()) => format!("recovery metadata failed; archive rolled back: {error}"),
-            Err(rollback) => format!(
-                "recovery metadata failed and rollback failed ({rollback}); archive remains at {}: {error}",
-                archive.display()
-            ),
-        });
-    }
 
     match crate::binding::unbind_with_permit(home, instance, &permit) {
         crate::binding::BindingRemoval::Removed => {
