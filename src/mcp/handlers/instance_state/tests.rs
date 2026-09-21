@@ -246,6 +246,70 @@ fn full_delete_rejects_invalid_name_before_permit_or_mutation_2855() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3696 RED: the real MCP delete entry must leave an exact signed binding and
+/// a durable recovery fence when release encounters a markerless worktree.
+/// This deliberately exercises `handle_delete_instance`, not the lifecycle
+/// helper directly, and does not manually remove the residual worktree.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn markerless_delete_preserves_binding_for_operator_recovery_3696() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("markerless-delete-3696");
+    let instance = "markerless-delete";
+    let branch = "review/markerless-delete";
+    let source_repo = home.join("source-repo");
+    let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+        .join(instance)
+        .join("review-markerless-delete");
+    std::fs::create_dir_all(&source_repo).unwrap();
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("residual.txt"), b"preserve this payload").unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!("instances:\n  {instance}:\n    backend: claude\n"),
+    )
+    .unwrap();
+    crate::binding::bind_full(
+        &home,
+        instance,
+        "",
+        branch,
+        &worktree,
+        &source_repo,
+        false,
+    )
+    .expect("bind markerless delete fixture");
+    let binding_path = crate::paths::binding_path(&home, instance);
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join(instance)
+        .join("binding.json.sig");
+    let binding_before = std::fs::read(&binding_path).unwrap();
+    let signature_before = std::fs::read(&signature_path).unwrap();
+
+    let result = handle_delete_instance(&home, &serde_json::json!({"instance": instance}), &None);
+
+    assert_eq!(result["code"], "recovery_required", "{result}");
+    assert!(result["error"].as_str().is_some_and(|error| {
+        error.contains("markerless") || error.contains("recovery")
+    }));
+    assert_eq!(std::fs::read(&binding_path).unwrap(), binding_before);
+    assert_eq!(std::fs::read(&signature_path).unwrap(), signature_before);
+    assert!(worktree.exists(), "the operator recovery target must remain");
+    assert!(
+        crate::agent::deleting::is_deleting(&home, instance),
+        "a recovery-required tombstone must fence same-name reuse"
+    );
+    let tombstone = home
+        .join("deletion-recovery")
+        .join(format!("{instance}.json"));
+    let tombstone_body: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&tombstone).unwrap()).unwrap();
+    assert_eq!(tombstone_body["state"], "recovery_required");
+    assert_eq!(tombstone_body["instance"], instance);
+    assert_eq!(tombstone_body["branch"], branch);
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 fn delete_instance_denies_non_owner_non_orchestrator_audit2_002() {
