@@ -49,6 +49,45 @@ fn create_task(home: &std::path::Path, task_id: &str) {
 }
 
 #[test]
+fn orphan_reconcile_preview_reaches_real_task_dispatch_entry_3584() {
+    let home = tmp_home("orphan-reconcile-preview-red-3584");
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "orphan_reconcile_preview",
+            "decision_id": "d-20260922032524703479-91",
+            "board": "Hack_agend-terminal",
+            "audit_reason": "red-first dispatch seam",
+            "mappings": [],
+        }),
+    );
+    assert_eq!(
+        response["code"], "invalid_request",
+        "the real task dispatch entry must own request validation: {response}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn orphan_reconcile_apply_reaches_real_task_dispatch_entry_3584() {
+    let home = tmp_home("orphan-reconcile-apply-red-3584");
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "orphan_reconcile_apply",
+            "confirmation": "not-a-uuid",
+        }),
+    );
+    assert_eq!(
+        response["code"], "invalid_confirmation",
+        "the real task dispatch entry must validate the confirmation: {response}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn governed_create_persists_atomic_authority_3419() {
     let home = tmp_home("governed-create-3419");
     let decision = crate::decisions::post(
