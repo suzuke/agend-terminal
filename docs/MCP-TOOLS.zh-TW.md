@@ -15,15 +15,15 @@ Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance 
 
 管理 task board。動作：`create`、`list`、`get`、`claim`、`done`、`update`、`sweep`、`board_sweep`、`board_unretire`、`health`、`activity`、`metadata_set`、`metadata_get`、`ack_plan`、`orphan_reconcile_preview`、`orphan_reconcile_apply`。
 
-- **REQUIRED：** 每次呼叫都要提供 `action`。Orphan reconciliation 另外需要 `decision_id` 與 `board`；apply 還需要凍結的 `mappings` 與 preview 回傳的 `confirmation` token。
+- **REQUIRED：** 每次呼叫都要提供 `action`。Orphan reconciliation 的 preview 需要精確的 `decision_id`、`board`、非空的 `audit_reason` 與完整凍結七列的 `mappings`。Apply 只消耗 preview 回傳的 `confirmation` token；mapping 與 audit scope 都凍結在 token 裡。
 - **STOP：** 沒有相符的 preview confirmation 時，不得 apply orphan reconciliation。
 - **OPTIONAL：** 用 `verbose`、`fields`、`include_history` 與 filter 控制 list 輸出。
 
 先 preview，再只套用凍結的 mapping：
 
 ```json
-{"action":"orphan_reconcile_preview","decision_id":"d-...","board":"project"}
-{"action":"orphan_reconcile_apply","decision_id":"d-...","board":"project","mappings":[{"predecessor_id":"t-old","replacement_id":"t-new"}],"confirmation":"preview-token"}
+{"action":"orphan_reconcile_preview","decision_id":"d-20260922032524703479-91","board":"Hack_agend-terminal","audit_reason":"apply the approved seven-row orphan reconciliation","mappings":[{"predecessor_id":"t-20260907235055249429-95750-527","replacement_id":"t-20260911011514337302-80976-487"},{"predecessor_id":"t-20260914111234728581-87735-45","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260914111259722658-87735-46","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260914111332528060-87735-47","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260915052051881509-87735-153","replacement_id":"t-20260915052412876647-87735-158"},{"predecessor_id":"t-20260914153935855471-87735-78","replacement_id":"t-20260914174754306925-87735-97"},{"predecessor_id":"t-20260921192747528323-35876-350","replacement_id":"t-20260921210143816824-35876-355"}]}
+{"action":"orphan_reconcile_apply","confirmation":"<preview confirmation UUID>"}
 ```
 
 - 主要欄位包括 `id`／`task_id`、`title`、`description`、`assignee`、`priority`、`status`、`branch`、`depends_on`、`result`、`due_at`、`project` 與 `scope`。
@@ -71,7 +71,7 @@ Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance 
 
 管理 CI watch。動作：`watch`、`unwatch`、`status`、`defer`、`ack_handoff`。
 
-- **REQUIRED：** `watch`、`unwatch` 與 `ack_handoff` 需要 `repository`；`ack_handoff` 需要 `branch`；`defer` 與 `ack_handoff` 需要 `episode`。
+- **REQUIRED：** `watch` 必須提供明確的 `repository`，或 caller binding 中有有效的 `source_repo`；`unwatch`、`defer` 與 `ack_handoff` 必須明確提供 `repository`。`defer` 與 `ack_handoff` 需要 `branch`；`defer` 與 `ack_handoff` 需要 `episode`。
 - **`defer` REQUIRED：** `wake_task_id`、`reason` 與有界的 `defer_secs`（60–3600）。
 - **OPTIONAL：** `notification_only`、`head_sha`、`subject_head_sha`、`review_class` 與 provider 欄位。
 - **STOP：** Protected exact-head watch 缺少完整 SHA、task、授權與 continuation 欄位時會 fail closed。

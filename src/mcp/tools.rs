@@ -393,8 +393,8 @@ pub(crate) fn def_ci() -> Value {
     json!({"name": "ci", "description": "Manage CI watching and handoff pickup. Actions: watch, unwatch, status, defer, ack_handoff.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["watch", "unwatch", "status", "defer", "ack_handoff"]},
-            "repository": {"type": "string", "description": "GitHub `owner/repo` slug. Required for watch/unwatch/ack_handoff; optional filter for status."},
-            "branch": {"type": "string", "description": "Branch to watch (default: main); required for ack_handoff; optional filter for status."},
+            "repository": {"type": "string", "description": "GitHub `owner/repo` slug. For watch, provide this explicitly or use a valid caller binding with `source_repo`; unwatch/defer/ack_handoff require it explicitly. Optional filter for status."},
+            "branch": {"type": "string", "description": "Branch to watch (default: main); required for defer and ack_handoff; optional filter for status."},
             "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"},
             "next_after_ci": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}], "description": "Instance or instances to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to each target."},
             "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#972: review threshold for the daemon's PR-state aggregator. `single` (default) — §3.6 one VERIFIED unlocks the merge gate. `dual` — §3.5 two distinct VERIFIED required before `[pr-ready-for-merge]` fires."},
@@ -549,6 +549,19 @@ mod tests {
                 .is_some_and(|s| s.contains("ack_handoff")),
             "#2817: top-level CI description must name the settlement action"
         );
+    }
+
+    #[test]
+    fn ci_schema_describes_repository_and_branch_requirements_3708() {
+        let d = def_ci();
+        let props = &d["inputSchema"]["properties"];
+        let repository = props["repository"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(repository.contains("valid caller binding"));
+        assert!(repository.contains("unwatch/defer/ack_handoff require it explicitly"));
+        let branch = props["branch"]["description"].as_str().unwrap_or_default();
+        assert!(branch.contains("required for defer and ack_handoff"));
     }
 
     /// #2453 R2 P1: the restart_daemon schema must describe app-mode IN-PLACE re-exec

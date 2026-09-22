@@ -15,15 +15,15 @@ The daemon registry and live `tools/list` schema are authoritative. Role filteri
 
 Manage task boards. Actions: `create`, `list`, `get`, `claim`, `done`, `update`, `sweep`, `board_sweep`, `board_unretire`, `health`, `activity`, `metadata_set`, `metadata_get`, `ack_plan`, `orphan_reconcile_preview`, `orphan_reconcile_apply`.
 
-- **REQUIRED:** Every call supplies `action`. Orphan reconciliation also requires `decision_id` and `board`; apply requires the frozen `mappings` and the preview `confirmation` token.
+- **REQUIRED:** Every call supplies `action`. Orphan-reconcile preview requires the exact `decision_id`, `board`, a non-empty `audit_reason`, and the complete frozen seven-row `mappings` set. Apply consumes only the preview `confirmation` token; that token freezes the mappings and audit scope.
 - **STOP:** Never apply an orphan reconciliation without a matching preview confirmation.
 - **OPTIONAL:** Use `verbose`, `fields`, `include_history`, and filters to control list output.
 
 Preview, then apply only the frozen mapping:
 
 ```json
-{"action":"orphan_reconcile_preview","decision_id":"d-...","board":"project"}
-{"action":"orphan_reconcile_apply","decision_id":"d-...","board":"project","mappings":[{"predecessor_id":"t-old","replacement_id":"t-new"}],"confirmation":"preview-token"}
+{"action":"orphan_reconcile_preview","decision_id":"d-20260922032524703479-91","board":"Hack_agend-terminal","audit_reason":"apply the approved seven-row orphan reconciliation","mappings":[{"predecessor_id":"t-20260907235055249429-95750-527","replacement_id":"t-20260911011514337302-80976-487"},{"predecessor_id":"t-20260914111234728581-87735-45","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260914111259722658-87735-46","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260914111332528060-87735-47","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260915052051881509-87735-153","replacement_id":"t-20260915052412876647-87735-158"},{"predecessor_id":"t-20260914153935855471-87735-78","replacement_id":"t-20260914174754306925-87735-97"},{"predecessor_id":"t-20260921192747528323-35876-350","replacement_id":"t-20260921210143816824-35876-355"}]}
+{"action":"orphan_reconcile_apply","confirmation":"<preview confirmation UUID>"}
 ```
 
 - Core fields include `id`/`task_id`, `title`, `description`, `assignee`, `priority`, `status`, `branch`, `depends_on`, `result`, `due_at`, `project`, and `scope`.
@@ -71,7 +71,7 @@ Manage batch deployments. Actions: `deploy`, `teardown`, `list`.
 
 Manage CI watches. Actions: `watch`, `unwatch`, `status`, `defer`, `ack_handoff`.
 
-- **REQUIRED:** `repository` is required for `watch`, `unwatch`, and `ack_handoff`; `branch` is required for `ack_handoff`; `episode` is required for `defer` and `ack_handoff`.
+- **REQUIRED:** `watch` needs either an explicit `repository` or a valid caller binding with `source_repo`; `unwatch`, `defer`, and `ack_handoff` require explicit `repository`. `branch` is required for `defer` and `ack_handoff`; `episode` is required for `defer` and `ack_handoff`.
 - **REQUIRED for `defer`:** `wake_task_id`, `reason`, and bounded `defer_secs` (60–3600).
 - **OPTIONAL:** `notification_only`, `head_sha`, `subject_head_sha`, `review_class`, and provider fields.
 - **STOP:** Protected exact-head watches fail closed without the required full SHA, task, authorization, and continuation fields.
