@@ -1287,6 +1287,10 @@ mod tests {
             ("task", "plan_ack_reason", "tasks/handler.rs handle_create validation + metadata seed (#2249)"),
             ("task", "review_class", "tasks/handler.rs handle_create → Task.metadata review_class seed; dispatch/poll fail-closed authority (#2745)"),
             ("task", "governing_decision_id", "tasks/handler.rs handle_create → TaskEvent::Created governing authority (#3419)"),
+            ("task", "decision_id", "tasks/orphan_reconcile.rs preview/apply exact governing decision allowlist (#3584 slice 6)"),
+            ("task", "board", "tasks/orphan_reconcile.rs preview/apply exact project-board route gate (#3584 slice 6)"),
+            ("task", "mappings", "tasks/orphan_reconcile.rs preview parses the frozen seven-row mapping set (#3584 slice 6)"),
+            ("task", "confirmation", "tasks/orphan_reconcile.rs apply consumes the actor-bound preview token (#3584 slice 6)"),
             // ── decision ──
             ("decision", "action", "decisions.rs routing"),
             ("decision", "title", "decisions.rs post"),

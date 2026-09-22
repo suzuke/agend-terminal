@@ -431,7 +431,9 @@ pub(crate) fn cancel_review_assignment_task(
 
 pub(crate) use handler::create_schedule_task;
 pub use handler::handle;
+#[cfg(test)]
 pub(crate) use handler::handle_with_live_instances;
+pub(crate) use handler::handle_with_live_instances_and_refresh;
 pub use handler::register_subscriber as register_cascade_subscriber;
 // #2117 P2: resolution helpers for the out-of-`tasks` callers — comms dispatch
 // auto-create (target board) and the per-board task sweep (project id from a

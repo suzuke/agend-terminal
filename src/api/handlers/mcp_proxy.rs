@@ -186,7 +186,20 @@ fn timeout_response(
 /// Handle `mcp_tool` API method: proxy a tool call through the daemon
 /// where process-global state (ACTIVE_CHANNEL, heartbeat_pair, etc.)
 /// is available. Applies per-tool timeout.
+#[cfg(test)]
 pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
+    handle_mcp_tool_with_operator_authority(params, ctx, false)
+}
+
+/// Dispatch an MCP call with authenticated transport authority carried
+/// separately from the spoofable `params["instance"]` identity. The API
+/// socket passes `true` only for the boot-minted operator principal after the
+/// capability gate has accepted the request.
+pub(crate) fn handle_mcp_tool_with_operator_authority(
+    params: &Value,
+    ctx: &HandlerCtx,
+    trusted_operator: bool,
+) -> Value {
     let tool = match params["tool"].as_str() {
         Some(t) if !t.is_empty() => t,
         _ => return json!({"ok": false, "error": "missing 'tool' parameter"}),
@@ -208,6 +221,19 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         .get("action")
         .and_then(|v| v.as_str())
         .map(String::from);
+    if tool == "task"
+        && matches!(
+            action.as_deref(),
+            Some("orphan_reconcile_preview" | "orphan_reconcile_apply")
+        )
+        && !trusted_operator
+    {
+        return json!({
+            "ok": false,
+            "error": "task orphan reconciliation is operator-only and requires the authenticated operator transport",
+            "code": "operator_only",
+        });
+    }
     let instance = params["instance"].as_str().unwrap_or("").to_string();
     let role_kind = match role_kind_for_instance(ctx.home, &instance, "tool call") {
         Ok(role_kind) => role_kind,
@@ -1025,6 +1051,48 @@ mod tests {
         assert!(
             err.contains("create_instance") && err.contains("Reviewer"),
             "denial should name the denied tool and typed role, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn orphan_reconciliation_requires_authenticated_operator_transport_3584() {
+        let dir = toollist_ctx_home("orphan-auth");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home: &dir,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
+        };
+        let params = json!({
+            "instance": "operator",
+            "tool": "task",
+            "arguments": {
+                "action": "orphan_reconcile_preview",
+                "mappings": []
+            }
+        });
+
+        let forged = handle_mcp_tool_with_operator_authority(&params, &ctx, false);
+        assert_eq!(forged["ok"], false, "forged agent call must fail: {forged}");
+        assert_eq!(forged["code"], "operator_only", "got {forged}");
+
+        let trusted = handle_mcp_tool_with_operator_authority(&params, &ctx, true);
+        assert_eq!(trusted["ok"], true, "trusted transport reaches the handler: {trusted}");
+        assert_eq!(
+            trusted["result"]["code"],
+            "invalid_request",
+            "trusted path must be authorized before the frozen mapping validation: {trusted}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

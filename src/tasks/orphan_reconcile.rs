@@ -372,23 +372,38 @@ fn preview_with_authority(
     };
     let directory = home.join(CONFIRMATION_DIR);
     if let Err(error) = std::fs::create_dir_all(&directory).and_then(|_| {
-        crate::store::save_atomic(
-            &directory.join(format!("{operation_id}.json")),
-            &confirmation,
-        )
-        .map_err(std::io::Error::other)
+        let bytes = serde_json::to_vec_pretty(&confirmation).map_err(std::io::Error::other)?;
+        crate::store::atomic_write(&directory.join(format!("{operation_id}.json")), &bytes)
+            .map_err(std::io::Error::other)
     }) {
         return json!({"error":format!("confirmation write failed: {error}"),"code":"confirmation_write_failed"});
     }
-    let bytes = match serde_json::to_vec(&confirmation) {
+    let bytes = match std::fs::read(directory.join(format!("{operation_id}.json"))) {
         Ok(bytes) => bytes,
         Err(error) => return json!({"error":error.to_string(),"code":"confirmation_invalid"}),
     };
+    let preview_digest = crate::daemon::utils::sha256_hex(&bytes);
+    let signature = match crate::config_integrity::sign(home, preview_digest.as_bytes()) {
+        Ok(signature) => signature,
+        Err(error) => return json!({"error":error.to_string(),"code":"confirmation_write_failed"}),
+    };
+    if let Err(error) = crate::store::atomic_write(
+        &directory.join(format!("{operation_id}.sha256")),
+        preview_digest.as_bytes(),
+    )
+    .and_then(|_| {
+        crate::store::atomic_write(
+            &directory.join(format!("{operation_id}.sig")),
+            signature.as_bytes(),
+        )
+    }) {
+        return json!({"error":format!("confirmation integrity sidecar write failed: {error}"),"code":"confirmation_write_failed"});
+    }
     json!({
         "ok": true,
         "result": {
             "confirmation": operation_id,
-            "preview_digest": crate::daemon::utils::sha256_hex(&bytes),
+            "preview_digest": preview_digest,
             "mapping_digest": confirmation.mapping_digest,
             "event_count": 7,
             "valid_for_seconds": CONFIRMATION_TTL_SECS,
@@ -409,6 +424,27 @@ fn load_confirmation(home: &Path, token: &str) -> Result<(Confirmation, Vec<u8>)
     let bytes = std::fs::read(path).map_err(|error| {
         json!({"error":format!("confirmation unavailable: {error}"),"code":"confirmation_unavailable"})
     })?;
+    let digest = crate::daemon::utils::sha256_hex(&bytes);
+    let stored_digest = std::fs::read_to_string(
+        home.join(CONFIRMATION_DIR).join(format!("{token}.sha256")),
+    )
+    .map_err(|error| {
+        json!({"error":format!("confirmation digest unavailable: {error}"),"code":"confirmation_integrity"})
+    })?;
+    let signature = std::fs::read_to_string(
+        home.join(CONFIRMATION_DIR).join(format!("{token}.sig")),
+    )
+    .map_err(|error| {
+        json!({"error":format!("confirmation signature unavailable: {error}"),"code":"confirmation_integrity"})
+    })?;
+    if stored_digest != digest
+        || !crate::config_integrity::verify(home, stored_digest.as_bytes(), signature.trim())
+    {
+        return Err(json!({
+            "error":"confirmation integrity verification failed",
+            "code":"confirmation_integrity"
+        }));
+    }
     let confirmation: Confirmation = serde_json::from_slice(&bytes).map_err(|error| {
         json!({"error":format!("confirmation invalid: {error}"),"code":"confirmation_invalid"})
     })?;
@@ -472,6 +508,7 @@ fn apply_with_authority(
     actor: &str,
     args: &Value,
     authority: &super::sweep::OwnerAuthority,
+    authority_refresh: &dyn Fn() -> Result<super::sweep::OwnerAuthority, Value>,
 ) -> Value {
     let token = args["confirmation"].as_str().unwrap_or("");
     let (confirmation, bytes) = match load_confirmation(home, token) {
@@ -578,6 +615,12 @@ fn apply_with_authority(
         .expect("frozen mapping is non-empty");
     let emitter = crate::task_events::InstanceName::from(actor);
     let append = crate::task_events::append_batch_computed_at(&board, &emitter, |state| {
+        let fresh_authority = authority_refresh().map_err(|error| {
+            format!("owner authority unavailable before commit: {error}")
+        })?;
+        if authority_digest(&fresh_authority) != authority_digest(authority) {
+            return Err("owner authority changed before commit".to_string());
+        }
         let mut existing = 0usize;
         for (index, mapping) in confirmation.canonical_mappings.iter().enumerate() {
             let predecessor = state
@@ -627,7 +670,7 @@ fn apply_with_authority(
             }
             let approved = mapping_for(&mapping.predecessor_id)
                 .ok_or_else(|| "mapping is not approved".to_string())?;
-            validate_predecessor(predecessor, approved, authority)?;
+            validate_predecessor(predecessor, approved, &fresh_authority)?;
             if predecessor.superseded_by.is_some() || predecessor.status.is_terminal() {
                 return Err("predecessor changed before commit".to_string());
             }
@@ -732,7 +775,10 @@ pub(super) fn handle(home: &Path, actor: &str, args: &Value) -> Value {
                 return json!({"error":"invalid confirmation","code":"invalid_confirmation"});
             }
             match authority(home) {
-                Ok(authority) => apply_with_authority(home, actor, args, &authority),
+                Ok(initial_authority) => {
+                    let refresh = || authority(home);
+                    apply_with_authority(home, actor, args, &initial_authority, &refresh)
+                }
                 Err(error) => error,
             }
         }
@@ -746,6 +792,17 @@ pub(super) fn handle_with_live_instances(
     args: &Value,
     live_instances: &HashSet<String>,
 ) -> Value {
+    let refresh = || Some(live_instances.clone());
+    handle_with_live_instances_and_refresh(home, actor, args, live_instances, &refresh)
+}
+
+pub(super) fn handle_with_live_instances_and_refresh(
+    home: &Path,
+    actor: &str,
+    args: &Value,
+    live_instances: &HashSet<String>,
+    live_refresh: &dyn Fn() -> Option<HashSet<String>>,
+) -> Value {
     if actor != "operator" {
         return json!({"error":"orphan reconciliation is operator-only","code":"operator_only"});
     }
@@ -755,7 +812,18 @@ pub(super) fn handle_with_live_instances(
     };
     match args["action"].as_str() {
         Some("orphan_reconcile_preview") => preview_with_authority(home, actor, args, &authority),
-        Some("orphan_reconcile_apply") => apply_with_authority(home, actor, args, &authority),
+        Some("orphan_reconcile_apply") => {
+            let refresh = || {
+                live_refresh().ok_or_else(|| {
+                    json!({
+                        "error":"live owner authority unavailable",
+                        "code":"owner_authority_unavailable"
+                    })
+                })
+                .and_then(|live| authority_with_live_instances(home, &live))
+            };
+            apply_with_authority(home, actor, args, &authority, &refresh)
+        }
         _ => json!({"error":"unknown orphan reconciliation action","code":"unknown_action"}),
     }
 }
@@ -1003,6 +1071,76 @@ mod tests {
             std::fs::read(board.join("task_events.jsonl")).unwrap(),
             before_apply,
             "a stale batch must append zero events"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn authority_change_inside_append_fence_refuses_before_batch_append() {
+        let (home, mappings) = fixture();
+        let board = crate::task_events::board_root(&home, BOARD_PROJECT);
+        let preview = handle_with_live_instances(
+            &home,
+            "operator",
+            &preview_args(&mappings),
+            &HashSet::new(),
+        );
+        let confirmation = preview["result"]["confirmation"].as_str().unwrap();
+        let before = std::fs::read(board.join("task_events.jsonl")).expect("fixture log");
+        let newly_live = HashSet::from(["claude-3df878".to_string()]);
+        let refresh = || Some(newly_live.clone());
+        let applied = handle_with_live_instances_and_refresh(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "orphan_reconcile_apply",
+                "confirmation": confirmation,
+            }),
+            &HashSet::new(),
+            &refresh,
+        );
+        assert_eq!(applied["code"], "stale_preview", "authority race: {applied}");
+        assert_eq!(
+            std::fs::read(board.join("task_events.jsonl")).expect("event log"),
+            before,
+            "authority change must append zero events"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn edited_confirmation_bytes_and_ttl_refuse_before_batch_append() {
+        let (home, mappings) = fixture();
+        let board = crate::task_events::board_root(&home, BOARD_PROJECT);
+        let preview = handle_with_live_instances(
+            &home,
+            "operator",
+            &preview_args(&mappings),
+            &HashSet::new(),
+        );
+        let confirmation = preview["result"]["confirmation"].as_str().unwrap();
+        let path = home
+            .join(CONFIRMATION_DIR)
+            .join(format!("{confirmation}.json"));
+        let mut bytes: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        bytes["audit_reason"] = Value::String("edited after preview".into());
+        bytes["created_at"] = Value::String("2099-01-01T00:00:00Z".into());
+        crate::store::atomic_write(&path, &serde_json::to_vec_pretty(&bytes).unwrap()).unwrap();
+        let before = std::fs::read(board.join("task_events.jsonl")).expect("fixture log");
+        let applied = handle_with_live_instances(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "orphan_reconcile_apply",
+                "confirmation": confirmation,
+            }),
+            &HashSet::new(),
+        );
+        assert_eq!(applied["code"], "confirmation_integrity", "tampered confirmation: {applied}");
+        assert_eq!(
+            std::fs::read(board.join("task_events.jsonl")).expect("event log"),
+            before,
+            "tampered confirmation must append zero events"
         );
         std::fs::remove_dir_all(home).ok();
     }

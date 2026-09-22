@@ -85,7 +85,7 @@ pub(crate) fn handle_with_live_instances(
     instance_name: &str,
     args: &Value,
     live_instances: &std::collections::HashSet<String>,
-) -> Value {
+    ) -> Value {
     match args["action"].as_str() {
         Some("sweep") => handle_sweep_with_live_instances(home, args, live_instances),
         Some("orphan_reconcile_preview" | "orphan_reconcile_apply") => {
@@ -100,6 +100,27 @@ pub(crate) fn handle_with_live_instances(
         Some("board_unretire") => super::board_unretire::handle(home, args),
         Some("health") => handle_health_with_live_instances(home, Some(live_instances)),
         _ => handle(home, instance_name, args),
+    }
+}
+
+pub(crate) fn handle_with_live_instances_and_refresh(
+    home: &Path,
+    instance_name: &str,
+    args: &Value,
+    live_instances: &std::collections::HashSet<String>,
+    live_refresh: &dyn Fn() -> Option<std::collections::HashSet<String>>,
+) -> Value {
+    match args["action"].as_str() {
+        Some("orphan_reconcile_preview" | "orphan_reconcile_apply") => {
+            super::orphan_reconcile::handle_with_live_instances_and_refresh(
+                home,
+                instance_name,
+                args,
+                live_instances,
+                live_refresh,
+            )
+        }
+        _ => handle_with_live_instances(home, instance_name, args, live_instances),
     }
 }
 

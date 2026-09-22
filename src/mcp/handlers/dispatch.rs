@@ -457,15 +457,25 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
             "error": "runtime unavailable: runtime-backed task action requires the in-process daemon runtime"
         });
     };
-    let live_instances =
+    let live_refresh = || {
         crate::agent_ops::list_snapshot(ctx.home, &runtime.registry, &runtime.externals)["result"]
             ["agents"]
             .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|agent| agent["name"].as_str().map(String::from))
-            .collect::<std::collections::HashSet<_>>();
-    crate::tasks::handle_with_live_instances(ctx.home, ctx.instance_name, ctx.args, &live_instances)
+            .map(|agents| {
+                agents
+                    .iter()
+                    .filter_map(|agent| agent["name"].as_str().map(String::from))
+                    .collect::<std::collections::HashSet<_>>()
+            })
+    };
+    let live_instances = live_refresh().unwrap_or_default();
+    crate::tasks::handle_with_live_instances_and_refresh(
+        ctx.home,
+        ctx.instance_name,
+        ctx.args,
+        &live_instances,
+        &live_refresh,
+    )
 }
 pub(crate) fn dispatch_usage_limit_takeover(ctx: &HandlerCtx<'_>) -> Value {
     usage_limit_takeover::handle_usage_limit_takeover(ctx)
