@@ -1520,6 +1520,90 @@ fn test_concurrent_creates_unique_ids() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3716 regression: a durable append must not become visible to a concurrent
+/// catalog commit before the writer has applied that same envelope in memory.
+/// The test-only seam drops the event-log lock after fsync and pauses the first
+/// writer. The unfixed path lets the second writer append from a stale catalog
+/// ordering snapshot, then the first writer fails its catalog apply as
+/// `OutOfOrder`.
+#[test]
+fn concurrent_creates_serialize_catalog_apply_after_durable_append_3716() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let home = tmp_home("concurrent-catalog-order-key");
+    let first_durable = mpsc::channel();
+    let release_first = mpsc::channel();
+    let second_durable = mpsc::channel();
+    let hook_count = std::sync::Arc::new(AtomicUsize::new(0));
+    let hook_count_for_hook = std::sync::Arc::clone(&hook_count);
+    let (first_durable_tx, first_durable_rx) = first_durable;
+    let (release_first_tx, release_first_rx) = release_first;
+    let (second_durable_tx, second_durable_rx) = second_durable;
+    let release_first_rx = std::sync::Arc::new(std::sync::Mutex::new(release_first_rx));
+    let release_first_rx_for_hook = std::sync::Arc::clone(&release_first_rx);
+    crate::task_events::catalog::install_after_durable_append_hook_for_test(&home, move |_| {
+        if hook_count_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+            first_durable_tx
+                .send(())
+                .expect("first durable append observer");
+            release_first_rx_for_hook
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("release first writer");
+        } else {
+            second_durable_tx
+                .send(())
+                .expect("second durable append observer");
+        }
+    });
+
+    let home_a = home.clone();
+    let first = std::thread::spawn(move || {
+        handle(
+            &home_a,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "first"}),
+        )
+    });
+    first_durable_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first writer must pause after durable append");
+
+    let home_b = home.clone();
+    let second = std::thread::spawn(move || {
+        handle(
+            &home_b,
+            "agent-b",
+            &serde_json::json!({"action": "create", "title": "second"}),
+        )
+    });
+    let second_reached_durable_before_first_applied = second_durable_rx
+        .recv_timeout(Duration::from_millis(250))
+        .is_ok();
+
+    release_first_tx.send(()).expect("release first writer");
+    let first_result = first.join().expect("first create");
+    let second_result = second.join().expect("second create");
+
+    assert!(
+        !second_reached_durable_before_first_applied,
+        "second writer reached durable append while first catalog apply was paused: first={first_result} second={second_result}"
+    );
+    assert_eq!(
+        first_result["status"], "created",
+        "first create: {first_result}"
+    );
+    assert_eq!(
+        second_result["status"], "created",
+        "second create: {second_result}"
+    );
+    assert_eq!(list_all(&home).len(), 2);
+    std::fs::remove_dir_all(home).ok();
+}
+
 #[test]
 fn test_task_blocked_when_dep_not_done() {
     let home = tmp_home("dep-blocked");

@@ -35,6 +35,33 @@ std::thread_local! {
 }
 
 #[cfg(test)]
+type AfterDurableAppendHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static AFTER_DURABLE_APPEND_HOOK: std::sync::OnceLock<
+    parking_lot::Mutex<Option<(PathBuf, AfterDurableAppendHook)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_after_durable_append_hook_for_test(
+    board: &Path,
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) {
+    let hooks = AFTER_DURABLE_APPEND_HOOK.get_or_init(|| parking_lot::Mutex::new(None));
+    *hooks.lock() = Some((board.to_path_buf(), std::sync::Arc::new(hook)));
+}
+
+#[cfg(test)]
+fn after_durable_append_hook_for_test(board: &Path) -> Option<AfterDurableAppendHook> {
+    let hooks = AFTER_DURABLE_APPEND_HOOK.get()?;
+    let hooks = hooks.lock();
+    hooks
+        .as_ref()
+        .filter(|(target, _)| target == board)
+        .map(|(_, hook)| std::sync::Arc::clone(hook))
+}
+
+#[cfg(test)]
 pub(crate) fn reset_status_batch_queries_for_test() {
     STATUS_BATCH_QUERIES.with(|count| count.set(0));
 }
@@ -875,6 +902,9 @@ where
     }
     let log_path = super::log_path(board);
     let lock_path = log_path.with_extension("jsonl.lock");
+    #[cfg(test)]
+    let mut file_lock = Some(crate::store::acquire_file_lock(&lock_path)?);
+    #[cfg(not(test))]
     let file_lock = crate::store::acquire_file_lock(&lock_path)?;
     drop(board_set_lock);
     if super::recover_half_writes_under_lock(board) {
@@ -921,20 +951,24 @@ where
         return Ok(Ok(Vec::new()));
     }
 
-    let _refresh = catalog.refresh.lock();
+    let mut refresh = Some(catalog.refresh.lock());
     catalog
         .refresh_all_locked(&home, true)
         .map_err(|_| anyhow::anyhow!("task catalog is unreadable"))?;
-    let mut inner = catalog
-        .inner
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if inner.phase != Phase::Ready {
+    let mut inner = Some(
+        catalog
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    if inner.as_ref().expect("catalog guard").phase != Phase::Ready {
         anyhow::bail!("task catalog is not ready");
     }
 
     let count = events.len();
     let catalog_floor = inner
+        .as_ref()
+        .expect("catalog guard")
         .boards
         .get(&board_id)
         .and_then(|projection| projection.last_seq_for(instance))
@@ -942,6 +976,8 @@ where
     let start_seq = super::next_seq_under_lock(board, instance, count as u64, catalog_floor)?;
     let timestamp = next_commit_timestamp(
         inner
+            .as_ref()
+            .expect("catalog guard")
             .boards
             .get(&board_id)
             .and_then(BoardProjection::last_order_key),
@@ -982,7 +1018,24 @@ where
     }
     log.sync_all()?;
 
+    #[cfg(test)]
+    if let Some(hook) = after_durable_append_hook_for_test(board) {
+        drop(inner.take());
+        drop(refresh.take());
+        drop(file_lock.take());
+        hook(board);
+        refresh = Some(catalog.refresh.lock());
+        inner = Some(
+            catalog
+                .inner
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
     let mut next = inner
+        .as_ref()
+        .expect("catalog guard")
         .boards
         .get(&board_id)
         .cloned()
@@ -998,12 +1051,19 @@ where
         stamp.mtime_ns,
         post_append_events,
     ));
-    inner.boards.insert(board_id.clone(), next);
-    rebuild_routes(&mut inner);
+    inner
+        .as_mut()
+        .expect("catalog guard")
+        .boards
+        .insert(board_id.clone(), next);
+    rebuild_routes(inner.as_mut().expect("catalog guard"));
 
-    drop(inner);
+    drop(inner.take());
+    #[cfg(test)]
+    drop(file_lock.take());
+    #[cfg(not(test))]
     drop(file_lock);
-    drop(_refresh);
+    drop(refresh.take());
 
     for envelope in envelopes.iter().filter(|envelope| {
         matches!(
