@@ -491,6 +491,10 @@ fn durable_operation_state(
                 }
             }
         }
+        #[cfg(test)]
+        if applied > 0 && applied < confirmation.canonical_mappings.len() {
+            fire_after_partial_durable_proof_hook_for_test(home);
+        }
     }
     if applied == 0 {
         Ok(None)
@@ -500,6 +504,45 @@ fn durable_operation_state(
         Err(
             json!({"error":"durable reconciliation proof is partial","code":"reconciliation_conflict"}),
         )
+    }
+}
+
+#[cfg(test)]
+type AfterPartialDurableProofHook = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(test)]
+static AFTER_PARTIAL_DURABLE_PROOF_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::path::PathBuf, AfterPartialDurableProofHook)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_after_partial_durable_proof_hook_for_test(
+    home: &Path,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    let hooks = AFTER_PARTIAL_DURABLE_PROOF_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    *hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((home.to_path_buf(), Box::new(hook)));
+}
+
+#[cfg(test)]
+fn fire_after_partial_durable_proof_hook_for_test(home: &Path) {
+    let Some(hooks) = AFTER_PARTIAL_DURABLE_PROOF_HOOK.get() else {
+        return;
+    };
+    let mut hooks = hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hook = hooks
+        .as_ref()
+        .is_some_and(|(target, _)| target == home)
+        .then(|| hooks.take())
+        .flatten()
+        .map(|(_, hook)| hook);
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
@@ -516,6 +559,33 @@ fn apply_with_authority(
         Err(error) => return error,
     };
     let preview_digest = crate::daemon::utils::sha256_hex(&bytes);
+    // Lock every distinct ID before resolving the fresh routes. This makes an
+    // identical concurrent apply wait for the winner, then observe its durable
+    // proof instead of racing against a post-commit route fingerprint.
+    let mut ids: Vec<String> = confirmation
+        .canonical_mappings
+        .iter()
+        .flat_map(|mapping| {
+            [
+                mapping.predecessor_id.clone(),
+                mapping.replacement_id.clone(),
+            ]
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let mut id_locks = Vec::with_capacity(ids.len());
+    for id in &ids {
+        match super::board_router::acquire_task_id_lock(home, id) {
+            Ok(lock) => id_locks.push(lock),
+            Err(error) => {
+                return json!({"error":format!("task lock failed: {error}"),"code":"task_lock_failed"})
+            }
+        }
+    }
+    // Read the durable proof only after the per-ID locks are held. The batch
+    // writer appends one JSONL envelope at a time, so an unlocked read can see
+    // a transient partial proof and incorrectly reject the idempotent retry.
     match durable_operation_state(home, &confirmation, &preview_digest) {
         Ok(Some(true)) => {
             return json!({"ok":true,"result":{"already_applied":true,"event_count":7}})
@@ -552,30 +622,6 @@ fn apply_with_authority(
     }
     if confirmation.owner_authority_digest != authority_digest(authority) {
         return json!({"error":"owner authority changed since preview","code":"owner_authority_changed"});
-    }
-    // Lock every distinct ID before resolving the fresh routes. This makes an
-    // identical concurrent apply wait for the winner, then observe its durable
-    // proof instead of racing against a post-commit route fingerprint.
-    let mut ids: Vec<String> = confirmation
-        .canonical_mappings
-        .iter()
-        .flat_map(|mapping| {
-            [
-                mapping.predecessor_id.clone(),
-                mapping.replacement_id.clone(),
-            ]
-        })
-        .collect();
-    ids.sort();
-    ids.dedup();
-    let mut id_locks = Vec::with_capacity(ids.len());
-    for id in &ids {
-        match super::board_router::acquire_task_id_lock(home, id) {
-            Ok(lock) => id_locks.push(lock),
-            Err(error) => {
-                return json!({"error":format!("task lock failed: {error}"),"code":"task_lock_failed"})
-            }
-        }
     }
     let routed = match validate_routes(home, &confirmation.canonical_mappings, &confirmation.board)
     {
@@ -834,6 +880,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn tmp_home(label: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1164,6 +1212,36 @@ mod tests {
             .as_str()
             .expect("confirmation")
             .to_string();
+        let expected_locks = mappings
+            .iter()
+            .flat_map(|mapping| [&mapping.predecessor_id, &mapping.replacement_id])
+            .collect::<HashSet<_>>()
+            .len();
+        let (locks_ready_tx, locks_ready_rx) = mpsc::channel();
+        let observed_locks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_locks_for_hook = std::sync::Arc::clone(&observed_locks);
+        crate::tasks::board_router::install_after_task_id_lock_hook_for_test(&home, move |_, _| {
+            if observed_locks_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+                == expected_locks
+            {
+                locks_ready_tx.send(()).expect("all task locks observer");
+            }
+        });
+        let (partial_observed_tx, partial_observed_rx) = mpsc::channel();
+        super::install_after_partial_durable_proof_hook_for_test(&home, move || {
+            partial_observed_tx
+                .send(())
+                .expect("partial proof observer");
+        });
+        let (partial_tx, partial_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        crate::task_events::catalog::install_after_first_event_append_hook_for_test(
+            &home,
+            move || {
+                partial_tx.send(()).expect("partial append observer");
+                release_rx.recv().expect("release partial append");
+            },
+        );
         let home_a = home.clone();
         let token_a = confirmation.clone();
         let first = std::thread::spawn(move || {
@@ -1177,6 +1255,12 @@ mod tests {
                 &HashSet::new(),
             )
         });
+        locks_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first apply must hold every task-ID lock");
+        partial_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("winner must expose a synced partial append");
         let home_b = home.clone();
         let second = std::thread::spawn(move || {
             handle_with_live_instances(
@@ -1189,6 +1273,14 @@ mod tests {
                 &HashSet::new(),
             )
         });
+        let partial_proof_observed = partial_observed_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+        release_tx.send(()).expect("release winner");
+        assert!(
+            !partial_proof_observed,
+            "losing retry must not inspect a partial proof before acquiring the winner's task locks"
+        );
         let first = first.join().expect("first apply");
         let second = second.join().expect("second apply");
         let responses = [first, second];

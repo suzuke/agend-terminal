@@ -243,7 +243,45 @@ pub(super) fn acquire_task_id_lock(
     home: &Path,
     task_id: &str,
 ) -> anyhow::Result<crate::store::FileFlockGuard> {
-    crate::store::acquire_file_lock(&task_id_lock_path(home, task_id))
+    let guard = crate::store::acquire_file_lock(&task_id_lock_path(home, task_id))?;
+    #[cfg(test)]
+    fire_after_task_id_lock_hook_for_test(home, task_id);
+    Ok(guard)
+}
+
+#[cfg(test)]
+type AfterTaskIdLockHook = Box<dyn Fn(&Path, &str) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static AFTER_TASK_ID_LOCK_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(PathBuf, AfterTaskIdLockHook)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(super) fn install_after_task_id_lock_hook_for_test(
+    home: &Path,
+    hook: impl Fn(&Path, &str) + Send + Sync + 'static,
+) {
+    let hooks = AFTER_TASK_ID_LOCK_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    *hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((home.to_path_buf(), Box::new(hook)));
+}
+
+#[cfg(test)]
+fn fire_after_task_id_lock_hook_for_test(home: &Path, task_id: &str) {
+    let Some(hooks) = AFTER_TASK_ID_LOCK_HOOK.get() else {
+        return;
+    };
+    let hooks = hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((target, hook)) = hooks.as_ref() {
+        if target == home {
+            hook(home, task_id);
+        }
+    }
 }
 
 /// Resolve a globally unique task id through the authoritative catalog.

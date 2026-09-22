@@ -34,6 +34,49 @@ std::thread_local! {
     static STATUS_BATCH_QUERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// Test-only scheduling seam for the batch append race regression. The hook is
+// fired after the first envelope is written and synced, while the board lock
+// remains held, so a concurrent reader can be forced to observe a partial
+// proof without changing production behavior.
+#[cfg(test)]
+type AfterFirstEventAppendHook = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(test)]
+static AFTER_FIRST_EVENT_APPEND_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(PathBuf, AfterFirstEventAppendHook)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_after_first_event_append_hook_for_test(
+    home: &Path,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    let hooks = AFTER_FIRST_EVENT_APPEND_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    *hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((home.to_path_buf(), Box::new(hook)));
+}
+
+#[cfg(test)]
+fn fire_after_first_event_append_hook_for_test(home: &Path) {
+    let Some(hooks) = AFTER_FIRST_EVENT_APPEND_HOOK.get() else {
+        return;
+    };
+    let mut hooks = hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hook = hooks
+        .as_ref()
+        .is_some_and(|(target, _)| target == home)
+        .then(|| hooks.take())
+        .flatten()
+        .map(|(_, hook)| hook);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 #[cfg(test)]
 type AfterDurableAppendHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync + 'static>;
 
@@ -1021,8 +1064,29 @@ where
         .create(true)
         .append(true)
         .open(&log_path)?;
-    for line in lines {
+    for (line_index, line) in lines.into_iter().enumerate() {
         writeln!(log, "{line}")?;
+        #[cfg(not(test))]
+        let _ = line_index;
+        #[cfg(test)]
+        if line_index == 0 {
+            log.sync_all()?;
+            // Let the proof reader resolve the route while this test-only
+            // partial-append pause holds the file lock. Production keeps the
+            // catalog and refresh guards across the append; releasing them
+            // here makes the JSONL partial-write window observable to the
+            // regression.
+            drop(inner.take());
+            drop(refresh.take());
+            fire_after_first_event_append_hook_for_test(&home);
+            refresh = Some(catalog.refresh.lock());
+            inner = Some(
+                catalog
+                    .inner
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+        }
     }
     log.sync_all()?;
 
