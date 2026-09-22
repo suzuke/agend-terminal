@@ -309,6 +309,11 @@ type CatalogSnapshot<T> = (Result<T, CatalogRouteError>, Option<CatalogRevision>
 
 pub struct StrictTaskCatalog {
     home: Option<PathBuf>,
+    /// Serialize in-process commits across all boards in this home. The event
+    /// log flock remains the cross-process durability fence, while this guard
+    /// keeps one process from publishing a durable append before the same
+    /// envelope has been applied to its shared catalog projection.
+    commit: parking_lot::Mutex<()>,
     refresh: parking_lot::Mutex<()>,
     inner: RwLock<CatalogInner>,
     rebuild_in_flight: AtomicBool,
@@ -355,6 +360,7 @@ impl StrictTaskCatalog {
         }
         Self {
             home,
+            commit: parking_lot::Mutex::new(()),
             refresh: parking_lot::Mutex::new(()),
             inner: RwLock::new(CatalogInner {
                 phase,
@@ -383,6 +389,7 @@ impl StrictTaskCatalog {
                     }
                     Phase::Ready => {}
                 }
+                let _commit = self.commit.lock();
                 let result = self.refresh_all(home, false);
                 if result.is_err()
                     && matches!(
@@ -951,6 +958,7 @@ where
         return Ok(Ok(Vec::new()));
     }
 
+    let _commit = catalog.commit.lock();
     let mut refresh = Some(catalog.refresh.lock());
     catalog
         .refresh_all_locked(&home, true)
@@ -1064,6 +1072,7 @@ where
     #[cfg(not(test))]
     drop(file_lock);
     drop(refresh.take());
+    drop(_commit);
 
     for envelope in envelopes.iter().filter(|envelope| {
         matches!(
