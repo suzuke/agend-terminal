@@ -62,6 +62,9 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         "done" => handle_done(home, instance_name, emitter, args),
         "update" => handle_update(home, instance_name, emitter, args),
         "sweep" => handle_sweep(home, args),
+        "orphan_reconcile_preview" | "orphan_reconcile_apply" => {
+            super::orphan_reconcile::handle(home, instance_name, args)
+        }
         "board_sweep" => super::board_sweep::handle(home, args),
         "board_unretire" => super::board_unretire::handle(home, args),
         "health" => handle_health(home),
@@ -85,6 +88,14 @@ pub(crate) fn handle_with_live_instances(
 ) -> Value {
     match args["action"].as_str() {
         Some("sweep") => handle_sweep_with_live_instances(home, args, live_instances),
+        Some("orphan_reconcile_preview" | "orphan_reconcile_apply") => {
+            super::orphan_reconcile::handle_with_live_instances(
+                home,
+                instance_name,
+                args,
+                live_instances,
+            )
+        }
         Some("board_sweep") => super::board_sweep::handle(home, args),
         Some("board_unretire") => super::board_unretire::handle(home, args),
         Some("health") => handle_health_with_live_instances(home, Some(live_instances)),

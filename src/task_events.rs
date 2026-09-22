@@ -53,8 +53,9 @@ pub mod catalog;
 /// SCHEMA_VERSION` check in [`replay`]. v2 readers accept v1 envelopes
 /// (the new `Created` fields default to `None` / `Vec::new()`).
 /// v3 (#3279) adds the typed [`TaskEvent::Superseded`] terminal transition.
-/// Older readers must reject rather than silently fold it as an active task.
-pub const SCHEMA_VERSION: u32 = 3;
+/// v4 (#3584) adds the optional typed reconciliation proof to that event.
+/// Older readers must reject rather than silently fold either form as an active task.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Hot-file event count [`compact`] trims the hot log back down to.
 pub const COMPACTION_KEEP: usize = 10_000;
@@ -326,6 +327,8 @@ pub enum TaskEvent {
         task_id: TaskId,
         by: InstanceName,
         successor_id: TaskId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proof: Option<SupersessionReconciliationProof>,
     },
     Linked {
         task_id: TaskId,
@@ -742,6 +745,27 @@ pub struct OperatorSettlement {
     pub holder_instance: Option<InstanceName>,
     pub target: OperatorSettlementTarget,
     pub result: String,
+}
+
+/// Durable proof for the operator-only orphan predecessor reconciliation path.
+/// The proof is deliberately part of the typed event rather than a free-form
+/// audit line, so retries can distinguish the same operation from a conflicting
+/// successor after a restart.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupersessionReconciliationProof {
+    pub operation_id: String,
+    pub preview_digest: String,
+    pub mapping_digest: String,
+    pub board: String,
+    pub audit_reason: String,
+    pub predecessor_created_at: String,
+    pub replacement_created_at: String,
+    pub replacement_terminal_event_instance: String,
+    pub replacement_terminal_event_seq: u64,
+    pub replacement_record_sha256: String,
+    pub replacement_evidence_sha256: String,
+    pub actor_digest: String,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -440,18 +440,21 @@ pub(crate) fn dispatch_restart_daemon_with_requester(
 // handler. Unknown actions produce tool-specific error JSON.
 // ---------------------------------------------------------------------
 
-/// #2454 Slice 5: task health/sweep are runtime-backed reads.  They must use
-/// the live registry forwarded through the in-process MCP ingress and must
-/// fail closed when that runtime is absent; all other task actions preserve
-/// the existing public `tasks::handle` path.
+/// #2454/#3584: task health/sweep and orphan reconciliation are runtime-backed
+/// actions. They use the live registry forwarded through the in-process MCP
+/// ingress and fail closed when that runtime is absent; all other task actions
+/// preserve the existing public `tasks::handle` path.
 pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
     let action = ctx.args["action"].as_str().unwrap_or("");
-    if !matches!(action, "health" | "sweep") {
+    if !matches!(
+        action,
+        "health" | "sweep" | "orphan_reconcile_preview" | "orphan_reconcile_apply"
+    ) {
         return task::handle_task(ctx.home, ctx.args, ctx.instance_name);
     }
     let Some(runtime) = ctx.runtime else {
         return json!({
-            "error": "runtime unavailable: task health/sweep requires the in-process daemon runtime"
+            "error": "runtime unavailable: runtime-backed task action requires the in-process daemon runtime"
         });
     };
     let live_instances =
@@ -894,7 +897,16 @@ mod tests {
             (
                 "task",
                 &[
-                    "create", "list", "claim", "update", "done", "sweep", "health", "activity",
+                    "create",
+                    "list",
+                    "claim",
+                    "update",
+                    "done",
+                    "sweep",
+                    "health",
+                    "activity",
+                    "orphan_reconcile_preview",
+                    "orphan_reconcile_apply",
                 ],
             ),
             ("ci", &["watch", "unwatch", "status", "defer"]),

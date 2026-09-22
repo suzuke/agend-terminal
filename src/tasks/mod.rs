@@ -11,6 +11,7 @@ mod handler;
 pub mod lifecycle;
 pub(crate) mod operator_settlement;
 mod orphan;
+mod orphan_reconcile;
 mod supersession;
 mod sweep;
 

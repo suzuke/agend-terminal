@@ -134,6 +134,7 @@ pub(super) fn create_with_supersession(
             task_id: typed_predecessor.clone(),
             by: emitter.clone(),
             successor_id: typed_successor.clone(),
+            proof: None,
         });
         Ok(events)
     });

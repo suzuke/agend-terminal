@@ -1241,6 +1241,7 @@ fn state_machine_exhaustive_transitions() {
                 task_id: tid.clone(),
                 by: inst.clone(),
                 successor_id: TaskId::from("t-successor"),
+                proof: None,
             }],
             TaskStatus::Blocked => vec![TaskEvent::Blocked {
                 task_id: tid.clone(),

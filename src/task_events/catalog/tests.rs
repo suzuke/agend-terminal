@@ -1107,6 +1107,7 @@ fn incremental_apply_matches_incumbent_replay() {
             task_id: task_id.clone(),
             by: actor.clone(),
             successor_id: TaskId::from("t-20260824000000000000-1-3"),
+            proof: None,
         },
         TaskEvent::Claimed {
             task_id: child_id.clone(),

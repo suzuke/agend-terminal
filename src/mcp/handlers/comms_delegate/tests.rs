@@ -1372,6 +1372,7 @@ mod review_assignment_marker_tests {
                     task_id: crate::task_events::TaskId("t-rev-1".into()),
                     by: by.clone(),
                     successor_id: crate::task_events::TaskId("t-rev-2".into()),
+                    proof: None,
                 },
             ),
         ];
