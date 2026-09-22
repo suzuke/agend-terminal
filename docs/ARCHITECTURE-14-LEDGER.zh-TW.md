@@ -2,11 +2,20 @@
 
 # Architecture-14 收斂 ledger
 
+> **Status：** 歷史收斂 snapshot
+> **Audience：** Reviewer 與 maintainer
+> **Authority：** 歷史 evidence；目前權威是 SOURCE-OF-TRUTH 與 protected-main source/test
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 這是 Architecture-14 收斂計畫的權威進度 ledger。它記錄的是架構 outcome，
 不是 PR throughput：merged PR 可作為某項目的 evidence，但不會只因 merge
 本身就完成該項目。
 
-## Snapshot 與權威
+## 歷史 snapshot 與目前權威
+
+本 ledger 是歷史 snapshot，不是目前 runtime contract。目前狀態請以
+[SOURCE-OF-TRUTH.md](SOURCE-OF-TRUTH.md) 與 protected-main source/test 為準。
+**STOP：** 未重新核實前，不得把下方 snapshot 數字當成目前狀態。
 
 - Snapshot 日期：2026-07-17
 - `agend-terminal` baseline：`main` 上的

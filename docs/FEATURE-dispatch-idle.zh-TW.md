@@ -2,6 +2,11 @@
 
 # Dispatch Idle Tracking — 任務回應超時追蹤
 
+> **Status：** 目前 workflow 指南
+> **Audience：** Agent 與 operator
+> **Authority：** dispatch-idle daemon 與 binding_state MCP surface
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 ## 使用情境
 
 > **適用對象：** Agent 基礎設施——agent 透過 MCP tools 使用，operator 通常不直接操作。
@@ -155,23 +160,17 @@ Fail-open 語義：如果清理過程中讀取 fleet.yaml 或 task board 失敗�
 
 ---
 
-## 可見性查詢
+## 檢查待處理 dispatch
 
-Agent 可以查詢與自己相關的 dispatch idle 狀態：
+使用 `binding_state` 檢查某個 instance 的 dispatch metadata：
 
 ```json
-{
-  "tool": "dispatch_idle",
-  "action": "list"
-}
+{"tool":"binding_state","instance":"lead"}
 ```
 
-回傳分為兩個視角：
-
-- **as_dispatcher**：以分派者身份，看到自己分派出去的所有 pending/exceeded sidecar
-- **as_target**：以被分派者身份，看到針對自己的所有 sidecar
-
-已經過期清理或被 report 解除的 sidecar 不會出現。
+回應會提供 `dispatched_waiting_for`（等待回覆的 dispatch）與
+`pending_response_to`（等待你回覆的 inbound dispatch）。**STOP：**
+不要呼叫 `dispatch_idle` MCP 工具；不存在這個公開工具。
 
 ---
 

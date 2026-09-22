@@ -2,6 +2,11 @@
 
 # CI Watch — Automated PR CI Monitoring
 
+> **Status:** Current workflow guide
+> **Audience:** Agents and operators
+> **Authority:** CI MCP schema and daemon watch state
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 CI Watch polls a forge CI provider for a repository and branch, records PR/CI state, and delivers terminal results to subscribers and optional follow-up agents.
 
 ## Usage Scenarios
@@ -70,6 +75,26 @@ Calling `watch` again for the same key is append-idempotent: it preserves poll s
 Both status filters are optional. The result exposes persisted watch and latest-poll diagnostics.
 
 Releasing a worktree does not implicitly unsubscribe CI Watch. Watch lifetime is managed by terminal state, TTL, explicit `unwatch`, and its own cleanup rules.
+
+## Defer and acknowledge a handoff
+
+Use `defer` when a terminal task should wake the CI track later:
+
+```json
+{"tool":"ci","action":"defer","repository":"owner/repo","episode":"episode-...","wake_task_id":"t-...","reason":"waiting for task","defer_secs":600}
+```
+
+Use `ack_handoff` to settle one pickup without removing the watch:
+
+```json
+{"tool":"ci","action":"ack_handoff","repository":"owner/repo","branch":"feat/my-feature","episode":"episode-..."}
+```
+
+`episode` is the exact identity returned by `ci action=status`. **STOP:**
+`defer_secs` must be 60–3600, and protected exact-head watches must satisfy
+the full SHA, task, authorization, and continuation requirements below.
+
+See [MCP Tools](MCP-TOOLS.md) for the complete CI schema.
 
 ## Dispatch Auto-Arm
 

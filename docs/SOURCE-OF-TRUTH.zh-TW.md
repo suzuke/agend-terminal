@@ -2,6 +2,11 @@
 
 # Source-of-Truth Matrix — 真相源矩陣
 
+> **Status：** Active engineering norm
+> **Audience：** Reviewer 與 maintainer
+> **Authority：** Protected-main source、test 與本 matrix
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 **狀態**：ACTIVE — 工程規範。新增狀態、新增儲存、或替既有狀態新增一個讀取者，
 合併前都必須在此分類。
 
@@ -13,8 +18,10 @@ branch 堆積根因就是一個「沒人知道已死的 stale 欄位」
 真相源修法，都是個案式各自確立的。本文件把它們系統化。
 
 **重新核實**：以下命名過的 store、writer 與 reader 已對照
-`main@1d83b423`（2026-07-16）檢查。函式／型別名是穩定錨點；`path:line`
+`main@62b28f36`（2026-09-22）檢查。函式／型別名是穩定錨點；`path:line`
 尾碼是導航提示，檔案拆分後可能移動。改動列出的入口時，請同步更新錨點與行號提示。
+
+**STOP：** 尚未重新核實的 matrix 不能證明目前行為。
 
 ---
 

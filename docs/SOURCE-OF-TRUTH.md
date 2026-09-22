@@ -2,6 +2,11 @@
 
 # Source-of-Truth Matrix
 
+> **Status:** Active engineering norm
+> **Audience:** Reviewers and maintainers
+> **Authority:** Protected-main source, tests, and this matrix
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 **Status**: ACTIVE — engineering norm. New state, new storage, or a new
 reader of existing state must be classified here before merge.
 
@@ -14,9 +19,11 @@ post-#994 `topics.json` single-source rule and the `binding.json` truth-source
 fix were each established case-by-case. This doc systematizes them.
 
 **Revalidated**: named stores, writers, and readers below were checked against
-`main@1d83b423` (2026-07-16). Function/type names are the stable anchors;
+`main@62b28f36` (2026-09-22). Function/type names are the stable anchors;
 `path:line` suffixes are navigation hints and may move as files are split. When
 you touch a listed entry point, update the anchor and its line hint here.
+
+**STOP:** An unrefreshed matrix is not proof of current behavior.
 
 ---
 

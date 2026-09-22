@@ -2,13 +2,29 @@
 
 # AgEnD MCP Tools Reference (34 tools)
 
+> **Status:** Current exact schema reference
+> **Audience:** Agents and reviewers
+> **Authority:** Live tools/list schema and daemon registry
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 The daemon registry and live `tools/list` schema are authoritative. Role filtering can expose a subset of these 34 registered tools to an instance.
 
 ## Action-based Tools
 
 ### `task`
 
-Manage task boards. Actions: `create`, `list`, `get`, `claim`, `done`, `update`, `sweep`, `health`, `activity`, `metadata_set`, `metadata_get`, `ack_plan`.
+Manage task boards. Actions: `create`, `list`, `get`, `claim`, `done`, `update`, `sweep`, `board_sweep`, `board_unretire`, `health`, `activity`, `metadata_set`, `metadata_get`, `ack_plan`, `orphan_reconcile_preview`, `orphan_reconcile_apply`.
+
+- **REQUIRED:** Every call supplies `action`. Orphan reconciliation also requires `decision_id` and `board`; apply requires the frozen `mappings` and the preview `confirmation` token.
+- **STOP:** Never apply an orphan reconciliation without a matching preview confirmation.
+- **OPTIONAL:** Use `verbose`, `fields`, `include_history`, and filters to control list output.
+
+Preview, then apply only the frozen mapping:
+
+```json
+{"action":"orphan_reconcile_preview","decision_id":"d-...","board":"project"}
+{"action":"orphan_reconcile_apply","decision_id":"d-...","board":"project","mappings":[{"predecessor_id":"t-old","replacement_id":"t-new"}],"confirmation":"preview-token"}
+```
 
 - Core fields include `id`/`task_id`, `title`, `description`, `assignee`, `priority`, `status`, `branch`, `depends_on`, `result`, `due_at`, `project`, and `scope`.
 - `list` returns actionable tasks by default; use `include_history:true` to include done/cancelled tasks and filters such as `filter_status` or `filter_assignee` to narrow it.
@@ -34,7 +50,12 @@ Manage teams. Actions: `create`, `delete`, `list`, `update`.
 
 ### `schedule`
 
-Manage timed delivery. Actions: `create`, `list`, `update`, `delete`.
+Manage timed delivery. Actions: `create`, `list`, `update`, `delete`, `runs`, `complete`, `deliver`, `resolve_recovery`.
+
+- **REQUIRED:** `attempt_id` is required for `complete` and `deliver`; those actions also use `run_id`.
+- **STOP:** Use `resolve_recovery` only after an operator confirms workers are stopped, delivery is reconciled, and cleanup is complete.
+
+The normal lifecycle is `create` or `list`, inspect `runs`, then `complete` or `deliver` the selected `run_id` and `attempt_id`.
 
 - Fields: `id`, `label`, `instance`, `message`, `cron`, `run_at`, `timezone`, `enabled`.
 - `list` returns the newest three history entries and `runs_total` by default; use `full_history:true` for all retained entries, up to 50.
@@ -48,7 +69,17 @@ Manage batch deployments. Actions: `deploy`, `teardown`, `list`.
 
 ### `ci`
 
-Manage CI watches. Actions: `watch`, `unwatch`, `status`.
+Manage CI watches. Actions: `watch`, `unwatch`, `status`, `defer`, `ack_handoff`.
+
+- **REQUIRED:** `repository` is required for `watch`, `unwatch`, and `ack_handoff`; `branch` is required for `ack_handoff`; `episode` is required for `defer` and `ack_handoff`.
+- **REQUIRED for `defer`:** `wake_task_id`, `reason`, and bounded `defer_secs` (60–3600).
+- **OPTIONAL:** `notification_only`, `head_sha`, `subject_head_sha`, `review_class`, and provider fields.
+- **STOP:** Protected exact-head watches fail closed without the required full SHA, task, authorization, and continuation fields.
+
+```json
+{"action":"defer","repository":"owner/repo","episode":"episode-...","wake_task_id":"t-...","reason":"waiting for task","defer_secs":600}
+{"action":"ack_handoff","repository":"owner/repo","branch":"feat/example","episode":"episode-..."}
+```
 
 - Fields: `repository`, `branch`, `interval_secs`, `next_after_ci`, `review_class`, `ci_provider`, `ci_provider_url`, `task_id`, `head_sha`, `subject_head_sha`.
 - Use `repository` (GitHub `owner/repo`), not `repo`. `watch` may derive it from the caller's binding; `unwatch` requires it explicitly.

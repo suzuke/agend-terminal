@@ -2,6 +2,11 @@
 
 # Teams
 
+> **Status：** 目前 workflow 指南
+> **Audience：** Operator 與 agent
+> **Authority：** fleet.yaml、team handler 與即時 team schema
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 Team 將 agent 組成具名單位，以進行結構化協作。每個 team 都有 members、optional（但強烈建議設定）的 orchestrator，並儲存在 `fleet.yaml` 中，而不是獨立的資料來源。
 
 ## 使用情境
@@ -27,12 +32,20 @@ Team 將 agent 組成具名單位，以進行結構化協作。每個 team 都�
 
 - `src/teams.rs`——主要實作（projection model）。
 - `src/fleet/mod.rs`——實際 storage layer。
-- `src/mcp/handlers/dispatch.rs`——將 `team` parameter route 到 `send`。
-- `src/mcp/handlers/comms.rs`——檢查 team 與 orchestrator relationship。
+- `src/mcp/handlers/comms.rs`——將 `team` selector route 到 broadcast，並檢查 team／orchestrator relationship。
+- `src/mcp/handlers/dispatch.rs`——負責 team CRUD dispatch，不負責訊息 routing。
 - `src/api/handlers/instance.rs`——讀取 team info 以注入 prompt。
 - `Team` 是 projection model；`TeamConfig` 是 `fleet.yaml` 的 write type。
 - `stale_members` 只會在 list projection 中填入。
 - `degraded` 是 view-layer signal，不是 persisted field。
+
+使用 `team` selector 廣播給整個 team：
+
+```json
+{"team":"fixup","message":"Merge freeze starts now","request_kind":"update"}
+```
+
+**STOP：** `team` 代表 broadcast，不是單一收件者。
 
 ## 3. 資料模型
 

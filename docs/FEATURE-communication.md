@@ -2,6 +2,11 @@
 
 # Inter-Agent Communication System
 
+> **Status:** Current workflow guide
+> **Audience:** Agents and operators
+> **Authority:** Send/inbox handlers and the live MCP schema
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 AgEnD Terminal's communication system enables structured message passing between agents — delegating tasks, asking questions, reporting results, and broadcasting updates.
 
 ## Usage Scenarios
@@ -79,7 +84,11 @@ Every message has a `request_kind` that determines the recipient's handling obli
 
 ### task — Task Delegation
 
-Used to assign work to another agent. Create and pass a `task_id` whenever possible. Broadcast task dispatch requires one; the current single-target compatibility path can auto-create a task when it is omitted.
+Used to assign work to another agent.
+
+- **REQUIRED:** Broadcast task dispatch (`instances`, `team`, or `tags`) must include `task_id`.
+- **OPTIONAL compatibility:** Single-target task dispatch may auto-create a task when `task_id` is omitted.
+- **RECOMMENDED:** Create the task explicitly first for the stable, auditable flow.
 
 ```json
 {
@@ -90,6 +99,12 @@ Used to assign work to another agent. Create and pass a `task_id` whenever possi
   "branch": "fix/1177-sha-gate-empty",
   "success_criteria": "Fix complete + cargo test passes + PR created"
 }
+```
+
+The example above uses the recommended explicit-task flow. The compatibility path is single-target only:
+
+```json
+{"instance":"dev","message":"Check the task status","request_kind":"task"}
 ```
 
 Task type supports additional management parameters:
@@ -319,6 +334,8 @@ Sprint 58 Wave 4 introduced the anti-stall contract:
 
 - `request_kind=task` in broadcast mode (`instances`/`team`/`tags`) **must** include `task_id`
 - `request_kind=task` in single-target mode currently auto-creates a task if `task_id` is omitted; explicit creation remains the stable, auditable flow
+
+**STOP:** Do not rely on single-target auto-creation for a broadcast; create and pass the task ID first.
 
 How to obtain a `task_id`:
 

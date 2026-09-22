@@ -2,14 +2,23 @@
 
 # Recovery Stage
 
+> **Status：** 目前 Stage 1 指南，含明確標示的歷史 section
+> **Audience：** Agent、operator 與 reviewer
+> **Authority：** Recovery dispatcher source 與 protected-main test
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 `#685` staged auto-recovery dispatcher 的權威來源。
 
-> **目前狀態（已於 `main@1d83b423`、2026-07-16 重新驗證）：** live
+> **目前狀態（已於 `main@62b28f36`、2026-09-22 重新驗證）：** live
 > dispatcher 只保留 Stage 1，且預設仍為 shadow。在 canonical per-tick
 > 順序中，它位於 `HangDetectionHandler` 與
 > `BackendExitDetectionHandler` 之後。Shadow mode 不做 PTY I/O，但仍會
 > 記錄 `Stage1Pending` 與 `last_stage1_fired_at`，作為 one-shot re-fire
 > guard。§RS.9 與 §RS.10 只屬歷史紀錄。
+
+**使用本頁：** 先閱讀上方目前的 Stage 1 行為。**STOP：** 標示為歷史的
+section 是 evidence，不是 live implementation 指引。**OPTIONAL：** 排查
+regression 時再閱讀歷史理由。
 
 **#2549 P2 更新（operator decision `d-20260703021554626467-13`）：**
 Stage 2（auto-restart）與 dispatcher 驅動的 Stage 3 escalation path
@@ -288,7 +297,7 @@ short-circuit cycle，**直接** escalation 至 `Stage3Eligible`——要求 ope
 ### 9.2 Spawn 間的選擇性欄位保留
 
 Decision §1 critical wrinkle（dev round 1）：`spawn_agent` 在
-`rg "reg.insert" src/agent.rs` 建立一個**全新、使用預設 `HealthTracker`
+`rg "reg.insert" src/agent/mod.rs` 建立一個**全新、使用預設 `HealthTracker`
 的 `AgentCore`**。既有 Crash path 透過 `daemon/mod.rs` 的
 `saved_health.clone()` 保留所有 health；Stage 2 需要不同語意：
 

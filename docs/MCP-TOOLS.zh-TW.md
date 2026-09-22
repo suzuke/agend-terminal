@@ -2,13 +2,29 @@
 
 # AgEnD MCP Tools Reference — 工具參考（34 個工具）
 
+> **Status：** 目前精確 schema 參考
+> **Audience：** Agent 與 reviewer
+> **Authority：** 即時 tools/list schema 與 daemon registry
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance role 不同，實際顯示的工具可能是這 34 個已註冊工具的子集。
 
 ## 動作型工具（Action-based Tools）
 
 ### `task`
 
-管理 task board。動作：`create`、`list`、`get`、`claim`、`done`、`update`、`sweep`、`health`、`activity`、`metadata_set`、`metadata_get`、`ack_plan`。
+管理 task board。動作：`create`、`list`、`get`、`claim`、`done`、`update`、`sweep`、`board_sweep`、`board_unretire`、`health`、`activity`、`metadata_set`、`metadata_get`、`ack_plan`、`orphan_reconcile_preview`、`orphan_reconcile_apply`。
+
+- **REQUIRED：** 每次呼叫都要提供 `action`。Orphan reconciliation 另外需要 `decision_id` 與 `board`；apply 還需要凍結的 `mappings` 與 preview 回傳的 `confirmation` token。
+- **STOP：** 沒有相符的 preview confirmation 時，不得 apply orphan reconciliation。
+- **OPTIONAL：** 用 `verbose`、`fields`、`include_history` 與 filter 控制 list 輸出。
+
+先 preview，再只套用凍結的 mapping：
+
+```json
+{"action":"orphan_reconcile_preview","decision_id":"d-...","board":"project"}
+{"action":"orphan_reconcile_apply","decision_id":"d-...","board":"project","mappings":[{"predecessor_id":"t-old","replacement_id":"t-new"}],"confirmation":"preview-token"}
+```
 
 - 主要欄位包括 `id`／`task_id`、`title`、`description`、`assignee`、`priority`、`status`、`branch`、`depends_on`、`result`、`due_at`、`project` 與 `scope`。
 - `list` 預設只回傳可執行任務；用 `include_history:true` 納入 done/cancelled 任務，並可用 `filter_status`、`filter_assignee` 等條件縮小範圍。
@@ -34,7 +50,12 @@ Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance 
 
 ### `schedule`
 
-管理定時投遞。動作：`create`、`list`、`update`、`delete`。
+管理定時投遞。動作：`create`、`list`、`update`、`delete`、`runs`、`complete`、`deliver`、`resolve_recovery`。
+
+- **REQUIRED：** `complete` 與 `deliver` 需要 `attempt_id`，並使用 `run_id`。
+- **STOP：** 只有在 operator 確認 worker 已停止、投遞已對帳且清理完成後，才能使用 `resolve_recovery`。
+
+正常生命週期是 `create` 或 `list`、查看 `runs`，再用選定的 `run_id` 與 `attempt_id` 執行 `complete` 或 `deliver`。
 
 - 欄位：`id`、`label`、`instance`、`message`、`cron`、`run_at`、`timezone`、`enabled`。
 - `list` 預設回傳最新三筆 history 與 `runs_total`；設 `full_history:true` 可取回最多 50 筆保留記錄。
@@ -48,7 +69,17 @@ Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance 
 
 ### `ci`
 
-管理 CI watch。動作：`watch`、`unwatch`、`status`。
+管理 CI watch。動作：`watch`、`unwatch`、`status`、`defer`、`ack_handoff`。
+
+- **REQUIRED：** `watch`、`unwatch` 與 `ack_handoff` 需要 `repository`；`ack_handoff` 需要 `branch`；`defer` 與 `ack_handoff` 需要 `episode`。
+- **`defer` REQUIRED：** `wake_task_id`、`reason` 與有界的 `defer_secs`（60–3600）。
+- **OPTIONAL：** `notification_only`、`head_sha`、`subject_head_sha`、`review_class` 與 provider 欄位。
+- **STOP：** Protected exact-head watch 缺少完整 SHA、task、授權與 continuation 欄位時會 fail closed。
+
+```json
+{"action":"defer","repository":"owner/repo","episode":"episode-...","wake_task_id":"t-...","reason":"waiting for task","defer_secs":600}
+{"action":"ack_handoff","repository":"owner/repo","branch":"feat/example","episode":"episode-..."}
+```
 
 - 欄位：`repository`、`branch`、`interval_secs`、`next_after_ci`、`review_class`、`ci_provider`、`ci_provider_url`、`task_id`、`head_sha`、`subject_head_sha`。
 - 使用 `repository`（GitHub `owner/repo`），不是 `repo`。`watch` 可從 caller binding 推導；`unwatch` 必須明確提供。

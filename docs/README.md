@@ -2,13 +2,18 @@
 
 # AgEnD Terminal — Documentation
 
+> **Status:** Current documentation index
+> **Audience:** Operators, agents, reviewers, and contributors
+> **Authority:** This index plus each linked topic owner
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 Everything beyond the [project README](../README.md), mapped by topic. Every
 repository-authored Markdown document is maintained as an English /
 Traditional-Chinese pair; neither language is allowed to silently omit a
 section, table, code block, or link target.
 
-> New here? Start with [Quick Start](FEATURE-quickstart.md), then
-> [Fleet Configuration](FEATURE-fleet.md).
+> **Start here:** Use the [goal router](START-HERE.md) to choose Operator,
+> Agent, Reviewer, or Incident. New operators can then open [Quick Start](FEATURE-quickstart.md).
 
 ## Placement and maintenance policy
 
@@ -52,6 +57,7 @@ believed then, not a current contract.
 
 | Document | EN | 中文 | Covers |
 |---|---|---|---|
+| Start Here | [EN](START-HERE.md) | [中文](START-HERE.zh-TW.md) | Goal-based routing for operators, agents, reviewers, and incidents |
 | Quick Start | [EN](FEATURE-quickstart.md) | [中文](FEATURE-quickstart.zh-TW.md) | Install through first live fleet |
 | Fleet Configuration | [EN](FEATURE-fleet.md) | [中文](FEATURE-fleet.zh-TW.md) | `fleet.yaml`, backends, roles, teams, and workspaces |
 | Usage Guide | [EN](USAGE.md) | [中文](USAGE.zh-TW.md) | Daily operation and common flows |

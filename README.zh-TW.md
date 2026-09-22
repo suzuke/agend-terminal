@@ -7,6 +7,11 @@
 
 # AgEnD Terminal
 
+> **Status：** 目前產品總覽
+> **Audience：** Operator 與 contributor
+> **Authority：** Protected-main source 與下方目前指南
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 統籌 AI coding agent——不只是執行它們。
 
 ![AgEnD Terminal — orchestrating a fleet of AI coding agents in a multi-pane TUI](docs/tui-screenshot.png)
@@ -19,7 +24,7 @@
 
 - **Fleet-as-code** — 一份 YAML 就宣告完每個 agent 的 backend、role、工作目錄與所屬 team。`agend-terminal start` 一次把整個 fleet 拉起來。
 - **6 種 backend** — Claude Code、Codex、Kiro、OpenCode、Antigravity CLI 與 Grok Build。換 backend 只要改一個欄位。
-- **內建 agent 協調** — agent 之間透過 32 個 MCP 工具委派工作、互相查詢、廣播更新，不需要任何膠水程式碼。
+- **內建 agent 協調** — agent 之間透過 34 個 MCP 工具委派工作、互相查詢、廣播更新，不需要任何膠水程式碼。
 - **自動 git worktree 隔離** — 綁定 branch 的 task／instance 可使用 daemon 管理的 worktree；未綁定者使用設定的 workspace。
 - **Crash 後自動復原並移交上下文** — agent 會自動重啟並接續原本的對話。內建指數退避、健康監控與 hung 偵測。
 - **遠端操控** — 透過多 pane 的 TUI、Telegram 或 Discord 操控整個 fleet，agent 需要你介入時會主動通知。
@@ -112,7 +117,7 @@ graph LR
 |---|---|---|
 | Fleet 統籌（`fleet.yaml`、PTY 啟動、監督、自動重啟） | Beta | 核心路徑；測試充分 |
 | Git worktree 隔離 | Beta | branch-bound worktree lease／release／GC |
-| MCP 協調工具（32 個） | Beta | `send`／`inbox`／`task`／… |
+| MCP 協調工具（34 個） | Beta | `send`／`inbox`／`task`／… |
 | 任務看板 | Beta | append-only event log（schema v2） |
 | Telegram channel | Beta | 主要 channel；支援 polling、binding 與通知 |
 | Claude Code／Codex／Kiro／OpenCode backend | Beta | 已測試 |
@@ -132,7 +137,7 @@ Kill-switch 與 feature flag 詳見 [環境變數](docs/env-vars.zh-TW.md) 與 [
 - [快速開始指南](docs/FEATURE-quickstart.zh-TW.md) — 首次啟動逐步教學
 - [Fleet 設定](docs/FEATURE-fleet.zh-TW.md) — `fleet.yaml` 參考
 - [CLI 參考](docs/CLI.zh-TW.md) — 所有子命令
-- [MCP 工具](docs/MCP-TOOLS.zh-TW.md) — 32 個 agent 協調工具
+- [MCP 工具](docs/MCP-TOOLS.zh-TW.md) — 34 個 agent 協調工具
 - [已知問題](docs/KNOWN_ISSUES.zh-TW.md) — 刻意暫緩的項目；開 issue 前請先看
 - [**文件總索引**](docs/README.zh-TW.md) — 所有指南與參考文件的雙語地圖
 

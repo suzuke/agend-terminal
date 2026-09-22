@@ -2,6 +2,11 @@
 
 # CI Watch — 自動 PR CI 監看
 
+> **Status：** 目前 workflow 指南
+> **Audience：** Agent 與 operator
+> **Authority：** CI MCP schema 與 daemon watch state
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 CI Watch 會針對 repository 與 branch 輪詢 forge CI provider、記錄 PR／CI 狀態，並把終態結果送給 subscribers 與可選的後續 agents。
 
 ## 使用情境
@@ -70,6 +75,26 @@ CI Watch 會評估 selected head 所回傳的所有最新 CI runs。MCP schema �
 兩個 status filter 都是可選的。結果會顯示持久化 watch 與最新 polling diagnostics。
 
 釋放 worktree 不會隱式取消 CI Watch。Watch 的生命週期由 terminal state、TTL、明確 `unwatch` 與自身 cleanup 規則管理。
+
+## Defer 與確認 handoff
+
+當 terminal task 應在稍後喚醒 CI track 時，使用 `defer`：
+
+```json
+{"tool":"ci","action":"defer","repository":"owner/repo","episode":"episode-...","wake_task_id":"t-...","reason":"waiting for task","defer_secs":600}
+```
+
+使用 `ack_handoff` 確認單一 pickup，但不移除 watch：
+
+```json
+{"tool":"ci","action":"ack_handoff","repository":"owner/repo","branch":"feat/my-feature","episode":"episode-..."}
+```
+
+`episode` 是 `ci action=status` 回傳的精確 identity。**STOP：**
+`defer_secs` 必須是 60–3600；protected exact-head watch 仍必須符合下方的
+完整 SHA、task、授權與 continuation 條件。
+
+完整 CI schema 請見 [MCP 工具](MCP-TOOLS.zh-TW.md)。
 
 ## Dispatch 自動啟用
 

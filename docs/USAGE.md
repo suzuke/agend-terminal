@@ -2,6 +2,11 @@
 
 # Usage Guide
 
+> **Status:** Current daily-operations guide
+> **Audience:** Operators and agents
+> **Authority:** CLI/runtime behavior and current MCP schema
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 ## Binaries
 
 | Binary | Purpose |
@@ -77,7 +82,7 @@ access without keeping a terminal open.
 agend-mcp-bridge
 ```
 
-Stdio JSON-RPC 2.0 server providing 32 tools (task management,
+Stdio JSON-RPC 2.0 server providing 34 tools (task management,
 decisions, messaging, CI watch, etc.). Not meant to be run manually.
 
 Each supported AI backend (Claude Code, Kiro, Codex, OpenCode, Antigravity,

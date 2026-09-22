@@ -2,6 +2,11 @@
 
 # Usage Guide — 使用指南
 
+> **Status：** 目前日常操作指南
+> **Audience：** Operator 與 agent
+> **Authority：** CLI/runtime 行為與目前 MCP schema
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 ## Binaries
 
 | Binary | 用途 |
@@ -66,7 +71,7 @@ agend-terminal tray   # requires: cargo build --features tray
 agend-mcp-bridge
 ```
 
-Stdio JSON-RPC 2.0 伺服器，提供 32 個工具（任務管理、決策、訊息傳遞、CI watch 等）。並非設計來手動執行。
+Stdio JSON-RPC 2.0 伺服器，提供 34 個工具（任務管理、決策、訊息傳遞、CI watch 等）。並非設計來手動執行。
 
 每個支援的 AI backend（Claude Code、Kiro、Codex、OpenCode、Antigravity 與 Grok）會依其原生 MCP 設定，自動以子程序啟動它；daemon 會寫入對應 backend 格式的 bridge 設定。
 

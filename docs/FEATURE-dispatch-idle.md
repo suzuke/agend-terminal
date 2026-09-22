@@ -2,6 +2,11 @@
 
 # Dispatch Idle Tracking — Task Response Timeout Monitoring
 
+> **Status:** Current workflow guide
+> **Audience:** Agents and operators
+> **Authority:** dispatch-idle daemon and binding_state MCP surface
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 ## Usage Scenarios
 
 > **Target audience:** Agent infrastructure — agents use this via MCP tools; operators typically don't interact directly.
@@ -172,23 +177,17 @@ behavior.
 
 ---
 
-## Visibility Query
+## Inspect pending dispatches
 
-Agents can query dispatch idle state related to themselves:
+Use `binding_state` to inspect dispatch metadata for an instance:
 
 ```json
-{
-  "tool": "dispatch_idle",
-  "action": "list"
-}
+{"tool":"binding_state","instance":"lead"}
 ```
 
-The response is split into two perspectives:
-
-- **as_dispatcher**: all pending/exceeded sidecars dispatched by you.
-- **as_target**: all sidecars targeting you.
-
-Expired, cleaned-up, or report-dismissed sidecars do not appear.
+The response exposes `dispatched_waiting_for` (dispatches waiting on a reply)
+and `pending_response_to` (inbound dispatches awaiting your response). **STOP:**
+Do not use a `dispatch_idle` MCP call; no public tool with that name exists.
 
 ---
 

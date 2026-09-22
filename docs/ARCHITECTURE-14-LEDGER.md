@@ -2,11 +2,21 @@
 
 # Architecture-14 convergence ledger
 
+> **Status:** Historical convergence snapshot
+> **Audience:** Reviewers and maintainers
+> **Authority:** Historical evidence; current authority is SOURCE-OF-TRUTH and protected-main source/tests
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 This is the authoritative progress ledger for the Architecture-14 convergence
 program. It records architecture outcomes, not PR throughput: a merged PR is
 evidence for an item, but does not complete the item by itself.
 
-## Snapshot and authority
+## Historical snapshot and current authority
+
+This ledger is a historical snapshot, not a current runtime contract. For
+current state, use [SOURCE-OF-TRUTH.md](SOURCE-OF-TRUTH.md) and protected-main
+source/tests. **STOP:** Do not use the snapshot counts below as current status
+without revalidation.
 
 - Snapshot date: 2026-07-17
 - `agend-terminal` baseline: `3f80ee5c75a087c5309dcb6d8d28ba7f3948edf5`

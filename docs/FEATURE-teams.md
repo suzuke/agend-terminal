@@ -2,6 +2,11 @@
 
 # Teams
 
+> **Status:** Current workflow guide
+> **Audience:** Operators and agents
+> **Authority:** fleet.yaml, team handlers, and live team schema
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 Teams group agents into named units for structured collaboration. Each team has
 members, an optional (but strongly recommended) orchestrator, and is stored as
 part of `fleet.yaml` — not as a separate data source.
@@ -29,12 +34,20 @@ part of `fleet.yaml` — not as a separate data source.
 
 - `src/teams.rs` — primary implementation (projection model).
 - `src/fleet/mod.rs` — actual storage layer.
-- `src/mcp/handlers/dispatch.rs` — routes the `team` parameter to `send`.
-- `src/mcp/handlers/comms.rs` — checks team and orchestrator relationships.
+- `src/mcp/handlers/comms.rs` — routes the `team` selector to broadcast and checks team/orchestrator relationships.
+- `src/mcp/handlers/dispatch.rs` — owns team CRUD dispatch, not message routing.
 - `src/api/handlers/instance.rs` — reads team info for prompt injection.
 - `Team` is the projection model; `TeamConfig` is the `fleet.yaml` write type.
 - `stale_members` is populated only during list projection.
 - `degraded` is a view-layer signal, not a persisted field.
+
+Broadcast to a team with the `team` selector:
+
+```json
+{"team":"fixup","message":"Merge freeze starts now","request_kind":"update"}
+```
+
+**STOP:** Use `team` for a broadcast; do not treat it as a single recipient.
 
 ## 3. Data Model
 

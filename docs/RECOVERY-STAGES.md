@@ -2,14 +2,23 @@
 
 # Recovery Stages
 
+> **Status:** Current Stage-1 guide with labeled historical sections
+> **Audience:** Agents, operators, and reviewers
+> **Authority:** Recovery dispatcher source and protected-main tests
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 Source-of-truth for the `#685` staged auto-recovery dispatcher.
 
-> **CURRENT STATUS (revalidated at `main@1d83b423`, 2026-07-16):** the live
+> **CURRENT STATUS (revalidated at `main@62b28f36`, 2026-09-22):** the live
 > dispatcher is Stage-1-only and remains shadow-by-default. In canonical
 > per-tick order it runs after `HangDetectionHandler` and
 > `BackendExitDetectionHandler`. Shadow mode performs no PTY I/O, but it
 > still records `Stage1Pending` plus `last_stage1_fired_at` as a one-shot
 > re-fire guard. Sections §RS.9 and §RS.10 are historical records only.
+
+**Use this page:** Read the current Stage-1 behavior above first. **STOP:**
+Sections marked historical are evidence, not live implementation guidance.
+**OPTIONAL:** Read the historical rationale when investigating a regression.
 
 **#2549 P2 update (operator decision `d-20260703021554626467-13`):**
 Stage 2 (auto-restart) and the dispatcher-driven Stage 3 escalation path
@@ -300,7 +309,7 @@ automated thrashing.
 ### 9.2 Selective field preservation across spawn
 
 Decision §1 critical wrinkle (dev round 1): `spawn_agent` at
-`rg "reg.insert" src/agent.rs` creates a **fresh `AgentCore` with
+`rg "reg.insert" src/agent/mod.rs` creates a **fresh `AgentCore` with
 default `HealthTracker`**. Existing Crash path preserves all health
 via `saved_health.clone()` at `daemon/mod.rs` Stage 2 needs different
 semantics:

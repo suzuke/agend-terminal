@@ -7,6 +7,11 @@
 
 # AgEnD Terminal
 
+> **Status:** Current product overview
+> **Audience:** Operators and contributors
+> **Authority:** Protected-main source and linked current guides
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 Orchestrate AI coding agents — not just run them.
 
 ![AgEnD Terminal — orchestrating a fleet of AI coding agents in a multi-pane TUI](docs/tui-screenshot.png)
@@ -17,7 +22,7 @@ Declare your entire AI dev team in one `fleet.yaml`. AgEnD Terminal launches eac
 
 - **Fleet-as-code** — One YAML file declares every agent's backend, role, working directory, and team membership. `agend-terminal start` brings the whole fleet up.
 - **6 backends** — Claude Code, Codex, Kiro, OpenCode, Antigravity CLI, and Grok Build. Swap backends by changing one field.
-- **Built-in agent coordination** — Agents delegate tasks, query each other, and broadcast updates through 32 MCP tools. No glue code.
+- **Built-in agent coordination** — Agents delegate tasks, query each other, and broadcast updates through 34 MCP tools. No glue code.
 - **Automatic git worktree isolation** — Branch-bound tasks and instances can use daemon-managed worktrees. Unbound instances use their configured workspace.
 - **Crash recovery with context handover** — Agents auto-respawn and resume their conversation. Exponential backoff, health monitoring, and hung detection built in.
 - **Remote control** — Drive the fleet through a multi-pane TUI, Telegram, or Discord. Get notifications when agents need attention.
@@ -117,7 +122,7 @@ change between minor versions.
 |---|---|---|
 | Fleet orchestration (`fleet.yaml`, PTY spawn, supervision, auto-respawn) | Beta | Core path; extensive tests |
 | Git worktree isolation | Beta | Branch-bound worktree lease / release / GC |
-| MCP coordination tools (32) | Beta | `send` / `inbox` / `task` / … |
+| MCP coordination tools (34) | Beta | `send` / `inbox` / `task` / … |
 | Task board | Beta | Append-only event log (schema v2) |
 | Telegram channel | Beta | Primary channel; polling, bindings, and notifications |
 | Claude Code / Codex / Kiro / OpenCode backends | Beta | Tested |
@@ -138,7 +143,7 @@ and [configuration](docs/FEATURE-configuration.md).
 - [Quick Start Guide](docs/FEATURE-quickstart.md) — First-run walkthrough
 - [Fleet Configuration](docs/FEATURE-fleet.md) — `fleet.yaml` reference
 - [CLI Reference](docs/CLI.md) — All subcommands
-- [MCP Tools](docs/MCP-TOOLS.md) — 32 agent coordination tools
+- [MCP Tools](docs/MCP-TOOLS.md) — 34 agent coordination tools
 - [Known Issues](docs/KNOWN_ISSUES.md) — Intentionally-deferred items; check before filing an issue
 - [**Documentation Index**](docs/README.md) — Full bilingual map of every guide and reference
 

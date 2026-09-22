@@ -2,6 +2,11 @@
 
 # Agent 間通訊系統
 
+> **Status：** 目前 workflow 指南
+> **Audience：** Agent 與 operator
+> **Authority：** send/inbox handler 與即時 MCP schema
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 AgEnD Terminal 的通訊系統讓 agent 之間能進行結構化的訊息傳遞——委派任務、提出查詢、回報結果、廣播更新。
 
 ## 使用情境
@@ -79,7 +84,11 @@ Drain 會把回傳的 batch 標為 `delivering`，而不是 processed。每個 r
 
 ### task — 任務委派
 
-用於指派工作給其他 agent。應盡量先建立並傳入 `task_id`。Broadcast task dispatch 必須提供；目前 single-target 相容路徑在省略時可自動建立 task。
+用於指派工作給其他 agent。
+
+- **REQUIRED：** Broadcast task dispatch（`instances`、`team` 或 `tags`）必須提供 `task_id`。
+- **OPTIONAL 相容路徑：** Single-target task dispatch 省略 `task_id` 時可以自動建立 task。
+- **RECOMMENDED：** 先明確建立 task，使用穩定且可稽核的流程。
 
 ```json
 {
@@ -90,6 +99,12 @@ Drain 會把回傳的 batch 標為 `delivering`，而不是 processed。每個 r
   "branch": "fix/1177-sha-gate-empty",
   "success_criteria": "修復完成 + cargo test 通過 + PR 建立"
 }
+```
+
+上面的範例使用建議的明確建立 task 流程。相容路徑只適用於 single-target：
+
+```json
+{"instance":"dev","message":"Check the task status","request_kind":"task"}
 ```
 
 task 類型支援額外的任務管理參數：
@@ -319,6 +334,8 @@ Sprint 58 Wave 4 引入了反停滯（anti-stall）契約：
 
 - `request_kind=task` 的廣播模式（`instances`／`team`／`tags`）**必須**提供 `task_id`
 - `request_kind=task` 的單一目標模式目前在未提供 `task_id` 時會自動建立；明確建立仍是穩定、可稽核的流程
+
+**STOP：** Broadcast 不得依賴 single-target 自動建立；請先建立並傳入 task ID。
 
 取得 `task_id` 的方式：
 

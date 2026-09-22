@@ -2,9 +2,14 @@
 
 # Hung 狀態轉換稽核
 
-> **目前狀態說明（`main@1d83b423`，2026-07-16）。** 本文件保留
+> **Status：** 保留歷史、但含目前 source pointer 的稽核
+> **Audience：** Reviewer 與 incident responder
+> **Authority：** 目前 health/state source；本文件保留 audit history
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
+> **目前狀態說明（`main@62b28f36`，2026-09-22）。** 本文件保留
 > #685 Phase 1 的轉換稽核與穩定 section anchor。Live source 才是權威：
-> state tracking 已從 `src/state.rs` 移至 `src/state/mod.rs` 加上
+> state tracking 已移至 `src/state/mod.rs` 加上
 > `src/state/patterns.rs` / `src/backend_profile.rs`；Gemini 已退役
 > （Agy 是其後繼者，且目前也支援 Grok）；舊有「只警告、沒有 recovery
 > consumer」結論也已被取代。目前 `check_hang` 的 wiring 位於
@@ -23,6 +28,9 @@ site 的 inline structured comment 及 `check_hang` function-level rustdoc
 Issue：[#685](https://github.com/suzuke/agend-terminal/issues/685) Phase 1
 交付項目 #1。Decision：`d-20260513154400110972-2`。範圍嚴格受限——請見
 下方 `§Scope`。
+
+**CURRENT：** 先閱讀上方 live path 與 current baseline。**STOP：**
+下方 historical hypothesis 不是目前 backend tuning 的指引。
 
 維護規則：section ID（`§Entry.E1`、`§Exit.X1` 等）是 **contract**
 anchor——重新命名任何 heading 都會破壞 PR scope，且必須同步更新 inline
@@ -84,7 +92,7 @@ F9 productive-output contract 已整併至下方 §F9.1–§F9.5。這些 sectio
 
 - `HealthState::Healthy / Recovering / Unstable / Failed / ErrorLoop`
   轉換——它們不是由 `check_hang` 驅動（見 §Invariants 5b），另有其他稽核。
-- `AgentState`（位於 `src/state.rs`）——F39 evidence 位於該處，但本 scope
+- `AgentState`（位於 `src/state/mod.rs`）——F39 evidence 位於該處，但本 scope
   只透過下方 §F39 cross-reference table 引用，不會修改它。
 
 ## 不變量
@@ -169,7 +177,7 @@ F9 productive-output contract 已整併至下方 §F9.1–§F9.5。這些 sectio
     `last_heartbeat_at_ms / heartbeat_age_ms / silent_ms / agent_state`
 - **FP vector**——F39：vterm scrollback 中殘留的
   `AgentState::Thinking` pattern（regex 針對 rendered screen text，比對到
-  已捲出畫面的文字後仍可能 latch）。`src/state.rs` 的
+  已捲出畫面的文字後仍可能 latch）。`src/state/mod.rs` 的
   `LATCHED_STATE_EXPIRY`（30s）會限制影響，但並不完美。見 §F39
   cross-reference。
 - **FN vector**——與 §Entry.E1 相同的 F9；低於 threshold 的 output 會讓
@@ -236,7 +244,7 @@ F9 productive-output contract 已整併至下方 §F9.1–§F9.5。這些 sectio
 `src/state/mod.rs`、`src/behavioral.rs` 及 `src/health.rs` 中的 F9 inline
 structured comment 相互配套。
 
-**目前 baseline**：已於 `main@1d83b423`（2026-07-16）重新驗證。Gate
+**目前 baseline**：已於 `main@62b28f36`（2026-09-22）重新驗證。Gate
 預設仍為 shadow（`AGEND_PRODUCTIVE_GATE=1` 會啟用 classification）。Gemini
 退役後，其 calibration 已重新命名為 Agy。Grok 是受支援的 backend，但目前
 使用 generic marker/cache path；Grok 專屬的 F9 calibration 仍未驗證。
@@ -460,7 +468,7 @@ infrastructure 更糟。
 
 ## §F39 — AgentState Thinking Pattern Stickiness（cross-audit：AgentState，不是 HealthState）
 
-本節是 **cross-audit boundary**：§F39 記錄 `src/state.rs` 中
+本節是 **cross-audit boundary**：§F39 記錄 `src/state/mod.rs` 與
 `AgentState::Thinking` pattern 的語意。這些 pattern 會作為 input signal
 餵給 `check_hang`，但本身不是 `HealthState` mutator。之所以把 F39 納入
 Hung-state audit，是因為 `AgentState::Thinking` pattern 會影響 §Entry.E2
@@ -475,7 +483,7 @@ Sibling decision：`d-20260513161542381785-0`（N 個 sub-task 中的第 2 個�
 
 ### §F39.1 — 各 backend 的 pattern
 
-`AgentState::Thinking` 透過 `src/state.rs` 中的 regex pattern catalog，
+`AgentState::Thinking` 透過 `src/state/mod.rs` 與 `src/state/patterns.rs` 中的 regex pattern catalog，
 依 backend 分別 match。Pattern 只屬於單一 backend（`StateTracker::new`
 期間，以 `Backend` enum variant 作為 state pattern lookup 的 key），因此
 cross-backend contamination 必須先發生 backend detection 錯誤——見 §F39.5
@@ -483,8 +491,8 @@ cross-backend contamination 必須先發生 backend detection 錯誤——見 §
 
 | Backend | Pattern | 在 source 中尋找 | Source evidence | 歷史 |
 |---|---|---|---|---|
-| Kiro (kiro-cli) | `r"Kiro is working\|esc to cancel"` | `rg "Kiro is working" src/state.rs` | pattern line 上方的 `[measured]` comment | Sprint 34 PR-1（generation 期間顯示 `Kiro is working`） |
-| Gemini (gemini-cli) | `r"esc to cancel"` | `rg "esc to cancel" src/state.rs` | pattern 附近的 `[measured]` comment | 最初是 bare `r"Thinking"`——已縮窄至 `esc to cancel` 以減少 stale match。進一步縮窄（例如要求 leading Braille spinner `⠦`）是待另一個後續 PR 評估的 quick-win candidate，**不在**本 audit 內。 |
+| Kiro (kiro-cli) | `r"Kiro is working\|esc to cancel"` | `rg "Kiro is working" src/state/patterns.rs` | pattern line 上方的 `[measured]` comment | Sprint 34 PR-1（generation 期間顯示 `Kiro is working`） |
+| Gemini (gemini-cli) | `r"esc to cancel"` | `rg "esc to cancel" src/state/patterns.rs` | pattern 附近的 `[measured]` comment | 最初是 bare `r"Thinking"`——已縮窄至 `esc to cancel` 以減少 stale match。進一步縮窄（例如要求 leading Braille spinner `⠦`）是待另一個後續 PR 評估的 quick-win candidate，**不在**本 audit 內。 |
 
 Cross-backend overlap：literal substring `"esc to cancel"` 同時出現在 Kiro
 與 Gemini pattern。因為 pattern catalog 依 backend 分隔，只要 backend
@@ -496,20 +504,20 @@ fallback），它**沒有 Thinking pattern**；因此 cross-contamination 必須
 ### §F39.2 — LATCHED_STATE_EXPIRY 語意
 
 ```rust
-const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);  // src/state.rs
+const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);  // src/state/mod.rs
 ```
 
 Expiry 透過 `maybe_expire_latched_state`
-（`rg "fn maybe_expire_latched_state" src/state.rs`）與 active-state
+（`rg "fn maybe_expire_latched_state" src/state/mod.rs`）與 active-state
 hysteresis 互動：當 `current` 是會自行 expiry 的 active state
 （`Thinking | ToolUse`），且
 `since.elapsed() >= LATCHED_STATE_EXPIRY`，tracker 會轉換至 `Ready`。
 Fallback 由兩個 call site 觸發：
 
-1. `feed()` non-match branch（`rg "maybe_expire_latched_state" src/state.rs`——
+1. `feed()` non-match branch（`rg "maybe_expire_latched_state" src/state/mod.rs`——
    第一個 call site，約在 line 759）——screen 已改變但沒有 pattern match 時，
    fallback 會移除 stale latched state。
-2. `tick()` periodic supervisor call（`rg "fn tick" src/state.rs`——第二個
+2. `tick()` periodic supervisor call（`rg "fn tick" src/state/mod.rs`——第二個
    call site，約在 line 843）——即使沒有 PTY output 也會執行，涵蓋先前
    incident「`dev-reviewer 卡在互動 prompt`」中的「screen frozen at
    dismissed prompt」情境。
@@ -523,11 +531,11 @@ oscillation 重設。
 「scrollback pattern 重新 match → `since` 重設 → expiry 永不觸發」這個直覺
 說法是**錯的**。兩個既有 guard 會阻止單純 re-match path 破壞 expiry：
 
-- `feed()` hash-dedup（`rg "last_screen_hash" src/state.rs`）——若 rendered
+- `feed()` hash-dedup（`rg "last_screen_hash" src/state/mod.rs`）——若 rendered
   screen hash 未改變，`feed()` 會在進入 `detect()` 前 short-circuit。
   相同 hash ⇒ 看得到相同 pattern ⇒ 不會 spurious re-detect。
 - `transition(same_state)` early return
-  （`rg "if new_state == self.current" src/state.rs`）——若 `detect()` 回傳
+  （`rg "if new_state == self.current" src/state/mod.rs`）——若 `detect()` 回傳
   目前已經處於的相同 state，`transition()` 會 short-circuit，不動 `since`。
 
 這兩個 guard 正確處理 Scenario A 與 B。Scenario C 才是真正的 bug surface。
@@ -598,7 +606,7 @@ sub-task 5）的 hypothesis，不是 recommendation。**
 | (f) Per-pattern / dynamic `LATCHED_STATE_EXPIRY` | 每個 pattern 使用自己的 expiry 值（`Thinking` 較短），或在 current state 持續 > 2× typical duration 時動態縮短 | 測量各 backend 的 typical Thinking duration；找出 outlier |
 
 **不同 lever——(d) 與 (f)**：(d) 延長 `min_hold`（位於
-`rg "min_hold" src/state.rs` 的 priority transition gate），讓 oscillation
+`rg "min_hold" src/state/mod.rs` 的 priority transition gate），讓 oscillation
 更難發生；(f) 縮短 `LATCHED_STATE_EXPIRY`，讓 latched state 更早 expiry。
 兩者可以彼此獨立組合。
 
@@ -609,7 +617,7 @@ scrollback 中 stale `esc to cancel` 文字造成的 FP，且不需要 co-patter
 gate。待 fixture corpus data 可用時，重新評估完整的 (c) hypothesis。
 
 **F9 layer distinction**：此 hypothesis 位於 `AgentState` layer
-（`src/state.rs` 的 `Thinking` pattern stickiness）。F9 productive-output
+（`src/state/mod.rs` 的 `Thinking` pattern stickiness）。F9 productive-output
 gate（§F9.1–§F9.5，decision `d-20260513235514013631-0`）則位於
 `HealthState` layer（`src/health.rs::check_hang` 中的 `Hung`
 classification）。兩者**不重疊**：F39 mitigation 調整哪些
@@ -618,7 +626,7 @@ classification）。兩者**不重疊**：F39 mitigation 調整哪些
 涵蓋另一層的修正。
 
 **已拒絕**：screen-hash change 時由 tick 強制 recheck——`tick()` 已經
-定期呼叫 `maybe_expire_latched_state`（`rg "fn tick" src/state.rs`），
+定期呼叫 `maybe_expire_latched_state`（`rg "fn tick" src/state/mod.rs`），
 且無論 caller 為何，底層的
 `since.elapsed() >= LATCHED_STATE_EXPIRY` check 都完全相同。這無法處理
 Scenario C 的 `since` reset 機制。
@@ -654,9 +662,9 @@ Scenario C 的 `since` reset 機制。
   state。此驗證不在範圍內，但對 F9 / mitigation design 值得記錄。
 
 - **缺少 Scenario C unit test**：
-  `rg "oscillation|bounce" src/state.rs` → tests 中 0 hits。現有 test
+  `rg "oscillation|bounce" src/state/mod.rs` → tests 中 0 hits。現有 test
   涵蓋 happy-path `LATCHED_STATE_EXPIRY`
-  （`rg "fn feed_fallback_expires_thinking" src/state.rs`），但沒有涵蓋
+  （`rg "fn feed_fallback_expires_thinking" src/state/mod.rs`），但沒有涵蓋
   priority oscillation。任何 mitigation sub-task 落地時，都要加入
   Scenario-C-specific unit test。
 

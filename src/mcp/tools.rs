@@ -49,7 +49,7 @@ pub(crate) fn def_download_attachment() -> Value {
 }
 
 pub(crate) fn def_send() -> Value {
-    json!({"name": "send", "description": "Send a message to another instance or broadcast to multiple. Replaces send_to_instance/delegate_task/report_result/request_information/broadcast. Sprint 58 Wave 4 PR-1: kind=task dispatches MUST include task_id (call task action=create first to obtain a 't-...' id).",
+    json!({"name": "send", "description": "Send a message to another instance or broadcast to multiple. Replaces send_to_instance/delegate_task/report_result/request_information/broadcast. Sprint 58 Wave 4 PR-1: broadcast kind=task dispatches MUST include task_id; the current single-target compatibility path may auto-create one when omitted (explicit task action=create remains the stable contract).",
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance to send to (single recipient)"},
             "instances": {"type": "array", "items": {"type": "string"}, "description": "Names of existing instances to broadcast to (broadcast mode)"},
@@ -57,7 +57,7 @@ pub(crate) fn def_send() -> Value {
             "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags filter (broadcast mode)"},
             "message": {"type": "string", "description": "Canonical message text routed to the corresponding task, report, or query handler. Required unless message_from_file is provided."},
             "message_from_file": {"type": "string", "description": "Path to a text file whose contents become the message. Overrides 'message' when both are provided. Must be an absolute path to a regular UTF-8 text file (max 1 MiB)."},
-            "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior). NOTE: kind=task requires task_id (Sprint 58 Wave 4 PR-1 anti-stall contract)."},
+            "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior). Broadcast kind=task requires task_id; single-target kind=task may auto-create one when omitted (Sprint 58 Wave 4 PR-1 anti-stall contract)."},
             "report_purpose": {"type": "string", "enum": ["task_result", "analysis_decision", "source_spike", "rca", "code_review"], "description": "Typed purpose for request_kind=report. New report callers should always set it. Missing legacy values remain ordinary LegacyUntyped reports with zero code-review authority."},
             "code_review": {"type": "object", "additionalProperties": false, "properties": {
                 "assignment_id": {"type": "string", "description": "Exact assignment generation UUID delivered by a typed review_assignment."},
@@ -66,7 +66,7 @@ pub(crate) fn def_send() -> Value {
             }, "required": ["assignment_id", "verdict", "evidence_digest"], "description": "Non-authoritative code-review request. Valid only with report_purpose=code_review; the API sink derives and validates the exact repo/PR/task/full-head/class/slot/reviewer subject from the still-active assignment."},
             "success_criteria": {"type": "string", "description": "For task delegation"},
             "context": {"type": "string"},
-            "task_id": {"type": "string", "description": "Task board ID for correlation. REQUIRED when request_kind=task — caller must obtain via `task action=create` and reference the resulting `t-...` id, closing the Wave 3 PR-1 dispatch protocol gap."},
+            "task_id": {"type": "string", "description": "Task board ID for correlation. REQUIRED for broadcast request_kind=task. Single-target task dispatch may auto-create one when omitted; callers should use task action=create first for the stable, auditable flow."},
             "correlation_id": {"type": "string"},
             "parent_id": {"type": "string"},
             "thread_id": {"type": "string"},

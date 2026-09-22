@@ -2,9 +2,14 @@
 
 # Hung-State Transition Audit
 
-> **CURRENT-STATUS NOTE (`main@1d83b423`, 2026-07-16).** This file preserves
+> **Status:** Historical audit with current source pointers
+> **Audience:** Reviewers and incident responders
+> **Authority:** Current health/state source; this document preserves audit history
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
+> **CURRENT-STATUS NOTE (`main@62b28f36`, 2026-09-22).** This file preserves
 > the #685 Phase-1 transition audit and its stable section anchors. The live
-> source is authoritative: state tracking moved from `src/state.rs` to
+> source is authoritative: state tracking moved to
 > `src/state/mod.rs` + `src/state/patterns.rs` / `src/backend_profile.rs`;
 > Gemini is retired (Agy is its successor, and Grok is now supported); and the
 > old "warn only, no recovery consumer" conclusion is superseded. Current
@@ -22,6 +27,9 @@ comments at each mutation site and the `check_hang` function-level rustdoc.
 Issue: [#685](https://github.com/suzuke/agend-terminal/issues/685) Phase 1
 deliverable #1. Decision: `d-20260513154400110972-2`. Scope is strict — see
 `§Scope` below.
+
+**CURRENT:** Read the live paths and current baseline above first. **STOP:**
+historical hypotheses below are not guidance for current backend tuning.
 
 Maintenance: section IDs (`§Entry.E1`, `§Exit.X1`, etc.) are **contract**
 anchors — renaming any heading is a PR-scope-break that must propagate to
@@ -84,7 +92,7 @@ Out-of-scope (explicit):
 
 - `HealthState::Healthy / Recovering / Unstable / Failed / ErrorLoop` transitions —
   not driven by `check_hang` (see §Invariants 5b). Audited elsewhere.
-- `AgentState` (in `src/state.rs`) — F39 evidence lives there but is referenced
+- `AgentState` (in `src/state/mod.rs`) — F39 evidence lives there but is referenced
   only via the §F39 cross-reference table below; not mutated by this scope.
 
 ## Invariants
@@ -175,7 +183,7 @@ These hold at HEAD `2f24376` and are forward-locked by decision
 - **FP vector** — F39: stale `AgentState::Thinking` pattern in vterm
   scrollback (the regex match is against rendered screen text and can
   latch on text that scrolled off-screen). Bounded by
-  `LATCHED_STATE_EXPIRY` (30s) in `src/state.rs` but not perfectly. See
+  `LATCHED_STATE_EXPIRY` (30s) in `src/state/mod.rs` but not perfectly. See
   §F39 cross-reference.
 - **FN vector** — F9 same as §Entry.E1; sub-threshold output keeps
   `silent` below trigger.
@@ -243,7 +251,7 @@ deliverables #2 + #3): the dual-path supplement to silence-based Hung
 detection. It is a companion to the F9 inline structured comments in
 `src/state/mod.rs`, `src/behavioral.rs`, and `src/health.rs`.
 
-**Current baseline**: revalidated at `main@1d83b423` (2026-07-16). The gate
+**Current baseline**: revalidated at `main@62b28f36` (2026-09-22). The gate
 remains shadow-by-default (`AGEND_PRODUCTIVE_GATE=1` enables classification).
 Gemini-specific calibration was renamed to Agy when Gemini retired. Grok is a
 supported backend but currently uses the generic marker/cache path; its
@@ -473,7 +481,7 @@ shadow infrastructure is worse than no infrastructure.
 ## §F39 — AgentState Thinking Pattern Stickiness (cross-audit: AgentState, not HealthState)
 
 This section is a **cross-audit boundary**: §F39 documents `AgentState::Thinking`
-pattern semantics in `src/state.rs`, which feed `check_hang` as an input
+pattern semantics in `src/state/mod.rs` and `src/state/patterns.rs`, which feed `check_hang` as an input
 signal but are not themselves `HealthState` mutators. F39 is included in
 this Hung-state audit because the `AgentState::Thinking` pattern feeds the
 §Entry.E2 precondition path (heartbeat-fresh + PTY-silent classification),
@@ -489,15 +497,15 @@ Sibling decision: `d-20260513161542381785-0` (sub-task 2 of N).
 ### §F39.1 — Patterns per backend
 
 `AgentState::Thinking` is matched per-backend via regex pattern catalogs in
-`src/state.rs`. Patterns are scoped to a single backend (state pattern
+`src/state/mod.rs` and `src/state/patterns.rs`. Patterns are scoped to a single backend (state pattern
 lookup keyed on `Backend` enum variant during `StateTracker::new`), so
 cross-backend contamination requires the prior step (backend detection)
 to be wrong — see §F39.5 cross-backend overlap.
 
 | Backend | Pattern | Find in source | Source evidence | History |
 |---|---|---|---|---|
-| Kiro (kiro-cli) | `r"Kiro is working\|esc to cancel"` | `rg "Kiro is working" src/state.rs` | `[measured]` comment above pattern line | Sprint 34 PR-1 (`Kiro is working` shown during generation) |
-| Gemini (gemini-cli) | `r"esc to cancel"` | `rg "esc to cancel" src/state.rs` | `[measured]` comment near pattern | Originally bare `r"Thinking"` — already narrowed to `esc to cancel` to reduce stale matches. Further narrow (e.g. require leading Braille spinner `⠦`) is a candidate quick-win to-be-evaluated in a separate follow-up PR, NOT in this audit. |
+| Kiro (kiro-cli) | `r"Kiro is working\|esc to cancel"` | `rg "Kiro is working" src/state/patterns.rs` | `[measured]` comment above pattern line | Sprint 34 PR-1 (`Kiro is working` shown during generation) |
+| Gemini (gemini-cli) | `r"esc to cancel"` | `rg "esc to cancel" src/state/patterns.rs` | `[measured]` comment near pattern | Originally bare `r"Thinking"` — already narrowed to `esc to cancel` to reduce stale matches. Further narrow (e.g. require leading Braille spinner `⠦`) is a candidate quick-win to-be-evaluated in a separate follow-up PR, NOT in this audit. |
 
 Cross-backend overlap: the literal `"esc to cancel"` substring appears in
 both Kiro and Gemini patterns. Because pattern catalogs are scoped
@@ -510,19 +518,19 @@ different managed backend. Out of scope for this audit — see §F39.5.
 ### §F39.2 — LATCHED_STATE_EXPIRY semantics
 
 ```rust
-const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);  // src/state.rs
+const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);  // src/state/mod.rs
 ```
 
 The expiry interacts with active-state hysteresis via
-`maybe_expire_latched_state` (`rg "fn maybe_expire_latched_state" src/state.rs`):
+`maybe_expire_latched_state` (`rg "fn maybe_expire_latched_state" src/state/mod.rs`):
 when `current` is a self-expiring active state (`Thinking | ToolUse`) and
 `since.elapsed() >= LATCHED_STATE_EXPIRY`, the tracker transitions to
 `Ready`. The fallback fires from two call-sites:
 
-1. `feed()` non-match branch (`rg "maybe_expire_latched_state" src/state.rs` —
+1. `feed()` non-match branch (`rg "maybe_expire_latched_state" src/state/mod.rs` —
    first call-site, line near 759) — when screen changed but no pattern
    matched, the fallback drops stale latched state.
-2. `tick()` periodic supervisor call (`rg "fn tick" src/state.rs` — second
+2. `tick()` periodic supervisor call (`rg "fn tick" src/state/mod.rs` — second
    call-site, line near 843) — runs even when no PTY output (covers the
    "screen frozen at dismissed prompt" case from prior incident
    `dev-reviewer 卡在互動 prompt`).
@@ -537,11 +545,11 @@ The intuitive "scrollback pattern re-matches → `since` resets → expiry
 never fires" framing is **wrong**. Two existing guards prevent the naive
 re-match path from breaking expiry:
 
-- `feed()` hash-dedup (`rg "last_screen_hash" src/state.rs`) — if the
+- `feed()` hash-dedup (`rg "last_screen_hash" src/state/mod.rs`) — if the
   rendered screen hash is unchanged, `feed()` short-circuits before
   reaching `detect()`. Same hash ⇒ same patterns visible ⇒ no spurious
   re-detect.
-- `transition(same_state)` early return (`rg "if new_state == self.current" src/state.rs`) —
+- `transition(same_state)` early return (`rg "if new_state == self.current" src/state/mod.rs`) —
   if `detect()` returns the same state we're already in, `transition()`
   short-circuits without touching `since`.
 
@@ -618,7 +626,7 @@ validation (`#685` sub-task 5). Not recommendations.**
 | (f) Per-pattern / dynamic `LATCHED_STATE_EXPIRY` | Per-pattern expiry value (shorter for `Thinking`), or dynamic shrink when current state held > 2× typical duration | Measure typical Thinking duration per backend; identify outliers |
 
 **Distinct levers — (d) vs (f)**: (d) extends `min_hold` (the priority
-transition gate at `rg "min_hold" src/state.rs`) to make oscillation
+  transition gate at `rg "min_hold" src/state/mod.rs`) to make oscillation
 harder; (f) shortens `LATCHED_STATE_EXPIRY` so the latched state
 expires sooner. Both are independently composable.
 
@@ -629,7 +637,7 @@ PR #763 (decision `d-20260513231713506833-1`). Reduces FPs from stale
 Re-evaluate the full (c) hypothesis when fixture corpus data is available.
 
 **F9 layer distinction**: this hypothesis lives at the `AgentState`
-layer (`Thinking` pattern stickiness in `src/state.rs`). The F9
+layer (`Thinking` pattern stickiness in `src/state/mod.rs` and `src/state/patterns.rs`). The F9
 productive-output gate (§F9.1–§F9.5, decision
 `d-20260513235514013631-0`) operates at the `HealthState`
 layer (`Hung` classification in `src/health.rs::check_hang`). The two
@@ -639,7 +647,7 @@ classification path independent of `AgentState`. A fix at one layer
 does not subsume a fix at the other.
 
 **Rejected**: tick force-recheck on screen-hash change — `tick()` already
-calls `maybe_expire_latched_state` periodically (`rg "fn tick" src/state.rs`),
+calls `maybe_expire_latched_state` periodically (`rg "fn tick" src/state/mod.rs`),
 and the underlying `since.elapsed() >= LATCHED_STATE_EXPIRY` check is
 identical regardless of caller. Does not address Scenario C's `since`
 reset mechanic.
@@ -674,9 +682,9 @@ reset mechanic.
   silent latching to the wrong state can occur. Out-of-scope verification —
   worth noting for F9 / mitigation design.
 
-- **Missing unit test for Scenario C**: `rg "oscillation|bounce" src/state.rs`
+- **Missing unit test for Scenario C**: `rg "oscillation|bounce" src/state/mod.rs`
   → 0 hits in tests. Existing tests cover happy-path
-  `LATCHED_STATE_EXPIRY` (`rg "fn feed_fallback_expires_thinking" src/state.rs`),
+  `LATCHED_STATE_EXPIRY` (`rg "fn feed_fallback_expires_thinking" src/state/mod.rs`),
   but not priority oscillation. Add Scenario-C-specific unit test when
   any mitigation sub-task lands.
 
