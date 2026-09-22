@@ -85,7 +85,7 @@ pub(crate) fn handle_with_live_instances(
     instance_name: &str,
     args: &Value,
     live_instances: &std::collections::HashSet<String>,
-    ) -> Value {
+) -> Value {
     match args["action"].as_str() {
         Some("sweep") => handle_sweep_with_live_instances(home, args, live_instances),
         Some("orphan_reconcile_preview" | "orphan_reconcile_apply") => {

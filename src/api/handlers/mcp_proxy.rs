@@ -1088,10 +1088,12 @@ mod tests {
         assert_eq!(forged["code"], "operator_only", "got {forged}");
 
         let trusted = handle_mcp_tool_with_operator_authority(&params, &ctx, true);
-        assert_eq!(trusted["ok"], true, "trusted transport reaches the handler: {trusted}");
         assert_eq!(
-            trusted["result"]["code"],
-            "invalid_request",
+            trusted["ok"], true,
+            "trusted transport reaches the handler: {trusted}"
+        );
+        assert_eq!(
+            trusted["result"]["code"], "invalid_request",
             "trusted path must be authorized before the frozen mapping validation: {trusted}"
         );
 

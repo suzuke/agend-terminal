@@ -615,9 +615,8 @@ fn apply_with_authority(
         .expect("frozen mapping is non-empty");
     let emitter = crate::task_events::InstanceName::from(actor);
     let append = crate::task_events::append_batch_computed_at(&board, &emitter, |state| {
-        let fresh_authority = authority_refresh().map_err(|error| {
-            format!("owner authority unavailable before commit: {error}")
-        })?;
+        let fresh_authority = authority_refresh()
+            .map_err(|error| format!("owner authority unavailable before commit: {error}"))?;
         if authority_digest(&fresh_authority) != authority_digest(authority) {
             return Err("owner authority changed before commit".to_string());
         }
@@ -814,13 +813,14 @@ pub(super) fn handle_with_live_instances_and_refresh(
         Some("orphan_reconcile_preview") => preview_with_authority(home, actor, args, &authority),
         Some("orphan_reconcile_apply") => {
             let refresh = || {
-                live_refresh().ok_or_else(|| {
-                    json!({
-                        "error":"live owner authority unavailable",
-                        "code":"owner_authority_unavailable"
+                live_refresh()
+                    .ok_or_else(|| {
+                        json!({
+                            "error":"live owner authority unavailable",
+                            "code":"owner_authority_unavailable"
+                        })
                     })
-                })
-                .and_then(|live| authority_with_live_instances(home, &live))
+                    .and_then(|live| authority_with_live_instances(home, &live))
             };
             apply_with_authority(home, actor, args, &authority, &refresh)
         }
@@ -1099,7 +1099,10 @@ mod tests {
             &HashSet::new(),
             &refresh,
         );
-        assert_eq!(applied["code"], "stale_preview", "authority race: {applied}");
+        assert_eq!(
+            applied["code"], "stale_preview",
+            "authority race: {applied}"
+        );
         assert_eq!(
             std::fs::read(board.join("task_events.jsonl")).expect("event log"),
             before,
@@ -1136,7 +1139,10 @@ mod tests {
             }),
             &HashSet::new(),
         );
-        assert_eq!(applied["code"], "confirmation_integrity", "tampered confirmation: {applied}");
+        assert_eq!(
+            applied["code"], "confirmation_integrity",
+            "tampered confirmation: {applied}"
+        );
         assert_eq!(
             std::fs::read(board.join("task_events.jsonl")).expect("event log"),
             before,

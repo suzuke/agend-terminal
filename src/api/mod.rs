@@ -919,11 +919,13 @@ fn handle_session(
                     method::CLEAR_BLOCKED_REASON => {
                         handlers::instance::handle_clear_blocked_reason(params, &ctx)
                     }
-                    method::MCP_TOOL => handlers::mcp_proxy::handle_mcp_tool_with_operator_authority(
-                        params,
-                        &ctx,
-                        principal == crate::auth_cookie::Principal::Operator,
-                    ),
+                    method::MCP_TOOL => {
+                        handlers::mcp_proxy::handle_mcp_tool_with_operator_authority(
+                            params,
+                            &ctx,
+                            principal == crate::auth_cookie::Principal::Operator,
+                        )
+                    }
                     method::MCP_TOOLS_LIST => {
                         handlers::mcp_proxy::handle_mcp_tools_list(params, &ctx)
                     }
