@@ -1064,10 +1064,6 @@ pub(crate) fn teardown_with_runtime(
                                         fleet_remove_error = Some(error.to_string())
                                     }
                                 }
-                            } else if let Err(error) =
-                                crate::fleet::remove_instance_from_yaml(home, inst)
-                            {
-                                fleet_remove_error = Some(error.to_string());
                             }
                         }
                     },

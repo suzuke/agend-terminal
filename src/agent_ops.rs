@@ -341,12 +341,13 @@ pub(crate) fn delete_instance_with_exit_status_and_post_for_deployment_generatio
     expected_generation: Option<&str>,
     after_delete: impl FnOnce(bool),
 ) -> Option<(DeleteOutcome, bool)> {
+    let expected_generation = expected_generation?;
     let mut fence = crate::daemon::lifecycle::DeleteFence::admit(home, name, true);
     let generation_matches = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|fleet| fleet.instances.get(name)?.deployment_generation.clone())
         .as_deref()
-        == expected_generation;
+        == Some(expected_generation);
     if !generation_matches {
         return None;
     }
