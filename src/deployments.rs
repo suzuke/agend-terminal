@@ -384,7 +384,15 @@ fn prepare_work_dir(
     inst_suffix: &str,
     inst_name: &str,
     branch: Option<&str>,
-) -> String {
+) -> bool {
+    let absent_before_create = matches!(
+        std::fs::symlink_metadata(inst_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    if !absent_before_create {
+        tracing::warn!(%inst_name, path = %inst_dir.display(), "deployment workdir already exists; preserving unowned path");
+        return false;
+    }
     if let Some(br) = branch {
         let branch_name = format!("{deploy_name}/{inst_suffix}");
         // W1.2: LOCAL `git worktree add` via the bypass+bounded helper. The 3-way
@@ -405,6 +413,8 @@ fn prepare_work_dir(
         ) {
             Ok(_) => {
                 tracing::info!(%inst_name, %branch_name, "created worktree");
+                return absent_before_create
+                    && write_deployment_owner_marker(inst_dir, deploy_name, inst_name);
             }
             Err(crate::git_helpers::GitError::NonZero { stderr, .. }) => {
                 tracing::warn!(%inst_name, error = %stderr, "worktree failed");
@@ -414,9 +424,64 @@ fn prepare_work_dir(
             }
         }
     } else {
-        std::fs::create_dir_all(inst_dir).ok();
+        if let Some(parent) = inst_dir.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                tracing::warn!(%inst_name, %error, "deployment workdir parent creation failed");
+                return false;
+            }
+        }
+        if let Err(error) = std::fs::create_dir(inst_dir) {
+            tracing::warn!(%inst_name, %error, "deployment workdir creation failed");
+            return false;
+        }
+        return write_deployment_owner_marker(inst_dir, deploy_name, inst_name);
     }
-    inst_dir.display().to_string()
+    false
+}
+
+const DEPLOYMENT_OWNER_MARKER: &str = ".agend-deployment-owner";
+
+fn deployment_owner_marker_contents(
+    directory: &Path,
+    deploy_name: &str,
+    instance: &str,
+) -> Option<Vec<u8>> {
+    let canonical = crate::paths::canonical_workspace_path(directory).ok()?;
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "deployment": deploy_name,
+        "instance": instance,
+        "directory": canonical,
+    }))
+    .ok()
+}
+
+fn write_deployment_owner_marker(directory: &Path, deploy_name: &str, instance: &str) -> bool {
+    use std::io::Write;
+    let Some(contents) = deployment_owner_marker_contents(directory, deploy_name, instance) else {
+        return false;
+    };
+    let marker = directory.join(DEPLOYMENT_OWNER_MARKER);
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .and_then(|mut file| file.write_all(&contents));
+    if let Err(error) = result {
+        tracing::warn!(path = %marker.display(), %error, "deployment ownership marker creation failed; cleanup will preserve path");
+        return false;
+    }
+    true
+}
+
+fn deployment_owner_marker_matches(directory: &Path, deploy_name: &str, instance: &str) -> bool {
+    let Some(expected) = deployment_owner_marker_contents(directory, deploy_name, instance) else {
+        return false;
+    };
+    match std::fs::read(directory.join(DEPLOYMENT_OWNER_MARKER)) {
+        Ok(actual) => actual == expected,
+        Err(_) => false,
+    }
 }
 
 fn persist_to_fleet_yaml(
@@ -736,19 +801,38 @@ pub(crate) fn deploy_with_runtime(
     }
 
     let directory = std::path::PathBuf::from(&params.directory);
+    let mut materialized = Vec::with_capacity(yaml_entries.len());
     for (inst_name, _) in &yaml_entries {
         let suffix = inst_name
             .strip_prefix(&format!("{}-", params.deploy_name))
             .unwrap_or(inst_name);
         let inst_dir = directory.join(inst_name);
-        let _ = prepare_work_dir(
+        if !prepare_work_dir(
             &inst_dir,
             &directory,
             &params.deploy_name,
             suffix,
             inst_name,
             params.branch.as_deref(),
-        );
+        ) {
+            let cleanup = Deployment {
+                name: params.deploy_name.clone(),
+                template: params.template.clone(),
+                instances: materialized,
+                team: None,
+                directory: params.directory.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(error) = crate::fleet::remove_instances_from_yaml(home, &created) {
+                tracing::error!(%error, deploy_name = %params.deploy_name, "failed to roll back fleet entries after workdir materialization failure");
+            }
+            cleanup_deployment_dirs_impl(home, &cleanup, false);
+            return serde_json::json!({
+                "error": format!("deployment '{}' could not safely materialize working directory for '{inst_name}'", params.deploy_name),
+                "code": "deploy_workdir_materialization_failed",
+            });
+        }
+        materialized.push(inst_name.clone());
     }
 
     // #3624 症狀 1：先 CREATE_TEAM（members 用 entries 建好的預期名單）
@@ -1005,14 +1089,34 @@ pub fn list(home: &Path) -> Value {
 /// All filesystem ops are best-effort (`let _ = ...` / matched and logged);
 /// a single per-instance failure doesn't abort the rest of the sweep.
 fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
+    cleanup_deployment_dirs_impl(home, deployment, true);
+}
+
+fn cleanup_deployment_dirs_impl(home: &Path, deployment: &Deployment, remove_parent: bool) {
     // Serialize the fleet snapshot + filesystem deletion with all workspace
     // admissions. Otherwise a newly admitted instance could claim a path after
     // this snapshot and have its directory removed based on stale ownership.
-    let _fleet_lock = match crate::fleet::persist::acquire_fleet_lock(home) {
-        Ok(lock) => lock,
-        Err(error) => {
-            tracing::warn!(%error, "deployment cleanup refused: fleet lock unavailable");
-            return;
+    cleanup_deployment_dirs_with_wait_hook(home, deployment, remove_parent, || {});
+}
+
+fn cleanup_deployment_dirs_with_wait_hook(
+    home: &Path,
+    deployment: &Deployment,
+    remove_parent: bool,
+    mut on_lock_contention: impl FnMut(),
+) {
+    let lock_path = home.join(".fleet.yaml.lock");
+    let _fleet_lock = loop {
+        match crate::store::try_acquire_file_lock(&lock_path) {
+            Ok(Some(lock)) => break lock,
+            Ok(None) => {
+                on_lock_contention();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "deployment cleanup refused: fleet lock unavailable");
+                return;
+            }
         }
     };
     let custom_root = std::path::Path::new(&deployment.directory);
@@ -1040,13 +1144,15 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     for inst in &deployment.instances {
         // Custom-directory branch: deploy()'s `inst_dir = dir.join(&inst_name)`.
         let custom_subdir = custom_root.join(inst);
-        let custom_admitted = deployment_member_cleanup_admitted(
-            fleet.as_ref(),
-            home,
-            inst,
-            &custom_subdir,
-            &custom_subdir,
-        );
+        let custom_admitted =
+            deployment_owner_marker_matches(&custom_subdir, &deployment.name, inst)
+                && deployment_member_cleanup_admitted(
+                    fleet.as_ref(),
+                    home,
+                    inst,
+                    &custom_subdir,
+                    &custom_subdir,
+                );
         if custom_admitted && dir_is_repo {
             // Instances are named `{deploy_name}-{suffix}`; the worktree branch
             // is `{deploy_name}/{suffix}` (see prepare_work_dir).
@@ -1085,6 +1191,7 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
         // teardown semantics that cleaned `home/workspace/<inst>` directly.
         let default_subdir = crate::paths::workspace_dir(home).join(inst);
         if default_subdir.exists()
+            && deployment_owner_marker_matches(&default_subdir, &deployment.name, inst)
             && deployment_member_cleanup_admitted(
                 fleet.as_ref(),
                 home,
@@ -1113,13 +1220,15 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     // don't leak `/tmp/team-foo/` shells behind. `remove_dir` (NOT
     // `remove_dir_all`) errors on non-empty, which is exactly what we
     // want: any operator-dropped file preserves the parent.
-    if deployment_path_cleanup_admitted(
-        fleet.as_ref(),
-        home,
-        custom_root,
-        custom_root,
-        &deployment.instances,
-    ) {
+    if remove_parent
+        && deployment_path_cleanup_admitted(
+            fleet.as_ref(),
+            home,
+            custom_root,
+            custom_root,
+            &deployment.instances,
+        )
+    {
         rmdir_if_empty(custom_root);
     }
 }
@@ -1134,7 +1243,38 @@ fn deployment_member_cleanup_admitted(
     candidate: &Path,
     owned_path: &Path,
 ) -> bool {
-    deployment_path_cleanup_admitted(fleet, home, candidate, owned_path, &[instance.to_string()])
+    if !deployment_path_cleanup_admitted(
+        fleet,
+        home,
+        candidate,
+        owned_path,
+        &[instance.to_string()],
+    ) {
+        return false;
+    }
+    if let Some(entry) = fleet.and_then(|fleet| fleet.instances.get(instance)) {
+        let active_path = entry
+            .working_directory
+            .as_deref()
+            .map(crate::fleet::resolve::expand_tilde_path)
+            .unwrap_or_else(|| crate::paths::workspace_dir(home).join(instance));
+        let candidate = match crate::paths::canonical_workspace_path(candidate) {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+        match crate::paths::canonical_workspace_path(&active_path) {
+            Ok(active) if active == candidate => return true,
+            Ok(active) => {
+                tracing::warn!(path = %candidate.display(), active = %active.display(), instance, "deployment cleanup refused: same-name fleet workspace points elsewhere");
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(path = %active_path.display(), %error, instance, "deployment cleanup refused: same-name fleet workspace is ambiguous");
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn deployment_path_cleanup_admitted(
