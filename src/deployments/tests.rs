@@ -290,17 +290,13 @@ fn deploy_reports_fleet_rollback_and_cleanup_residuals_3721() {
         .iter()
         .filter_map(serde_json::Value::as_str)
         .collect::<Vec<_>>();
-    assert!(
-        residuals
-            .iter()
-            .any(|residual| residual.contains("team-worker"))
-    );
+    assert!(residuals
+        .iter()
+        .any(|residual| residual.contains("team-worker")));
     assert!(residuals.iter().any(|residual| residual.contains("fleet")));
-    assert!(
-        residuals
-            .iter()
-            .any(|residual| residual.contains("cleanup"))
-    );
+    assert!(residuals
+        .iter()
+        .any(|residual| residual.contains("cleanup")));
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&root).ok();
 }
@@ -1541,6 +1537,73 @@ fn teardown_surfaces_record_save_failure_not_fake_torn_down() {
 }
 
 #[test]
+fn teardown_preserves_cleanup_residual_for_retry_by_deployment_name_3721() {
+    let home = tmp_home("teardown-cleanup-residual-3721");
+    let custom_root = tmp_home("teardown-cleanup-root-3721");
+    let member = "demo-worker";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(member_dir.join("operator-data"), "preserve").unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    let mut store = DeploymentStore::default();
+    store.deployments.push(Deployment {
+        name: "demo".into(),
+        template: "tpl".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
+    });
+    save(&home, &mut store).unwrap();
+
+    let result = teardown(&home, &serde_json::json!({"name": "demo"}));
+
+    assert_eq!(result["status"], "torn_down_partial", "{result}");
+    assert!(
+        result["cleanup_residuals"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.as_str().is_some_and(|s| s.contains(member)))
+        }),
+        "cleanup residual must be visible to the caller: {result}"
+    );
+    let stored = load(&home);
+    let retained = stored.deployments.iter().find(|d| d.name == "demo");
+    assert!(
+        retained.is_some(),
+        "retryable cleanup state must retain deployment record"
+    );
+    assert!(
+        retained.unwrap().instances.is_empty(),
+        "deleted instances must not be retried as live deletes"
+    );
+    assert_eq!(retained.unwrap().cleanup_instances, vec![member]);
+    assert!(reconcile_orphan_deployments(&home).is_empty());
+    assert_eq!(
+        load(&home).deployments.len(),
+        1,
+        "boot reconciliation must preserve cleanup retry state"
+    );
+    let retry = teardown(&home, &serde_json::json!({"name": "demo"}));
+    assert_eq!(retry["status"], "torn_down_partial", "{retry}");
+    assert!(retry["instances"]
+        .as_array()
+        .is_some_and(|items| items.is_empty()));
+    assert!(retry["cleanup_residuals"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty()));
+    assert!(
+        member_dir.join("operator-data").exists(),
+        "unowned path must be preserved"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+#[test]
 fn close_last_instance_prunes_deployment_entry() {
     // Production smoke for the Issue #474 fix: deploy → simulate the
     // TUI close path (remove from fleet.yaml + reconcile_after_close)
@@ -1643,6 +1706,7 @@ fn reconcile_orphans_prunes_stale_entry_at_boot() {
         name: "ghost".into(),
         template: "tpl".into(),
         instances: vec!["ghost-instance-that-never-was".into()],
+        cleanup_instances: Vec::new(),
         team: None,
         directory: home.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -1733,6 +1797,7 @@ fn deploy_with_custom_directory(
         name: deploy_name.to_string(),
         template: "tpl".to_string(),
         instances: inst_names.clone(),
+        cleanup_instances: Vec::new(),
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -1857,6 +1922,7 @@ fn teardown_preserves_custom_member_nested_in_another_workspace_3721() {
         name: "demo".into(),
         template: "tpl".into(),
         instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -1900,6 +1966,7 @@ fn teardown_preserves_default_fallback_nested_in_another_workspace_3721() {
         name: "demo".into(),
         template: "tpl".into(),
         instances: vec!["demo-worker".into()],
+        cleanup_instances: Vec::new(),
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -1941,6 +2008,7 @@ fn cleanup_deployment_dirs_handles_missing_subdirs_gracefully() {
         name: "ghost".to_string(),
         template: "tpl".to_string(),
         instances: vec!["ghost-a".to_string()],
+        cleanup_instances: Vec::new(),
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -2119,6 +2187,7 @@ fn make_deployment(name: &str, members: &[&str], directory: &Path) -> Deployment
         name: name.to_string(),
         template: "tpl".to_string(),
         instances: inst_names,
+        cleanup_instances: Vec::new(),
         team: None,
         directory: directory.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),

@@ -9,6 +9,8 @@ pub struct Deployment {
     pub name: String,
     pub template: String,
     pub instances: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_instances: Vec<String>,
     pub team: Option<String>,
     pub directory: String,
     pub created_at: String,
@@ -883,6 +885,7 @@ pub(crate) fn deploy_with_runtime(
                 name: params.deploy_name.clone(),
                 template: params.template.clone(),
                 instances: materialized,
+                cleanup_instances: Vec::new(),
                 team: None,
                 directory: params.directory.clone(),
                 created_at: chrono::Utc::now().to_rfc3339(),
@@ -937,6 +940,7 @@ pub(crate) fn deploy_with_runtime(
         name: params.deploy_name.to_string(),
         template: params.template.to_string(),
         instances: created.clone(),
+        cleanup_instances: Vec::new(),
         team: if team_created {
             Some(params.deploy_name.to_string())
         } else {
@@ -1072,11 +1076,6 @@ pub(crate) fn teardown_with_runtime(
         .filter(|i| !residuals.contains(i))
         .cloned()
         .collect();
-    let deleted_deployment = Deployment {
-        instances: deleted.clone(),
-        ..deployment.clone()
-    };
-
     // Managed runtime deletes removed each confirmed-deleted row while its
     // DeleteFence remained held, so a same-name generation cannot be erased
     // by a later name-only batch mutation. Offline cleanup has no active
@@ -1093,7 +1092,17 @@ pub(crate) fn teardown_with_runtime(
     // `home/workspace/<inst>` loop missed.
     // #3505: only clean what was actually deleted — a refused instance is
     // still alive and its workspace must survive for the retry.
-    cleanup_deployment_dirs(home, &deleted_deployment);
+    let cleanup_instances = deployment
+        .cleanup_instances
+        .iter()
+        .chain(deleted.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let cleanup_deployment = Deployment {
+        instances: cleanup_instances.clone(),
+        ..deployment.clone()
+    };
+    let cleanup_residuals = cleanup_deployment_dirs_impl(home, &cleanup_deployment, true);
 
     // Delete team if exists — but only on FULL teardown. A partial teardown
     // still has live residual members; deleting their team would strand them.
@@ -1112,12 +1121,17 @@ pub(crate) fn teardown_with_runtime(
     let mut store = load(home);
     // #3505: partial teardown NARROWS the record to the residuals (retry
     // stays possible via the same name); full teardown removes it.
-    if residuals.is_empty() {
+    if residuals.is_empty() && cleanup_residuals.is_empty() {
         // Remove from store
         store.deployments.retain(|d| d.name != name);
     } else {
         for d in store.deployments.iter_mut().filter(|d| d.name == name) {
             d.instances = residuals.clone();
+            d.cleanup_instances = if cleanup_residuals.is_empty() {
+                Vec::new()
+            } else {
+                cleanup_instances.clone()
+            };
         }
     }
     // #bughunt2: if the record-removal save fails, the instances are already
@@ -1137,7 +1151,7 @@ pub(crate) fn teardown_with_runtime(
     // #3505 P0(a): partial teardown surfaces the refused names instead of
     // a silent clean `torn_down` — the operator can retry the same name
     // once the residual exits. Full teardown keeps the exact prior shape.
-    if residuals.is_empty() {
+    if residuals.is_empty() && cleanup_residuals.is_empty() {
         serde_json::json!({"status": "torn_down", "name": name, "instances": deployment.instances})
     } else {
         serde_json::json!({
@@ -1146,9 +1160,14 @@ pub(crate) fn teardown_with_runtime(
             "instances": deployment.instances,
             "deleted": deleted,
             "residuals": residuals,
+            "cleanup_residuals": cleanup_residuals,
             "hint": format!(
-                "teardown refused for {} — still live, registry + port + workspace retained; retry `teardown name={name}` once they exit",
-                residuals.join(", "),
+                "{}; retry `teardown name={name}` after addressing the residual",
+                if residuals.is_empty() {
+                    "workspace cleanup left residuals"
+                } else {
+                    "teardown refused for live instances; their registry, port, and workspace are retained"
+                },
             ),
         })
     }
@@ -1606,7 +1625,7 @@ pub(crate) fn reconcile_orphan_deployments(home: &Path) -> Vec<String> {
     let mut pruned_deployments: Vec<Deployment> = Vec::new();
     store.deployments.retain(|d| {
         let any_live = d.instances.iter().any(|i| live_instances.contains(i));
-        if any_live {
+        if any_live || !d.cleanup_instances.is_empty() {
             true
         } else {
             pruned_names.push(d.name.clone());
