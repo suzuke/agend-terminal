@@ -806,6 +806,22 @@ pub fn ensure_not_protected_json(branch: &str) -> Result<(), serde_json::Value> 
 /// is missing the 5 Kiro paths: `.kiro/agents/{agend.json,agend-prompt.md,
 /// default.json}`, `.kiro/prompts/agend.md`, `.kiro/settings.json`.
 pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) -> Option<String> {
+    let _id_lock = match crate::store::acquire_workspace_identity_lock(home, working_dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return Some(format!(
+                "could not acquire workspace-identity lock: {error}"
+            ));
+        }
+    };
+    cleanup_working_dir_under_identity_lock(home, name, working_dir)
+}
+
+fn cleanup_working_dir_under_identity_lock(
+    home: &Path,
+    name: &str,
+    working_dir: &Path,
+) -> Option<String> {
     // Workspace-identity guard (fail-closed): before removing anything under
     // `working_dir`, refuse if the directory's on-disk identity belongs to a
     // DIFFERENT instance (or is corrupt/unreadable). Deleting instance A must
@@ -819,11 +835,7 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) -> Optio
     // directory. The SINGLE returned verdict is what `full_delete_instance`
     // reports — it does NOT probe a second (unlocked) time. A lock-acquire
     // failure is itself fail-closed: refuse and preserve.
-    let id_lock = crate::store::acquire_workspace_identity_lock(home, working_dir);
-    let conflict = match &id_lock {
-        Ok(_) => working_dir_ownership_conflict(working_dir, name),
-        Err(e) => Some(format!("could not acquire workspace-identity lock: {e}")),
-    };
+    let conflict = working_dir_ownership_conflict(working_dir, name);
     if let Some(reason) = &conflict {
         tracing::error!(
             dir = %working_dir.display(), name, %reason,
@@ -988,6 +1000,16 @@ pub(crate) fn cleanup_working_dir_admitted(
     working_dir: &Path,
     admission: &cleanup_admission::CleanupAdmission,
 ) -> Option<String> {
+    cleanup_working_dir_admitted_with_pre_cleanup(home, name, working_dir, admission, || Ok(()))
+}
+
+pub(crate) fn cleanup_working_dir_admitted_with_pre_cleanup(
+    home: &Path,
+    name: &str,
+    working_dir: &Path,
+    admission: &cleanup_admission::CleanupAdmission,
+    before_cleanup: impl FnOnce() -> Result<(), String>,
+) -> Option<String> {
     match admission {
         cleanup_admission::CleanupAdmission::Preserve { reason } => {
             tracing::warn!(
@@ -1010,19 +1032,38 @@ pub(crate) fn cleanup_working_dir_admitted(
         cleanup_admission::CleanupAdmission::Refuse { reason } => Some(reason.clone()),
         cleanup_admission::CleanupAdmission::RemoveOwned { canonical }
         | cleanup_admission::CleanupAdmission::ScrubExclusive { canonical } => {
-            match dunce::canonicalize(working_dir) {
-                Ok(actual) if actual == *canonical => cleanup_working_dir(home, name, working_dir),
-                Ok(actual) => Some(format!(
+            let _id_lock = match crate::store::acquire_workspace_identity_lock(home, working_dir) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    return Some(format!(
+                        "could not acquire workspace-identity lock: {error}"
+                    ));
+                }
+            };
+            match crate::paths::canonical_workspace_path(working_dir) {
+                Ok(actual) if actual == *canonical => {}
+                Ok(actual) => {
+                    return Some(format!(
                     "working directory changed after admission: {} now resolves to {}, expected {}",
                     working_dir.display(),
                     actual.display(),
                     canonical.display()
-                )),
-                Err(error) => Some(format!(
-                    "working directory no longer canonicalizes after admission: {} ({error})",
-                    working_dir.display()
-                )),
+                ))
+                }
+                Err(error) => {
+                    return Some(format!(
+                        "working directory no longer canonicalizes after admission: {} ({error})",
+                        working_dir.display()
+                    ))
+                }
             }
+            if let Some(reason) = working_dir_ownership_conflict(working_dir, name) {
+                return Some(format!("cleanup refused: {reason}"));
+            }
+            if let Err(reason) = before_cleanup() {
+                return Some(reason);
+            }
+            cleanup_working_dir_under_identity_lock(home, name, working_dir)
         }
     }
 }
