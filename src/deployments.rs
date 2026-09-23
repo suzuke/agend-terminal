@@ -458,6 +458,9 @@ fn deployment_owner_marker_contents(
 
 fn write_deployment_owner_marker(directory: &Path, deploy_name: &str, instance: &str) -> bool {
     use std::io::Write;
+    if cfg!(test) && fail_deployment_owner_marker_test_hook() {
+        return false;
+    }
     let Some(contents) = deployment_owner_marker_contents(directory, deploy_name, instance) else {
         return false;
     };
@@ -1489,6 +1492,19 @@ pub fn reconcile_orphans(home: &Path) -> Vec<String> {
 #[cfg(test)]
 std::thread_local! {
     static AFTER_RUNTIME_INSTANCE_DELETES_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static FAIL_NEXT_DEPLOYMENT_OWNER_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn fail_deployment_owner_marker_test_hook() -> bool {
+    #[cfg(test)]
+    return FAIL_NEXT_DEPLOYMENT_OWNER_MARKER.with(|fail| fail.replace(false));
+    #[cfg(not(test))]
+    false
+}
+
+#[cfg(test)]
+fn fail_next_deployment_owner_marker_for_test() {
+    FAIL_NEXT_DEPLOYMENT_OWNER_MARKER.with(|fail| fail.set(true));
 }
 
 #[cfg(test)]

@@ -161,6 +161,40 @@ fn deploy_rolls_back_when_member_path_preexists_without_ownership_3721() {
 }
 
 #[test]
+fn deploy_rolls_back_currently_created_path_when_owner_marker_fails_3721() {
+    let home = tmp_home("marker_failure_rollback_3721");
+    let root = std::env::temp_dir().join(format!(
+        "agend-marker-failure-{}-{}",
+        std::process::id(),
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    super::fail_next_deployment_owner_marker_for_test();
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    let candidate = root.join("team-worker");
+    assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    assert!(
+        !candidate.exists(),
+        "a path created by this failed attempt must be rolled back"
+    );
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(!fleet.instances.contains_key("team-worker"));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn deploy_preserves_preexisting_same_name_fleet_entry_3721() {
     let home = tmp_home("same_name_fleet_entry_3721");
     let root = std::env::temp_dir().join(format!(
