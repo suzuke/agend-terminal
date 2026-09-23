@@ -2481,8 +2481,14 @@ fn managed_claude_spawn_uses_agend_instance_name() {
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    let separator = argv.iter().position(|arg| arg == "--").unwrap();
-    let name_flag = argv.iter().position(|arg| arg == "--name").unwrap();
+    let separator = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .expect("caller argument separator is present");
+    let name_flag = argv
+        .iter()
+        .position(|arg| arg == "--name")
+        .expect("managed Claude name flag is present");
     assert!(
         name_flag < separator,
         "Claude's managed name must remain a CLI option before caller's -- boundary; argv={argv:?}"
