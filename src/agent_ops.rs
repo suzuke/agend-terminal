@@ -329,29 +329,16 @@ pub(crate) fn delete_instance_with_exit_status(
     delete_instance_with_exit_status_for_restart(home, name, context, skip_exit_wait, None)
 }
 
-/// Delete an instance while running a caller-owned finalization step before
-/// the name's deletion fence is released. Deployment teardown uses this to
-/// remove the retired fleet row atomically with the generation transition.
-pub(crate) fn delete_instance_with_exit_status_and_post(
-    home: &Path,
-    name: &str,
-    context: &DeleteContext<'_>,
-    skip_exit_wait: bool,
-    after_delete: impl FnOnce(bool),
-) -> (DeleteOutcome, bool) {
-    delete_instance_with_exit_status_inner(home, name, context, skip_exit_wait, None, after_delete)
-}
-
 /// Delete only the deployment generation currently admitted under `name`.
 /// The provisional delete fence blocks a concurrent spawn while the fleet
-/// generation is checked; a mismatch refuses before transport state or the
-/// live runtime instance is touched.
+/// generation is checked. A mismatch, including a legacy deployment record
+/// facing a row with generation metadata, refuses before runtime deletion.
 pub(crate) fn delete_instance_with_exit_status_and_post_for_deployment_generation(
     home: &Path,
     name: &str,
     context: &DeleteContext<'_>,
     skip_exit_wait: bool,
-    expected_generation: &str,
+    expected_generation: Option<&str>,
     after_delete: impl FnOnce(bool),
 ) -> Option<(DeleteOutcome, bool)> {
     let mut fence = crate::daemon::lifecycle::DeleteFence::admit(home, name, true);
@@ -359,7 +346,7 @@ pub(crate) fn delete_instance_with_exit_status_and_post_for_deployment_generatio
         .ok()
         .and_then(|fleet| fleet.instances.get(name)?.deployment_generation.clone())
         .as_deref()
-        == Some(expected_generation);
+        == expected_generation;
     if !generation_matches {
         return None;
     }

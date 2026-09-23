@@ -1039,7 +1039,8 @@ pub(crate) fn teardown_with_runtime(
         };
         for inst in &deployment.instances {
             let mut fleet_remove_error = None;
-            let delete_result = if let Some(generation) = deployment.generation_id.as_deref() {
+            let generation = deployment.generation_id.as_deref();
+            let delete_result =
                 crate::agent_ops::delete_instance_with_exit_status_and_post_for_deployment_generation(
                     home,
                     inst,
@@ -1048,39 +1049,32 @@ pub(crate) fn teardown_with_runtime(
                     generation,
                     |observed_exit| {
                         if observed_exit {
-                            match crate::fleet::remove_instances_from_yaml_for_generation(
-                                home,
-                                &[(inst.as_str(), generation)],
-                            ) {
-                                Ok(preserved) if preserved.is_empty() => {}
-                                Ok(_) => {
-                                    fleet_remove_error = Some(
-                                        "a newer fleet generation was preserved".into(),
-                                    );
+                            if let Some(generation) = generation {
+                                match crate::fleet::remove_instances_from_yaml_for_generation(
+                                    home,
+                                    &[(inst.as_str(), generation)],
+                                ) {
+                                    Ok(preserved) if preserved.is_empty() => {}
+                                    Ok(_) => {
+                                        fleet_remove_error = Some(
+                                            "a newer fleet generation was preserved".into(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        fleet_remove_error = Some(error.to_string())
+                                    }
                                 }
-                                Err(error) => fleet_remove_error = Some(error.to_string()),
-                            }
-                        }
-                    },
-                )
-            } else {
-                Some(crate::agent_ops::delete_instance_with_exit_status_and_post(
-                    home,
-                    inst,
-                    &delete_context,
-                    false,
-                    |observed_exit| {
-                        if observed_exit {
-                            if let Err(error) = crate::fleet::remove_instance_from_yaml(home, inst)
+                            } else if let Err(error) =
+                                crate::fleet::remove_instance_from_yaml(home, inst)
                             {
                                 fleet_remove_error = Some(error.to_string());
                             }
                         }
                     },
-                ))
-            };
+                );
             let Some((_outcome, observed_exit)) = delete_result else {
                 preserved_generations.push(inst.clone());
+                residuals.push(inst.clone());
                 continue;
             };
             if let Some(error) = fleet_remove_error {
