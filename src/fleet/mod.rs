@@ -10,8 +10,9 @@ pub use watchdog::WatchdogConfig;
 pub use persist::{
     add_instance_to_yaml, add_instances_to_yaml, add_team_to_yaml, duplicate_identity_owner_before,
     insert_new_instances_to_yaml, migrate_teams_json_to_yaml, remove_instance_from_yaml,
-    remove_instances_from_yaml, remove_team_from_yaml, update_channel_telegram_group_id,
-    update_instance_field, update_team_in_yaml, workspace_identity_collision, TeamWriteOutcome,
+    remove_instances_from_yaml, remove_instances_from_yaml_for_generation, remove_team_from_yaml,
+    update_channel_telegram_group_id, update_instance_field, update_team_in_yaml,
+    workspace_identity_collision, TeamWriteOutcome,
 };
 
 use crate::backend::Backend;
@@ -541,6 +542,9 @@ pub struct InstanceConfig {
     /// Drives the `delete_instance` creator-ACL path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+    /// Opaque deployment generation used to guard rollback and owned-workdir cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_generation: Option<String>,
     /// Backend preset name — overrides defaults.backend.
     pub backend: Option<Backend>,
     pub command: Option<String>,
@@ -1144,6 +1148,8 @@ pub struct InstanceYamlEntry {
     /// Mirror of [`InstanceConfig::created_by`] — the identified caller that
     /// ran `create_instance`, written at spawn time.
     pub created_by: Option<String>,
+    /// Opaque token tying a deployed fleet row to its materialization generation.
+    pub deployment_generation: Option<String>,
     /// Mirror of [`InstanceConfig::context_alert_pct`].
     pub context_alert_pct: Option<f32>,
     /// Mirror of [`InstanceConfig::context_handoff_pct`].

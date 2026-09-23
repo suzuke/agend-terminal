@@ -16,7 +16,7 @@ fn tmp_home(tag: &str) -> std::path::PathBuf {
 
 fn mark_deployment_member(path: &Path, deployment: &str, instance: &str) {
     assert!(
-        super::write_deployment_owner_marker(path, deployment, instance),
+        super::write_deployment_owner_marker(path, deployment, instance, None),
         "test fixture must carry daemon-created ownership evidence"
     );
 }
@@ -286,10 +286,21 @@ fn deploy_reports_fleet_rollback_and_cleanup_residuals_3721() {
     let residuals = out["residuals"].as_array().expect(
         "rollback must return a structured list containing the initial materialization residual and rollback/cleanup failures",
     );
-    let residuals = residuals.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>();
-    assert!(residuals.iter().any(|residual| residual.contains("team-worker")));
+    let residuals = residuals
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(
+        residuals
+            .iter()
+            .any(|residual| residual.contains("team-worker"))
+    );
     assert!(residuals.iter().any(|residual| residual.contains("fleet")));
-    assert!(residuals.iter().any(|residual| residual.contains("cleanup")));
+    assert!(
+        residuals
+            .iter()
+            .any(|residual| residual.contains("cleanup"))
+    );
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&root).ok();
 }
@@ -1252,6 +1263,10 @@ templates:
         3,
         "every member must get a unique working_directory, got {workdirs:?}"
     );
+    let generation_id = load(&home).deployments[0]
+        .generation_id
+        .clone()
+        .expect("deployment must persist its generation token");
     for name in ["dev-lead", "dev-impl-1", "dev-impl-2"] {
         let wd = reloaded
             .instances
@@ -1263,7 +1278,12 @@ templates:
             "{name}'s working_directory must end with its own name, got {wd}"
         );
         assert!(
-            super::deployment_owner_marker_matches(Path::new(&wd), "dev", name),
+            super::deployment_owner_marker_matches(
+                Path::new(&wd),
+                "dev",
+                name,
+                Some(&generation_id),
+            ),
             "freshly created deployment workdir must carry exact ownership evidence"
         );
     }
@@ -1626,6 +1646,7 @@ fn reconcile_orphans_prunes_stale_entry_at_boot() {
         team: None,
         directory: home.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
     });
     save(&home, &mut store).expect("save store");
 
@@ -1715,6 +1736,7 @@ fn deploy_with_custom_directory(
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
     });
     save(&home, &mut store).unwrap();
     // Empty fleet.yaml — simulates the "all instances closed" state
@@ -1838,6 +1860,7 @@ fn teardown_preserves_custom_member_nested_in_another_workspace_3721() {
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
     });
     save(&home, &mut store).unwrap();
     std::fs::write(
@@ -1880,6 +1903,7 @@ fn teardown_preserves_default_fallback_nested_in_another_workspace_3721() {
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
     });
     save(&home, &mut store).unwrap();
     std::fs::write(
@@ -1920,6 +1944,7 @@ fn cleanup_deployment_dirs_handles_missing_subdirs_gracefully() {
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
     };
 
     // Must not panic.
@@ -2097,6 +2122,7 @@ fn make_deployment(name: &str, members: &[&str], directory: &Path) -> Deployment
         team: None,
         directory: directory.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
     }
 }
 

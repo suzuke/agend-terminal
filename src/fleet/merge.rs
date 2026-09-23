@@ -8,9 +8,12 @@ pub enum FieldClass {
 
 pub fn instance_field_class(field: &str) -> FieldClass {
     match field {
-        "id" | "topic_id" | "git_branch" | "source_repo" | "created_by" => {
-            FieldClass::DaemonManaged
-        }
+        "id"
+        | "topic_id"
+        | "git_branch"
+        | "source_repo"
+        | "created_by"
+        | "deployment_generation" => FieldClass::DaemonManaged,
         _ => FieldClass::OperatorHandEdit,
     }
 }
@@ -56,6 +59,7 @@ pub fn merge_instance_into_existing(
         ("command", &config.command),
         ("topic_binding_mode", &config.topic_binding_mode),
         ("created_by", &config.created_by),
+        ("deployment_generation", &config.deployment_generation),
     ] {
         merge_string_field(name, existing, field, value)?;
     }
@@ -208,6 +212,7 @@ pub(super) fn build_instance_mapping(config: &InstanceYamlEntry) -> serde_yaml_n
         ("command", &config.command),
         ("skills_path", &config.skills_path),
         ("created_by", &config.created_by),
+        ("deployment_generation", &config.deployment_generation),
     ] {
         if let Some(ref v) = val {
             inst.insert(key.into(), serde_yaml_ng::Value::String(v.clone()));

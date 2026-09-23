@@ -373,6 +373,37 @@ pub fn remove_instances_from_yaml(home: &Path, names: &[String]) -> Result<()> {
     })
 }
 
+/// Remove only fleet rows owned by the exact deployment generation. A name may
+/// have been deleted and re-admitted while an older deployment is rolling back.
+pub fn remove_instances_from_yaml_for_generation(
+    home: &Path,
+    entries: &[(&str, &str)],
+) -> Result<Vec<String>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut preserved = Vec::new();
+    mutate_fleet_yaml(home, "", |doc| {
+        if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
+            for (name, generation) in entries {
+                let key = serde_yaml_ng::Value::String((*name).to_string());
+                let owned = instances
+                    .get(&key)
+                    .and_then(|entry| entry.get("deployment_generation"))
+                    .and_then(serde_yaml_ng::Value::as_str)
+                    == Some(*generation);
+                if owned {
+                    instances.remove(&key);
+                } else if instances.contains_key(&key) {
+                    preserved.push((*name).to_string());
+                }
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(preserved)
+}
+
 fn mapping_is_telegram(m: &serde_yaml_ng::Mapping) -> bool {
     m.get(serde_yaml_ng::Value::String("type".into()))
         .and_then(|v| v.as_str())
