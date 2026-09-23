@@ -31,6 +31,20 @@ pub(crate) struct DeploymentRuntime<'a> {
     pub notifier: Option<&'a std::sync::Arc<dyn crate::api::ApiNotifier>>,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_RUNTIME_INSTANCE_DELETES_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_runtime_instance_deletes_test_hook() {
+    AFTER_RUNTIME_INSTANCE_DELETES_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 impl crate::store::SchemaVersioned for DeploymentStore {
     const CURRENT: u32 = 1;
     fn version_mut(&mut self) -> &mut u32 {
@@ -960,6 +974,8 @@ pub(crate) fn teardown_with_runtime(
                 residuals.push(inst.clone());
             }
         }
+        #[cfg(test)]
+        run_after_runtime_instance_deletes_test_hook();
     } else {
         delete_instances_legacy(home, &deployment.instances);
     }

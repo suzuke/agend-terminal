@@ -3239,6 +3239,73 @@ fn teardown_runtime_path_names_refused_instances_3505() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn teardown_same_name_readmission_between_delete_and_row_removal_3721() {
+    let home = tmp_home("teardown_same_name_generation_3721");
+    let custom_root = home.join("deployment-root");
+    let member = "svc-worker";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    let sentinel = member_dir.join("live-generation.txt");
+    std::fs::write(&sentinel, b"new-generation").unwrap();
+    let deployment = make_deployment("svc", &["worker"], &custom_root);
+    let mut store = DeploymentStore {
+        deployments: vec![deployment.clone()],
+        ..Default::default()
+    };
+    save(&home, &mut store).unwrap();
+    crate::fleet::add_instance_to_yaml(
+        &home,
+        member,
+        &crate::fleet::InstanceYamlEntry {
+            backend: Some("claude".into()),
+            working_directory: Some(member_dir.display().to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let hook_home = home.clone();
+    let hook_member_dir = member_dir.clone();
+    super::AFTER_RUNTIME_INSTANCE_DELETES_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert!(
+                !crate::agent::deleting::is_deleting(&hook_home, member),
+                "test window must be after the instance delete fence drops"
+            );
+            crate::fleet::add_instance_to_yaml(
+                &hook_home,
+                member,
+                &crate::fleet::InstanceYamlEntry {
+                    backend: Some("claude".into()),
+                    working_directory: Some(hook_member_dir.display().to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }));
+    });
+
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs = crate::api::ConfigRegistry::default();
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+    let result = teardown_with_runtime(&home, &serde_json::json!({"name":"svc"}), Some(&runtime));
+
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(
+        fleet.instances.contains_key(member),
+        "teardown must not remove a same-name generation admitted after delete: {result}"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"new-generation");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #3624 症狀 1 RED：deploy 必須先 CREATE_TEAM 後 spawn。舊順序是
 /// spawn → team，TUI roster sync 按 tick 當下 `teams.list_all()` 歸組：
 /// team 建好前先出現的成員落進 standalone tab（實測 lead 落單）。
