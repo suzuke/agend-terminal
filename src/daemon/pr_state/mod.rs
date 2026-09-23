@@ -1735,12 +1735,12 @@ fn apply_receipt_to_state(
     let head = receipt.reviewed_head.clone();
     let verdict = receipt.verdict;
     let assignment_id = receipt.assignment_id;
-    // Containment (not task68's append-only/worst-verdict ledger): one current
-    // authoritative receipt per assignment/slot. A later independently validated
-    // generation replaces the collapsed current view.
+    // Containment (not task68's append-only/worst-verdict ledger): keep one
+    // current authoritative receipt per assignment. Slot is routing metadata,
+    // not a uniqueness key; independent reviewers may share a slot.
     state
         .validated_review_receipts
-        .retain(|old| old.assignment_id != receipt.assignment_id && old.slot != receipt.slot);
+        .retain(|old| old.assignment_id != receipt.assignment_id);
     state.validated_review_receipts.push(receipt);
     if matches!(verdict, crate::review_receipt::ReviewVerdict::Verified) {
         state
