@@ -19,6 +19,20 @@ use crate::channel::telegram;
 use serde_json::json;
 use std::path::Path;
 
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_FLEET_DELETE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_fleet_delete_test_hook() {
+    AFTER_FLEET_DELETE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 /// #1907: remove `dir` and any empty subdirectories bottom-up, stopping at any
 /// non-empty dir. Used to drop a deleted agent's worktree root including the
 /// intermediate dirs a slash-containing branch nests (`worktrees/<name>/feat/x/`),
@@ -268,6 +282,8 @@ pub(crate) fn full_delete_instance_with_precondition(
         step_errors.push(format!("fleet.yaml removal: {e}"));
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");
     }
+    #[cfg(test)]
+    run_after_fleet_delete_test_hook();
     if let Some(tid) = topic_id {
         // #3232/#2550: remove the durable record only when the topic is known
         // absent. On failure, preserve its id under a reserved orphan tombstone:

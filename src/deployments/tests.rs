@@ -174,7 +174,7 @@ fn deploy_preserves_preexisting_same_name_fleet_entry_3721() {
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
         format!(
-            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances:\n  team-worker:\n    backend: codex\n    role: operator-owned\n    working_directory: {}\n",
+            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances:\n  team-worker:\n    backend: claude\n    role: operator-owned\n    working_directory: {}\n",
             candidate.display()
         ),
     )
@@ -199,7 +199,7 @@ fn deploy_preserves_preexisting_same_name_fleet_entry_3721() {
         &std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap(),
     )
     .unwrap();
-    assert_eq!(raw["instances"]["team-worker"]["backend"], "codex");
+    assert_eq!(raw["instances"]["team-worker"]["backend"], "claude");
     assert!(!load(&home)
         .deployments
         .iter()

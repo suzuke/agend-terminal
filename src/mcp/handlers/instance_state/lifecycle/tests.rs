@@ -873,6 +873,62 @@ fn full_delete_nested_survivor_preserves_workspace_and_claude_config_3721() {
     std::fs::remove_dir_all(home).ok();
 }
 
+#[test]
+fn full_delete_fresh_re_admission_preserves_claude_config_3721() {
+    let home = tmp_home("fresh_readmission_claude_config_3721");
+    let shared = tmp_home("fresh_readmission_shared_claude_config_3721");
+    let sentinel = shared.join("operator-data.txt");
+    std::fs::write(&sentinel, b"keep").unwrap();
+    let mcp_config = shared.join(".mcp.json");
+    std::fs::write(
+        &mcp_config,
+        br#"{"mcpServers":{"agend-claude-channel":{"command":"bridge"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n",
+            shared.display()
+        ),
+    )
+    .unwrap();
+    let hook_home = home.clone();
+    let hook_shared = shared.clone();
+    super::AFTER_FLEET_DELETE_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            crate::fleet::add_instance_to_yaml(
+                &hook_home,
+                "survivor",
+                &crate::fleet::InstanceYamlEntry {
+                    backend: Some("claude".into()),
+                    working_directory: Some(hook_shared.display().to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // Model backend provisioning after admission but before the
+            // original delete path's shared-config cleanup.
+            std::fs::write(
+                hook_shared.join(".mcp.json"),
+                br#"{"mcpServers":{"agend-claude-channel":{"command":"bridge"}}}"#,
+            )
+            .unwrap();
+        }));
+    });
+
+    let _ = super::full_delete_instance(&home, "victim");
+
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(fleet.instances.contains_key("survivor"));
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&mcp_config).unwrap()).unwrap();
+    assert!(config["mcpServers"].get("agend-claude-channel").is_some());
+    std::fs::remove_dir_all(home).ok();
+    std::fs::remove_dir_all(shared).ok();
+}
+
 #[cfg(unix)]
 #[test]
 fn full_delete_symlinked_parent_overlap_preserves_config_and_files_3721() {
