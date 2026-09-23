@@ -2450,15 +2450,42 @@ fn managed_claude_spawn_uses_agend_instance_name() {
     );
 
     let non_claude = SpawnConfig {
+        name: "non-claude-3709",
         backend: None,
         backend_command: "echo",
-        name: "non-claude-3709",
-        ..config
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
     };
     let (cmd, _, _) = build_command(&non_claude).expect("build non-Claude command");
     assert!(
         !cmd.get_argv().iter().any(|arg| arg == "--name"),
         "non-Claude backends must not receive Claude's --name flag"
+    );
+
+    let boundary_args = ["--model", "sonnet", "--", "prompt payload"].map(str::to_string);
+    let with_boundary = SpawnConfig {
+        args: &boundary_args,
+        ..config
+    };
+    let (cmd, _, _) = build_command(&with_boundary).expect("build command with arg boundary");
+    let argv: Vec<String> = cmd
+        .get_argv()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let separator = argv.iter().position(|arg| arg == "--").unwrap();
+    let name_flag = argv.iter().position(|arg| arg == "--name").unwrap();
+    assert!(
+        name_flag < separator,
+        "Claude's managed name must remain a CLI option before caller's -- boundary; argv={argv:?}"
     );
 }
 
