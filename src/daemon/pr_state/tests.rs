@@ -152,6 +152,40 @@ fn observe_typed_verified(state: &mut PrState, reviewer: &str, reviewed_head: &s
     );
 }
 
+/// A second typed assignment in the same slot must not evict the first
+/// reviewer's independently validated receipt. Dual quorum is by distinct
+/// reviewer identity, not by slot cardinality.
+#[test]
+fn same_slot_receipts_preserve_distinct_dual_reviewers() {
+    let head = "d".repeat(40);
+    let mut state = new_state(&head, ReviewClass::Dual);
+    state.ci_state = CiState::Green {
+        sha: head.clone(),
+        observed_at: now(),
+    };
+    state.draft_state = DraftState::Ready;
+
+    observe_typed_verified(&mut state, "reviewer-one", &head);
+    let first = state.validated_review_receipts[0].clone();
+    let second_source = format!("test-source-{}", uuid::Uuid::new_v4());
+    super::apply_receipt_to_state(
+        &mut state,
+        crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: format!("review-receipt:{second_source}"),
+            source_id: second_source,
+            evidence_digest: "c".repeat(64),
+            assignment_id: uuid::Uuid::new_v4(),
+            reviewer_instance_id: crate::types::InstanceId::new(),
+            reviewer_name: "reviewer-two".into(),
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            ..first
+        },
+    );
+
+    assert_eq!(state.validated_review_receipts.len(), 2);
+    assert!(merge_readiness(&state).is_ok());
+}
+
 fn observe_assignment_verdict(
     state: &mut PrState,
     assignment: &crate::daemon::assignment_authority::ActiveAssignment,
