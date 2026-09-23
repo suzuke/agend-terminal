@@ -303,14 +303,10 @@ fn create_instance_entries(
             .or(params.template_source_repo.clone());
 
         let inst_dir = dir.join(&inst_name);
-        let work_dir = prepare_work_dir(
-            &inst_dir,
-            &dir,
-            &params.deploy_name,
-            inst_suffix,
-            &inst_name,
-            params.branch.as_deref(),
-        );
+        // Keep entry construction side-effect free. Fleet admission below is
+        // the authority for workspace identity; materialize only after it has
+        // accepted every intended working directory.
+        let work_dir = inst_dir.display().to_string();
 
         yaml_entries.push((
             inst_name.clone(),
@@ -739,6 +735,22 @@ pub(crate) fn deploy_with_runtime(
         return e;
     }
 
+    let directory = std::path::PathBuf::from(&params.directory);
+    for (inst_name, _) in &yaml_entries {
+        let suffix = inst_name
+            .strip_prefix(&format!("{}-", params.deploy_name))
+            .unwrap_or(inst_name);
+        let inst_dir = directory.join(inst_name);
+        let _ = prepare_work_dir(
+            &inst_dir,
+            &directory,
+            &params.deploy_name,
+            suffix,
+            inst_name,
+            params.branch.as_deref(),
+        );
+    }
+
     // #3624 症狀 1：先 CREATE_TEAM（members 用 entries 建好的預期名單）
     // 後 spawn。舊順序 spawn → team 讓 TUI roster sync 在 team 建好前的
     // tick 把先出現的成員歸進 standalone tab（實測 lead 落單）。team 建在
@@ -993,9 +1005,19 @@ pub fn list(home: &Path) -> Value {
 /// All filesystem ops are best-effort (`let _ = ...` / matched and logged);
 /// a single per-instance failure doesn't abort the rest of the sweep.
 fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
+    // Serialize the fleet snapshot + filesystem deletion with all workspace
+    // admissions. Otherwise a newly admitted instance could claim a path after
+    // this snapshot and have its directory removed based on stale ownership.
+    let _fleet_lock = match crate::fleet::persist::acquire_fleet_lock(home) {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(%error, "deployment cleanup refused: fleet lock unavailable");
+            return;
+        }
+    };
     let custom_root = std::path::Path::new(&deployment.directory);
     let fleet_path = crate::fleet::fleet_yaml_path(home);
-    let fleet = match crate::fleet::FleetConfig::load(&fleet_path) {
+    let fleet = match crate::fleet::FleetConfig::load_snapshot_under_lock(&fleet_path) {
         Ok(config) => Some(config),
         Err(_)
             if std::fs::symlink_metadata(&fleet_path)
@@ -1091,11 +1113,13 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     // don't leak `/tmp/team-foo/` shells behind. `remove_dir` (NOT
     // `remove_dir_all`) errors on non-empty, which is exactly what we
     // want: any operator-dropped file preserves the parent.
-    if crate::paths::canonical_workspace_path(custom_root).is_ok_and(|root| {
-        crate::paths::canonical_workspace_path(home).is_ok_and(|home| root != home)
-            && crate::paths::canonical_workspace_path(&crate::paths::workspace_dir(home))
-                .is_ok_and(|workspace| root != workspace)
-    }) {
+    if deployment_path_cleanup_admitted(
+        fleet.as_ref(),
+        home,
+        custom_root,
+        custom_root,
+        &deployment.instances,
+    ) {
         rmdir_if_empty(custom_root);
     }
 }
@@ -1109,6 +1133,16 @@ fn deployment_member_cleanup_admitted(
     instance: &str,
     candidate: &Path,
     owned_path: &Path,
+) -> bool {
+    deployment_path_cleanup_admitted(fleet, home, candidate, owned_path, &[instance.to_string()])
+}
+
+fn deployment_path_cleanup_admitted(
+    fleet: Option<&crate::fleet::FleetConfig>,
+    home: &Path,
+    candidate: &Path,
+    owned_path: &Path,
+    ignored_instances: &[String],
 ) -> bool {
     let canonical = match crate::paths::canonical_workspace_path(candidate) {
         Ok(path) => path,
@@ -1124,12 +1158,23 @@ fn deployment_member_cleanup_admitted(
     if canonical != expected_canonical {
         return false;
     }
+    let reserved_roots = [
+        crate::paths::canonical_workspace_path(home),
+        crate::paths::canonical_workspace_path(&crate::paths::workspace_dir(home)),
+    ];
+    if reserved_roots
+        .iter()
+        .any(|root| root.as_ref().is_ok_and(|root| root == &canonical))
+    {
+        tracing::warn!(path = %canonical.display(), "deployment cleanup refused: reserved root");
+        return false;
+    }
     let Some(fleet) = fleet else {
         tracing::warn!(path = %canonical.display(), "deployment cleanup refused: fleet snapshot unavailable");
         return false;
     };
     for (name, entry) in &fleet.instances {
-        if name == instance {
+        if ignored_instances.iter().any(|ignored| ignored == name) {
             continue;
         }
         let survivor = entry

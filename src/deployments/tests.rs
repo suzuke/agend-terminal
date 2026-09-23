@@ -84,6 +84,44 @@ fn deploy_rejects_bad_template_name() {
 }
 
 #[test]
+fn deploy_overlap_rejection_has_no_directory_side_effect() {
+    let home = tmp_home("overlap_no_side_effect_3721");
+    let root = std::env::temp_dir().join(format!("agend-deploy-overlap-{}", std::process::id()));
+    let candidate = root.join("team-worker");
+    std::fs::create_dir_all(&candidate).unwrap();
+    let sentinel = candidate.join("operator-data.txt");
+    std::fs::write(&sentinel, b"preserve").unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances:\n  owner:\n    backend: claude\n    working_directory: {}\n",
+            candidate.display()
+        ),
+    )
+    .unwrap();
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    assert!(
+        out.get("error").is_some(),
+        "overlap must be rejected: {out}"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    assert!(
+        candidate.exists(),
+        "rejected deploy must not materialize or remove path"
+    );
+    assert!(!root.join("team-worker").join(".git").exists());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn deploy_persists_role_into_fleet_yaml() {
     // Role declared on a template instance must flow into fleet.yaml's
     // instances: block so pane_factory::create_pane_from_resolved can
@@ -1738,6 +1776,81 @@ fn cleanup_deployment_dirs_preserves_parent_with_unrelated_file() {
         "operator-dropped file MUST remain on disk: {unrelated:?}"
     );
 
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+#[test]
+fn cleanup_deployment_dirs_preserves_empty_parent_used_by_survivor_3721() {
+    let home = tmp_home("p15_live_empty_root_3721");
+    let custom_root =
+        std::env::temp_dir().join(format!("agend-p15-{}-live-root", std::process::id()));
+    std::fs::create_dir_all(&custom_root).unwrap();
+    std::fs::create_dir_all(custom_root.join("p15live-a")).unwrap();
+    let dep = make_deployment("p15live", &["a"], &custom_root);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  p15live-a:\n    backend: claude\n    working_directory: {}\n  survivor:\n    backend: claude\n    working_directory: {}\n",
+            custom_root.join("p15live-a").display(),
+            custom_root.display()
+        ),
+    )
+    .unwrap();
+
+    cleanup_deployment_dirs(&home, &dep);
+
+    assert!(
+        custom_root.exists(),
+        "empty deployment root that is an active workspace must survive"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+#[test]
+fn cleanup_waits_for_fleet_admission_and_uses_fresh_snapshot_3721() {
+    let home = tmp_home("cleanup_fleet_race_3721");
+    let custom_root =
+        std::env::temp_dir().join(format!("agend-p15-{}-fleet-race", std::process::id()));
+    let member = "p15race-a";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    let sentinel = member_dir.join("operator-data.txt");
+    std::fs::write(&sentinel, b"preserve").unwrap();
+    let dep = make_deployment("p15race", &["a"], &custom_root);
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+
+    // Hold the admission lock while cleanup starts. Publish the newly admitted
+    // workspace before releasing it; cleanup must then load this fresh snapshot.
+    let lock = crate::fleet::persist::acquire_fleet_lock(&home).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let cleanup_home = home.clone();
+    let cleanup_dep = dep.clone();
+    let cleanup = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        cleanup_deployment_dirs(&cleanup_home, &cleanup_dep);
+        finished_tx.send(()).unwrap();
+    });
+    started_rx.recv().unwrap();
+    assert_eq!(
+        finished_rx.recv_timeout(std::time::Duration::from_millis(50)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "cleanup must wait for the fleet admission lock"
+    );
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  survivor:\n    backend: claude\n    working_directory: {}\n",
+            member_dir.display()
+        ),
+    )
+    .unwrap();
+    drop(lock);
+    cleanup.join().unwrap();
+
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&custom_root).ok();
 }

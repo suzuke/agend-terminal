@@ -759,6 +759,20 @@ impl FleetConfig {
         Ok((*Self::load_arc(path)?).clone())
     }
 
+    /// Load a normalized fleet snapshot without performing ID backfill writes.
+    /// The caller must hold [`persist::acquire_fleet_lock`] across this read
+    /// and any dependent mutation. This avoids recursively acquiring the fleet
+    /// lock from `backfill_ids` when a caller needs one atomic read/decide/write.
+    pub fn load_snapshot_under_lock(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read fleet config: {}", path.display()))?;
+        let mut config: FleetConfig = serde_yaml_ng::from_str(&content)
+            .with_context(|| format!("Failed to parse fleet config: {}", path.display()))?;
+        config.normalize();
+        config.home = path.parent().map(|p| p.to_path_buf());
+        Ok(config)
+    }
+
     /// #1989: resolved schema version — an omitted `schema_version:` means 1.
     pub fn effective_schema_version(&self) -> u32 {
         self.schema_version.unwrap_or(1)
