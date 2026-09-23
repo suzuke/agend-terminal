@@ -997,8 +997,9 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     let fleet = match crate::fleet::FleetConfig::load(&fleet_path) {
         Ok(config) => Some(config),
-        Err(_) if std::fs::symlink_metadata(&fleet_path)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        Err(_)
+            if std::fs::symlink_metadata(&fleet_path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
         {
             Some(crate::fleet::FleetConfig::default())
         }
@@ -1018,7 +1019,11 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
         // Custom-directory branch: deploy()'s `inst_dir = dir.join(&inst_name)`.
         let custom_subdir = custom_root.join(inst);
         let custom_admitted = deployment_member_cleanup_admitted(
-            fleet.as_ref(), home, inst, &custom_subdir, &custom_subdir,
+            fleet.as_ref(),
+            home,
+            inst,
+            &custom_subdir,
+            &custom_subdir,
         );
         if custom_admitted && dir_is_repo {
             // Instances are named `{deploy_name}-{suffix}`; the worktree branch
@@ -1059,11 +1064,23 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
         let default_subdir = crate::paths::workspace_dir(home).join(inst);
         if default_subdir.exists() {
             if deployment_member_cleanup_admitted(
-                fleet.as_ref(), home, inst, &default_subdir, &default_subdir,
+                fleet.as_ref(),
+                home,
+                inst,
+                &default_subdir,
+                &default_subdir,
             ) {
                 if let Ok(canonical) = crate::paths::canonical_workspace_path(&default_subdir) {
-                    let admission = crate::agent_ops::cleanup_admission::CleanupAdmission::RemoveOwned { canonical };
-                    let _ = crate::agent_ops::cleanup_working_dir_admitted(home, inst, &default_subdir, &admission);
+                    let admission =
+                        crate::agent_ops::cleanup_admission::CleanupAdmission::RemoveOwned {
+                            canonical,
+                        };
+                    let _ = crate::agent_ops::cleanup_working_dir_admitted(
+                        home,
+                        inst,
+                        &default_subdir,
+                        &admission,
+                    );
                 }
             }
         }
@@ -1076,7 +1093,8 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     // want: any operator-dropped file preserves the parent.
     if crate::paths::canonical_workspace_path(custom_root).is_ok_and(|root| {
         crate::paths::canonical_workspace_path(home).is_ok_and(|home| root != home)
-            && crate::paths::canonical_workspace_path(&crate::paths::workspace_dir(home)).is_ok_and(|workspace| root != workspace)
+            && crate::paths::canonical_workspace_path(&crate::paths::workspace_dir(home))
+                .is_ok_and(|workspace| root != workspace)
     }) {
         rmdir_if_empty(custom_root);
     }
@@ -1114,11 +1132,17 @@ fn deployment_member_cleanup_admitted(
         if name == instance {
             continue;
         }
-        let survivor = entry.working_directory.as_deref()
+        let survivor = entry
+            .working_directory
+            .as_deref()
             .map(crate::fleet::resolve::expand_tilde_path)
             .unwrap_or_else(|| crate::paths::workspace_dir(home).join(name));
         match crate::paths::canonical_workspace_path(&survivor) {
-            Ok(path) if matches!(crate::paths::workspace_paths_overlap(&canonical, &path), Ok(false)) => {}
+            Ok(path)
+                if matches!(
+                    crate::paths::workspace_paths_overlap(&canonical, &path),
+                    Ok(false)
+                ) => {}
             Ok(path) => {
                 tracing::warn!(path = %canonical.display(), survivor = %path.display(), "deployment cleanup preserved overlapping active workspace");
                 return false;

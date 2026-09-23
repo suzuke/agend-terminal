@@ -91,9 +91,7 @@ pub fn canonical_workspace_path(path: &Path) -> Result<PathBuf, String> {
                 return Ok(canonical);
             }
             Err(error) => match std::fs::symlink_metadata(&probe) {
-                Err(metadata_error)
-                    if metadata_error.kind() == std::io::ErrorKind::NotFound =>
-                {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
                     let Some(name) = probe.file_name() else {
                         return Err(format!(
                             "path {} has no canonicalizable ancestor: {error}",

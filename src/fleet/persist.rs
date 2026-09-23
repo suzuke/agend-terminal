@@ -175,7 +175,7 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 find_workspace_identity_collision(home, instances, name, &candidate_wd)
             {
                 return Err(anyhow::anyhow!(
-                "workspace identity collision: instance '{name}' would overlap the canonical \
+                    "workspace identity collision: instance '{name}' would overlap the canonical \
                      working directory of existing instance '{collider}' ({}). Refusing \
                      workspace overlap (fail-closed).",
                     candidate_wd.display()
