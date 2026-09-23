@@ -2816,7 +2816,7 @@ fn teardown_api_calls_not_under_flock() {
         .find(&["acquire_file", "_lock"].concat())
         .expect("teardown locks the record removal");
     let delete_at = body
-        .find("delete_instance_with_exit_status(")
+        .find("delete_instance_with_exit_status_and_post(")
         .expect("teardown invokes the typed DELETE owner");
     assert!(
         delete_at < lock_at,
@@ -2882,7 +2882,7 @@ fn deployment_runtime_dispatch_forwards_typed_capability_slice14() {
     for needle in [
         "spawn_instance(",
         "team_ops::create",
-        "delete_instance_with_exit_status(",
+        "delete_instance_with_exit_status_and_post(",
     ] {
         let body = source_function_containing(deployments, needle);
         assert!(

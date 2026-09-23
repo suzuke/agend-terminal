@@ -31,20 +31,6 @@ pub(crate) struct DeploymentRuntime<'a> {
     pub notifier: Option<&'a std::sync::Arc<dyn crate::api::ApiNotifier>>,
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static AFTER_RUNTIME_INSTANCE_DELETES_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-fn run_after_runtime_instance_deletes_test_hook() {
-    AFTER_RUNTIME_INSTANCE_DELETES_HOOK.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
-}
-
 impl crate::store::SchemaVersioned for DeploymentStore {
     const CURRENT: u32 = 1;
     fn version_mut(&mut self) -> &mut u32 {
@@ -956,6 +942,8 @@ pub(crate) fn teardown_with_runtime(
     // The legacy (runtime=None) transport path cannot observe refusal, so
     // its contract is unchanged.
     let mut residuals: Vec<String> = Vec::new();
+    let remove_legacy_fleet_rows =
+        runtime.is_none() && crate::daemon::find_active_run_dir(home).is_none();
     if let Some(runtime) = runtime {
         let delete_context = crate::agent_ops::DeleteContext {
             registry: runtime.registry,
@@ -964,18 +952,32 @@ pub(crate) fn teardown_with_runtime(
             notifier: runtime.notifier,
         };
         for inst in &deployment.instances {
-            let (_outcome, observed_exit) = crate::agent_ops::delete_instance_with_exit_status(
-                home,
-                inst,
-                &delete_context,
-                false,
-            );
-            if !observed_exit {
+            let mut fleet_remove_error = None;
+            let (_outcome, observed_exit) =
+                crate::agent_ops::delete_instance_with_exit_status_and_post(
+                    home,
+                    inst,
+                    &delete_context,
+                    false,
+                    |observed_exit| {
+                        if observed_exit {
+                            if let Err(error) = crate::fleet::remove_instance_from_yaml(home, inst)
+                            {
+                                fleet_remove_error = Some(error.to_string());
+                            }
+                        }
+                    },
+                );
+            if let Some(error) = fleet_remove_error {
+                tracing::warn!(instance = %inst, %error, "failed to remove deleted fleet row under delete fence");
+                residuals.push(inst.clone());
+            } else if !observed_exit {
                 residuals.push(inst.clone());
             }
         }
-        #[cfg(test)]
-        run_after_runtime_instance_deletes_test_hook();
+        if cfg!(test) {
+            run_after_runtime_instance_deletes_test_hook();
+        }
     } else {
         delete_instances_legacy(home, &deployment.instances);
     }
@@ -994,15 +996,15 @@ pub(crate) fn teardown_with_runtime(
         ..deployment.clone()
     };
 
-    // Symmetrical with `deploy`: we wrote entries into fleet.yaml so
-    // pane_factory could render identity; teardown must remove them or
-    // daemon restart would resurrect dead agents via auto_start_fleet. Remove
-    // confirmed-deleted names BEFORE filesystem cleanup: cleanup's fresh
-    // locked snapshot must refuse a same-name row re-admitted after this
-    // removal, rather than confusing it with the old deployment generation.
-    // #3505: only remove deleted entries — refused instances stay live.
-    if let Err(e) = crate::fleet::remove_instances_from_yaml(home, &deleted) {
-        tracing::warn!(error = %e, "failed to clean up fleet.yaml on teardown");
+    // Managed runtime deletes removed each confirmed-deleted row while its
+    // DeleteFence remained held, so a same-name generation cannot be erased
+    // by a later name-only batch mutation. Offline cleanup has no active
+    // spawner; it retains the legacy batch removal. An active legacy daemon's
+    // DELETE path owns row removal under its lifecycle fence.
+    if remove_legacy_fleet_rows {
+        if let Err(e) = crate::fleet::remove_instances_from_yaml(home, &deleted) {
+            tracing::warn!(error = %e, "failed to clean up fleet.yaml on teardown");
+        }
     }
 
     // Smoke 2 fix: filesystem cleanup of every spawned subdir, including
@@ -1483,6 +1485,23 @@ pub fn reconcile_after_close(home: &Path, removed_names: &[String]) -> Vec<Strin
 pub fn reconcile_orphans(home: &Path) -> Vec<String> {
     reconcile_orphan_deployments(home)
 }
+
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_RUNTIME_INSTANCE_DELETES_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_runtime_instance_deletes_test_hook() {
+    AFTER_RUNTIME_INSTANCE_DELETES_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_after_runtime_instance_deletes_test_hook() {}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

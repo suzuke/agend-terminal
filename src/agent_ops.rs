@@ -317,10 +317,9 @@ pub enum DeleteOutcome {
 /// semantics for managed and external agents. Runtime callers use the live
 /// registries directly; transport fallback belongs to the MCP routing layer.
 ///
-/// #3505: merged into `delete_instance_with_exit_status` — the sole
-/// production caller (`deployments::teardown_with_runtime`) needs the
-/// exit-observation bit to name refused instances, and no other caller
-/// remains. Callers that ignore the bit take `.0`.
+/// Test-only convenience wrapper for callers that do not need post-delete
+/// work to run under the generation fence.
+#[cfg(test)]
 pub(crate) fn delete_instance_with_exit_status(
     home: &Path,
     name: &str,
@@ -328,6 +327,19 @@ pub(crate) fn delete_instance_with_exit_status(
     skip_exit_wait: bool,
 ) -> (DeleteOutcome, bool) {
     delete_instance_with_exit_status_for_restart(home, name, context, skip_exit_wait, None)
+}
+
+/// Delete an instance while running a caller-owned finalization step before
+/// the name's deletion fence is released. Deployment teardown uses this to
+/// remove the retired fleet row atomically with the generation transition.
+pub(crate) fn delete_instance_with_exit_status_and_post(
+    home: &Path,
+    name: &str,
+    context: &DeleteContext<'_>,
+    skip_exit_wait: bool,
+    after_delete: impl FnOnce(bool),
+) -> (DeleteOutcome, bool) {
+    delete_instance_with_exit_status_inner(home, name, context, skip_exit_wait, None, after_delete)
 }
 
 /// Delete with optional internal restart correlation carried on the lifecycle
@@ -339,6 +351,17 @@ pub(crate) fn delete_instance_with_exit_status_for_restart(
     context: &DeleteContext<'_>,
     skip_exit_wait: bool,
     restart_id: Option<&str>,
+) -> (DeleteOutcome, bool) {
+    delete_instance_with_exit_status_inner(home, name, context, skip_exit_wait, restart_id, |_| {})
+}
+
+fn delete_instance_with_exit_status_inner(
+    home: &Path,
+    name: &str,
+    context: &DeleteContext<'_>,
+    skip_exit_wait: bool,
+    restart_id: Option<&str>,
+    after_delete: impl FnOnce(bool),
 ) -> (DeleteOutcome, bool) {
     // The public runtime entry owns the complete deletion fence even for an
     // external agent. External-first resolution must not bypass transport
@@ -362,6 +385,7 @@ pub(crate) fn delete_instance_with_exit_status_for_restart(
             );
         }
     }
+    after_delete(observed_exit);
     (outcome, observed_exit)
 }
 
