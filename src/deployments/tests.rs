@@ -1454,6 +1454,87 @@ fn teardown_cleans_custom_directory_subdirs() {
 }
 
 #[test]
+fn teardown_preserves_custom_member_nested_in_another_workspace_3721() {
+    let home = tmp_home("teardown_nested_custom_3721");
+    let owner_workspace = crate::paths::workspace_dir(&home).join("owner");
+    let custom_root = owner_workspace.join("custom-deployment");
+    let member = "demo-worker";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    let sentinel = member_dir.join("operator-data.txt");
+    std::fs::write(&sentinel, b"must survive").unwrap();
+
+    let mut store = load(&home);
+    store.deployments.push(Deployment {
+        name: "demo".into(),
+        template: "tpl".into(),
+        instances: vec![member.into()],
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    });
+    save(&home, &mut store).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  owner:\n    backend: claude\n    working_directory: {}\n  demo-worker:\n    backend: claude\n    working_directory: {}\n",
+            owner_workspace.display(),
+            member_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let _ = teardown(&home, &serde_json::json!({"name": "demo"}));
+
+    assert!(
+        std::fs::read(&sentinel).ok().as_deref() == Some(&b"must survive"[..]),
+        "teardown must not recursively delete a custom deployment member inside another live workspace"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn teardown_preserves_default_fallback_nested_in_another_workspace_3721() {
+    let home = tmp_home("teardown_nested_fallback_3721");
+    let default_member = crate::paths::workspace_dir(&home).join("demo-worker");
+    let survivor = default_member.join("nested-survivor");
+    std::fs::create_dir_all(&survivor).unwrap();
+    let sentinel = default_member.join("operator-data.txt");
+    std::fs::write(&sentinel, b"must survive").unwrap();
+    let custom_root = crate::paths::workspace_dir(&home).join("demo");
+    let custom_member = custom_root.join("demo-worker");
+    std::fs::create_dir_all(&custom_member).unwrap();
+
+    let mut store = load(&home);
+    store.deployments.push(Deployment {
+        name: "demo".into(),
+        template: "tpl".into(),
+        instances: vec!["demo-worker".into()],
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    });
+    save(&home, &mut store).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  owner:\n    backend: claude\n    working_directory: {}\n  demo-worker:\n    backend: claude\n    working_directory: {}\n",
+            survivor.display(),
+            default_member.display()
+        ),
+    )
+    .unwrap();
+
+    let _ = teardown(&home, &serde_json::json!({"name": "demo"}));
+
+    assert!(
+        std::fs::read(&sentinel).ok().as_deref() == Some(&b"must survive"[..]),
+        "default workspace cleanup fallback must honor nested live-workspace admission"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn cleanup_deployment_dirs_handles_missing_subdirs_gracefully() {
     // Pre-removed subdirs (e.g., manual cleanup, or a previous reconcile
     // already ran) must not panic the helper. Tests the

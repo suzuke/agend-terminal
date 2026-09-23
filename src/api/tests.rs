@@ -132,6 +132,22 @@ fn validate_work_dir_rejects_outside_roots() {
 }
 
 #[test]
+fn validate_work_dir_rejects_agend_roots_issue_3721() {
+    let home = tmp_home("validate_reserved_roots_3721");
+    let workspace = crate::paths::workspace_dir(&home);
+    for reserved in [&home, &workspace] {
+        let error = validate_working_directory(reserved, &home)
+            .expect_err("AgEnD roots themselves must not be instance working directories");
+        assert!(
+            format!("{error}").contains("reserved"),
+            "expected reserved-root refusal for {}: {error}",
+            reserved.display()
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 #[serial_test::serial(env)]
 fn validate_work_dir_env_override_accepted() {
     let home = tmp_home("validate_env");

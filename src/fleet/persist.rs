@@ -981,6 +981,65 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[test]
+    fn add_instance_refuses_ancestor_and_descendant_workspace_overlap_3721() {
+        let home = tmp_home("overlap-3721");
+        let parent = crate::paths::workspace_dir(&home).join("owner");
+        add_instance_to_yaml(
+            &home,
+            "owner",
+            &InstanceYamlEntry {
+                working_directory: Some(parent.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let descendant = parent.join("nested");
+        let error = add_instance_to_yaml(
+            &home,
+            "nested-agent",
+            &InstanceYamlEntry {
+                working_directory: Some(descendant.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("a workspace nested under another instance must be refused");
+        assert!(
+            error.to_string().contains("owner") && error.to_string().contains("nested-agent"),
+            "refusal should name both overlapping instances: {error}"
+        );
+
+        let child_home = tmp_home("ancestor-overlap-3721");
+        let nested = crate::paths::workspace_dir(&child_home)
+            .join("owner")
+            .join("nested");
+        add_instance_to_yaml(
+            &child_home,
+            "owner",
+            &InstanceYamlEntry {
+                working_directory: Some(nested.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let error = add_instance_to_yaml(
+            &child_home,
+            "parent-agent",
+            &InstanceYamlEntry {
+                working_directory: Some(nested.parent().unwrap().display().to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("a workspace that contains another instance must be refused");
+        assert!(
+            error.to_string().contains("owner") && error.to_string().contains("parent-agent"),
+            "refusal should name both overlapping instances: {error}"
+        );
+        std::fs::remove_dir_all(home).ok();
+        std::fs::remove_dir_all(child_home).ok();
+    }
+
     /// Admission guard: two instances with the SAME explicit working_directory refuse.
     #[test]
     fn add_instance_refuses_duplicate_explicit_working_directory() {
