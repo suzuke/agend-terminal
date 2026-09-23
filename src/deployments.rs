@@ -495,7 +495,7 @@ fn persist_to_fleet_yaml(
     }
     let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =
         yaml_entries.iter().map(|(n, e)| (n.as_str(), e)).collect();
-    crate::fleet::add_instances_to_yaml(home, &refs).map_err(|e| {
+    crate::fleet::insert_new_instances_to_yaml(home, &refs).map_err(|e| {
         tracing::error!(error = %e, template, deploy_name, count = yaml_entries.len(),
             "deploy: Phase 2 add_instances_to_yaml failed — aborting before Phase 3 spawn");
         serde_json::json!({
@@ -978,20 +978,23 @@ pub(crate) fn teardown_with_runtime(
         ..deployment.clone()
     };
 
+    // Symmetrical with `deploy`: we wrote entries into fleet.yaml so
+    // pane_factory could render identity; teardown must remove them or
+    // daemon restart would resurrect dead agents via auto_start_fleet. Remove
+    // confirmed-deleted names BEFORE filesystem cleanup: cleanup's fresh
+    // locked snapshot must refuse a same-name row re-admitted after this
+    // removal, rather than confusing it with the old deployment generation.
+    // #3505: only remove deleted entries — refused instances stay live.
+    if let Err(e) = crate::fleet::remove_instances_from_yaml(home, &deleted) {
+        tracing::warn!(error = %e, "failed to clean up fleet.yaml on teardown");
+    }
+
     // Smoke 2 fix: filesystem cleanup of every spawned subdir, including
     // custom-`directory` deployments that the prior inline
     // `home/workspace/<inst>` loop missed.
     // #3505: only clean what was actually deleted — a refused instance is
     // still alive and its workspace must survive for the retry.
     cleanup_deployment_dirs(home, &deleted_deployment);
-
-    // Symmetrical with `deploy`: we wrote entries into fleet.yaml so
-    // pane_factory could render identity; teardown must remove them or
-    // daemon restart would resurrect dead agents via auto_start_fleet.
-    // #3505: only remove deleted entries — refused instances stay live.
-    if let Err(e) = crate::fleet::remove_instances_from_yaml(home, &deleted) {
-        tracing::warn!(error = %e, "failed to clean up fleet.yaml on teardown");
-    }
 
     // Delete team if exists — but only on FULL teardown. A partial teardown
     // still has live residual members; deleting their team would strand them.
@@ -1243,36 +1246,12 @@ fn deployment_member_cleanup_admitted(
     candidate: &Path,
     owned_path: &Path,
 ) -> bool {
-    if !deployment_path_cleanup_admitted(
-        fleet,
-        home,
-        candidate,
-        owned_path,
-        &[instance.to_string()],
-    ) {
+    if fleet.is_some_and(|fleet| fleet.instances.contains_key(instance)) {
+        tracing::warn!(instance, path = %candidate.display(), "deployment cleanup refused: instance name has been re-admitted");
         return false;
     }
-    if let Some(entry) = fleet.and_then(|fleet| fleet.instances.get(instance)) {
-        let active_path = entry
-            .working_directory
-            .as_deref()
-            .map(crate::fleet::resolve::expand_tilde_path)
-            .unwrap_or_else(|| crate::paths::workspace_dir(home).join(instance));
-        let candidate = match crate::paths::canonical_workspace_path(candidate) {
-            Ok(path) => path,
-            Err(_) => return false,
-        };
-        match crate::paths::canonical_workspace_path(&active_path) {
-            Ok(active) if active == candidate => return true,
-            Ok(active) => {
-                tracing::warn!(path = %candidate.display(), active = %active.display(), instance, "deployment cleanup refused: same-name fleet workspace points elsewhere");
-                return false;
-            }
-            Err(error) => {
-                tracing::warn!(path = %active_path.display(), %error, instance, "deployment cleanup refused: same-name fleet workspace is ambiguous");
-                return false;
-            }
-        }
+    if !deployment_path_cleanup_admitted(fleet, home, candidate, owned_path, &[]) {
+        return false;
     }
     true
 }

@@ -161,6 +161,51 @@ fn deploy_rolls_back_when_member_path_preexists_without_ownership_3721() {
 }
 
 #[test]
+fn deploy_preserves_preexisting_same_name_fleet_entry_3721() {
+    let home = tmp_home("same_name_fleet_entry_3721");
+    let root = std::env::temp_dir().join(format!("agend-same-name-fleet-{}", std::process::id()));
+    let candidate = root.join("team-worker");
+    std::fs::create_dir_all(&candidate).unwrap();
+    let sentinel = candidate.join("operator-data.txt");
+    std::fs::write(&sentinel, b"preserve").unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances:\n  team-worker:\n    backend: codex\n    role: operator-owned\n    working_directory: {}\n",
+            candidate.display()
+        ),
+    )
+    .unwrap();
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    assert_eq!(out["code"], "deploy_yaml_persist_failed");
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let old = fleet.instances.get("team-worker").unwrap();
+    assert_eq!(old.role.as_deref(), Some("operator-owned"));
+    assert_eq!(
+        old.working_directory.as_deref(),
+        Some(candidate.to_str().unwrap())
+    );
+    let raw: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        &std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["instances"]["team-worker"]["backend"], "codex");
+    assert!(!load(&home)
+        .deployments
+        .iter()
+        .any(|deployment| deployment.name == "team"));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn deploy_persists_role_into_fleet_yaml() {
     // Role declared on a template instance must flow into fleet.yaml's
     // instances: block so pane_factory::create_pane_from_resolved can
@@ -1952,6 +1997,57 @@ fn cleanup_waits_for_fleet_admission_and_uses_fresh_snapshot_3721() {
     cleanup.join().unwrap();
 
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+#[test]
+fn cleanup_preserves_same_name_re_admitted_at_same_path_3721() {
+    let (home, custom_root) =
+        deploy_with_custom_directory("same_name_readmitted_cleanup_3721", "reused", &["worker"]);
+    let member = "reused-worker";
+    let member_dir = custom_root.join(member);
+    let sentinel = member_dir.join("operator-data.txt");
+    std::fs::write(&sentinel, b"preserve").unwrap();
+    let dep = load(&home).deployments.into_iter().next().unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+
+    // Simulate delete removing the old fleet row, followed by a new same-name
+    // instance being admitted at the same custom path before cleanup gets the
+    // fleet lock. The fresh row must be treated as active, not as the old
+    // deployment member whose marker still happens to be present.
+    let lock = crate::fleet::persist::acquire_fleet_lock(&home).unwrap();
+    let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let cleanup_home = home.clone();
+    let cleanup_dep = dep.clone();
+    let cleanup = std::thread::spawn(move || {
+        let mut reported = false;
+        cleanup_deployment_dirs_with_wait_hook(&cleanup_home, &cleanup_dep, true, || {
+            if !reported {
+                reported = true;
+                contended_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            }
+        });
+    });
+    contended_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("cleanup must contend before reading the fleet snapshot");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  {member}:\n    backend: claude\n    working_directory: {}\n",
+            member_dir.display()
+        ),
+    )
+    .unwrap();
+    drop(lock);
+    resume_tx.send(()).unwrap();
+    cleanup.join().unwrap();
+
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    assert!(member_dir.join(super::DEPLOYMENT_OWNER_MARKER).exists());
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&custom_root).ok();
 }

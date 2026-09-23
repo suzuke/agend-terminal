@@ -117,6 +117,24 @@ pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry)
 }
 
 pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]) -> Result<()> {
+    add_instances_to_yaml_with_existing_policy(home, entries, false)
+}
+
+/// Insert deployment entries only when every requested instance name is absent.
+/// The check and insertion share the fleet mutation lock, so a concurrent
+/// deployment cannot turn rollback into deletion of a pre-existing member.
+pub fn insert_new_instances_to_yaml(
+    home: &Path,
+    entries: &[(&str, &InstanceYamlEntry)],
+) -> Result<()> {
+    add_instances_to_yaml_with_existing_policy(home, entries, true)
+}
+
+fn add_instances_to_yaml_with_existing_policy(
+    home: &Path,
+    entries: &[(&str, &InstanceYamlEntry)],
+    reject_existing: bool,
+) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -128,6 +146,14 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
             .get_mut("instances")
             .and_then(|v| v.as_mapping_mut())
             .context("instances is not a mapping")?;
+
+        if reject_existing {
+            if let Some((name, _)) = entries.iter().find(|(name, _)| {
+                instances.contains_key(serde_yaml_ng::Value::String((*name).to_string()))
+            }) {
+                anyhow::bail!("instance '{name}' already exists in fleet.yaml");
+            }
+        }
 
         // 1. Apply every insert/merge first.
         let mut conflicts: Vec<super::merge::FieldConflict> = Vec::new();
