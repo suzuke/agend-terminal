@@ -199,6 +199,101 @@ fn deploy_reports_residual_when_owner_marker_fails_3721() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[test]
+fn deploy_rollback_preserves_same_name_re_admission_generation_3721() {
+    let home = tmp_home("rollback_generation_3721");
+    let root = std::env::temp_dir().join(format!(
+        "agend-rollback-generation-{}-{}",
+        std::process::id(),
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    let replacement_wd = root.join("replacement-generation");
+    let replacement_home = home.clone();
+    let replacement_wd_for_hook = replacement_wd.clone();
+    super::fail_next_deployment_owner_marker_for_test();
+    super::set_before_failed_workdir_residual_hook_for_test(move || {
+        crate::fleet::remove_instance_from_yaml(&replacement_home, "team-worker").unwrap();
+        std::fs::create_dir_all(&replacement_wd_for_hook).unwrap();
+        crate::fleet::insert_new_instances_to_yaml(
+            &replacement_home,
+            &[(
+                "team-worker",
+                &crate::fleet::InstanceYamlEntry {
+                    backend: Some("claude".to_string()),
+                    role: Some("replacement-generation".to_string()),
+                    working_directory: Some(replacement_wd_for_hook.display().to_string()),
+                    ..Default::default()
+                },
+            )],
+        )
+        .unwrap();
+    });
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let replacement = fleet.instances.get("team-worker").expect(
+        "failed deployment rollback must not remove a replacement generation admitted in the meantime",
+    );
+    assert_eq!(replacement.role.as_deref(), Some("replacement-generation"));
+    assert_eq!(
+        replacement.working_directory.as_deref(),
+        Some(replacement_wd.to_str().unwrap())
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn deploy_reports_fleet_rollback_and_cleanup_residuals_3721() {
+    let home = tmp_home("rollback_residuals_3721");
+    let root = std::env::temp_dir().join(format!(
+        "agend-rollback-residuals-{}-{}",
+        std::process::id(),
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    std::fs::write(
+        &fleet_path,
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    let fleet_path_for_hook = fleet_path.clone();
+    super::fail_next_deployment_owner_marker_for_test();
+    super::set_before_failed_workdir_residual_hook_for_test(move || {
+        std::fs::write(&fleet_path_for_hook, "instances: [invalid").unwrap();
+    });
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    let residuals = out["residuals"].as_array().expect(
+        "rollback must return a structured list containing the initial materialization residual and rollback/cleanup failures",
+    );
+    let residuals = residuals.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>();
+    assert!(residuals.iter().any(|residual| residual.contains("team-worker")));
+    assert!(residuals.iter().any(|residual| residual.contains("fleet")));
+    assert!(residuals.iter().any(|residual| residual.contains("cleanup")));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[cfg(unix)]
 #[test]
 fn deploy_marker_failure_preserves_replacement_after_identity_check_3721() {
