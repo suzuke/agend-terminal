@@ -1851,7 +1851,7 @@ fn teardown_preserves_newer_runtime_generation_after_stale_record_retry_3721() {
 }
 
 #[test]
-fn teardown_preserves_newer_runtime_generation_after_legacy_record_retry_3721() {
+fn teardown_refuses_legacy_record_without_generation_identity_3721() {
     let home = tmp_home("teardown_legacy_stale_record_generation_3721");
     let old_root = home.join("old-generation");
     let new_root = home.join("new-generation");
@@ -1890,7 +1890,6 @@ fn teardown_preserves_newer_runtime_generation_after_legacy_record_retry_3721() 
         &crate::fleet::InstanceYamlEntry {
             backend: Some("claude".into()),
             working_directory: Some(new_member_dir.display().to_string()),
-            deployment_generation: Some("new-generation-id".into()),
             ..Default::default()
         },
     )
@@ -1920,10 +1919,7 @@ fn teardown_preserves_newer_runtime_generation_after_legacy_record_retry_3721() 
         "legacy stale-record retry must not delete the newer runtime instance: {result}"
     );
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
-    assert_eq!(
-        fleet.instances[member].deployment_generation.as_deref(),
-        Some("new-generation-id")
-    );
+    assert_eq!(fleet.instances[member].deployment_generation, None);
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"new");
 
     std::fs::remove_dir_all(&home).ok();
