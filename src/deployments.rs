@@ -420,18 +420,11 @@ fn prepare_work_dir(
         ) {
             Ok(_) => {
                 tracing::info!(%inst_name, %branch_name, "created worktree");
-                let created_identity = std::fs::symlink_metadata(inst_dir).ok();
                 if write_deployment_owner_marker(inst_dir, deploy_name, inst_name) {
                     return WorkDirPreparation::Ready;
                 }
                 return WorkDirPreparation::Failed {
-                    residual: rollback_failed_work_dir(
-                        inst_dir,
-                        parent_dir,
-                        created_identity.as_ref(),
-                        Some(&branch_name),
-                    )
-                    .then(|| format!("{} (branch {branch_name})", inst_dir.display())),
+                    residual: Some(failed_workdir_residual(inst_dir, Some(&branch_name))),
                 };
             }
             Err(crate::git_helpers::GitError::NonZero { stderr, .. }) => {
@@ -452,89 +445,28 @@ fn prepare_work_dir(
             tracing::warn!(%inst_name, %error, "deployment workdir creation failed");
             return WorkDirPreparation::Failed { residual: None };
         }
-        let created_identity = std::fs::symlink_metadata(inst_dir).ok();
         if write_deployment_owner_marker(inst_dir, deploy_name, inst_name) {
             return WorkDirPreparation::Ready;
         }
         return WorkDirPreparation::Failed {
-            residual: rollback_failed_work_dir(
-                inst_dir,
-                parent_dir,
-                created_identity.as_ref(),
-                None,
-            )
-            .then(|| inst_dir.display().to_string()),
+            residual: Some(failed_workdir_residual(inst_dir, None)),
         };
     }
     WorkDirPreparation::Failed { residual: None }
 }
 
-fn rollback_failed_work_dir(
-    inst_dir: &Path,
-    parent_dir: &Path,
-    created_identity: Option<&std::fs::Metadata>,
-    branch_name: Option<&str>,
-) -> bool {
-    let Some(created_identity) = created_identity else {
-        tracing::error!(path = %inst_dir.display(), "failed deployment marker write; cannot verify created path identity, preserving residual");
-        return true;
-    };
-    if !std::fs::symlink_metadata(inst_dir)
-        .is_ok_and(|metadata| same_path_identity(created_identity, &metadata))
-    {
-        tracing::error!(path = %inst_dir.display(), "failed deployment marker write; path identity changed, preserving residual");
-        return true;
-    }
-
+fn failed_workdir_residual(inst_dir: &Path, branch_name: Option<&str>) -> String {
     if cfg!(test) {
-        run_before_failed_workdir_removal_test_hook();
+        run_before_failed_workdir_residual_test_hook();
     }
-
+    let path = inst_dir.display().to_string();
     if let Some(branch_name) = branch_name {
-        let path = inst_dir.display().to_string();
-        let _ =
-            crate::git_helpers::git_bypass(parent_dir, &["worktree", "remove", "--force", &path]);
-        if std::fs::symlink_metadata(inst_dir)
-            .is_ok_and(|metadata| same_path_identity(created_identity, &metadata))
-        {
-            let _ = std::fs::remove_dir_all(inst_dir);
-        }
-        let _ = crate::git_helpers::git_bypass(parent_dir, &["worktree", "prune"]);
-        let _ = crate::git_helpers::git_bypass(parent_dir, &["branch", "-D", branch_name]);
-        let branch_exists = crate::git_helpers::git_bypass(
-            parent_dir,
-            &["rev-parse", "--verify", "--quiet", branch_name],
-        )
-        .is_ok_and(|output| output.status.success());
-        let path_exists = std::fs::symlink_metadata(inst_dir).is_ok();
-        if path_exists || branch_exists {
-            tracing::error!(path = %inst_dir.display(), %branch_name, "failed deployment rollback left a worktree or branch residual");
-            return true;
-        }
-        return false;
+        tracing::error!(%path, %branch_name, "deployment owner marker failed; preserving worktree and branch residual");
+        format!("{path} (branch {branch_name}; inspect/remove worktree and branch)")
+    } else {
+        tracing::error!(%path, "deployment owner marker failed; preserving directory residual");
+        path
     }
-
-    match std::fs::remove_dir_all(inst_dir) {
-        Ok(()) => false,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => {
-            tracing::error!(path = %inst_dir.display(), %error, "failed deployment rollback could not remove newly created directory");
-            true
-        }
-    }
-}
-
-#[cfg(unix)]
-fn same_path_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_path_identity(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
-    // Without a stable filesystem object identity, do not recursively delete a
-    // path after marker failure. The caller reports it as an actionable residual.
-    false
 }
 
 const DEPLOYMENT_OWNER_MARKER: &str = ".agend-deployment-owner";
@@ -1593,7 +1525,7 @@ pub fn reconcile_orphans(home: &Path) -> Vec<String> {
 std::thread_local! {
     static AFTER_RUNTIME_INSTANCE_DELETES_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static FAIL_NEXT_DEPLOYMENT_OWNER_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static BEFORE_FAILED_WORKDIR_REMOVAL_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_FAILED_WORKDIR_RESIDUAL_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn fail_deployment_owner_marker_test_hook() -> bool {
@@ -1609,15 +1541,15 @@ fn fail_next_deployment_owner_marker_for_test() {
 }
 
 #[cfg(test)]
-fn set_before_failed_workdir_removal_hook_for_test(hook: impl FnOnce() + 'static) {
-    BEFORE_FAILED_WORKDIR_REMOVAL_HOOK.with(|slot| {
+fn set_before_failed_workdir_residual_hook_for_test(hook: impl FnOnce() + 'static) {
+    BEFORE_FAILED_WORKDIR_RESIDUAL_HOOK.with(|slot| {
         slot.borrow_mut().replace(Box::new(hook));
     });
 }
 
 #[cfg(test)]
-fn run_before_failed_workdir_removal_test_hook() {
-    BEFORE_FAILED_WORKDIR_REMOVAL_HOOK.with(|slot| {
+fn run_before_failed_workdir_residual_test_hook() {
+    BEFORE_FAILED_WORKDIR_RESIDUAL_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
             hook();
         }
@@ -1625,7 +1557,7 @@ fn run_before_failed_workdir_removal_test_hook() {
 }
 
 #[cfg(not(test))]
-fn run_before_failed_workdir_removal_test_hook() {}
+fn run_before_failed_workdir_residual_test_hook() {}
 
 #[cfg(test)]
 fn run_after_runtime_instance_deletes_test_hook() {

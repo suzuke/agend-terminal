@@ -161,7 +161,7 @@ fn deploy_rolls_back_when_member_path_preexists_without_ownership_3721() {
 }
 
 #[test]
-fn deploy_rolls_back_currently_created_path_when_owner_marker_fails_3721() {
+fn deploy_reports_residual_when_owner_marker_fails_3721() {
     let home = tmp_home("marker_failure_rollback_3721");
     let root = std::env::temp_dir().join(format!(
         "agend-marker-failure-{}-{}",
@@ -184,26 +184,14 @@ fn deploy_rolls_back_currently_created_path_when_owner_marker_fails_3721() {
 
     let candidate = root.join("team-worker");
     assert_eq!(out["code"], "deploy_workdir_materialization_failed");
-    #[cfg(unix)]
-    assert!(
-        out["residual"].is_null(),
-        "successful rollback is not residual state: {out}"
-    );
-    #[cfg(unix)]
-    assert!(
-        !candidate.exists(),
-        "a path created by this failed attempt must be rolled back"
-    );
-    #[cfg(not(unix))]
     assert_eq!(
         out["residual"],
         candidate.display().to_string(),
-        "without stable path identity, report rather than delete the residual"
+        "marker failure must report the retained directory residual"
     );
-    #[cfg(not(unix))]
     assert!(
         candidate.exists(),
-        "ambiguous path identity must be preserved"
+        "marker failure must preserve the directory rather than delete it by pathname"
     );
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
     assert!(!fleet.instances.contains_key("team-worker"));
@@ -233,7 +221,7 @@ fn deploy_marker_failure_preserves_replacement_after_identity_check_3721() {
     let swap_created_path = created_path.clone();
     let swap_sentinel = sentinel.clone();
     super::fail_next_deployment_owner_marker_for_test();
-    super::set_before_failed_workdir_removal_hook_for_test(move || {
+    super::set_before_failed_workdir_residual_hook_for_test(move || {
         std::fs::rename(&swap_candidate, &swap_created_path).unwrap();
         std::fs::create_dir(&swap_candidate).unwrap();
         std::fs::write(&swap_sentinel, b"operator-owned replacement").unwrap();
@@ -261,7 +249,7 @@ fn deploy_marker_failure_preserves_replacement_after_identity_check_3721() {
 }
 
 #[test]
-fn deploy_rolls_back_branch_worktree_when_owner_marker_fails_3721() {
+fn deploy_reports_branch_residual_when_owner_marker_fails_3721() {
     fn git(dir: &Path, args: &[&str]) -> std::process::Output {
         crate::git_helpers::git_bypass(dir, args).expect("git")
     }
@@ -298,32 +286,19 @@ fn deploy_rolls_back_branch_worktree_when_owner_marker_fails_3721() {
 
     let candidate = root.join("team-worker");
     assert_eq!(out["code"], "deploy_workdir_materialization_failed");
-    #[cfg(unix)]
     assert!(
-        !candidate.exists(),
-        "the failed branch worktree created by this attempt must be removed"
+        candidate.exists(),
+        "marker failure must preserve the branch worktree rather than remove it by pathname"
     );
-    #[cfg(unix)]
     assert!(
-        !git(&root, &["rev-parse", "--verify", "--quiet", "team/worker"])
+        git(&root, &["rev-parse", "--verify", "--quiet", "team/worker"])
             .status
             .success(),
-        "failed branch deployment must remove its generated branch"
+        "marker failure must preserve the generated branch"
     );
-    #[cfg(not(unix))]
-    {
-        assert!(
-            candidate.exists(),
-            "ambiguous worktree identity must be preserved"
-        );
-        assert!(
-            git(&root, &["rev-parse", "--verify", "--quiet", "team/worker"])
-                .status
-                .success(),
-            "unremoved generated branch must be reported as a residual"
-        );
-        assert!(out["residual"].as_str().unwrap().contains("team/worker"));
-    }
+    let residual = out["residual"].as_str().unwrap();
+    assert!(residual.contains(candidate.to_str().unwrap()));
+    assert!(residual.contains("team/worker"));
     std::fs::remove_dir_all(&home).ok();
 }
 
