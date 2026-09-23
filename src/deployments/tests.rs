@@ -163,7 +163,10 @@ fn deploy_rolls_back_when_member_path_preexists_without_ownership_3721() {
 #[test]
 fn deploy_preserves_preexisting_same_name_fleet_entry_3721() {
     let home = tmp_home("same_name_fleet_entry_3721");
-    let root = std::env::temp_dir().join(format!("agend-same-name-fleet-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "agend-deploy-rollback-fleet-row-{}",
+        std::process::id()
+    ));
     let candidate = root.join("team-worker");
     std::fs::create_dir_all(&candidate).unwrap();
     let sentinel = candidate.join("operator-data.txt");
