@@ -211,6 +211,55 @@ fn deploy_rolls_back_currently_created_path_when_owner_marker_fails_3721() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(unix)]
+#[test]
+fn deploy_marker_failure_preserves_replacement_after_identity_check_3721() {
+    let home = tmp_home("marker_swap_rollback_3721");
+    let root = std::env::temp_dir().join(format!(
+        "agend-marker-swap-{}-{}",
+        std::process::id(),
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    let candidate = root.join("team-worker");
+    let created_path = root.join("team-worker-created");
+    let sentinel = candidate.join("operator-data.txt");
+    let swap_candidate = candidate.clone();
+    let swap_created_path = created_path.clone();
+    let swap_sentinel = sentinel.clone();
+    super::fail_next_deployment_owner_marker_for_test();
+    super::set_before_failed_workdir_removal_hook_for_test(move || {
+        std::fs::rename(&swap_candidate, &swap_created_path).unwrap();
+        std::fs::create_dir(&swap_candidate).unwrap();
+        std::fs::write(&swap_sentinel, b"operator-owned replacement").unwrap();
+    });
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    assert_eq!(
+        std::fs::read(&sentinel).ok().as_deref(),
+        Some(&b"operator-owned replacement"[..]),
+        "swap after identity check must not let rollback delete the replacement tree"
+    );
+    assert_eq!(
+        out["residual"],
+        candidate.display().to_string(),
+        "the retained replacement must be reported as an actionable residual"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn deploy_rolls_back_branch_worktree_when_owner_marker_fails_3721() {
     fn git(dir: &Path, args: &[&str]) -> std::process::Output {

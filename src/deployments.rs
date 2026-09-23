@@ -486,6 +486,10 @@ fn rollback_failed_work_dir(
         return true;
     }
 
+    if cfg!(test) {
+        run_before_failed_workdir_removal_test_hook();
+    }
+
     if let Some(branch_name) = branch_name {
         let path = inst_dir.display().to_string();
         let _ =
@@ -1589,6 +1593,7 @@ pub fn reconcile_orphans(home: &Path) -> Vec<String> {
 std::thread_local! {
     static AFTER_RUNTIME_INSTANCE_DELETES_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static FAIL_NEXT_DEPLOYMENT_OWNER_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BEFORE_FAILED_WORKDIR_REMOVAL_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn fail_deployment_owner_marker_test_hook() -> bool {
@@ -1602,6 +1607,25 @@ fn fail_deployment_owner_marker_test_hook() -> bool {
 fn fail_next_deployment_owner_marker_for_test() {
     FAIL_NEXT_DEPLOYMENT_OWNER_MARKER.with(|fail| fail.set(true));
 }
+
+#[cfg(test)]
+fn set_before_failed_workdir_removal_hook_for_test(hook: impl FnOnce() + 'static) {
+    BEFORE_FAILED_WORKDIR_REMOVAL_HOOK.with(|slot| {
+        slot.borrow_mut().replace(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_before_failed_workdir_removal_test_hook() {
+    BEFORE_FAILED_WORKDIR_REMOVAL_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_failed_workdir_removal_test_hook() {}
 
 #[cfg(test)]
 fn run_after_runtime_instance_deletes_test_hook() {
