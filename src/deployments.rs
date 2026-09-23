@@ -1027,6 +1027,7 @@ pub(crate) fn teardown_with_runtime(
     // The legacy (runtime=None) transport path cannot observe refusal, so
     // its contract is unchanged.
     let mut residuals: Vec<String> = Vec::new();
+    let mut preserved_generations: Vec<String> = Vec::new();
     let remove_legacy_fleet_rows =
         runtime.is_none() && crate::daemon::find_active_run_dir(home).is_none();
     if let Some(runtime) = runtime {
@@ -1038,8 +1039,32 @@ pub(crate) fn teardown_with_runtime(
         };
         for inst in &deployment.instances {
             let mut fleet_remove_error = None;
-            let (_outcome, observed_exit) =
-                crate::agent_ops::delete_instance_with_exit_status_and_post(
+            let delete_result = if let Some(generation) = deployment.generation_id.as_deref() {
+                crate::agent_ops::delete_instance_with_exit_status_and_post_for_deployment_generation(
+                    home,
+                    inst,
+                    &delete_context,
+                    false,
+                    generation,
+                    |observed_exit| {
+                        if observed_exit {
+                            match crate::fleet::remove_instances_from_yaml_for_generation(
+                                home,
+                                &[(inst.as_str(), generation)],
+                            ) {
+                                Ok(preserved) if preserved.is_empty() => {}
+                                Ok(_) => {
+                                    fleet_remove_error = Some(
+                                        "a newer fleet generation was preserved".into(),
+                                    );
+                                }
+                                Err(error) => fleet_remove_error = Some(error.to_string()),
+                            }
+                        }
+                    },
+                )
+            } else {
+                Some(crate::agent_ops::delete_instance_with_exit_status_and_post(
                     home,
                     inst,
                     &delete_context,
@@ -1052,7 +1077,12 @@ pub(crate) fn teardown_with_runtime(
                             }
                         }
                     },
-                );
+                ))
+            };
+            let Some((_outcome, observed_exit)) = delete_result else {
+                preserved_generations.push(inst.clone());
+                continue;
+            };
             if let Some(error) = fleet_remove_error {
                 tracing::warn!(instance = %inst, %error, "failed to remove deleted fleet row under delete fence");
                 residuals.push(inst.clone());
@@ -1152,9 +1182,13 @@ pub(crate) fn teardown_with_runtime(
     // a silent clean `torn_down` — the operator can retry the same name
     // once the residual exits. Full teardown keeps the exact prior shape.
     if residuals.is_empty() && cleanup_residuals.is_empty() {
-        serde_json::json!({"status": "torn_down", "name": name, "instances": deployment.instances})
+        let mut result = serde_json::json!({"status": "torn_down", "name": name, "instances": deployment.instances});
+        if !preserved_generations.is_empty() {
+            result["preserved_generations"] = serde_json::json!(preserved_generations);
+        }
+        result
     } else {
-        serde_json::json!({
+        let mut result = serde_json::json!({
             "status": "torn_down_partial",
             "name": name,
             "instances": deployment.instances,
@@ -1169,7 +1203,11 @@ pub(crate) fn teardown_with_runtime(
                     "teardown refused for live instances; their registry, port, and workspace are retained"
                 },
             ),
-        })
+        });
+        if !preserved_generations.is_empty() {
+            result["preserved_generations"] = serde_json::json!(preserved_generations);
+        }
+        result
     }
 }
 
@@ -1209,6 +1247,7 @@ pub fn list(home: &Path) -> Value {
 ///
 /// All filesystem ops are best-effort; failures are returned as actionable
 /// residuals, and a single per-instance failure doesn't abort the sweep.
+#[cfg(test)]
 fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     for residual in cleanup_deployment_dirs_impl(home, deployment, true) {
         tracing::warn!(%residual, deployment = %deployment.name, "deployment cleanup left a residual");
@@ -1616,54 +1655,69 @@ pub(crate) fn reconcile_orphan_deployments(home: &Path) -> Vec<String> {
         }
     };
 
-    // Collect the pruned `Deployment` records (not just names) so we can
-    // hand each one to `cleanup_deployment_dirs` after the store is saved.
-    // Smoke 2 fix: without this we lose the `directory` + `instances` info
-    // needed to remove custom-directory subdirs.
-    let mut pruned_names = Vec::new();
-    let mut pruned_teams = Vec::new();
-    let mut pruned_deployments: Vec<Deployment> = Vec::new();
-    store.deployments.retain(|d| {
-        let any_live = d.instances.iter().any(|i| live_instances.contains(i));
-        if any_live || !d.cleanup_instances.is_empty() {
-            true
-        } else {
-            pruned_names.push(d.name.clone());
-            if let Some(t) = d.team.clone() {
-                pruned_teams.push(t);
-            }
-            pruned_deployments.push(d.clone());
-            false
+    // Persist cleanup-only state before touching directories. If filesystem
+    // cleanup fails, the deployment remains addressable and can be retried by
+    // name; successful cleanup removes the record in the second save.
+    let mut cleanup_candidates = Vec::new();
+    for deployment in &mut store.deployments {
+        let any_live = deployment
+            .instances
+            .iter()
+            .any(|instance| live_instances.contains(instance));
+        if any_live {
+            continue;
         }
-    });
-
-    if pruned_names.is_empty() {
-        return pruned_names;
+        let mut cleanup_instances = deployment.cleanup_instances.clone();
+        cleanup_instances.extend(deployment.instances.iter().cloned());
+        cleanup_instances.sort();
+        cleanup_instances.dedup();
+        deployment.instances.clear();
+        deployment.cleanup_instances = cleanup_instances.clone();
+        cleanup_candidates.push(Deployment {
+            instances: cleanup_instances,
+            ..deployment.clone()
+        });
     }
 
-    // Persist pruned store first so a crash between save and team-delete
-    // doesn't leave the deployment-store in a more-stale state than the
-    // teams-store; teams without their parent deployment is the safer
-    // failure mode.
+    if cleanup_candidates.is_empty() {
+        return Vec::new();
+    }
     if let Err(e) = save(home, &mut store) {
         tracing::warn!(
             error = %e,
-            pruned = ?pruned_names,
-            "deployments reconcile: save failed — entries may resurface on next load"
+            "deployments reconcile: pending cleanup save failed — skipping filesystem cleanup"
         );
         return Vec::new();
     }
 
+    let mut pruned_names = Vec::new();
+    let mut pruned_teams = Vec::new();
+    for deployment in &cleanup_candidates {
+        let residuals = cleanup_deployment_dirs_impl(home, deployment, true);
+        if residuals.is_empty() {
+            pruned_names.push(deployment.name.clone());
+            if let Some(team) = deployment.team.as_ref() {
+                pruned_teams.push(team.clone());
+            }
+            store
+                .deployments
+                .retain(|record| record.name != deployment.name);
+        } else {
+            for residual in residuals {
+                tracing::warn!(%residual, deployment = %deployment.name, "deployment reconciliation cleanup left a residual");
+            }
+        }
+    }
+    if let Err(e) = save(home, &mut store) {
+        tracing::warn!(
+            error = %e,
+            pruned = ?pruned_names,
+            "deployments reconcile: final cleanup save failed — cleanup-only records remain for retry"
+        );
+        return Vec::new();
+    }
     for team in &pruned_teams {
         let _ = crate::teams::delete(home, &serde_json::json!({"name": team}));
-    }
-
-    // Smoke 2 fix: clean each pruned deployment's spawned subdirs. Runs
-    // AFTER the store save + team delete so a deployment store entry
-    // doesn't survive its filesystem cleanup (the safer failure mode is
-    // "files gone, store entry stays" not "store says clean, files leak").
-    for dep in &pruned_deployments {
-        cleanup_deployment_dirs(home, dep);
     }
 
     tracing::info!(

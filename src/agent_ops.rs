@@ -342,6 +342,43 @@ pub(crate) fn delete_instance_with_exit_status_and_post(
     delete_instance_with_exit_status_inner(home, name, context, skip_exit_wait, None, after_delete)
 }
 
+/// Delete only the deployment generation currently admitted under `name`.
+/// The provisional delete fence blocks a concurrent spawn while the fleet
+/// generation is checked; a mismatch refuses before transport state or the
+/// live runtime instance is touched.
+pub(crate) fn delete_instance_with_exit_status_and_post_for_deployment_generation(
+    home: &Path,
+    name: &str,
+    context: &DeleteContext<'_>,
+    skip_exit_wait: bool,
+    expected_generation: &str,
+    after_delete: impl FnOnce(bool),
+) -> Option<(DeleteOutcome, bool)> {
+    let mut fence = crate::daemon::lifecycle::DeleteFence::admit(home, name, true);
+    let generation_matches = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|fleet| fleet.instances.get(name)?.deployment_generation.clone())
+        .as_deref()
+        == Some(expected_generation);
+    if !generation_matches {
+        return None;
+    }
+
+    fence.commit_cleanup(name);
+    let (outcome, observed_exit) = delete_instance_impl(home, name, context, skip_exit_wait, None);
+    if observed_exit {
+        if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
+            tracing::warn!(
+                agent = %name,
+                error = %error,
+                "delete: transport delivery cleanup failed"
+            );
+        }
+    }
+    after_delete(observed_exit);
+    Some((outcome, observed_exit))
+}
+
 /// Delete with optional internal restart correlation carried on the lifecycle
 /// event. Public deletion callers leave this unset; restart callers provide the
 /// daemon-generated id without exposing it in the MCP schema.

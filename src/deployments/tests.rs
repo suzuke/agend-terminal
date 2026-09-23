@@ -3644,6 +3644,10 @@ templates:
 #[test]
 fn teardown_runtime_path_names_refused_instances_3505() {
     let home = deploy_single_instance_for_test("teardown-partial-3505", "svc");
+    let generation = load(&home).deployments[0]
+        .generation_id
+        .clone()
+        .expect("deployment fixture has a generation id");
     // Plant a never-exiting child for svc-worker, wired through fleet.yaml
     // so `resolve_uuid` hits this registry entry (mirrors
     // `daemon::lifecycle::tests` refusal fixtures).
@@ -3652,8 +3656,9 @@ fn teardown_runtime_path_names_refused_instances_3505() {
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
         format!(
-            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances:\n  svc-worker:\n    backend: claude\n    id: {}\n",
+            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances:\n  svc-worker:\n    backend: claude\n    id: {}\n    deployment_generation: {}\n",
             worker_id.full(),
+            generation,
         ),
     )
     .expect("write fleet.yaml with id");

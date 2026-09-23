@@ -4815,11 +4815,27 @@ fn deployment_runtime_some_teardown_reaches_typed_delete_owner_slice14() {
     std::env::set_var("AGEND_HOME", &home);
     let working_directory = home.join("workspace").join("slice14-lead");
     std::fs::create_dir_all(&working_directory).unwrap();
+    let generation_id = "slice14-generation";
+    let canonical_working_directory =
+        crate::paths::canonical_workspace_path(&working_directory).unwrap();
+    std::fs::write(
+        working_directory.join(".agend-deployment-owner"),
+        serde_json::json!({
+            "schema_version": 2,
+            "deployment": "slice14",
+            "instance": "slice14-lead",
+            "directory": canonical_working_directory,
+            "generation_id": generation_id
+        })
+        .to_string(),
+    )
+    .unwrap();
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
         format!(
-            "instances:\n  slice14-lead:\n    backend: shell\n    working_directory: {}\nteams:\n  slice14:\n    members: [slice14-lead]\n    created_at: now\n",
-            working_directory.display()
+            "instances:\n  slice14-lead:\n    backend: shell\n    working_directory: {}\n    deployment_generation: {}\nteams:\n  slice14:\n    members: [slice14-lead]\n    created_at: now\n",
+            working_directory.display(),
+            generation_id
         ),
     )
     .unwrap();
@@ -4831,6 +4847,7 @@ fn deployment_runtime_some_teardown_reaches_typed_delete_owner_slice14() {
                 "name": "slice14",
                 "template": "slice14",
                 "instances": ["slice14-lead"],
+                "generation_id": generation_id,
                 "team": "slice14",
                 "directory": home.join("workspace").display().to_string(),
                 "created_at": "now"
