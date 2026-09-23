@@ -1491,12 +1491,13 @@ mod tests {
             let sentinel = home.join("sentinel.txt");
             let script = argv_capture_script(&home, &sentinel);
             register_seat(&home, &format!("seat-{tag}"));
+            let work_dir = home.join(format!("seat-{tag}-work"));
             let resolved = resolved_seat(
                 &format!("seat-{tag}"),
                 backend.clone(),
                 vec![script],
                 model,
-                &home,
+                &work_dir,
             );
             let outcome = run_attach(
                 AttachSpec::Agent {
@@ -1544,12 +1545,13 @@ mod tests {
         let sentinel = home.join("sentinel.txt");
         let script = argv_capture_script(&home, &sentinel);
         register_seat(&home, "seat-sync");
+        let work_dir = home.join("seat-sync-work");
         let mut resolved = resolved_seat(
             "seat-sync",
             crate::backend::Backend::ClaudeCode,
             vec!["--model".into(), "pinned".into()],
             Some("fleet-loser"),
-            &home,
+            &work_dir,
         );
         // Use the capture script itself as the wrapper executable. The declared
         // Claude identity must enrich its argv without relying on its basename.
