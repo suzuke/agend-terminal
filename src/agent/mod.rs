@@ -908,13 +908,24 @@ fn build_command(
             .zip(*working_dir)
             .map(|(b, wd)| b.spawn_flags(wd))
             .unwrap_or_default();
+        let mut backend_args: Vec<String> =
+            preset.into_iter().chain(args.iter().cloned()).collect();
+        if matches!(detected_backend.as_ref(), Some(Backend::ClaudeCode)) {
+            let insert_at = backend_args
+                .iter()
+                .position(|arg| arg == "--")
+                .unwrap_or(backend_args.len());
+            backend_args.splice(
+                insert_at..insert_at,
+                ["--name".to_string(), name.to_string()],
+            );
+        }
         // #3317/#3402: overrides lead, so they precede any Codex subcommand.
         // Empty for every non-Codex backend.
         codex_config_args
             .iter()
             .cloned()
-            .chain(preset)
-            .chain(args.iter().cloned())
+            .chain(backend_args)
             .chain(flags)
             .collect()
     };

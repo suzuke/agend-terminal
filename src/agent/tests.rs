@@ -2418,6 +2418,83 @@ fn build_command_without_declared_backend_keeps_legacy_inference_2801() {
     );
 }
 
+#[test]
+fn managed_claude_spawn_uses_agend_instance_name() {
+    let backend = Backend::ClaudeCode;
+    let config = SpawnConfig {
+        name: "claude-nulls-lead",
+        backend: Some(&backend),
+        backend_command: "claude",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+
+    let (cmd, _, _) = build_command(&config).expect("build command");
+    let argv: Vec<String> = cmd
+        .get_argv()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--name" && pair[1] == "claude-nulls-lead"),
+        "managed Claude must use its AgEnD instance name; argv={argv:?}"
+    );
+
+    let non_claude = SpawnConfig {
+        name: "non-claude-3709",
+        backend: None,
+        backend_command: "echo",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+    let (cmd, _, _) = build_command(&non_claude).expect("build non-Claude command");
+    assert!(
+        !cmd.get_argv().iter().any(|arg| arg == "--name"),
+        "non-Claude backends must not receive Claude's --name flag"
+    );
+
+    let boundary_args = ["--model", "sonnet", "--", "prompt payload"].map(str::to_string);
+    let with_boundary = SpawnConfig {
+        args: &boundary_args,
+        ..config
+    };
+    let (cmd, _, _) = build_command(&with_boundary).expect("build command with arg boundary");
+    let argv: Vec<String> = cmd
+        .get_argv()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let separator = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .expect("caller argument separator is present");
+    let name_flag = argv
+        .iter()
+        .position(|arg| arg == "--name")
+        .expect("managed Claude name flag is present");
+    assert!(
+        name_flag < separator,
+        "Claude's managed name must remain a CLI option before caller's -- boundary; argv={argv:?}"
+    );
+}
+
 /// #2106: an operator's per-instance `ANTHROPIC_AUTH_TOKEN` in fleet.yaml
 /// `env:` must reach a claude-backed instance — it is a credential the backend
 /// declares (`credential_env_keys`) — so the operator can point that instance at
