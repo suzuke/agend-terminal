@@ -1851,6 +1851,85 @@ fn teardown_preserves_newer_runtime_generation_after_stale_record_retry_3721() {
 }
 
 #[test]
+fn teardown_preserves_newer_runtime_generation_after_legacy_record_retry_3721() {
+    let home = tmp_home("teardown_legacy_stale_record_generation_3721");
+    let old_root = home.join("old-generation");
+    let new_root = home.join("new-generation");
+    let member = "svc-worker";
+    let old_member_dir = old_root.join(member);
+    std::fs::create_dir_all(&old_member_dir).unwrap();
+    let new_member_dir = new_root.join(member);
+    std::fs::create_dir_all(&new_member_dir).unwrap();
+    let sentinel = new_member_dir.join("live-generation.txt");
+    std::fs::write(&sentinel, "new").unwrap();
+
+    let stale_record = Deployment {
+        name: "svc".into(),
+        template: "tpl".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: None,
+        directory: old_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
+    };
+    assert!(write_deployment_owner_marker(
+        &old_member_dir,
+        "svc",
+        member,
+        None
+    ));
+    let mut store = DeploymentStore {
+        deployments: vec![stale_record],
+        ..Default::default()
+    };
+    save(&home, &mut store).unwrap();
+    crate::fleet::add_instance_to_yaml(
+        &home,
+        member,
+        &crate::fleet::InstanceYamlEntry {
+            backend: Some("claude".into()),
+            working_directory: Some(new_member_dir.display().to_string()),
+            deployment_generation: Some("new-generation-id".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs = crate::api::ConfigRegistry::default();
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    externals.lock().insert(
+        member.to_string(),
+        crate::agent::ExternalAgentHandle {
+            backend_command: "remote".into(),
+            pid: 9913,
+        },
+    );
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+
+    let result = teardown_with_runtime(&home, &serde_json::json!({"name": "svc"}), Some(&runtime));
+
+    assert!(
+        externals.lock().contains_key(member),
+        "legacy stale-record retry must not delete the newer runtime instance: {result}"
+    );
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert_eq!(
+        fleet.instances[member].deployment_generation.as_deref(),
+        Some("new-generation-id")
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"new");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn reconcile_after_close_is_idempotent() {
     // Repeated reconciles on the same already-clean state must no-op
     // (no spurious team-delete calls, no panics).
