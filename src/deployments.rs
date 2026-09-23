@@ -377,6 +377,11 @@ fn create_instance_entries(
     Ok((created, yaml_entries))
 }
 
+enum WorkDirPreparation {
+    Ready,
+    Failed { residual: Option<String> },
+}
+
 fn prepare_work_dir(
     inst_dir: &std::path::Path,
     parent_dir: &std::path::Path,
@@ -384,14 +389,16 @@ fn prepare_work_dir(
     inst_suffix: &str,
     inst_name: &str,
     branch: Option<&str>,
-) -> bool {
+) -> WorkDirPreparation {
     let absent_before_create = matches!(
         std::fs::symlink_metadata(inst_dir),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     );
     if !absent_before_create {
         tracing::warn!(%inst_name, path = %inst_dir.display(), "deployment workdir already exists; preserving unowned path");
-        return false;
+        return WorkDirPreparation::Failed {
+            residual: Some(inst_dir.display().to_string()),
+        };
     }
     if let Some(br) = branch {
         let branch_name = format!("{deploy_name}/{inst_suffix}");
@@ -413,8 +420,19 @@ fn prepare_work_dir(
         ) {
             Ok(_) => {
                 tracing::info!(%inst_name, %branch_name, "created worktree");
-                return absent_before_create
-                    && write_deployment_owner_marker(inst_dir, deploy_name, inst_name);
+                let created_identity = std::fs::symlink_metadata(inst_dir).ok();
+                if write_deployment_owner_marker(inst_dir, deploy_name, inst_name) {
+                    return WorkDirPreparation::Ready;
+                }
+                return WorkDirPreparation::Failed {
+                    residual: rollback_failed_work_dir(
+                        inst_dir,
+                        parent_dir,
+                        created_identity.as_ref(),
+                        Some(&branch_name),
+                    )
+                    .then(|| format!("{} (branch {branch_name})", inst_dir.display())),
+                };
             }
             Err(crate::git_helpers::GitError::NonZero { stderr, .. }) => {
                 tracing::warn!(%inst_name, error = %stderr, "worktree failed");
@@ -427,15 +445,91 @@ fn prepare_work_dir(
         if let Some(parent) = inst_dir.parent() {
             if let Err(error) = std::fs::create_dir_all(parent) {
                 tracing::warn!(%inst_name, %error, "deployment workdir parent creation failed");
-                return false;
+                return WorkDirPreparation::Failed { residual: None };
             }
         }
         if let Err(error) = std::fs::create_dir(inst_dir) {
             tracing::warn!(%inst_name, %error, "deployment workdir creation failed");
-            return false;
+            return WorkDirPreparation::Failed { residual: None };
         }
-        return write_deployment_owner_marker(inst_dir, deploy_name, inst_name);
+        let created_identity = std::fs::symlink_metadata(inst_dir).ok();
+        if write_deployment_owner_marker(inst_dir, deploy_name, inst_name) {
+            return WorkDirPreparation::Ready;
+        }
+        return WorkDirPreparation::Failed {
+            residual: rollback_failed_work_dir(
+                inst_dir,
+                parent_dir,
+                created_identity.as_ref(),
+                None,
+            )
+            .then(|| inst_dir.display().to_string()),
+        };
     }
+    WorkDirPreparation::Failed { residual: None }
+}
+
+fn rollback_failed_work_dir(
+    inst_dir: &Path,
+    parent_dir: &Path,
+    created_identity: Option<&std::fs::Metadata>,
+    branch_name: Option<&str>,
+) -> bool {
+    let Some(created_identity) = created_identity else {
+        tracing::error!(path = %inst_dir.display(), "failed deployment marker write; cannot verify created path identity, preserving residual");
+        return true;
+    };
+    if !std::fs::symlink_metadata(inst_dir)
+        .is_ok_and(|metadata| same_path_identity(created_identity, &metadata))
+    {
+        tracing::error!(path = %inst_dir.display(), "failed deployment marker write; path identity changed, preserving residual");
+        return true;
+    }
+
+    if let Some(branch_name) = branch_name {
+        let path = inst_dir.display().to_string();
+        let _ =
+            crate::git_helpers::git_bypass(parent_dir, &["worktree", "remove", "--force", &path]);
+        if std::fs::symlink_metadata(inst_dir)
+            .is_ok_and(|metadata| same_path_identity(created_identity, &metadata))
+        {
+            let _ = std::fs::remove_dir_all(inst_dir);
+        }
+        let _ = crate::git_helpers::git_bypass(parent_dir, &["worktree", "prune"]);
+        let _ = crate::git_helpers::git_bypass(parent_dir, &["branch", "-D", branch_name]);
+        let branch_exists = crate::git_helpers::git_bypass(
+            parent_dir,
+            &["rev-parse", "--verify", "--quiet", branch_name],
+        )
+        .is_ok_and(|output| output.status.success());
+        let path_exists = std::fs::symlink_metadata(inst_dir).is_ok();
+        if path_exists || branch_exists {
+            tracing::error!(path = %inst_dir.display(), %branch_name, "failed deployment rollback left a worktree or branch residual");
+            return true;
+        }
+        return false;
+    }
+
+    match std::fs::remove_dir_all(inst_dir) {
+        Ok(()) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::error!(path = %inst_dir.display(), %error, "failed deployment rollback could not remove newly created directory");
+            true
+        }
+    }
+}
+
+#[cfg(unix)]
+fn same_path_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_path_identity(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
+    // Without a stable filesystem object identity, do not recursively delete a
+    // path after marker failure. The caller reports it as an actionable residual.
     false
 }
 
@@ -810,14 +904,15 @@ pub(crate) fn deploy_with_runtime(
             .strip_prefix(&format!("{}-", params.deploy_name))
             .unwrap_or(inst_name);
         let inst_dir = directory.join(inst_name);
-        if !prepare_work_dir(
+        let preparation = prepare_work_dir(
             &inst_dir,
             &directory,
             &params.deploy_name,
             suffix,
             inst_name,
             params.branch.as_deref(),
-        ) {
+        );
+        if let WorkDirPreparation::Failed { residual } = preparation {
             let cleanup = Deployment {
                 name: params.deploy_name.clone(),
                 template: params.template.clone(),
@@ -833,6 +928,7 @@ pub(crate) fn deploy_with_runtime(
             return serde_json::json!({
                 "error": format!("deployment '{}' could not safely materialize working directory for '{inst_name}'", params.deploy_name),
                 "code": "deploy_workdir_materialization_failed",
+                "residual": residual,
             });
         }
         materialized.push(inst_name.clone());

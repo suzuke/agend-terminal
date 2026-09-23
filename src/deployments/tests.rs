@@ -185,6 +185,10 @@ fn deploy_rolls_back_currently_created_path_when_owner_marker_fails_3721() {
     let candidate = root.join("team-worker");
     assert_eq!(out["code"], "deploy_workdir_materialization_failed");
     assert!(
+        out["residual"].is_null(),
+        "successful rollback is not residual state: {out}"
+    );
+    assert!(
         !candidate.exists(),
         "a path created by this failed attempt must be rolled back"
     );
@@ -192,6 +196,57 @@ fn deploy_rolls_back_currently_created_path_when_owner_marker_fails_3721() {
     assert!(!fleet.instances.contains_key("team-worker"));
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn deploy_rolls_back_branch_worktree_when_owner_marker_fails_3721() {
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        crate::git_helpers::git_bypass(dir, args).expect("git")
+    }
+
+    let home = tmp_home("branch_marker_failure_rollback_3721");
+    let root = home.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-b", "main"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    super::fail_next_deployment_owner_marker_for_test();
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root, "branch":"main"}),
+    );
+
+    let candidate = root.join("team-worker");
+    assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    assert!(
+        !candidate.exists(),
+        "the failed branch worktree created by this attempt must be removed"
+    );
+    assert!(
+        !git(&root, &["rev-parse", "--verify", "--quiet", "team/worker"])
+            .status
+            .success(),
+        "failed branch deployment must remove its generated branch"
+    );
+    std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
