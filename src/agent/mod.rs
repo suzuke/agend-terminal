@@ -908,6 +908,11 @@ fn build_command(
             .zip(*working_dir)
             .map(|(b, wd)| b.spawn_flags(wd))
             .unwrap_or_default();
+        let claude_name_args = if matches!(detected_backend.as_ref(), Some(Backend::ClaudeCode)) {
+            vec!["--name".to_string(), name.to_string()]
+        } else {
+            Vec::new()
+        };
         // #3317/#3402: overrides lead, so they precede any Codex subcommand.
         // Empty for every non-Codex backend.
         codex_config_args
@@ -915,6 +920,7 @@ fn build_command(
             .cloned()
             .chain(preset)
             .chain(args.iter().cloned())
+            .chain(claude_name_args)
             .chain(flags)
             .collect()
     };
