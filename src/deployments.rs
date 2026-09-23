@@ -1062,26 +1062,26 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
         // `home/workspace/<deploy_name>/<inst>`) AND covers historical
         // teardown semantics that cleaned `home/workspace/<inst>` directly.
         let default_subdir = crate::paths::workspace_dir(home).join(inst);
-        if default_subdir.exists() {
-            if deployment_member_cleanup_admitted(
+        if default_subdir.exists()
+            && deployment_member_cleanup_admitted(
                 fleet.as_ref(),
                 home,
                 inst,
                 &default_subdir,
                 &default_subdir,
-            ) {
-                if let Ok(canonical) = crate::paths::canonical_workspace_path(&default_subdir) {
-                    let admission =
-                        crate::agent_ops::cleanup_admission::CleanupAdmission::RemoveOwned {
-                            canonical,
-                        };
-                    let _ = crate::agent_ops::cleanup_working_dir_admitted(
-                        home,
-                        inst,
-                        &default_subdir,
-                        &admission,
-                    );
-                }
+            )
+        {
+            if let Ok(canonical) = crate::paths::canonical_workspace_path(&default_subdir) {
+                let admission =
+                    crate::agent_ops::cleanup_admission::CleanupAdmission::RemoveOwned {
+                        canonical,
+                    };
+                let _ = crate::agent_ops::cleanup_working_dir_admitted(
+                    home,
+                    inst,
+                    &default_subdir,
+                    &admission,
+                );
             }
         }
     }
