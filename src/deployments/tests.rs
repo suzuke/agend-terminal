@@ -1728,6 +1728,129 @@ fn reconcile_orphans_prunes_stale_entry_at_boot() {
 }
 
 #[test]
+fn reconcile_preserves_cleanup_residual_for_retry_by_deployment_name_3721() {
+    let home = tmp_home("reconcile-cleanup-residual-3721");
+    let custom_root = tmp_home("reconcile-cleanup-root-3721");
+    let member = "demo-worker";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(member_dir.join("operator-data"), "preserve").unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    let mut store = DeploymentStore::default();
+    store.deployments.push(Deployment {
+        name: "demo".into(),
+        template: "tpl".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
+    });
+    save(&home, &mut store).unwrap();
+
+    assert!(reconcile_orphan_deployments(&home).is_empty());
+    let retained = load(&home).deployments;
+    assert_eq!(retained.len(), 1, "failed cleanup must retain retry state");
+    assert!(retained[0].instances.is_empty());
+    assert_eq!(retained[0].cleanup_instances, vec![member]);
+    assert!(reconcile_orphan_deployments(&home).is_empty());
+    assert_eq!(
+        load(&home).deployments.len(),
+        1,
+        "boot retry must not prune residual"
+    );
+    assert!(member_dir.join("operator-data").exists());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+#[test]
+fn teardown_preserves_newer_runtime_generation_after_stale_record_retry_3721() {
+    let home = tmp_home("teardown_stale_record_generation_3721");
+    let old_root = home.join("old-generation");
+    let new_root = home.join("new-generation");
+    let member = "svc-worker";
+    let old_member_dir = old_root.join(member);
+    std::fs::create_dir_all(&old_member_dir).unwrap();
+    std::fs::write(old_member_dir.join("old-generation.txt"), "old").unwrap();
+    let new_member_dir = new_root.join(member);
+    std::fs::create_dir_all(&new_member_dir).unwrap();
+    let sentinel = new_member_dir.join("live-generation.txt");
+    std::fs::write(&sentinel, "new").unwrap();
+
+    let stale_record = Deployment {
+        name: "svc".into(),
+        template: "tpl".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: None,
+        directory: old_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: Some("old-generation-id".into()),
+    };
+    assert!(write_deployment_owner_marker(
+        &old_member_dir,
+        "svc",
+        member,
+        Some("old-generation-id")
+    ));
+    let mut store = DeploymentStore {
+        deployments: vec![stale_record],
+        ..Default::default()
+    };
+    save(&home, &mut store).unwrap();
+    crate::fleet::add_instance_to_yaml(
+        &home,
+        member,
+        &crate::fleet::InstanceYamlEntry {
+            backend: Some("claude".into()),
+            working_directory: Some(new_member_dir.display().to_string()),
+            deployment_generation: Some("new-generation-id".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs = crate::api::ConfigRegistry::default();
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    externals.lock().insert(
+        member.to_string(),
+        crate::agent::ExternalAgentHandle {
+            backend_command: "remote".into(),
+            pid: 9912,
+        },
+    );
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+
+    let result = teardown_with_runtime(&home, &serde_json::json!({"name": "svc"}), Some(&runtime));
+
+    assert!(
+        externals.lock().contains_key(member),
+        "retry for stale generation must not delete the newer runtime instance: {result}"
+    );
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert_eq!(
+        fleet.instances[member].deployment_generation.as_deref(),
+        Some("new-generation-id")
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"new");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn reconcile_after_close_is_idempotent() {
     // Repeated reconciles on the same already-clean state must no-op
     // (no spurious team-delete calls, no panics).
