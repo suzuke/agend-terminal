@@ -137,25 +137,8 @@ pub fn validate_working_directory(
     path: &std::path::Path,
     home: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
-    use std::path::Component;
-    // Reject path traversal at component level
-    if path.components().any(|c| matches!(c, Component::ParentDir)) {
-        anyhow::bail!("working_directory must not contain '..'");
-    }
-    // Canonicalize to resolve symlinks. `dunce::canonicalize` (not
-    // `std::fs::canonicalize`) so that on Windows the returned path does NOT
-    // carry the `\\?\` UNC verbatim prefix: this value becomes the PTY cwd
-    // (agent::build_command -> cmd.cwd), and a `\\?\`-prefixed cwd makes
-    // cmd.exe-based backends warn "UNC paths are not supported" and silently
-    // fall back to C:\Windows (#893 — same prefix bug already fixed for the
-    // session-name encode path in backend::canonicalize_for_encode).
-    let canonical = if path.exists() {
-        dunce::canonicalize(path)
-            .map_err(|e| anyhow::anyhow!("working_directory canonicalize failed: {e}"))?
-    } else {
-        // Path doesn't exist yet (will be created) — use parent for validation
-        path.to_path_buf()
-    };
+    let canonical = crate::paths::validate_workspace_root(home, path)
+        .map_err(|error| anyhow::anyhow!("working_directory admission refused: {error}"))?;
     // Allowed-roots check
     if !is_under_allowed_root(&canonical, home) {
         anyhow::bail!("working_directory outside allowed roots");

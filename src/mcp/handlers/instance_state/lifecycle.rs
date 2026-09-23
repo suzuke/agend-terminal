@@ -334,7 +334,12 @@ pub(crate) fn full_delete_instance_with_precondition(
     // corrupt/unreadable identity, or a lock-acquire failure) preserves the
     // foreign tree; surface it as a step error so the delete reports failure
     // instead of a false success while B's directory is (correctly) left intact.
-    if is_claude {
+    let cleanup_permitted = matches!(
+        &cleanup_admission,
+        crate::agent_ops::cleanup_admission::CleanupAdmission::RemoveOwned { .. }
+            | crate::agent_ops::cleanup_admission::CleanupAdmission::ScrubExclusive { .. }
+    );
+    if is_claude && cleanup_permitted {
         if let Err(error) = crate::mcp_config::remove_claude_channel_config(&working_dir) {
             step_errors.push(format!("Claude ChannelBridge config cleanup: {error}"));
         }

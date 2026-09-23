@@ -994,6 +994,16 @@ pub fn list(home: &Path) -> Value {
 /// a single per-instance failure doesn't abort the rest of the sweep.
 fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     let custom_root = std::path::Path::new(&deployment.directory);
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
+    let fleet = match crate::fleet::FleetConfig::load(&fleet_path) {
+        Ok(config) => Some(config),
+        Err(_) if std::fs::symlink_metadata(&fleet_path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Some(crate::fleet::FleetConfig::default())
+        }
+        Err(_) => None,
+    };
     // MED-4: a branch-mode deploy creates a git worktree per instance via
     // `git worktree add -b {deploy}/{suffix}` in the deploy directory (which IS
     // the source repo in branch mode). A bare `remove_dir_all` left a prunable
@@ -1007,7 +1017,10 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     for inst in &deployment.instances {
         // Custom-directory branch: deploy()'s `inst_dir = dir.join(&inst_name)`.
         let custom_subdir = custom_root.join(inst);
-        if dir_is_repo {
+        let custom_admitted = deployment_member_cleanup_admitted(
+            fleet.as_ref(), home, inst, &custom_subdir, &custom_subdir,
+        );
+        if custom_admitted && dir_is_repo {
             // Instances are named `{deploy_name}-{suffix}`; the worktree branch
             // is `{deploy_name}/{suffix}` (see prepare_work_dir).
             let suffix = inst
@@ -1024,7 +1037,7 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
             let _ = crate::git_helpers::git_bypass(custom_root, &["branch", "-D", &branch]);
             let _ = crate::git_helpers::git_bypass(custom_root, &["worktree", "prune"]);
         }
-        if custom_subdir.exists() {
+        if custom_admitted && custom_subdir.exists() {
             match std::fs::remove_dir_all(&custom_subdir) {
                 Ok(()) => tracing::info!(
                     inst = %inst,
@@ -1045,7 +1058,14 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
         // teardown semantics that cleaned `home/workspace/<inst>` directly.
         let default_subdir = crate::paths::workspace_dir(home).join(inst);
         if default_subdir.exists() {
-            let _ = crate::agent_ops::cleanup_working_dir(home, inst, &default_subdir);
+            if deployment_member_cleanup_admitted(
+                fleet.as_ref(), home, inst, &default_subdir, &default_subdir,
+            ) {
+                if let Ok(canonical) = crate::paths::canonical_workspace_path(&default_subdir) {
+                    let admission = crate::agent_ops::cleanup_admission::CleanupAdmission::RemoveOwned { canonical };
+                    let _ = crate::agent_ops::cleanup_working_dir_admitted(home, inst, &default_subdir, &admission);
+                }
+            }
         }
     }
     // Sprint 54 P1-5: best-effort rmdir of the custom-directory parent.
@@ -1054,7 +1074,62 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     // don't leak `/tmp/team-foo/` shells behind. `remove_dir` (NOT
     // `remove_dir_all`) errors on non-empty, which is exactly what we
     // want: any operator-dropped file preserves the parent.
-    rmdir_if_empty(custom_root);
+    if crate::paths::canonical_workspace_path(custom_root).is_ok_and(|root| {
+        crate::paths::canonical_workspace_path(home).is_ok_and(|home| root != home)
+            && crate::paths::canonical_workspace_path(&crate::paths::workspace_dir(home)).is_ok_and(|workspace| root != workspace)
+    }) {
+        rmdir_if_empty(custom_root);
+    }
+}
+
+/// Admit a deployment-owned child only when its exact canonical location is
+/// still disjoint from every effective fleet workspace. This also works after
+/// orphan reconciliation has already removed the member from fleet.yaml.
+fn deployment_member_cleanup_admitted(
+    fleet: Option<&crate::fleet::FleetConfig>,
+    home: &Path,
+    instance: &str,
+    candidate: &Path,
+    owned_path: &Path,
+) -> bool {
+    let canonical = match crate::paths::canonical_workspace_path(candidate) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(path = %candidate.display(), %error, "deployment cleanup refused: candidate path is ambiguous");
+            return false;
+        }
+    };
+    let expected_canonical = match crate::paths::canonical_workspace_path(owned_path) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    if canonical != expected_canonical {
+        return false;
+    }
+    let Some(fleet) = fleet else {
+        tracing::warn!(path = %canonical.display(), "deployment cleanup refused: fleet snapshot unavailable");
+        return false;
+    };
+    for (name, entry) in &fleet.instances {
+        if name == instance {
+            continue;
+        }
+        let survivor = entry.working_directory.as_deref()
+            .map(crate::fleet::resolve::expand_tilde_path)
+            .unwrap_or_else(|| crate::paths::workspace_dir(home).join(name));
+        match crate::paths::canonical_workspace_path(&survivor) {
+            Ok(path) if matches!(crate::paths::workspace_paths_overlap(&canonical, &path), Ok(false)) => {}
+            Ok(path) => {
+                tracing::warn!(path = %canonical.display(), survivor = %path.display(), "deployment cleanup preserved overlapping active workspace");
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(survivor = %survivor.display(), %error, "deployment cleanup refused: survivor path is ambiguous");
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Best-effort rmdir of an empty directory (Sprint 54 P1-5).

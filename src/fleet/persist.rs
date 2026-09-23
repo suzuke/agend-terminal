@@ -175,9 +175,9 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 find_workspace_identity_collision(home, instances, name, &candidate_wd)
             {
                 return Err(anyhow::anyhow!(
-                    "workspace identity collision: instance '{name}' would resolve to the same \
-                     canonical working directory as existing instance '{collider}' ({}). Refusing \
-                     to admit a duplicate workspace identity (fail-closed).",
+                "workspace identity collision: instance '{name}' would overlap the canonical \
+                     working directory of existing instance '{collider}' ({}). Refusing \
+                     workspace overlap (fail-closed).",
                     candidate_wd.display()
                 ));
             }
@@ -186,8 +186,8 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
     })
 }
 
-/// Return the name of an existing instance whose EFFECTIVE working directory shares
-/// `candidate_wd`'s canonical identity ([`crate::paths::workspace_identity`]), else `None`.
+/// Return the name of an existing instance whose EFFECTIVE working directory overlaps
+/// `candidate_wd` after canonicalization, else `None`.
 /// Excludes `candidate_name` itself (a same-name merge/update is not a duplicate). Read-only
 /// over the parsed fleet mapping; the caller holds the fleet lock, so this is atomic w.r.t.
 /// concurrent admissions.
@@ -201,7 +201,11 @@ fn find_workspace_identity_collision(
     candidate_name: &str,
     candidate_wd: &Path,
 ) -> Option<String> {
-    let candidate_id = crate::paths::workspace_identity(&expand_tilde(candidate_wd));
+    let candidate_path = expand_tilde(candidate_wd);
+    let candidate_canonical = match crate::paths::validate_workspace_root(home, &candidate_path) {
+        Ok(path) => path,
+        Err(error) => return Some(format!("workspace path admission refused: {error}")),
+    };
     for (k, v) in instances {
         let Some(existing_name) = k.as_str() else {
             continue;
@@ -211,8 +215,15 @@ fn find_workspace_identity_collision(
         }
         let explicit = v.get("working_directory").and_then(|x| x.as_str());
         let existing_wd = crate::paths::effective_working_dir(home, existing_name, explicit);
-        if crate::paths::workspace_identity(&expand_tilde(&existing_wd)) == candidate_id {
-            return Some(existing_name.to_string());
+        let existing_wd = expand_tilde(&existing_wd);
+        match crate::paths::workspace_paths_overlap(&candidate_canonical, &existing_wd) {
+            Ok(true) => return Some(existing_name.to_string()),
+            Ok(false) => {}
+            Err(error) => {
+                return Some(format!(
+                    "workspace path for existing instance '{existing_name}' is ambiguous: {error}"
+                ));
+            }
         }
     }
     None
@@ -270,7 +281,11 @@ pub fn duplicate_identity_owner_before(
     name: &str,
     candidate_wd: &Path,
 ) -> Option<String> {
-    let candidate_id = crate::paths::workspace_identity(&expand_tilde(candidate_wd));
+    let candidate_path = expand_tilde(candidate_wd);
+    let candidate_canonical = match crate::paths::validate_workspace_root(home, &candidate_path) {
+        Ok(path) => path,
+        Err(error) => return Some(format!("workspace path admission refused: {error}")),
+    };
     let mapping = match load_instances_mapping(home) {
         Ok(m) => m,
         Err(e) => return Some(format!("fleet unreadable — refusing boot admission: {e}")),
@@ -280,16 +295,29 @@ pub fn duplicate_identity_owner_before(
         let Some(existing_name) = k.as_str() else {
             continue;
         };
-        // Only an EARLIER-sorting instance can preempt this boot.
-        if existing_name >= name {
+        if existing_name == name {
             continue;
         }
         let explicit = v.get("working_directory").and_then(|x| x.as_str());
         let existing_wd = crate::paths::effective_working_dir(home, existing_name, explicit);
-        if crate::paths::workspace_identity(&expand_tilde(&existing_wd)) == candidate_id
-            && earliest.as_deref().is_none_or(|e| existing_name < e)
-        {
-            earliest = Some(existing_name.to_string());
+        let existing_wd = expand_tilde(&existing_wd);
+        match crate::paths::workspace_paths_overlap(&candidate_canonical, &existing_wd) {
+            Ok(false) => {}
+            Err(error) => {
+                return Some(format!(
+                    "workspace path for existing instance '{existing_name}' is ambiguous: {error}"
+                ));
+            }
+            Ok(true) => {
+                let exact = crate::paths::workspace_identity(&existing_wd)
+                    == crate::paths::workspace_identity(&candidate_canonical);
+                if !exact {
+                    return Some(existing_name.to_string());
+                }
+                if existing_name < name && earliest.as_deref().is_none_or(|e| existing_name < e) {
+                    earliest = Some(existing_name.to_string());
+                }
+            }
         }
     }
     earliest
@@ -883,6 +911,24 @@ mod tests {
             duplicate_identity_owner_before(&home, "alice", &shared),
             None
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn duplicate_identity_owner_before_refuses_nested_workspace_overlap_3721() {
+        let home = tmp_home("nested-owner-3721");
+        let parent = home.join("shared");
+        let child = parent.join("child");
+        let yaml = format!(
+            "instances:\n  alpha:\n    working_directory: '{p}'\n  beta:\n    working_directory: '{c}'\n",
+            p = parent.display(),
+            c = child.display()
+        );
+        std::fs::write(fleet_yaml_path(&home), yaml).unwrap();
+
+        assert!(duplicate_identity_owner_before(&home, "alpha", &parent).is_some());
+        assert!(duplicate_identity_owner_before(&home, "beta", &child).is_some());
+
         std::fs::remove_dir_all(&home).ok();
     }
 

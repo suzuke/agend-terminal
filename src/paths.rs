@@ -68,6 +68,103 @@ pub fn workspace_identity(path: &Path) -> String {
     full.to_string_lossy().to_lowercase()
 }
 
+/// Canonicalize an existing path or a not-yet-created path through its deepest
+/// existing ancestor. Any present-but-unresolvable entry is ambiguous and is
+/// rejected rather than treated as a lexical path.
+pub fn canonical_workspace_path(path: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!("path {} contains '..'", path.display()));
+    }
+
+    let mut probe = path.to_path_buf();
+    let mut suffix = Vec::new();
+    loop {
+        match dunce::canonicalize(&probe) {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) => match std::fs::symlink_metadata(&probe) {
+                Err(metadata_error)
+                    if metadata_error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    let Some(name) = probe.file_name() else {
+                        return Err(format!(
+                            "path {} has no canonicalizable ancestor: {error}",
+                            path.display()
+                        ));
+                    };
+                    suffix.push(name.to_os_string());
+                    let Some(parent) = probe.parent() else {
+                        return Err(format!(
+                            "path {} has no canonicalizable ancestor: {error}",
+                            path.display()
+                        ));
+                    };
+                    probe = parent.to_path_buf();
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "path {} exists but cannot canonicalize: {error}",
+                        probe.display()
+                    ));
+                }
+                Err(metadata_error) => {
+                    return Err(format!(
+                        "path {} metadata is ambiguous: {metadata_error}",
+                        probe.display()
+                    ));
+                }
+            },
+        }
+    }
+}
+
+fn folded_components(path: &Path) -> Vec<String> {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect()
+}
+
+fn component_prefix(left: &[String], right: &[String]) -> bool {
+    left.len() <= right.len() && left.iter().zip(right).all(|(a, b)| a == b)
+}
+
+/// True when either canonical path is equal to, an ancestor of, or a
+/// descendant of the other. Comparison is conservatively case-folded on every
+/// platform, matching workspace_identity's existing alias policy.
+pub fn workspace_paths_overlap(left: &Path, right: &Path) -> Result<bool, String> {
+    let left = folded_components(&canonical_workspace_path(left)?);
+    let right = folded_components(&canonical_workspace_path(right)?);
+    Ok(component_prefix(&left, &right) || component_prefix(&right, &left))
+}
+
+/// Validate a candidate path's canonical form and reject the two reserved
+/// roots themselves. Descendants remain valid, subject to per-instance
+/// overlap admission elsewhere.
+pub fn validate_workspace_root(home: &Path, candidate: &Path) -> Result<PathBuf, String> {
+    let canonical = canonical_workspace_path(candidate)?;
+    for (label, root) in [
+        ("AGEND_HOME", home.to_path_buf()),
+        ("AGEND_HOME/workspace", workspace_dir(home)),
+    ] {
+        let canonical_root = canonical_workspace_path(&root)?;
+        if folded_components(&canonical) == folded_components(&canonical_root) {
+            return Err(format!(
+                "working directory {} is reserved ({label})",
+                candidate.display()
+            ));
+        }
+    }
+    Ok(canonical)
+}
+
 /// Ownership an agend-provisioned artifact (AGENTS.md agend block,
 /// `.codex/config.toml` `AGEND_INSTANCE_NAME` stamp) records for a working
 /// directory. The fail-closed workspace-identity guards read this before a
