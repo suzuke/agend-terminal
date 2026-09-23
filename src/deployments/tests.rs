@@ -184,13 +184,26 @@ fn deploy_rolls_back_currently_created_path_when_owner_marker_fails_3721() {
 
     let candidate = root.join("team-worker");
     assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    #[cfg(unix)]
     assert!(
         out["residual"].is_null(),
         "successful rollback is not residual state: {out}"
     );
+    #[cfg(unix)]
     assert!(
         !candidate.exists(),
         "a path created by this failed attempt must be rolled back"
+    );
+    #[cfg(not(unix))]
+    assert_eq!(
+        out["residual"],
+        candidate.display().to_string(),
+        "without stable path identity, report rather than delete the residual"
+    );
+    #[cfg(not(unix))]
+    assert!(
+        candidate.exists(),
+        "ambiguous path identity must be preserved"
     );
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
     assert!(!fleet.instances.contains_key("team-worker"));
@@ -236,16 +249,32 @@ fn deploy_rolls_back_branch_worktree_when_owner_marker_fails_3721() {
 
     let candidate = root.join("team-worker");
     assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    #[cfg(unix)]
     assert!(
         !candidate.exists(),
         "the failed branch worktree created by this attempt must be removed"
     );
+    #[cfg(unix)]
     assert!(
         !git(&root, &["rev-parse", "--verify", "--quiet", "team/worker"])
             .status
             .success(),
         "failed branch deployment must remove its generated branch"
     );
+    #[cfg(not(unix))]
+    {
+        assert!(
+            candidate.exists(),
+            "ambiguous worktree identity must be preserved"
+        );
+        assert!(
+            git(&root, &["rev-parse", "--verify", "--quiet", "team/worker"])
+                .status
+                .success(),
+            "unremoved generated branch must be reported as a residual"
+        );
+        assert!(out["residual"].as_str().unwrap().contains("team/worker"));
+    }
     std::fs::remove_dir_all(&home).ok();
 }
 
