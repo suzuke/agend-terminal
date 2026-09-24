@@ -110,7 +110,17 @@ fn handle_create_with_id(
         routed_to: routed_to
             .as_ref()
             .map(|s| crate::task_events::InstanceName(s.clone())),
-        branch: args["branch"].as_str().map(String::from),
+        branch: args["branch"]
+            .as_str()
+            // #3706: an exact-empty branch carries no branch authority —
+            // normalize to None (branchless) so the assignee completion guard
+            // takes the Branchless path instead of failing the binding check
+            // on `Some("")`. Uses the same `!is_empty` predicate as the send
+            // contract (`comms_delegate` preflight, `messaging` checkout/link)
+            // so both sides agree; whitespace-only input keeps its original
+            // branch-bearing semantics (no trim — see #3707 review).
+            .filter(|branch| !branch.is_empty())
+            .map(String::from),
         // Sprint 55 P0-C: opt-out flag for daemon auto-bind on
         // dispatch. None = default auto-bind behavior preserved.
         bind: args["bind"].as_bool(),
