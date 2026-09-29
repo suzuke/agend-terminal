@@ -2292,3 +2292,169 @@ mod review_assignment_marker_tests {
         std::fs::remove_dir_all(source.parent().unwrap()).ok();
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #3706 follow-up (#3707 REJECT): the BRANCHLESS dispatch contract.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod branchless_dispatch_tests {
+    use super::super::handle_delegate_task;
+    use crate::identity::Sender;
+    use serde_json::{json, Value};
+
+    fn tmp_home(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-branchless-{}-{label}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    /// Two instances, NO `source_repo` on either — so any real bind attempt has
+    /// to fall back to the stub tier and cannot silently "succeed" against a
+    /// convenient real repo. Keeps the assertion about the *branch string*,
+    /// not about a repo that happens to be provisioned.
+    fn seed_fleet(home: &std::path::Path) {
+        let yaml = "instances:\n  lead:\n    backend: claude\n    id: 11111111-1111-4111-8111-111111111111\n  dev:\n    backend: claude\n    id: 22222222-2222-4222-8222-222222222222\nteams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n      - dev\n";
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+    }
+
+    fn dispatch(home: &std::path::Path, branch: &str) -> Value {
+        let sender = Some(Sender::new("lead").unwrap());
+        handle_delegate_task(
+            home,
+            &json!({
+                "instance": "dev",
+                "task": "do the work",
+                "branch": branch,
+                // An explicit, VALID review_class is what makes the preflight
+                // return None for an empty branch while auto-create still
+                // persists the class — the exact #3707 rejection vector.
+                "review_class": "single",
+            }),
+            &sender,
+            Some(&crate::mcp::handlers::minimal_test_runtime()),
+        )
+    }
+
+    /// #3707 REJECT RED: an empty-branch delegate dispatch carrying an explicit
+    /// valid `review_class` is BRANCHLESS end-to-end. `preflight_branch_authority`
+    /// returns `None` for it (`mod.rs:168` filters `!is_empty`), but
+    /// `maybe_auto_create_task` still forwards both `branch` and `review_class`
+    /// into creation; creation persists `branch=None` while preserving the class
+    /// in `Created`; `maybe_auto_create_task` reads that class back and
+    /// `branch_review_class` selects it. `maybe_auto_bind_lease` then accepts the
+    /// RAW `Some("")` (`mod.rs:189`) and drives worktree/lease provisioning with
+    /// an empty branch name.
+    ///
+    /// The branchless contract must gate the dispatch SIDE EFFECTS on a nonempty
+    /// branch, not just the authority preflight.
+    #[test]
+    fn empty_branch_dispatch_with_review_class_has_no_branch_side_effects_3706() {
+        let home = tmp_home("empty-side-effects");
+        seed_fleet(&home);
+        let out = dispatch(&home, "");
+        assert!(
+            out.get("error").is_none(),
+            "empty-branch dispatch must succeed: {out}"
+        );
+        // The auto-created task is branchless (delegates the assertion to
+        // `create_empty_branch_normalizes_to_branchless_3706`).
+        let task_id = out["auto_created_task_id"]
+            .as_str()
+            .expect("auto-created task id")
+            .to_string();
+        let record = crate::tasks::load_routed(&home, &task_id).expect("load task");
+        assert!(
+            record.record().branch.is_none(),
+            "auto-created task must be branchless, got {:?}",
+            record.record().branch
+        );
+        // No bind / no worktree / no CI watch may exist for the empty branch.
+        assert!(
+            crate::binding::read(&home, "dev").is_none(),
+            "empty-branch dispatch must NOT bind a worktree"
+        );
+        assert!(
+            out.get("ci_watch").is_none(),
+            "empty-branch dispatch must NOT arm a CI watch: {out}"
+        );
+        assert!(
+            !crate::daemon::ci_watch::has_instance_anywhere(&home, "dev"),
+            "empty-branch dispatch must leave no CI watch for the target"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3707 REJECT RED: the `bind: false` arm has the ANALOGOUS raw-string
+    /// check (`maybe_auto_watch_without_bind`, `mod.rs:257`). With the same
+    /// empty-branch + explicit-class dispatch, the watch path must not arm a
+    /// branch-scoped CI watch either.
+    #[test]
+    fn empty_branch_bind_false_dispatch_arms_no_watch_3706() {
+        let home = tmp_home("empty-bind-false");
+        seed_fleet(&home);
+        let sender = Some(Sender::new("lead").unwrap());
+        let out = handle_delegate_task(
+            &home,
+            &json!({
+                "instance": "dev",
+                "task": "do the work",
+                "branch": "",
+                "review_class": "single",
+                "bind": false,
+            }),
+            &sender,
+            Some(&crate::mcp::handlers::minimal_test_runtime()),
+        );
+        assert!(
+            out.get("error").is_none(),
+            "bind:false empty-branch dispatch must succeed: {out}"
+        );
+        assert!(
+            crate::binding::read(&home, "dev").is_none(),
+            "bind:false empty-branch dispatch must NOT bind"
+        );
+        assert!(
+            out.get("ci_watch").is_none(),
+            "bind:false empty-branch dispatch must NOT arm a CI watch: {out}"
+        );
+        assert!(
+            !crate::daemon::ci_watch::has_instance_anywhere(&home, "dev"),
+            "bind:false empty-branch dispatch must leave no CI watch for the target"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// GREEN guard: a NON-EMPTY branch with the same explicit class must still
+    /// reach the bind-lease path — proving the fix narrows only the empty
+    /// branchless case and does not disable branch dispatch side effects.
+    #[test]
+    fn nonempty_branch_dispatch_still_takes_the_bind_path_3706() {
+        let home = tmp_home("nonempty-control");
+        seed_fleet(&home);
+        // No `source_repo` anywhere ⇒ the stub-tier bind cannot resolve, so the
+        // dispatch surfaces a structured bind rejection rather than succeeding.
+        // That REJECTION is the proof the branch path was entered at all.
+        let out = dispatch(&home, "fix/real-work");
+        let attempted_bind = out
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|e| e.contains("dispatch rejected"));
+        let has_branch_code = out.get("code").is_some();
+        assert!(
+            attempted_bind || has_branch_code,
+            "non-empty branch must still enter the bind-lease path, got: {out}"
+        );
+        assert!(
+            crate::binding::read(&home, "dev").is_none(),
+            "stub-tier bind must not fabricate a binding"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}

@@ -157,6 +157,25 @@ fn compose_delegate_message(
     }
 }
 
+/// The dispatch's branch AUTHORITY, or `None` when the dispatch is branchless.
+///
+/// #3706: an exact-empty `branch` carries no branch authority, so it must be
+/// invisible to EVERY branch side effect — the authority preflight, the bind
+/// lease, the `bind: false` CI watch, and the runtime gate. Predating this
+/// helper, `maybe_auto_bind_lease` and `maybe_auto_watch_without_bind` read the
+/// RAW `args["branch"].as_str()`, so a `Some("")` that the preflight had already
+/// ruled branchless still reached `dispatch_auto_bind_lease_with_source_and_chain`
+/// (and, via auto-create, could carry an explicit `review_class` into it) and
+/// attempted lease/worktree provisioning with an empty branch name.
+///
+/// The predicate is the send contract's exact `!is_empty` filter
+/// (`comms_delegate` preflight, `agent_ops::messaging`, `tasks::create`) — no
+/// trim, so a whitespace-only branch stays branch-bearing and keeps failing
+/// closed everywhere.
+fn branch_authority(args: &Value) -> Option<&str> {
+    args["branch"].as_str().filter(|branch| !branch.is_empty())
+}
+
 /// Validate branch-dispatch authority before any branch-side effect. This is
 /// intentionally shared by ordinary and reviewer-assignment dispatches so a
 /// `bind: false` arm cannot skip the governing-decision reload.
@@ -165,9 +184,9 @@ fn preflight_branch_authority(
     args: &Value,
     checks: &DispatchPreChecks,
 ) -> Result<Option<ReviewClass>, Value> {
-    let Some(_branch) = args["branch"].as_str().filter(|branch| !branch.is_empty()) else {
+    if branch_authority(args).is_none() {
         return Ok(None);
-    };
+    }
     let task_id = args["task_id"].as_str().unwrap_or("");
     let review_class = crate::tasks::governance::resolve_dispatch_authority(
         home,
@@ -186,7 +205,7 @@ fn maybe_auto_bind_lease(
     task_id: Option<&str>,
     review_class: ReviewClass,
 ) -> Result<Option<dispatch_hook::CiWatchOutcome>, Value> {
-    let Some(branch) = args["branch"].as_str() else {
+    let Some(branch) = branch_authority(args) else {
         return Ok(None);
     };
     let task_id_val = task_id.unwrap_or("");
@@ -254,7 +273,7 @@ fn maybe_auto_watch_without_bind(
     task_id: Option<&str>,
     review_class: ReviewClass,
 ) -> Result<Option<dispatch_hook::CiWatchOutcome>, Value> {
-    let Some(branch) = args["branch"].as_str() else {
+    let Some(branch) = branch_authority(args) else {
         return Ok(None);
     };
     let mut watch_args = args.clone();
@@ -340,11 +359,7 @@ fn maybe_auto_create_task(
             ReviewClass::Dual => Some(ReviewClass::Dual),
             ReviewClass::Unresolved => None,
         });
-    if args["branch"]
-        .as_str()
-        .is_some_and(|branch| !branch.is_empty())
-        && created_review_class.is_none()
-    {
+    if branch_authority(args).is_some() && created_review_class.is_none() {
         return Err(json!({
             "error": "auto-created branch task has no durable review_class",
             "code": "review_class_unspecified",
@@ -495,10 +510,7 @@ pub(crate) fn handle_delegate_task(
     // preflight, so a runtime-less caller still gets the #2454 code rather than
     // an authority diagnostic. Skipped for review_assignment, which dispatches
     // via the store and never needed the runtime — that path stays byte-for-byte.
-    if !checks.review_assignment
-        && runtime.is_none()
-        && args["branch"].as_str().is_some_and(|b| !b.is_empty())
-    {
+    if !checks.review_assignment && runtime.is_none() && branch_authority(args).is_some() {
         return json!({
             "ok": false,
             "error": "branch dispatch requires in-process runtime",
